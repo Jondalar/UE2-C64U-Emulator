@@ -1,0 +1,21 @@
+[package]
+name = "ue2-vfat"
+description = "A host directory as a USB stick: FAT32 volume builder, guest-to-host sync, host watcher"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ue2-core = { path = "../ue2-core" }
+anyhow = "1"
+# 0.3.6 is the newest release: FAT32 formatting, long file names (`alloc`), timestamps through chrono.
+fatfs = "0.3.6"
+chrono = "0.4"
+libc = "0.2"
+notify = "8.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

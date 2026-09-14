@@ -1,0 +1,31 @@
+/firmware/
+/tools/
+/target/
+.DS_Store
+/run/
+# Local agent tooling (Claude Code, GitNexus), not part of the project.
+/.claude/
+/CLAUDE.md
+/AGENTS.md
+.gitnexus/
+__pycache__/
+
+# Safety net: firmware, ROM and media images never enter the repository. The firmware, the C64/1541 ROMs and
+# disk/cartridge/tune images are not ours to redistribute; tests and smokes build or read them outside the tree.
+*.ue2
+*.u64
+*.u2p
+*.u2l
+*.u2r
+*.rom
+*.bin
+*.bit
+*.elf
+*.crt
+*.d64
+*.g64
+*.d81
+*.prg
+*.sid
+*.tap
+*.t64

@@ -1,0 +1,38 @@
+# Example for `ue2emu run --config ue2emu.example.toml`.
+#
+# Every long flag of `ue2emu run` is a key, spelled like the flag without its dashes (`ue2emu run --help`).
+# Values are written as on the command line:
+#   - a flag with a value takes a string or a number     flash = "run/flash.bin"
+#   - a flag without a value takes true or false         headless = true
+#   - a repeatable flag takes an array, one per use      usb-dir = ["~/c64/usb", "~/c64/tools,ro"]
+#   - c64-roms takes true (bare flag) or a directory     c64-roms = "~/c64/roms"
+# Relative paths are relative to the directory of this file; a leading ~ or ~/ is your home directory.
+# A flag given on the command line replaces its value here: `ue2emu run --config ue2emu.toml --flash other.bin`.
+
+# Firmware: ultimate.elf, ultimate.app or a C64 Ultimate .ue2 update file.
+firmware = "~/c64u/c64u_v1.1.0.ue2"
+
+# Persistent SPI flash image, created erased if missing.
+flash = "run/flash.bin"
+
+# C64 KERNAL, BASIC and CHAR ROMs into /flash/roms of the flash image before boot: true takes them from the firmware
+# roms directory, a string names a directory.
+c64-roms = true
+
+# Host directories as USB sticks, PATH[,size=SIZE][,ro]; the guest's changes are written back.
+usb-dir = ["~/c64/usb"]
+
+# Wired Ethernet through libslirp NAT; the firmware web UI on http://127.0.0.1:8080.
+net = "user"
+web-port = 8080
+
+# A cartridge in the physical expansion port: FILE.crt[,rw|,save=OUT.crt][,flash-decode=11|15|both].
+# cart-slot = "~/c64/carts/game.crt,save=run/game-saved.crt"
+
+# Wall-clock pacing ("realtime" or "max") and SID audio through the default output device ("on" or "off").
+speed = "realtime"
+audio = "on"
+
+# Without a window, stopping after a minute.
+# headless = true
+# max-seconds = 60

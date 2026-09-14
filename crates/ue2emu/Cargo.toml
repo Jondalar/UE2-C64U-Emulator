@@ -1,0 +1,35 @@
+[package]
+name = "ue2emu"
+description = "U64-II / C64 Ultimate firmware emulator (CLI + window)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[features]
+default = ["trx64"]
+# TRX64 as the C64 behind the cart/DMA registers (docs/specs/S14-c64-trx64.md): needs the TRX64 checkout and a C++
+# toolchain. Without it `--c64 none`, the T0 register stub, is the only choice.
+trx64 = ["dep:c64-bridge"]
+
+[dependencies]
+ue2-core = { path = "../ue2-core" }
+ue2-net = { path = "../ue2-net" }
+ue2-vfat = { path = "../ue2-vfat" }
+c64-bridge = { path = "../c64-bridge", optional = true }
+# --c64-roms writes into the flash disk's FAT volume (the version ue2-vfat uses).
+fatfs = "0.3.6"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# run --config FILE.toml (config.rs).
+toml = "1"
+# Proven pairing from TRX64 trx64-cli (winit owns the main thread on macOS).
+winit = "0.30"
+softbuffer = "0.4"
+png = "0.17"
+gdbstub = "0.7"
+gdbstub_arch = "0.3"
+# SID audio out (--audio), the backend TRX64 trx64-cli uses (CoreAudio / ALSA / WASAPI).
+cpal = "0.15"
+
+[dev-dependencies]
+tempfile = "3"

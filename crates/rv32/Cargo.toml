@@ -1,0 +1,11 @@
+[package]
+name = "rv32"
+description = "RV32IM interpreter with rvlite trap semantics"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+object = "0.36"

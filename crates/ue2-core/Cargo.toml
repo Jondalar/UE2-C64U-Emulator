@@ -1,0 +1,15 @@
+[package]
+name = "ue2-core"
+description = "U64-II / C64 Ultimate machine: bus, devices, loader, run loop"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+rv32 = { path = "../rv32" }
+anyhow = "1"
+object = "0.36"
+cpp_demangle = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

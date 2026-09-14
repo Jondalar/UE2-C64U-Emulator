@@ -1,0 +1,16 @@
+[package]
+name = "ue2-net"
+description = "Host network backends for the RMII MAC: libslirp user-mode networking, socket_vmnet, vmnet bridged"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+links = "slirp"
+
+[dependencies]
+ue2-core = { path = "../ue2-core" }
+anyhow = "1"
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Completion and event handlers of vmnet.framework are blocks (the version winit already brings in).
+block2 = "0.5"
