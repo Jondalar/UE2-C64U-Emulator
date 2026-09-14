@@ -96,7 +96,13 @@ GPL-3.0-or-later (`LICENSE`).
 
 ## Quick start
 
-Prerequisites (`docs/status/install.md`, "Build"): Rust, a C++ compiler, libslirp (`brew install libslirp`), and the
+Install with Homebrew, which builds from source and installs `ue2emu` and `ue2-mcp`:
+
+```sh
+brew install jondalar/ue2emu/ue2emu
+```
+
+From a checkout instead: prerequisites (`docs/status/install.md`, "Build"): Rust, a C++ compiler, libslirp (`brew install libslirp`), and the
 untracked `firmware/1541ultimate` (a clone of GideonZ/1541ultimate with submodules). `scripts/build-firmware.sh`
 builds its `ultimate.elf` with a `riscv32-unknown-elf-*` toolchain in the untracked `tools/bin`.
 

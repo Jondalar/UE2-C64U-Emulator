@@ -21,8 +21,10 @@ Tools: emu_start, emu_stop, emu_list, emu_console, emu_screen, emu_screenshot, e
 emu_type, emu_wait, emu_expect, emu_rest, emu_control, emu_usb_sync, emu_cart_info, emu_cart_save.
 
 Environment (all optional):
-  UE2_REPO           emulator checkout (run/)                        [default: repo containing this binary]
-  UE2EMU_BIN         ue2emu binary                                   [default: $UE2_REPO/target/release/ue2emu]
+  UE2_REPO           emulator checkout (run/)                        [default: repo containing this binary,
+                                                                      else ~/.ue2emu]
+  UE2EMU_BIN         ue2emu binary                                   [default: $UE2_REPO/target/release/ue2emu,
+                                                                      outside a checkout the ue2emu next to this binary]
   UE2_FIRMWARE_TREE  default 1541ultimate checkout                   [default: $UE2_REPO/firmware/1541ultimate]
   UE2_MCP_RUN        instance directories                            [default: $UE2_REPO/run/mcp]
 

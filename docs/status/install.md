@@ -6,6 +6,10 @@ How to build the emulator, what each `ue2emu run` option does, how a `run --conf
 
 ## 1. Build
 
+**Homebrew:** `brew install jondalar/ue2emu/ue2emu` builds the tagged release from source with Homebrew's Rust and
+libslirp and installs `ue2emu` and `ue2-mcp` (tap: https://github.com/Jondalar/homebrew-ue2emu). Platform notes:
+`README.md`, "Platforms". Building from a checkout:
+
 | Prerequisite | Needed for | Notes |
 |---|---|---|
 | Rust (stable) with cargo | everything | built and tested with rustc 1.98.1 |
@@ -355,7 +359,8 @@ takes no arguments; each instance is a child `ue2emu run --headless --control 12
 `run/mcp/<id>/`. It does not build firmware. Reference (instances, flash modes, parameters, results, the control
 protocol): `docs/status/mcp.md`.
 
-**Build:** `cargo build --release -p ue2emu -p ue2-mcp`.
+**Build:** `cargo build --release -p ue2emu -p ue2-mcp`, or install both with Homebrew (section 1). An installed
+`ue2-mcp` outside a checkout starts the `ue2emu` next to it and keeps its instances in `~/.ue2emu/run/mcp/`.
 
 **Register** it in the project that uses the emulator (for example a 1541ultimate checkout), as `.mcp.json`:
 
@@ -380,12 +385,14 @@ or with the Claude Code CLI, run in that project (`--scope project` writes `.mcp
 claude mcp add ue2emu --scope project -e UE2_FIRMWARE_TREE=<1541ultimate checkout> -- <emulator checkout>/target/release/ue2-mcp
 ```
 
+With Homebrew the command is `$(brew --prefix)/bin/ue2-mcp`, e.g. `/opt/homebrew/bin/ue2-mcp` on Apple silicon.
+
 **Environment** (all optional, `crates/ue2-mcp/src/config.rs`):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `UE2_REPO` | the repo containing the binary | emulator checkout (`run/`) |
-| `UE2EMU_BIN` | `$UE2_REPO/target/release/ue2emu` | emulator binary |
+| `UE2_REPO` | the repo containing the binary, else `~/.ue2emu` | emulator checkout (`run/`) |
+| `UE2EMU_BIN` | `$UE2_REPO/target/release/ue2emu`; outside a checkout the `ue2emu` next to `ue2-mcp` | emulator binary |
 | `UE2_FIRMWARE_TREE` | `$UE2_REPO/firmware/1541ultimate` | default 1541ultimate checkout: `target/u64ii/riscv/ultimate/result/ultimate.elf` and `roms/` |
 | `UE2_MCP_RUN` | `$UE2_REPO/run/mcp` | instance directories |
 

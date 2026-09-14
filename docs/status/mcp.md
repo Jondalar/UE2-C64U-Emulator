@@ -12,6 +12,7 @@ also usable directly (last section).
 ```sh
 cd <emulator checkout>
 cargo build --release -p ue2emu -p ue2-mcp      # target/release/ue2emu, target/release/ue2-mcp
+# or: brew install jondalar/ue2emu/ue2emu       # $(brew --prefix)/bin/ue2emu, $(brew --prefix)/bin/ue2-mcp
 ```
 
 The emulator does not build firmware. The session that owns the firmware tree builds it with its own build; the
@@ -40,8 +41,8 @@ With `UE2_FIRMWARE_TREE` set, `emu_start` boots that checkout's
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `UE2_REPO` | the repo containing the binary | emulator checkout: `run/` |
-| `UE2EMU_BIN` | `$UE2_REPO/target/release/ue2emu` | emulator binary |
+| `UE2_REPO` | the repo containing the binary, else `~/.ue2emu` | emulator checkout: `run/` |
+| `UE2EMU_BIN` | `$UE2_REPO/target/release/ue2emu`; outside a checkout the `ue2emu` next to `ue2-mcp` | emulator binary |
 | `UE2_FIRMWARE_TREE` | `$UE2_REPO/firmware/1541ultimate` | default firmware checkout (boot image, roms) |
 | `UE2_MCP_RUN` | `$UE2_REPO/run/mcp` | instance directories |
 

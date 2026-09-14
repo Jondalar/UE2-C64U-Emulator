@@ -23,9 +23,11 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Config {
-        let repo = env_path("UE2_REPO").unwrap_or_else(default_repo);
+        let exe = std::env::current_exe().ok().map(|e| e.canonicalize().unwrap_or(e));
+        let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+        let (repo, emulator) = defaults(env_path("UE2_REPO"), exe.as_deref(), home.as_deref());
         Config {
-            emulator: env_path("UE2EMU_BIN").unwrap_or_else(|| repo.join("target/release/ue2emu")),
+            emulator: env_path("UE2EMU_BIN").unwrap_or(emulator),
             firmware_tree: env_path("UE2_FIRMWARE_TREE").unwrap_or_else(|| repo.join("firmware/1541ultimate")),
             run_base: env_path("UE2_MCP_RUN").unwrap_or_else(|| repo.join("run/mcp")),
             server_pid: std::process::id(),
@@ -38,17 +40,24 @@ fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).filter(|v| !v.is_empty()).map(|v| resolve(&v.to_string_lossy()))
 }
 
-/// The repo that contains this binary (`<repo>/target/release/ue2-mcp`), else the source checkout it was built from.
-fn default_repo() -> PathBuf {
+/// The base directory of the defaults (`run/mcp`, `firmware/1541ultimate`) and the emulator binary:
+/// - `repo` (`UE2_REPO`) or the checkout containing `exe` (`<repo>/target/release/ue2-mcp`): that checkout and its
+///   `target/release/ue2emu`;
+/// - an `exe` installed outside any checkout (Homebrew, `cargo install`): `~/.ue2emu` and the `ue2emu` next to `exe`.
+fn defaults(repo: Option<PathBuf>, exe: Option<&Path>, home: Option<&Path>) -> (PathBuf, PathBuf) {
     let is_repo = |d: &Path| d.join("crates/ue2emu/Cargo.toml").is_file();
-    if let Ok(exe) = std::env::current_exe() {
-        let exe = exe.canonicalize().unwrap_or(exe);
-        if let Some(dir) = exe.ancestors().skip(1).find(|d| is_repo(d)) {
-            return dir.to_path_buf();
+    let repo = repo.or_else(|| exe.and_then(|e| e.ancestors().skip(1).find(|d| is_repo(d))).map(Path::to_path_buf));
+    match repo {
+        Some(repo) => {
+            let emulator = repo.join("target/release/ue2emu");
+            (repo, emulator)
+        }
+        None => {
+            let base = home.map_or_else(|| PathBuf::from(".ue2emu"), |h| h.join(".ue2emu"));
+            let emulator = exe.and_then(Path::parent).map_or_else(|| PathBuf::from("ue2emu"), |d| d.join("ue2emu"));
+            (base, emulator)
         }
     }
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    dir.canonicalize().unwrap_or(dir)
 }
 
 /// A path argument: `~/` expands to $HOME, relative paths are relative to the server's working directory
@@ -98,6 +107,27 @@ mod tests {
         assert_eq!(resolve("~/x/y"), PathBuf::from(home).join("x/y"));
         assert_eq!(resolve("/abs/p"), PathBuf::from("/abs/p"));
         assert_eq!(resolve("rel/p"), std::env::current_dir().unwrap().join("rel/p"));
+    }
+
+    #[test]
+    fn defaults_follow_the_checkout_or_the_installed_binary() {
+        let dir = std::env::temp_dir().join(format!("ue2-mcp-defaults-{}", std::process::id()));
+        let checkout = dir.join("checkout");
+        std::fs::create_dir_all(checkout.join("crates/ue2emu")).unwrap();
+        std::fs::write(checkout.join("crates/ue2emu/Cargo.toml"), "").unwrap();
+        let home = dir.join("home");
+
+        let built = checkout.join("target/release/ue2-mcp");
+        assert_eq!(defaults(None, Some(&built), Some(&home)), (checkout.clone(), checkout.join("target/release/ue2emu")));
+
+        let installed = dir.join("Cellar/ue2emu/0.1.0/bin/ue2-mcp");
+        let expected = (home.join(".ue2emu"), dir.join("Cellar/ue2emu/0.1.0/bin/ue2emu"));
+        assert_eq!(defaults(None, Some(&installed), Some(&home)), expected, "installed outside a checkout");
+
+        let repo = dir.join("elsewhere");
+        let expected = (repo.clone(), repo.join("target/release/ue2emu"));
+        assert_eq!(defaults(Some(repo.clone()), Some(&installed), Some(&home)), expected, "UE2_REPO wins");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
