@@ -17,10 +17,12 @@ The Commodore C64 Ultimate firmware 1.1.0 runs as well:
   <img src="docs/images/c64u-sysinfo.png" width="49%" alt="C64 Ultimate system information">
 </p>
 
-The emulator runs the unmodified firmware (`ultimate.elf` or a `.ue2` update file) and models the hardware around it:
-menu and file browser, flash, SD card and USB sticks, the network with REST API and web UI, and a C64 with SID sound,
-cartridges and a 1541 drive. The C64 is [TRX64](https://github.com/Jondalar/TRX64). An MCP server lets Claude Code
-sessions start and drive emulator instances for automated tests.
+The emulator runs the application part of the firmware unmodified: `ultimate.elf`, or the application inside a `.ue2`
+update file. That is where the menu, file browser, REST API and web UI come from. The FPGA part of the firmware does
+not run; the emulator models the hardware the application talks to instead: flash, SD card, USB, network and the menu
+overlay. The C64 core is replaced by [TRX64](https://github.com/Jondalar/TRX64) behind the same register interface,
+with SID sound, cartridges and a 1541 drive. An MCP server lets Claude Code sessions start and drive emulator
+instances for automated tests.
 
 ## Install
 
