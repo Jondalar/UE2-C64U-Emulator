@@ -2,20 +2,20 @@
 
 How to build the emulator, what each `ue2emu run` option does, how a `run --config` TOML file works, how
 `ue2emu install` fills a flash image from a `.ue2` updater, and how a Claude Code session drives the emulator through
-`ue2-mcp`. Platforms, what is not shipped, ROMs and the TRX64 dependency: `README.md`, "0.1.0".
+`ue2-mcp`. It also covers platforms, the TRX64 dependency, firmware and ROMs, and the license.
 
 ## 1. Build
 
 **Homebrew:** `brew install jondalar/ue2emu/ue2emu` builds the tagged release from source with Homebrew's Rust and
-libslirp and installs `ue2emu` and `ue2-mcp` (tap: https://github.com/Jondalar/homebrew-ue2emu). Platform notes:
-`README.md`, "Platforms". Building from a checkout:
+libslirp and installs `ue2emu` and `ue2-mcp` (tap: https://github.com/Jondalar/homebrew-ue2emu). Platforms: see
+below. Building from a checkout:
 
 | Prerequisite | Needed for | Notes |
 |---|---|---|
 | Rust (stable) with cargo | everything | built and tested with rustc 1.98.1 |
 | C++ compiler | `trx64-core` compiles the vendored reSID (default feature `trx64`) | macOS: Xcode command line tools |
 | libslirp | `ue2-net` links `slirp` | macOS: `brew install libslirp`; search order below |
-| Network on the first build | cargo fetches `trx64-core` from GitHub | a local checkout instead: `README.md`, "TRX64 dependency" |
+| Network on the first build | cargo fetches `trx64-core` from GitHub | a local checkout instead: "TRX64 dependency" below |
 | `firmware/1541ultimate` (optional, untracked) | default `--firmware` and `--roms`; the firmware tests | clone of GideonZ/1541ultimate with submodules (neorv32, software/lwip, software/httpd) |
 | `tools/bin` (optional, untracked) | `scripts/build-firmware.sh` | `riscv32-unknown-elf-*` links to xPack riscv-none-elf-gcc 11.3.0-1 |
 
@@ -38,7 +38,77 @@ scripts/smoke-all.sh                                      # release build, every
   `8218a0a` gives 388 passed, 1 ignored.
 - `scripts/make-sd-image.sh` (used by `smoke-all.sh`) needs a macOS login session.
 
-## 2. `ue2emu run` options
+### Platforms
+
+- **macOS:** the main platform, developed on Apple silicon.
+- **Linux:** builds and passes the tests in CI on Ubuntu 24.04, not used interactively yet. It needs the libslirp
+  development package, version 4.7 or newer (Debian 12, Ubuntu 24.04). `--net vmnet-bridged` is macOS only.
+  `ue2-mcp` stops an emulator through `nc`; without `nc` the stop falls back to SIGTERM after about 3 seconds.
+- **Windows:** not supported. Besides libslirp, the code uses Unix APIs in `ue2-vfat` (`--usb-dir`), `ue2-mcp`
+  (instance control), `ue2-net` and `crates/ue2emu/src/c64roms.rs`.
+
+### TRX64 dependency
+
+`crates/c64-bridge` takes `trx64-core` from GitHub, pinned in its `Cargo.toml` to rev
+`69c9b30add4ea3ae7a46a53e81c56887585fe001` (head of TRX64 `main`, `trx64-core` 0.5.0); cargo fetches it on the first
+build. Its build.rs compiles the vendored reSID C++, so a C++ compiler is needed.
+`cargo build --release -p ue2emu --no-default-features` builds without TRX64 (`--c64 none` only). The bridge drives
+TRX64 internals, so run the tests and the C64 smokes (`docs/status/c64.md`) before moving `rev`.
+
+To build against a local TRX64 checkout, create an untracked `.cargo/config.toml` in the repo root:
+
+```toml
+[patch."https://github.com/Jondalar/TRX64"]
+trx64-core = { path = "<TRX64 checkout>/crates/trx64-core" }
+```
+
+- The patch key must be exactly `https://github.com/Jondalar/TRX64` (no trailing slash, no `.git`), the URL in
+  `crates/c64-bridge/Cargo.toml`. The local crate's version must still be 0.5.0.
+- `cargo tree -p c64-bridge -i trx64-core` shows the path source while the patch is active.
+- Cargo rewrites `Cargo.lock` while the patch is active (the `source = "git+…"` line of `trx64-core` goes). Do not
+  commit that `Cargo.lock`, nor `.cargo/`, which `.gitignore` does not cover; after removing the config,
+  `git checkout Cargo.lock`.
+
+## 2. Firmware and ROMs
+
+The repository ships no firmware and no ROMs; `.gitignore` keeps firmware, ROM and media images out of it. Bring your
+own:
+
+- **Firmware:** an `ultimate.elf` (your build, or `scripts/build-firmware.sh`), an `ultimate.app`, or a `.ue2` update
+  file (the upstream `update.ue2`, the Commodore `c64u_v1.1.0.ue2`), passed with `--firmware`.
+- **Roms directory:** `roms/` of a GideonZ/1541ultimate clone, passed with `--roms` (default
+  `firmware/1541ultimate/roms` under the repo root the binary was built from, so a Homebrew install always needs
+  `--roms`). The window and the `png` control command read the overlay font `chars.bin` there
+  (`crates/ue2emu/src/window.rs:46`), also when the firmware is a `.ue2`.
+
+**C64 KERNAL, BASIC, CHAR.** No updater writes them, so on a blank flash the C64 shows the firmware's "shipped
+without System ROMs" screen. `--c64-roms [DIR]` (on `run` and `install`, needs `--flash`) puts them into
+`/flash/roms` of the flash image before the firmware runs, as the menu's "Set as … ROM" would. DIR defaults to the
+`--roms` directory, where GideonZ/1541ultimate ships them. Per ROM the first file with the right size is taken
+(`crates/ue2emu/src/c64roms.rs`):
+
+| ROM | File names, in order | Size |
+|---|---|---|
+| KERNAL | `kernal.901227-03.bin`, `kernal.bin` | 8192 |
+| BASIC | `basic.901226-01.bin`, `basic.bin` | 8192 |
+| CHAR | `characters.901225-01.bin`, `chars.bin` | 4096 |
+
+- The 2048-byte `chars.bin` in the firmware tree is the overlay font; its size rules it out.
+- An erased `/flash` is formatted first, exactly as the firmware would format it.
+- Where `/flash` lives depends on the firmware: 3.15 moved it to 0x580000 on the 100T layout, older firmware (3.14d
+  and before) keeps it at 0x400000. An existing volume in either place is used, so after `ue2emu install` the ROMs go
+  where the installed firmware looks. On an erased flash the capabilities decide (0x580000 by default).
+- A file already there with other content is kept; `--c64-roms-force` replaces it.
+- When the ROMs are already there, nothing is written, so the flag can stay on every run.
+
+The first boot reaches BASIC `READY.`; the control command `c64screen` prints the C64 text screen
+(`docs/status/c64.md`).
+
+**1541 drive ROM.** It comes from the `.ue2`: `ue2emu install` runs its updater, which writes `1541.rom`, `1571.rom`
+and `1581.rom` into `/flash/roms` (section 5). A blank flash has no drive ROM and drive A stays off. "Set as 1541 ROM"
+on a `1541.bin` in the file browser also works (`docs/status/drive.md`).
+
+## 3. `ue2emu run` options
 
 From `ue2emu run --help`. The defaults under `firmware/1541ultimate` are relative to the repo root the binary was built
 from (`crates/ue2emu/src/main.rs:140-155`). In the window F12 is the menu button, the cursor keys navigate and Page Up
@@ -48,7 +118,7 @@ is RESTORE.
 
 | Option | Meaning |
 |---|---|
-| `--config FILE` | Read `run` flags from a TOML file (section 3) |
+| `--config FILE` | Read `run` flags from a TOML file (section 4) |
 | `--firmware ELF` (alias `--elf`) | Firmware image: `ultimate.elf` (with symbols), `ultimate.app` or a `.ue2`; default `firmware/1541ultimate/target/u64ii/riscv/ultimate/result/ultimate.elf` |
 | `--roms DIR` | Firmware roms directory: overlay font `chars.bin`, TRX64 ROM seeds, `--c64-roms` source; default `firmware/1541ultimate/roms` |
 | `--flash FILE` | Persistent SPI flash image, created erased if missing |
@@ -60,7 +130,7 @@ is RESTORE.
 | Option | Meaning |
 |---|---|
 | `--c64 trx64\|none` | C64 behind the cart/DMA registers: TRX64, or the T0 register stub (no C64 picture, DMA loads time out); default `trx64` when built with the `trx64` feature |
-| `--c64-roms [DIR]` | Put KERNAL, BASIC and CHAR from DIR (default `--roms`) into `/flash/roms` of the flash image before boot; needs `--flash` (`README.md`, "ROMs") |
+| `--c64-roms [DIR]` | Put KERNAL, BASIC and CHAR from DIR (default `--roms`) into `/flash/roms` of the flash image before boot; needs `--flash` (section 2) |
 | `--c64-roms-force` | With `--c64-roms`: replace a `/flash/roms` file whose content differs instead of keeping it |
 
 **Cartridges**
@@ -113,7 +183,63 @@ option.
 | `--no-halt` | Keep running when a firmware fault hook fires |
 | `--trace` | Record the last 256 PCs, printed when a fault hook halts the machine (implied by `--gdb`; about 3 % MIPS) |
 
-## 3. Config files: `run --config FILE.toml`
+### Examples
+
+```sh
+mkdir -p run
+
+# Window, realtime. --c64-roms puts the C64 KERNAL/BASIC/CHAR from the roms directory into the flash first.
+target/release/ue2emu run --flash run/flash.bin --c64-roms
+
+# Network on: the firmware web UI and REST API on http://127.0.0.1:8080.
+target/release/ue2emu run --flash run/flash.bin --c64-roms --net user
+
+# A cartridge in the physical expansion port, read-only by default (docs/status/cart-slot.md).
+target/release/ue2emu run --flash run/flash.bin --c64-roms --net user --cart-slot run/game.crt
+
+# Headless: open the menu, check the screen, move the cursor, write run/menu1.png and run/menu2.png.
+target/release/ue2emu run --headless --speed max --flash run/flash.bin --script scripts/smoke-menu.ctl
+
+# Every self-checking smoke script (menu, SD, flash persistence), in a temporary directory.
+scripts/smoke-all.sh
+
+# A 1000 Hz BASIC tone into a WAV, checked on the host.
+target/release/ue2emu run --headless --speed max --flash run/flash.bin --sid-socket1 armsid \
+    --audio-wav run/sid-tone.wav --script scripts/smoke-sid-tone.ctl
+scripts/wav-tone.py run/sid-tone.wav --expect 1000
+```
+
+`--flash` keeps config across runs (created erased if missing). Firmware paths default to `firmware/1541ultimate`
+under the repo root; elsewhere pass `--firmware` and `--roms` (`png` reads its font from `--roms`), and set
+`UE2_FIRMWARE` for the tests.
+
+- **Audio:** `--audio on|off` plays the SID on the default output device (on with a window, off with `--headless`).
+  `--audio-wav PATH` writes the mono sample stream, also headless. `--sid-socket1 armsid` fits an ARMSID in socket 1;
+  on a flash that has not saved it, the menu asks once to review the SID settings (OK, then save). Without it
+  UltiSID 1 at `$D400` plays (`docs/status/sid-audio.md`).
+- **Cartridges:** RETURN on a `.crt` in the file browser, then "Run Cart". Freezer carts freeze with F11 on the USB
+  keyboard (`--usb-keyboard`, menu closed); `.sid` and `.mus` files offer "Play Main Tune".
+  `scripts/make-test-crts.py DIR` writes a test CRT for each supported type (`docs/status/carts.md`).
+  `--cart-slot FILE.crt[,rw|,save=OUT.crt][,flash-decode=11|15|both]` puts a cartridge in the physical expansion port,
+  with its own flash and EEPROM, for dumpers and flash writers over DMA and REST; `,rw` writes flash changes back into
+  the CRT (`docs/status/cart-slot.md`).
+- **Disks:** put `1541.bin` and a `.d64` on the SD image. Choose "Set as 1541 ROM" on `1541.bin` once per flash,
+  then "Mount Disk" on the D64, and `load"$",8` on the C64. The firmware writes changed tracks back into the D64 file.
+  `scripts/d64tool.py` builds, lists and extracts D64s, also straight out of an SD image (`docs/status/drive.md`).
+  Self-checking C64 scripts, with their setup in the header: `smoke-sid-tone.ctl`, `smoke-c64-carts.ctl` (27 carts,
+  the freezer, the SID and MUS players), `smoke-c64-drive.ctl` (directory, LOAD, SAVE and write-back).
+- **USB:** `--usb IMAGE` (repeatable) attaches a USB stick, `--usb-keyboard` a HID keyboard that takes the window's
+  keys. `scripts/make-sd-image.sh` makes stick images too (`docs/status/usb.md`). `--usb-dir DIR[,size=SIZE][,ro]`
+  (repeatable) shares a host directory as a FAT32 stick. The firmware may write to it; changes are synced back safely
+  (deletions go to `DIR/.ue2-trash`, conflicts become copies, a mass-deletion guard asks for `usb-sync --force`), and
+  host changes reach the guest by an automatic replug. `scripts/smoke-usb-dir.sh` tests it (`docs/status/usb-dir.md`).
+- **Network:** `--net user` is libslirp NAT with `--hostfwd` (default `tcp:2323:23,tcp:2121:21,tcp:6464:64`) and a
+  web UI proxy on `--web-port` (default 8080) to guest port 80, e.g. `curl http://127.0.0.1:8080/v1/info`. The proxy
+  passes HTTP through and makes the web UI's API URLs carry the port. `--net vmnet-bridged[:IFACE]` (needs sudo) and
+  `--net socket-vmnet[:PATH]` (lima's socket_vmnet daemon) put the device on the LAN (`docs/status/network.md`).
+- **E2E:** `scripts/run-e2e.sh smoke` runs the upstream E2E suite against the emulator (`docs/status/e2e.md`).
+
+## 4. Config files: `run --config FILE.toml`
 
 Only `run` takes `--config`. `crates/ue2emu/src/config.rs` turns the file's entries into `--flag=value` arguments after
 `run`, leaves out the flags the command line gives, and parses the whole command line again.
@@ -217,7 +343,7 @@ target/release/ue2emu run --config ue2emu.toml                       # config: l
 target/release/ue2emu run --config ue2emu.toml --flash other.bin --headless
 ```
 
-## 4. `ue2emu install`: populating the flash with a `.ue2` updater
+## 5. `ue2emu install`: populating the flash with a `.ue2` updater
 
 Hardware gets its flash contents from the updater inside `update.ue2`, not from a copy of the application.
 `ue2emu install` does the same: it runs the updater record inside the emulator with the normal device set, answers its
@@ -351,7 +477,7 @@ All runs start from an erased flash; install runs flat out (`--speed` does not a
 - **FPGA image check is shallow.** Only the Xilinx sync word is checked. The bitstream bounds are symbols of the
   updater (`_u64e2_100t_swp_start/_end`) that a `.ue2` file does not carry.
 
-## 5. MCP server (`ue2-mcp`)
+## 6. MCP server (`ue2-mcp`)
 
 `ue2-mcp` is a stdio MCP server that lets a Claude Code session boot a firmware build in headless emulator instances
 and drive them: overlay UI, screen text, screenshots, UART console, REST, USB directories, a physical cartridge. It
@@ -433,3 +559,11 @@ wall clock. A failed assertion is a normal result starting `FAIL:`.
 
 `scripts/mcp-smoke.py --server target/release/ue2-mcp` runs a similar session over stdio as an MCP client
 (`docs/status/mcp.md`, "Verification").
+
+## 7. License
+
+GPL-3.0-or-later (`LICENSE`).
+
+- `crates/c64-bridge/src/cart.rs` ports `all_carts_v5.vhd` (with `freezer.vhd`) from GideonZ/1541ultimate (GPL v3),
+  `crates/c64-bridge/src/cart_eeprom.rs` its `microwire_eeprom.vhd`.
+- SID audio is reSID, vendored and compiled by TRX64's `trx64-core` (GPL).

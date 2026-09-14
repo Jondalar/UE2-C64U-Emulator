@@ -143,7 +143,8 @@ pub struct Report {
 }
 
 /// Put the KERNAL, BASIC and CHAR ROMs from `dir` into /flash/roms of the flash image at `flash` (created erased when
-/// missing), formatting an erased flash disk first. `capabilities` selects the flash layout. A file with other
+/// missing), formatting an erased flash disk first. `capabilities` selects the flash layout, unless the other layout's
+/// region already holds the volume ([`locate_flash_disk`]). A file with other
 /// content is kept unless `force`. Only changed sectors are written, so a second call changes nothing.
 pub fn write_roms(flash: &Path, capabilities: u32, dir: &Path, force: bool) -> Result<Report> {
     let sources = ROMS.iter().map(|rom| source(dir, rom)).collect::<Result<Vec<_>>>()?;
@@ -161,7 +162,7 @@ pub fn write_roms(flash: &Path, capabilities: u32, dir: &Path, force: bool) -> R
     let (mut image, full_size) = read_image(flash)?;
     let original = image.clone();
     let store = store_page(&image).map(<[u8]>::to_vec);
-    let (base, sectors) = flash_disk(capabilities);
+    let (base, sectors) = locate_flash_disk(&image, capabilities);
     let region = &mut image[base..base + sectors * SECTOR];
     let formatted = if FileSystem::new(Cursor::new(&mut *region), FsOptions::new()).is_ok() {
         false
@@ -259,6 +260,21 @@ fn flash_disk(capabilities: u32) -> (usize, usize) {
     } else {
         (0x40_0000, 0xBE_8000 / SECTOR)
     }
+}
+
+/// The `/flash` region of `image`: [`flash_disk`]'s, or the other table's when only that one starts with the boot
+/// sector of a volume of its size. Firmware before 3.15 has only the 50T table (w25q_flash.cc:47-54 at v3.14d) and keeps
+/// `/flash` at 0x400000 on a type-3 FPGA too, so after its updater the volume is there.
+fn locate_flash_disk(image: &[u8], capabilities: u32) -> (usize, usize) {
+    let preferred = flash_disk(capabilities);
+    let other = flash_disk(if preferred.0 == 0x40_0000 { 3 << 28 } else { 0 });
+    let holds_volume = |(base, sectors): (usize, usize)| {
+        let boot = &image[base..base + SECTOR];
+        boot[510..512] == [0x55, 0xAA]
+            && usize::from(u16::from_le_bytes([boot[11], boot[12]])) == SECTOR
+            && usize::from(u16::from_le_bytes([boot[19], boot[20]])) == sectors
+    };
+    [preferred, other].into_iter().find(|&region| holds_volume(region)).unwrap_or(preferred)
 }
 
 /// The C64 store's page: the first of the 24 config pages whose id matches (config.cc:127-137).
@@ -654,6 +670,26 @@ mod tests {
         assert_eq!(report.outcomes, [Outcome::Identical, Outcome::Identical, Outcome::Written]);
         let fs = volume(&flash, CAPS_50T);
         assert_eq!(read_file(&fs, "roms/characters.901225-01.bin"), Some(roms()[2].clone()));
+    }
+
+    /// Firmware before 3.15 keeps /flash at 0x400000 on a type-3 FPGA: the volume its updater made there is used.
+    #[test]
+    fn c64_roms_use_the_volume_of_the_other_layout() {
+        let dir = rom_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let flash = tmp.path().join("flash.bin");
+        let mut image = vec![0xFF; FLASH_SIZE];
+        mkfs(&mut image[0x40_0000..0x40_0000 + 3048 * SECTOR], 3048, 1).unwrap();
+        std::fs::write(&flash, &image).unwrap();
+        assert_eq!(locate_flash_disk(&image, CAPS_100T), (0x40_0000, 3048));
+        assert_eq!(locate_flash_disk(&vec![0xFF; FLASH_SIZE], CAPS_100T), (0x58_0000, 2664), "erased: by capabilities");
+
+        let report = write_roms(&flash, CAPS_100T, dir.path(), false).unwrap();
+        assert!(!report.formatted);
+        assert_eq!(report.outcomes, [Outcome::Written; 3]);
+        let fs = volume(&flash, CAPS_50T);
+        assert_eq!(read_file(&fs, "roms/kernal.bin"), Some(roms()[0].clone()));
+        assert_eq!(locate_flash_disk(&std::fs::read(&flash).unwrap(), CAPS_100T), (0x40_0000, 3048));
     }
 
     #[test]
