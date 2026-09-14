@@ -1,5 +1,6 @@
-//! Hand-written bindings for the part of `libslirp.h` (4.9.4, `SLIRP_CONFIG_VERSION_MAX` 6) that [`crate::UserNet`]
-//! uses. Layouts follow the header field by field; `libc` supplies the socket types.
+//! Hand-written bindings for the part of `libslirp.h` that [`crate::UserNet`] uses, at `SlirpConfig` version 4: the
+//! API of libslirp 4.7, which later releases keep. Layouts follow the header field by field; `libc` supplies the
+//! socket types.
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -11,8 +12,10 @@ pub struct Slirp {
     _private: [u8; 0],
 }
 
-/// Highest `SlirpConfig.version` of libslirp 4.8+: adds the socket poll callbacks to `SlirpCb`.
-pub const SLIRP_CONFIG_VERSION: u32 = 6;
+/// `SlirpConfig.version` 4 (libslirp 4.7) covers everything used here. Version 5 (4.8) adds NCSI fields, version 6
+/// (4.9) the socket callbacks and `slirp_pollfds_fill_socket`; on Unix a socket is an `int`, so neither is needed and
+/// the 4.7 of Debian 12 and Ubuntu 24.04 links.
+pub const SLIRP_CONFIG_VERSION: u32 = 4;
 
 pub const SLIRP_POLL_IN: c_int = 1 << 0;
 pub const SLIRP_POLL_OUT: c_int = 1 << 1;
@@ -22,12 +25,10 @@ pub const SLIRP_POLL_HUP: c_int = 1 << 4;
 
 /// `enum SlirpTimerId`.
 pub type SlirpTimerId = c_int;
-/// `slirp_os_socket` on Unix.
-pub type SlirpOsSocket = c_int;
 
 pub type SlirpWriteCb = unsafe extern "C" fn(buf: *const c_void, len: usize, opaque: *mut c_void) -> isize;
 pub type SlirpTimerCb = unsafe extern "C" fn(opaque: *mut c_void);
-pub type SlirpAddPollSocketCb = unsafe extern "C" fn(fd: SlirpOsSocket, events: c_int, opaque: *mut c_void) -> c_int;
+pub type SlirpAddPollCb = unsafe extern "C" fn(fd: c_int, events: c_int, opaque: *mut c_void) -> c_int;
 pub type SlirpGetREventsCb = unsafe extern "C" fn(idx: c_int, opaque: *mut c_void) -> c_int;
 
 /// `SlirpCb`. libslirp keeps the pointer, so the table must outlive the instance.
@@ -49,12 +50,9 @@ pub struct SlirpCb {
     pub init_completed: Option<unsafe extern "C" fn(slirp: *mut Slirp, opaque: *mut c_void)>,
     pub timer_new_opaque:
         unsafe extern "C" fn(id: SlirpTimerId, cb_opaque: *mut c_void, opaque: *mut c_void) -> *mut c_void,
-    // Version 6.
-    pub register_poll_socket: unsafe extern "C" fn(socket: SlirpOsSocket, opaque: *mut c_void),
-    pub unregister_poll_socket: unsafe extern "C" fn(socket: SlirpOsSocket, opaque: *mut c_void),
 }
 
-/// `SlirpConfig` (fields of versions 1-5; version 6 only extends `SlirpCb`).
+/// `SlirpConfig` (fields of versions 1-4).
 #[repr(C)]
 pub struct SlirpConfig {
     pub version: u32,
@@ -89,21 +87,13 @@ pub struct SlirpConfig {
     pub disable_dns: bool,
     // Version 4.
     pub disable_dhcp: bool,
-    // Version 5.
-    pub mfr_id: u32,
-    pub oob_eth_addr: [u8; 6],
 }
 
 extern "C" {
     pub fn slirp_new(cfg: *const SlirpConfig, callbacks: *const SlirpCb, opaque: *mut c_void) -> *mut Slirp;
     pub fn slirp_cleanup(slirp: *mut Slirp);
     /// `timeout` (ms) is only ever lowered.
-    pub fn slirp_pollfds_fill_socket(
-        slirp: *mut Slirp,
-        timeout: *mut u32,
-        add_poll: SlirpAddPollSocketCb,
-        opaque: *mut c_void,
-    );
+    pub fn slirp_pollfds_fill(slirp: *mut Slirp, timeout: *mut u32, add_poll: SlirpAddPollCb, opaque: *mut c_void);
     pub fn slirp_pollfds_poll(
         slirp: *mut Slirp,
         select_error: c_int,

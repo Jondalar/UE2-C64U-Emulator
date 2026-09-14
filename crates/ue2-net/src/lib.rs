@@ -163,8 +163,6 @@ impl UserNet {
             outbound_addr6: ptr::null_mut(),
             disable_dns: false,
             disable_dhcp: false,
-            mfr_id: 0,
-            oob_eth_addr: [0; 6],
         };
         let state = Box::into_raw(Box::new(State { epoch: Instant::now(), to_guest: Vec::new(), timers: Vec::new() }));
         // SAFETY: `cfg` is read during the call only; `CALLBACKS` is static and `state` lives until `Drop`.
@@ -267,7 +265,7 @@ impl NetBackend for UserNet {
         let fds: *mut Vec<pollfd> = &mut self.pollfds;
         let mut timeout = 0;
         // SAFETY: `add_poll` only pushes onto `self.pollfds`, which nothing else touches during the call.
-        unsafe { ffi::slirp_pollfds_fill_socket(self.slirp.as_ptr(), &mut timeout, add_poll, fds.cast()) };
+        unsafe { ffi::slirp_pollfds_fill(self.slirp.as_ptr(), &mut timeout, add_poll, fds.cast()) };
         // SAFETY: the buffer holds `len` initialised entries.
         let ready = unsafe { libc::poll(self.pollfds.as_mut_ptr(), self.pollfds.len() as libc::nfds_t, 0) };
         // SAFETY: as above; `get_revents` only reads `self.pollfds`.
@@ -304,8 +302,6 @@ static CALLBACKS: ffi::SlirpCb = ffi::SlirpCb {
     notify,
     init_completed: None,
     timer_new_opaque,
-    register_poll_socket: ignore_fd,
-    unregister_poll_socket: ignore_fd,
 };
 
 /// # Safety
@@ -353,7 +349,7 @@ unsafe extern "C" fn timer_mod(handle: *mut c_void, expire_ms: i64, opaque: *mut
     }
 }
 
-/// Sockets are collected afresh by every `slirp_pollfds_fill_socket`, so registration needs no bookkeeping.
+/// Sockets are collected afresh by every `slirp_pollfds_fill`, so registration needs no bookkeeping.
 unsafe extern "C" fn ignore_fd(_fd: c_int, _opaque: *mut c_void) {}
 
 /// Nothing sleeps on libslirp: the emulation thread polls it after every slice.

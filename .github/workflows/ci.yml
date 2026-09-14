@@ -25,11 +25,10 @@ jobs:
           - name: macos-arm64
             os: macos-latest
             container: ''
-          # libslirp >= 4.8 is required (slirp_pollfds_fill_socket, crates/ue2-net/src/ffi.rs). Debian 13 ships
-          # 4.8.0; Ubuntu 24.04, the ubuntu-latest image, only 4.7.0. Hence the container.
+          # ue2-net uses the libslirp 4.7 API (crates/ue2-net/src/ffi.rs), which is what Ubuntu 24.04 ships.
           - name: linux-x86_64
             os: ubuntu-latest
-            container: 'rust:trixie'
+            container: ''
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
@@ -44,8 +43,8 @@ jobs:
         # ALSA is what cpal links against; pkg-config is how alsa-sys finds it.
         if: runner.os == 'Linux'
         run: |
-          apt-get update -qq
-          apt-get install -y -qq libslirp-dev libasound2-dev pkg-config
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libslirp-dev libasound2-dev pkg-config
 
       - name: Toolchain
         run: |
