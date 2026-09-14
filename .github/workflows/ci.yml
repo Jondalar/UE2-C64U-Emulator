@@ -1,0 +1,70 @@
+# Build and test on every push to main and on pull requests.
+#
+# The runners have no firmware and no ROMs, so the tests that need them print "skipping" and pass. Everything else
+# runs: CPU, devices, loader formats, FAT, USB directory sync, --config, MCP and the TRX64 bridge.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple silicon. libslirp from Homebrew lands in /opt/homebrew/lib, where crates/ue2-net/build.rs looks.
+          - name: macos-arm64
+            os: macos-latest
+            container: ''
+          # libslirp >= 4.8 is required (slirp_pollfds_fill_socket, crates/ue2-net/src/ffi.rs). Debian 13 ships
+          # 4.8.0; Ubuntu 24.04, the ubuntu-latest image, only 4.7.0. Hence the container.
+          - name: linux-x86_64
+            os: ubuntu-latest
+            container: 'rust:trixie'
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System libraries (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libslirp
+
+      - name: System libraries (Linux)
+        # ALSA is what cpal links against; pkg-config is how alsa-sys finds it.
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq libslirp-dev libasound2-dev pkg-config
+
+      - name: Toolchain
+        run: |
+          set -eu
+          if ! command -v rustc >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+          cache-on-failure: true
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked

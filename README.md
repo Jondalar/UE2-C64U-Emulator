@@ -20,7 +20,8 @@ Usage guide — build prerequisites, every `run` option, `--config` files, `inst
 ### Platforms
 
 - **macOS:** supported; developed and tested on Apple silicon.
-- **Linux:** probably works, untested. Install the distribution's libslirp development package;
+- **Linux:** probably works, untested. Install the distribution's libslirp development package, version 4.8 or newer
+  (`slirp_pollfds_fill_socket`; Debian 13 has 4.8.0, Ubuntu 24.04 only 4.7.0);
   `crates/ue2-net/build.rs` links `slirp` from the linker's default paths, or from `SLIRP_LIB_DIR=DIR` when that is
   set. Known gap: `--net vmnet-bridged` needs macOS. `ue2-mcp` stops an emulator through `nc`; without it the
   stop falls back to SIGTERM after about 3 seconds.
