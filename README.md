@@ -10,6 +10,13 @@ flashing a device.
   <img src="docs/images/c64-ready.png" width="49%" alt="The C64 at READY">
 </p>
 
+The Commodore C64 Ultimate firmware 1.1.0 runs as well:
+
+<p>
+  <img src="docs/images/c64u-menu.png" width="49%" alt="C64 Ultimate main menu">
+  <img src="docs/images/c64u-sysinfo.png" width="49%" alt="C64 Ultimate system information">
+</p>
+
 The emulator runs the unmodified firmware (`ultimate.elf` or a `.ue2` update file) and models the hardware around it:
 menu and file browser, flash, SD card and USB sticks, the network with REST API and web UI, and a C64 with SID sound,
 cartridges and a 1541 drive. The C64 is [TRX64](https://github.com/Jondalar/TRX64). An MCP server lets Claude Code
