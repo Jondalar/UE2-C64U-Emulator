@@ -566,4 +566,5 @@ GPL-3.0-or-later (`LICENSE`).
 
 - `crates/c64-bridge/src/cart.rs` ports `all_carts_v5.vhd` (with `freezer.vhd`) from GideonZ/1541ultimate (GPL v3),
   `crates/c64-bridge/src/cart_eeprom.rs` its `microwire_eeprom.vhd`.
-- SID audio is reSID, vendored and compiled by TRX64's `trx64-core` (GPL).
+- SID audio is reSID by Dag Lem (GPL-2.0-or-later), an unmodified copy from VICE 3.10 that TRX64's `trx64-core`
+  vendors and compiles.

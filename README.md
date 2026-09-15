@@ -60,5 +60,5 @@ into a TOML file, started with `ue2emu run --config my.toml` ([example](docs/exa
 
 ## License
 
-GPL-3.0-or-later. The cartridge logic is ported from GideonZ/1541ultimate (GPL); the SID sound is reSID, built by
-TRX64.
+GPL-3.0-or-later. The cartridge logic is ported from GideonZ/1541ultimate (GPL). SID sound uses reSID by Dag Lem
+(GPL-2.0-or-later) from the VICE project, compiled in through TRX64.
