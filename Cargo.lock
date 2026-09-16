@@ -2617,7 +2617,7 @@ dependencies = [
 [[package]]
 name = "trx64-core"
 version = "0.7.1"
-source = "git+https://github.com/Jondalar/TRX64?rev=5f93646a9cce38bab12e0ebf96acb3c12d07628d#5f93646a9cce38bab12e0ebf96acb3c12d07628d"
+source = "git+https://github.com/Jondalar/TRX64?rev=c3d34bb#c3d34bbc9fba8133264f42307c02008e29d8ae23"
 dependencies = [
  "base64",
  "cc",

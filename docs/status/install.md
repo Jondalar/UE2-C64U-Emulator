@@ -50,7 +50,7 @@ scripts/smoke-all.sh                                      # release build, every
 ### TRX64 dependency
 
 `crates/c64-bridge` takes `trx64-core` from GitHub, pinned in its `Cargo.toml` to rev
-`5f93646a9cce38bab12e0ebf96acb3c12d07628d` (TRX64 main, `trx64-core` 0.7.1; no tag for it); cargo fetches it on the first
+`c3d34bbc9fba8133264f42307c02008e29d8ae23` (TRX64 main, `trx64-core` 0.7.1; no tag for it); cargo fetches it on the first
 build. Its build.rs compiles the vendored reSID C++, so a C++ compiler is needed.
 `cargo build --release -p ue2emu --no-default-features` builds without TRX64 (`--c64 none` only). The bridge drives
 TRX64 internals, so run the tests and the C64 smokes (`docs/status/c64.md`) before moving `rev`.

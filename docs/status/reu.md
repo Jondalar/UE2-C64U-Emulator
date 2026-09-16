@@ -144,7 +144,7 @@ The two findings themselves, both confirmed while building this:
 
 ## Build note
 
-The two changes above need **TRX64 0.7.1**, which is public on TRX64's `main` as `5f93646` — there is no tag and no
+The two changes above need **TRX64 0.7.1**, which is public on TRX64's `main` as `c3d34bb` — there is no tag and no
 release for it, so the pin names the rev. `crates/c64-bridge/Cargo.toml` points there, and an ordinary
 `cargo build` is enough.
 
