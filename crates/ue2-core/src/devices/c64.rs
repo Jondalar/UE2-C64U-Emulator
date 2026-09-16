@@ -146,6 +146,16 @@ const CD_RESET_SENSE: u8 = 0x10;
 const KILL_CART: u8 = 0x01;
 const KILL_FORCE: u8 = 0x02;
 
+/// C64_REU_ENABLE and C64_REU_SIZE (c64.h:62-63). The firmware writes the size first and the enable after
+/// (c64.cc:315-317), and both are read back as the latches they are (docs/status/reu.md).
+const REU_ENABLE: u32 = 0x08;
+const REU_SIZE: u32 = 0x09;
+
+/// C64_REU_SIZE 0..7 as KiB: `128 << n`, the firmware's `reu_size` table (c64.cc:60).
+fn reu_size_kb(reg: u8) -> u32 {
+    128 << (reg & 0x07)
+}
+
 /// `__cart_rom_start` in DDR (linker.x:269-287): the ROM of the CART_TYPE_NORMAL family, 16 K
 /// (`set_cartridge` memcpy, c64.cc:1285-1288).
 const CART_ROM_DDR: usize = 0x03C0_0000;
@@ -446,6 +456,22 @@ impl C64Port {
                     if val & KILL_FORCE != 0 {
                         b.set_cart(cart_type, cart_rom(ram));
                     }
+                }
+            }
+            // REU: both stay the latches the FPGA reads back, and the backend gets the value the latch took — the
+            // size first, which is the order the firmware writes them in (c64.cc:315-317, docs/status/reu.md).
+            REU_SIZE => {
+                self.cart.set(reg, val);
+                let size_kb = reu_size_kb(self.cart.get(REU_SIZE));
+                if let Some(b) = &mut self.backend {
+                    b.set_reu_size_kb(size_kb);
+                }
+            }
+            REU_ENABLE => {
+                self.cart.set(reg, val);
+                let on = self.cart.get(REU_ENABLE) & 0x01 != 0;
+                if let Some(b) = &mut self.backend {
+                    b.set_reu_enabled(on);
                 }
             }
             r => self.cart.set(r, val),
@@ -777,6 +803,8 @@ mod tests {
     const TYPE_ADDR: u32 = 0x1004_0005;
     const KILL_ADDR: u32 = 0x1004_0006;
     const DMA_ADDR: u32 = 0x1005_0000;
+    const REU_ENABLE_ADDR: u32 = 0x1004_0008;
+    const REU_SIZE_ADDR: u32 = 0x1004_0009;
     const MATRIX_ADDR: u32 = 0x1010_0300;
     const CORE_ADDR: u32 = 0x1018_0000;
     const UCI_ADDR: u32 = 0x1004_4000;
@@ -859,6 +887,42 @@ mod tests {
         assert_eq!(rig.r8(KILL_ADDR), 0, "CARTRIDGE_ACTIVE");
         assert_eq!(rig.r8(0x1004_000A), 0);
         assert_eq!(rig.r8(0x1004_000D), 0x01);
+    }
+
+    /// REU: `C64_REU_SIZE` 0..7 is the firmware's `reu_size` table (c64.cc:60).
+    #[test]
+    fn reu_size_is_the_firmware_table() {
+        assert_eq!([0, 1, 2, 3, 4, 5, 6, 7].map(reu_size_kb), [128, 256, 512, 1024, 2048, 4096, 8192, 16384]);
+        assert_eq!(reu_size_kb(0xFF), 16384, "the register is three bits (CART_REGS latches it with mask 0x07)");
+    }
+
+    /// REU: both registers reach the backend, in the order `set_emulation_flags` writes them — enable cleared, size,
+    /// enable set (c64.cc:309-318) — and both still read back as the latches the FPGA has (docs/status/reu.md).
+    #[test]
+    fn reu_enable_and_size_reach_the_backend() {
+        let mut b = Bench::new();
+        assert_eq!(b.r8(REU_SIZE_ADDR), 0x07, "C64_REU_SIZE resets to 16 MB");
+        assert_eq!(b.r8(REU_ENABLE_ADDR), 0x00, "and the REU is off");
+        assert!(!b.mock.reu_attached());
+
+        b.w8(REU_ENABLE_ADDR, 0);
+        b.w8(REU_SIZE_ADDR, 2);
+        b.w8(REU_ENABLE_ADDR, 1);
+        assert_eq!(b.mock.take(), [Call::Reu(false), Call::ReuSize(512), Call::Reu(true)]);
+        assert_eq!(*b.mock.reu.borrow(), Some(512), "a 512 KB REU is on the port");
+        assert_eq!((b.r8(REU_SIZE_ADDR), b.r8(REU_ENABLE_ADDR)), (2, 1), "read-back is the latch");
+
+        // The size moves under a running REU without taking it off the port (TRX64 Spec 854 D4).
+        b.w8(REU_SIZE_ADDR, 7);
+        assert_eq!(b.mock.take(), [Call::ReuSize(16384)]);
+        assert_eq!(*b.mock.reu.borrow(), Some(16384), "still attached, now 16 MB");
+
+        // Only bits 2:0 of the size and bit 0 of the enable are latched, so those are what the backend is told.
+        b.w8(REU_SIZE_ADDR, 0xF8);
+        assert_eq!((b.r8(REU_SIZE_ADDR), b.mock.take()), (0, vec![Call::ReuSize(128)]));
+        b.w8(REU_ENABLE_ADDR, 0xFE);
+        assert_eq!((b.r8(REU_ENABLE_ADDR), b.mock.take()), (0, vec![Call::Reu(false)]));
+        assert!(!b.mock.reu_attached(), "off the port again");
     }
 
     #[test]

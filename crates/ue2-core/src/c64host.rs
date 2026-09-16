@@ -110,6 +110,26 @@ pub trait C64Backend {
     /// The freeze button of freezer cartridges, MATRIX_KEYB[10] (freezer.vhd; keyboard_usb.cc:228).
     fn set_freeze_button(&mut self, _down: bool) {}
 
+    // ---- REU: the RAM Expansion Unit (docs/status/reu.md) ----
+
+    /// C64_REU_ENABLE (cart regs +0x8, c64.h:62): put the REU on the C64's expansion port, or take it off. The
+    /// firmware sets it from its "RAM Expansion Unit" setting at every cart init (c64.cc:315-317) and expects it to
+    /// take effect on a running machine.
+    ///
+    /// The REU's RAM is not the REU's: it is the DDR at `REU_MEMORY_BASE 0x1000000` (c64.h:14) that
+    /// [`C64Backend::lend_ddr`] lends, where the firmware preloads images with its own CPU (reu_preloader.cc:104). So
+    /// attaching keeps whatever is already there and detaching leaves it alone. Ignored by default.
+    fn set_reu_enabled(&mut self, _on: bool) {}
+    /// C64_REU_SIZE (cart regs +0x9, c64.h:63) as KiB: `128 << n` for n = 0..7, the firmware's `reu_size` table
+    /// (c64.cc:60), written at c64.cc:315. Applied to an REU that is already on the port without disturbing its
+    /// contents; an REU attached later starts at the last size given. Ignored by default.
+    fn set_reu_size_kb(&mut self, _size_kb: u32) {}
+    /// Whether the REU is on the port now. C64_REU_ENABLE itself reads back the latch, as the FPGA does; this is for
+    /// tests and status.
+    fn reu_attached(&self) -> bool {
+        false
+    }
+
     // ---- W4-DRIVE (docs/specs/S14-c64-trx64.md §W4-DRIVE) ----
     /// Disk drive `unit` (0 = drive A) on this C64's IEC bus, or None if the backend has none.
     fn drive(&mut self, _unit: u8) -> Option<&mut dyn C64Drive> {
@@ -314,6 +334,10 @@ pub(crate) mod mock {
         /// EEPROM window write (offset, value).
         Eeprom(u16, u8),
         Freeze(bool),
+        /// C64_REU_ENABLE.
+        Reu(bool),
+        /// C64_REU_SIZE, in KiB.
+        ReuSize(u32),
         /// UCI firmware-side write (offset, value).
         Uci(u16, u8),
     }
@@ -333,6 +357,10 @@ pub(crate) mod mock {
         pub(crate) detect: Rc<RefCell<Option<u8>>>,
         /// UCI: `Some` when the mock has a block, so `has_uci` is true (S15).
         pub(crate) uci: Rc<RefCell<Option<Uci>>>,
+        /// REU: its size in KiB while it is on the port, else None.
+        pub(crate) reu: Rc<RefCell<Option<u32>>>,
+        /// REU: the last `set_reu_size_kb`, which an attach takes.
+        pub(crate) reu_size: Rc<RefCell<u32>>,
     }
 
     impl Mock {
@@ -423,6 +451,22 @@ pub(crate) mod mock {
         }
         fn set_freeze_button(&mut self, down: bool) {
             self.push(Call::Freeze(down));
+        }
+
+        fn set_reu_enabled(&mut self, on: bool) {
+            let size = *self.reu_size.borrow();
+            *self.reu.borrow_mut() = on.then_some(size);
+            self.push(Call::Reu(on));
+        }
+        fn set_reu_size_kb(&mut self, size_kb: u32) {
+            *self.reu_size.borrow_mut() = size_kb;
+            if let Some(kb) = self.reu.borrow_mut().as_mut() {
+                *kb = size_kb;
+            }
+            self.push(Call::ReuSize(size_kb));
+        }
+        fn reu_attached(&self) -> bool {
+            self.reu.borrow().is_some()
         }
         fn cart_detect(&self) -> u8 {
             self.detect.borrow().unwrap_or(super::CART_DETECT_NONE)

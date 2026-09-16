@@ -19,8 +19,9 @@ What works, by milestone. Details are in the linked files.
   TRX64's mappers, flash boards (EasyFlash, GMod2, MegaByter, C64MegaCart) or the U64 cart logic, next to the internal
   cartridge; firmware DMA and REST dumps and flash writes reach it, and the TREX CRT Tool dumps it. The Ultimate
   Command Interface is served by TRX64's own block on its `u64` machine profile, so the firmware starts its UCI task
-  and the menu offers "Command Interface" (`docs/specs/S15-uci.md`). Open: REU, the IEC processor, drive B and
-  1571/1581, a second SID, NTSC.
+  and the menu offers "Command Interface" (`docs/specs/S15-uci.md`). The REU is TRX64's `Reu` over the firmware's own
+  DDR, attached and sized while the machine runs by `C64_REU_ENABLE` and `C64_REU_SIZE` (`docs/status/reu.md`).
+  Open: the IEC processor, drive B and 1571/1581, a second SID, NTSC.
 - **Install** (`docs/status/install.md`): the upstream `update.ue2` and the Commodore `c64u_v1.1.0.ue2` populate the
   flash; the Commodore 1.1.0 application boots and opens its menu. Its network services ship disabled.
 - **Speed** (60 s emulated at `--speed max`, upstream ELF): about 124 host MIPS with `--c64 trx64` (12.1 s wall), 111

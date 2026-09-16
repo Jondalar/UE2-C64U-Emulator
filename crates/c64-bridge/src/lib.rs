@@ -15,6 +15,7 @@ mod cart_eeprom;
 mod clock;
 mod drive;
 mod keys;
+mod reu;
 mod sid;
 mod slot;
 mod video;
@@ -26,6 +27,7 @@ use trx64_core::c64_6510core::{IK_NMI, INTERRUPT_DELAY, INT_SRC_RESTORE};
 use trx64_core::cart::CartMapper;
 use trx64_core::expansion::Hold;
 use trx64_core::keyboard::JoystickState;
+use trx64_core::reu::Reu;
 use trx64_core::vic::SpeedProfile;
 use trx64_core::{AccessCtx, BusKind, CpuHistoryRing, DeltaRing, Machine, Observer};
 use ue2_core::c64host::{C64Backend, C64CartSlot, C64Drive, C64Frame, C64Rom, CartSlotInfo, UciEvents};
@@ -33,6 +35,7 @@ use ue2_core::c64host::{C64Backend, C64CartSlot, C64Drive, C64Frame, C64Rom, Car
 use cart::{CartHandle, CartLogic, CartProxy, RunHints};
 use clock::Clock;
 use keys::Keys;
+use reu::ReuRam;
 use slot::{PhysicalCart, SlotHandle};
 
 pub use slot::FlashDecode;
@@ -111,6 +114,11 @@ pub struct Trx64Backend {
     sid: sid::Sid,
     /// W4-DRIVE: drive A on TRX64's drive 8 (drive.rs).
     drive: drive::DriveA,
+    /// REU: guest DDR at `REU_MEMORY_BASE` as the store TRX64's `Reu` holds (reu.rs, Spec 854).
+    reu: ReuRam,
+    /// C64_REU_SIZE in KiB, which the next attach takes. The register resets to "111" = 16 MB (c64.rs `CART_REGS`),
+    /// and the firmware writes it before it writes the enable (c64.cc:315-317).
+    reu_size_kb: u32,
 }
 
 impl Trx64Backend {
@@ -168,6 +176,8 @@ impl Trx64Backend {
             palette: Palette::default(),
             sid,
             drive,
+            reu: ReuRam::default(),
+            reu_size_kb: reu::DEFAULT_SIZE_KB,
         }
     }
 
@@ -434,6 +444,12 @@ impl C64Backend for Trx64Backend {
         let clk = self.m.c64_core.clk.max(self.m.clk);
         self.slot.with(|s| s.reset_release(clk));
         self.m.warm_reset();
+        // REU: the expansion port's RESET line resets the REC as it resets the cartridge (reu.c:602-615). TRX64's own
+        // reset reaches `Machine::cartridge` and not the port devices, so the REU is reset here. Its RAM is DDR and
+        // stays exactly as it was, which is what the REU does on real hardware too.
+        if let Some(reu) = self.m.reu_mut() {
+            reu.reset();
+        }
         self.m.clk = self.m.c64_core.clk;
         self.sid.reanchor(self.m.c64_core.clk);
         self.drive.after_c64_reset(&mut self.m, self.stopped);
@@ -607,7 +623,10 @@ impl C64Backend for Trx64Backend {
         video::frame(&self.m, &self.palette)
     }
 
-    fn lend_ddr(&mut self, ddr: Option<&mut [u8]>) {
+    fn lend_ddr(&mut self, mut ddr: Option<&mut [u8]>) {
+        // REU: TRX64 HOLDS the store for the life of the device, while the DDR is only LENT for this access, so the
+        // store cannot be the borrow — it is a second view of the very same lease (Spec 854 D3, reu.rs).
+        self.reu.set_ddr(ddr.as_mut().map(|d| (d.as_mut_ptr(), d.len())));
         self.cart.with(|c| c.set_ddr(ddr));
     }
 
@@ -622,6 +641,45 @@ impl C64Backend for Trx64Backend {
     fn set_freeze_button(&mut self, down: bool) {
         self.cart.with(|c| c.set_button(down));
         self.cart_changed();
+    }
+
+    // ---- REU: the RAM Expansion Unit (docs/status/reu.md) ----
+
+    /// C64_REU_ENABLE. `attach_expansion_also` rather than `attach_expansion`, so the REU joins whatever else is on
+    /// the port instead of replacing it, and `detach_reu` takes the REU back off and leaves the rest (Spec 854 §7).
+    /// Neither touches the UCI block, which is the machine profile's own device in a slot of its own (Spec 852), nor
+    /// the cartridge, which is `Machine::cartridge`.
+    fn set_reu_enabled(&mut self, on: bool) {
+        match (on, self.m.reu().is_some()) {
+            (true, false) => {
+                self.reu.set_size_kb(self.reu_size_kb);
+                // The store is guest DDR, so an REU that comes back finds the image the firmware preloaded there
+                // (reu_preloader.cc:104) and everything the last one wrote.
+                match Reu::new_with_store(self.reu_size_kb, Box::new(self.reu.clone())) {
+                    Some(reu) => self.m.attach_expansion_also(Box::new(reu)),
+                    // `128 << n` is always a size TRX64 builds, so the register cannot reach this.
+                    None => eprintln!("c64: TRX64 builds no REU of {} KB", self.reu_size_kb),
+                }
+            }
+            (false, true) => {
+                self.m.detach_reu();
+            }
+            _ => {}
+        }
+    }
+
+    /// C64_REU_SIZE. Spec 854 D4: only how much DRAM the REC reports as fitted changes. The store is DDR and keeps
+    /// its contents, so the firmware moving the setting drops neither a preloaded image nor what the C64 stashed.
+    fn set_reu_size_kb(&mut self, size_kb: u32) {
+        self.reu_size_kb = size_kb;
+        self.reu.set_size_kb(size_kb);
+        if let Some(reu) = self.m.reu_mut() {
+            reu.set_size_kb(size_kb);
+        }
+    }
+
+    fn reu_attached(&self) -> bool {
+        self.m.reu().is_some()
     }
 
     // W4-DRIVE: drive A is TRX64's drive 8 (drive.rs); there is no drive B.
@@ -1020,5 +1078,169 @@ mod tests {
         assert_eq!(c64.frame().palette[0], 0x0012_0000);
         c64.rom_write(C64Rom::Char, 0xFFF, 0xAB);
         assert_eq!((c64.rom_read(C64Rom::Char, 0xFFF), c64.m.char_rom[0xFFF]), (0xAB, 0xAB));
+    }
+
+    // ---- REU: the RAM Expansion Unit (TRX64 Spec 854, docs/status/reu.md) ----
+
+    use reu::{DEFAULT_SIZE_KB, REU_BASE, UNLENT};
+
+    /// `C64Port::tick`'s shape: DDR lent around the run and taken back after it. That window is the only time the
+    /// REU's store has anything behind it.
+    fn run_ms_lent(c64: &mut Trx64Backend, now: &mut u64, ms: u64, ddr: &mut [u8]) {
+        for _ in 0..ms {
+            *now += CLOCKS_PER_MS;
+            c64.lend_ddr(Some(ddr));
+            c64.advance_to(*now);
+            c64.lend_ddr(None);
+        }
+    }
+
+    /// A 6510 program for $C000 that runs one REU transfer and then loops: `cmd` is the command byte ($90 stash
+    /// C64→REU, $91 fetch REU→C64, both with the $FF00 trigger disabled), between `c64_addr` and `reu_addr`, `len`
+    /// bytes.
+    fn reu_program(cmd: u8, c64_addr: u16, reu_addr: u32, len: u16) -> Vec<u8> {
+        let ([c_lo, c_hi], [l_lo, l_hi]) = (c64_addr.to_le_bytes(), len.to_le_bytes());
+        let mut code = Vec::new();
+        let regs = [
+            (0x02, c_lo),
+            (0x03, c_hi),
+            (0x04, reu_addr as u8),
+            (0x05, (reu_addr >> 8) as u8),
+            (0x06, (reu_addr >> 16) as u8),
+            (0x07, l_lo),
+            (0x08, l_hi),
+            // Last: writing the command with bit 7 set starts the transfer.
+            (0x01, cmd),
+        ];
+        for (reg, val) in regs {
+            code.extend([0xA9, val, 0x8D, reg, 0xDF]);
+        }
+        let [lo, hi] = (0xC000 + code.len() as u16).to_le_bytes();
+        code.extend([0x4C, lo, hi]);
+        code
+    }
+
+    fn load(c64: &mut Trx64Backend, at: u16, bytes: &[u8]) {
+        for (i, &b) in bytes.iter().enumerate() {
+            c64.dma_write(at + i as u16, b, false);
+        }
+    }
+
+    /// Run `code` from $C000 with DDR lent, as an access that reaches the C64 bus does.
+    fn run_program(c64: &mut Trx64Backend, now: &mut u64, code: &[u8], ddr: &mut [u8]) {
+        load(c64, 0xC000, code);
+        c64.m.c64_core.reg_pc = 0xC000;
+        run_ms_lent(c64, now, 20, ddr);
+    }
+
+    /// C64_REU_ENABLE puts the REU on the port and takes it off while the machine runs, and C64_REU_SIZE moves under
+    /// it — without disturbing the UCI block or the cartridge.
+    #[test]
+    fn enable_and_size_move_at_runtime() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        let mut ddr = ddr();
+        c64.lend_ddr(Some(&mut ddr));
+        c64.set_reset(true);
+        c64.set_cart(0x41, &[]);
+        assert!(c64.has_uci() && c64.cart_active(), "the UCI block and a cartridge are there first");
+        assert!(!c64.reu_attached());
+        let ff00_before = c64.m.expansion_snoop_registered(0xFF00);
+
+        c64.set_reu_enabled(true);
+        assert_eq!(
+            c64.m.reu().map(|r| (r.size_kb(), r.ram_len(), r.ram_is_owned())),
+            Some((DEFAULT_SIZE_KB, DEFAULT_SIZE_KB * 1024, false)),
+            "the register's reset value, over a store the host owns (854 D7)"
+        );
+        c64.set_reu_size_kb(512);
+        assert_eq!(c64.m.reu().map(|r| (r.size_kb(), r.ram_len())), Some((512, 512 * 1024)));
+        assert!(c64.reu_attached() && c64.has_uci() && c64.cart_active(), "neither the UCI nor the cartridge moved");
+        assert!(c64.m.expansion_snoop_registered(0xFF00), "the REU's $FF00 trigger is snooped");
+
+        // 854 D4: the fitted size moves without rebuilding the device or touching a byte of DDR.
+        ddr[REU_BASE + 0x100] = 0x3C;
+        ddr[REU_BASE + 0x10_0000] = 0x5A;
+        assert_eq!(c64.m.reu().map(|r| r.ram_byte(0x10_0000)), Some(UNLENT), "above 512 KB no DRAM is fitted");
+        c64.set_reu_size_kb(16384);
+        assert_eq!(c64.m.reu().map(|r| r.ram_byte(0x10_0000)), Some(0x5A), "and the boundary moved");
+        assert_eq!(c64.m.reu().map(|r| r.ram_byte(0x100)), Some(0x3C), "what was below it is still there");
+
+        c64.set_reu_enabled(false);
+        assert!(!c64.reu_attached() && c64.m.reu().is_none());
+        assert!(c64.has_uci() && c64.cart_active(), "detaching took only the REU (854 §7)");
+        assert_eq!(c64.m.expansion_snoop_registered(0xFF00), ff00_before, "and its snoop with it");
+
+        // It comes back onto the DDR it left: the bytes were never the device's.
+        c64.set_reu_enabled(true);
+        assert_eq!(c64.m.reu().map(|r| (r.size_kb(), r.ram_byte(0x100))), Some((16384, 0x3C)));
+        c64.lend_ddr(None);
+    }
+
+    /// The transfer that matters: the C64 stashes into the REU and the bytes land in the firmware's DDR at
+    /// `REU_MEMORY_BASE`, then it fetches them back — including a byte the host changed in between, as a preload
+    /// does (reu_preloader.cc:104). One copy, and it is the firmware's.
+    #[test]
+    fn a_transfer_moves_bytes_between_c64_ram_and_the_firmwares_ddr() {
+        let Some((mut c64, mut now)) = booted() else { return };
+        let (mut ddr, pattern) = (ddr(), (0..16u8).map(|i| 0xA0 + i).collect::<Vec<_>>());
+        load(&mut c64, 0x0400, &pattern);
+        c64.set_reu_size_kb(512);
+        c64.set_reu_enabled(true);
+
+        run_program(&mut c64, &mut now, &reu_program(0x90, 0x0400, 0, 16), &mut ddr);
+        assert_eq!(&ddr[REU_BASE..REU_BASE + 16], &pattern[..], "the stash landed in DDR at REU_MEMORY_BASE");
+
+        // The firmware's CPU writes that region whenever it likes; the C64 must read what it wrote.
+        ddr[REU_BASE + 15] = 0x5A;
+        run_program(&mut c64, &mut now, &reu_program(0x91, 0x0500, 0, 16), &mut ddr);
+        let back: Vec<u8> = (0..16).map(|i| c64.dma_read(0x0500 + i, false)).collect();
+        assert_eq!(back[..15], pattern[..15], "the fetch brought the stash back");
+        assert_eq!(back[15], 0x5A, "and the host's own byte with it, not a copy of the REU's");
+    }
+
+    /// 854 D3 — a transfer with nothing lent completes, reads the store's stand-in byte, writes nothing and does not
+    /// panic. Between the accesses that lend, this is the normal state.
+    #[test]
+    fn a_transfer_with_nothing_lent_reads_a_stand_in_and_drops_writes() {
+        let Some((mut c64, mut now)) = booted() else { return };
+        let (ddr, pattern) = (ddr(), (0..16u8).map(|i| 0xA0 + i).collect::<Vec<_>>());
+        load(&mut c64, 0x0400, &pattern);
+        c64.set_reu_size_kb(512);
+        c64.set_reu_enabled(true);
+
+        // `run_ms`, not `run_ms_lent`: the C64 runs with no DDR under the store.
+        load(&mut c64, 0xC000, &reu_program(0x90, 0x0400, 0, 16));
+        c64.m.c64_core.reg_pc = 0xC000;
+        run_ms(&mut c64, &mut now, 20);
+        assert!(ddr[REU_BASE..REU_BASE + 16].iter().all(|&b| b == 0), "the stash wrote nothing");
+
+        load(&mut c64, 0xC000, &reu_program(0x91, 0x0500, 0, 16));
+        c64.m.c64_core.reg_pc = 0xC000;
+        run_ms(&mut c64, &mut now, 20);
+        let back: Vec<u8> = (0..16).map(|i| c64.dma_read(0x0500 + i, false)).collect();
+        assert!(back.iter().all(|&b| b == UNLENT), "and the fetch read the stand-in byte: {back:?}");
+        assert!(c64.reu_attached(), "the REU is still on the port and the machine ran on");
+    }
+
+    /// The expansion port's RESET line resets the REC and leaves the RAM alone (reu.c:602-615). TRX64's own reset
+    /// reaches `Machine::cartridge` and not the port devices, so the bridge does this one.
+    #[test]
+    fn a_c64_reset_resets_the_rec_and_keeps_the_ram() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        let mut ddr = ddr();
+        c64.lend_ddr(Some(&mut ddr));
+        c64.advance_to(0);
+        c64.set_reu_size_kb(512);
+        c64.set_reu_enabled(true);
+        c64.m.reu_mut().unwrap().restore_registers(&[0u8; 16]);
+        ddr[REU_BASE + 0x100] = 0x77;
+        let fresh = Reu::new(512).unwrap().snapshot_registers();
+        assert_ne!(c64.m.reu().unwrap().snapshot_registers(), fresh, "the REC is away from its reset state");
+
+        c64.set_reset(true);
+        c64.set_reset(false);
+        assert_eq!(c64.m.reu().unwrap().snapshot_registers(), fresh, "the RESET line reset the REC");
+        assert_eq!(c64.m.reu().unwrap().ram_byte(0x100), 0x77, "and left the RAM, which is the firmware's DDR");
+        c64.lend_ddr(None);
     }
 }
