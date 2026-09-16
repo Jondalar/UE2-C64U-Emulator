@@ -162,6 +162,18 @@ down)
     "$VENV/bin/python" "$FW/run-tests" --profile "$PROFILE" -o "$OUT/runs/$RUN" "$@" "$HOST" || status=$?
     "$VENV/bin/python" "$FW/tools/e2e_report.py" "$OUT/runs/$RUN" >/dev/null || true
     echo "run-e2e: run-tests exited $status; report $OUT/runs/$RUN/index.md" >&2
+    # uci-targets carries no profile tag upstream, so it runs from `standard` up (run-tests, Suite.profile) and the
+    # smoke and quick profiles skip it. It is the end-to-end check of the command interface (docs/specs/S15-uci.md),
+    # so those two profiles name it in a second pass of the same boot. E2E_UCI=0 switches that off, and a caller who
+    # selects suites with -s decides alone.
+    case " $* " in *" -s "*|*" --suite "*) uci=0 ;; *) uci=${E2E_UCI:-1} ;; esac
+    case "$PROFILE" in smoke|quick) ;; *) uci=0 ;; esac
+    if [ "$uci" = 1 ]; then
+        rm -rf "$OUT/runs/$RUN-uci"
+        "$VENV/bin/python" "$FW/run-tests" --profile "$PROFILE" -s uci-targets -o "$OUT/runs/$RUN-uci" "$HOST" || status=$?
+        "$VENV/bin/python" "$FW/tools/e2e_report.py" "$OUT/runs/$RUN-uci" >/dev/null || true
+        echo "run-e2e: uci-targets report $OUT/runs/$RUN-uci/index.md" >&2
+    fi
     exit "$status"
     ;;
 esac

@@ -153,7 +153,13 @@ varies between attempts (E5).
 `tests/e2e/io/command_interface/uci_targets_test.py` drives the UCI registers `$DF1B-$DF1F` over REST
 `machine:readmem` / `machine:writemem`, which are DMA cycles on the cartridge bus, so no 6502 code is involved. It is
 the end-to-end check of `docs/specs/S15-uci.md`: the firmware's targets talk to TRX64's UCI block through the C64
-registers. Run as `[E2E_REST_SHIM=1] scripts/run-e2e.sh quick -s uci-targets`:
+registers.
+
+Upstream the suite carries no profile tag, so it runs from `standard` up (`run-tests`, `Suite.profile`) and `smoke`
+and `quick` would skip it. `scripts/run-e2e.sh` therefore names it in a second `run-tests` pass of the same boot
+whenever the profile is `smoke` or `quick`, with its own report under `runs/<profile>[-shim]-uci/`. `E2E_UCI=0`
+switches that pass off, and a caller who selects suites with `-s` decides alone. A single run is still
+`[E2E_REST_SHIM=1] scripts/run-e2e.sh quick -s uci-targets`:
 
 | Run | Result |
 |---|---|
