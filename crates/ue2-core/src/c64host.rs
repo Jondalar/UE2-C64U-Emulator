@@ -39,6 +39,18 @@ pub struct C64Frame {
     pub charset: C64Charset,
 }
 
+/// What the UCI block saw on the C64 side that the firmware cannot see for itself (TRX64 `uci::UciEvents`, Spec 852
+/// D4). `devices::c64::C64Port` turns these into ITU low bit 7 and high IRQ 6 (docs/specs/S15-uci.md §3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UciEvents {
+    /// The C64 was reset. The firmware learns it through ITU low bit 7 and aborts a pending command
+    /// (command_intf.cc `ResetInterruptHandlerCmdIf`).
+    pub c64_reset: bool,
+    /// `$AB` to `$D038`, then `$CD` to `$D036`. The firmware's `unlock_irq` then maps the internal bus and enables
+    /// the block at `$DF1C` (u64_config.cc:1012-1019).
+    pub unlock: bool,
+}
+
 /// A C64 driven by `devices::c64::C64Port` (S14 §3). Addresses are C64 bus addresses; `now` is the 100 MHz clock.
 pub trait C64Backend {
     /// Run the C64 up to `now` (monotonic). The first call anchors the C64 clock to `now`. While stopped only the
@@ -113,6 +125,29 @@ pub trait C64Backend {
     /// The cartridge in the physical expansion port, or None if the port is empty.
     fn cart_slot(&mut self) -> Option<&mut dyn C64CartSlot> {
         None
+    }
+
+    // ---- UCI: the Ultimate Command Interface (docs/specs/S15-uci.md) ----
+
+    /// Whether this backend serves the UCI block. TRX64 has it on the `u64` profile, where it is part of the machine
+    /// (Spec 852). Without it `devices::c64::C64Port` keeps the T0 register table at 0x10044000.
+    fn has_uci(&self) -> bool {
+        false
+    }
+    /// A read of `CMD_IF_BASE` 0x10044000 + `off`: the sixteen registers below 0x800, the 2 K dual-port RAM above
+    /// (docs/hw/11 §UltiCommand). Side-effect free, as TRX64's `Uci::fw_read` is — none of the firmware-side reads
+    /// in `command_protocol.vhd` has one.
+    fn uci_read(&self, _off: u16) -> u8 {
+        0
+    }
+    fn uci_write(&mut self, _off: u16, _val: u8) {}
+    /// ITU low bit 4: `(handshake_in AND NOT irq_mask) != 0`, a level (command_protocol.vhd:310; itu.h:37).
+    fn uci_irq(&self) -> bool {
+        false
+    }
+    /// The C64-side events since the last call (TRX64 `Uci::take_events`).
+    fn uci_take_events(&mut self) -> UciEvents {
+        UciEvents::default()
     }
 }
 
@@ -239,7 +274,25 @@ pub(crate) mod mock {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use super::{C64Backend, C64Frame, C64Rom};
+    use super::{C64Backend, C64Frame, C64Rom, UciEvents};
+
+    /// A stand-in for TRX64's UCI block: the firmware window reads back what was written, and the test drives the
+    /// IRQ level and the events by hand.
+    #[derive(Clone)]
+    pub(crate) struct Uci {
+        /// The 0x1000-byte firmware window (registers below 0x800, RAM above).
+        pub(crate) mem: Vec<u8>,
+        /// What `uci_irq` reports (ITU low bit 4).
+        pub(crate) irq: bool,
+        /// Taken by the next `uci_take_events`.
+        pub(crate) events: UciEvents,
+    }
+
+    impl Default for Uci {
+        fn default() -> Self {
+            Uci { mem: vec![0; 0x1000], irq: false, events: UciEvents::default() }
+        }
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum Call {
@@ -261,6 +314,8 @@ pub(crate) mod mock {
         /// EEPROM window write (offset, value).
         Eeprom(u16, u8),
         Freeze(bool),
+        /// UCI firmware-side write (offset, value).
+        Uci(u16, u8),
     }
 
     /// Shared with the test after the backend moved into the device.
@@ -276,6 +331,8 @@ pub(crate) mod mock {
         pub(crate) leases: Rc<RefCell<Vec<Option<usize>>>>,
         /// What `cart_detect` returns; None is the trait default (CARTSLOT).
         pub(crate) detect: Rc<RefCell<Option<u8>>>,
+        /// UCI: `Some` when the mock has a block, so `has_uci` is true (S15).
+        pub(crate) uci: Rc<RefCell<Option<Uci>>>,
     }
 
     impl Mock {
@@ -369,6 +426,25 @@ pub(crate) mod mock {
         }
         fn cart_detect(&self) -> u8 {
             self.detect.borrow().unwrap_or(super::CART_DETECT_NONE)
+        }
+
+        fn has_uci(&self) -> bool {
+            self.uci.borrow().is_some()
+        }
+        fn uci_read(&self, off: u16) -> u8 {
+            self.uci.borrow().as_ref().map_or(0, |u| u.mem[usize::from(off)])
+        }
+        fn uci_write(&mut self, off: u16, val: u8) {
+            if let Some(u) = self.uci.borrow_mut().as_mut() {
+                u.mem[usize::from(off)] = val;
+            }
+            self.push(Call::Uci(off, val));
+        }
+        fn uci_irq(&self) -> bool {
+            self.uci.borrow().as_ref().is_some_and(|u| u.irq)
+        }
+        fn uci_take_events(&mut self) -> UciEvents {
+            self.uci.borrow_mut().as_mut().map(|u| std::mem::take(&mut u.events)).unwrap_or_default()
         }
     }
 }

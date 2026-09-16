@@ -39,9 +39,13 @@ const EEPROM_END: u32 = EEPROM + 0xFFF;
 /// W4-DRIVE: drive A (devices/drives.rs), served here so it reaches the backend's drive.
 const DRIVE_A: u32 = 0x2_0000;
 const DRIVE_A_END: u32 = DRIVE_A + 0x3FFF;
+/// UCI: `CMD_IF_BASE` 0x10044000, the firmware side of the Ultimate Command Interface (iomap.h:16). Served by the
+/// backend's block when it has one, else by the T0 table [`UCI_T0`] (docs/specs/S15-uci.md).
+const UCI: u32 = 0x4_4000;
+const UCI_END: u32 = UCI + 0xFFF;
 
 /// (offset, size) of every [`C64Port`] window.
-const WINDOWS: [(u32, u32); 10] = [
+const WINDOWS: [(u32, u32); 11] = [
     (DRIVE_A, 0x4000),
     (CART, 0x100),
     (DMA, 0x1_0000),
@@ -52,7 +56,47 @@ const WINDOWS: [(u32, u32); 10] = [
     (KERNAL, 0x2000),
     (CHAR, 0x1000),
     (EEPROM, 0x1000),
+    (UCI, 0x1000),
 ];
+
+/// UltiCommand interface 0x10044000 without a backend that has the block (command_protocol.vhd; moved here from
+/// devices/iec.rs with the UCI window). No C64 command ever arrives at T0.
+const UCI_T0: &[Span] = &[
+    // SLOT_BASE, slot_base(6 downto 1).
+    at(0x00, Reg::Latch { mask: 0x7E, init: 0 }),
+    // SLOT_ENABLE: bit7 = 0 writes the enable (bit0); bit7 = 1 writes the C64 bus ID instead, so the
+    // SoftIEC 0x8B (iec_drive.cc:199) leaves the slot disabled for c64.cc:1355.
+    at(0x01, Reg::Gated { mask: 0x01, veto: 0x80 }),
+    // 0x02 HANDSHAKE_OUT (freeze|trigger|state) and 0x03 STATUSBYTE read 0: 11 H14 `is_dma_active` false,
+    // 11 H7 / 00 §2 C3 ITU bit 4 stays low.
+    // 00 §2 A5, 11 H6: buffer bases read in the pre-main ctor (command_intf.cc:50-53), buffer address(10:3).
+    // +4/+5 writes are IRQ mask set/clear, not stores (command_intf.cc:117-118).
+    at(0x04, Reg::Set { cell: 0x0B, mask: 0x07, read: Some(0x00) }),
+    at(0x05, Reg::Clear { cell: 0x0B, mask: 0x07, read: Some(0x6F) }),
+    at(0x06, Reg::Const(0x70)),
+    at(0x07, Reg::Const(0xDF)),
+    at(0x08, Reg::Const(0xE0)),
+    at(0x09, Reg::Const(0xFF)),
+    // 0x0A status read pointer idles at 0x700 (low byte 0).
+    // IRQMASK, reset 0b111.
+    at(0x0B, Reg::Latch { mask: 0x07, init: 0x07 }),
+    // Response read pointer idles at the response buffer 0x380 (`reset_response`).
+    at(0x0C, Reg::Const(0x80)),
+    at(0x0D, Reg::Const(0x03)),
+    // 0x0E/0x0F COMMAND_LEN 0. Command 0x800, response 0xB80, status 0xF00 buffers.
+    span(0x800, 0x1000, RAM),
+];
+
+/// ITU low bit 4 `ITU_INTERRUPT_CMDIF` (itu.h:37): the UCI's firmware interrupt, a level
+/// (command_protocol.vhd:310; docs/hw/02 §Low IRQ byte).
+const UCI_IRQ_BIT: u8 = 4;
+/// ITU low bit 7 `ITU_INTERRUPT_RESET` (itu.h:40): the C64 reset, an edge (ultimate_logic_32.vhd:531).
+const C64_RESET_IRQ_BIT: u8 = 7;
+/// ITU high IRQ 6, `unlock_irq` (itu.h:46; u64_config.cc:974). A level with no ack register in the ITU; its handler
+/// drops the source with `C64_POKE(0xD038, 0)` (u64_config.cc:1014).
+const UNLOCK_IRQ_HIGH_BIT: u8 = 6;
+/// The DMA write that acks high IRQ 6 (u64_config.cc:1014).
+const UNLOCK_ACK_ADDR: u16 = 0xD038;
 
 /// Clocks between periodic C64 syncs: 1 ms, about 985 C64 cycles (S14 §4).
 const SYNC_PERIOD: u64 = 100_000;
@@ -237,6 +281,8 @@ pub struct C64Port {
     drive_a: DriveRegs,
     /// CARTSLOT: U64_CART_DETECT, shared with `U64Io` (docs/status/cart-slot.md).
     cart_detect: Option<Arc<AtomicU8>>,
+    /// UCI 0x10044000 while the backend has no block of its own (S15).
+    uci: RegTable,
 }
 
 impl Default for C64Port {
@@ -266,6 +312,7 @@ impl C64Port {
             pal_noted: false,
             drive_a: DriveRegs::new(0),
             cart_detect: None,
+            uci: RegTable::new("uci", UCI_T0),
         }
     }
 
@@ -477,6 +524,27 @@ impl C64Port {
             b.set_nmi(level);
         }
     }
+
+    /// UCI: whether the backend serves the block. Without one the window stays the T0 table (S15).
+    fn has_uci(&self) -> bool {
+        self.backend.as_ref().is_some_and(|b| b.has_uci())
+    }
+
+    /// The UCI's lines into the ITU, after anything that may have run the C64 or reached the block (S15 §3):
+    /// low bit 4 is the firmware IRQ level, recomputed every time; low bit 7 is the C64-reset edge and high IRQ 6
+    /// the unlock, both taken from the block's event queue. Without a UCI nothing is driven, as before.
+    fn update_uci(&mut self, ctx: &mut IoCtx) {
+        let Some(b) = self.backend.as_mut().filter(|b| b.has_uci()) else { return };
+        let irq = b.uci_irq();
+        let events = b.uci_take_events();
+        ctx.irq.set_level(UCI_IRQ_BIT, irq);
+        if events.c64_reset {
+            ctx.irq.pulse(C64_RESET_IRQ_BIT);
+        }
+        if events.unlock {
+            ctx.irq.set_high(UNLOCK_IRQ_HIGH_BIT, true);
+        }
+    }
 }
 
 /// The cart ROM area of DDR.
@@ -496,6 +564,7 @@ impl IoDevice for C64Port {
                 self.sync(ctx.now);
                 let val = self.peek8(off);
                 self.return_ddr();
+                self.update_uci(ctx);
                 val
             }
             DMA..=DMA_END => {
@@ -507,6 +576,17 @@ impl IoDevice for C64Port {
                     None => self.dma.read(addr),
                 };
                 self.return_ddr();
+                self.update_uci(ctx);
+                val
+            }
+            // UCI: the block is C64-side state, so the C64 runs up to this instruction first, as the cart registers
+            // do. `uci_read` itself has no side effects (S15 §3).
+            UCI..=UCI_END if self.has_uci() => {
+                self.lend_ddr(ctx);
+                self.sync(ctx.now);
+                let val = self.backend.as_ref().map_or(0, |b| b.uci_read((off - UCI) as u16));
+                self.return_ddr();
+                self.update_uci(ctx);
                 val
             }
             // W4-DRIVE: drive A.
@@ -515,6 +595,7 @@ impl IoDevice for C64Port {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 self.return_ddr();
+                self.update_uci(ctx);
                 let drive = self.backend.as_mut().and_then(|b| b.drive(0));
                 self.drive_a.read(off - DRIVE_A, ctx, drive)
             }
@@ -529,6 +610,7 @@ impl IoDevice for C64Port {
                 self.sync(ctx.now);
                 self.cart_write(off & 0x0F, val, ctx.ram);
                 self.return_ddr();
+                self.update_uci(ctx);
             }
             DMA..=DMA_END => {
                 self.lend_ddr(ctx);
@@ -539,12 +621,30 @@ impl IoDevice for C64Port {
                     None => self.dma.mem[usize::from(addr)] = val,
                 }
                 self.return_ddr();
+                // UCI: `unlock_irq` acks high IRQ 6 with `C64_POKE(0xD038, 0)`; the ITU has no ack register of its
+                // own, so this write is the only thing that drops the source (u64_config.cc:1012-1014, 02 H8).
+                if addr == UNLOCK_ACK_ADDR && val == 0 && self.has_uci() {
+                    ctx.irq.set_high(UNLOCK_IRQ_HIGH_BIT, false);
+                }
+                self.update_uci(ctx);
             }
+            // UCI, when the backend has the block.
+            UCI..=UCI_END if self.has_uci() => {
+                self.lend_ddr(ctx);
+                self.sync(ctx.now);
+                if let Some(b) = &mut self.backend {
+                    b.uci_write((off - UCI) as u16, val);
+                }
+                self.return_ddr();
+                self.update_uci(ctx);
+            }
+            UCI..=UCI_END => self.uci.set(off - UCI, val),
             MATRIX..=MATRIX_END => {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 self.matrix_write(off - MATRIX, val);
                 self.return_ddr();
+                self.update_uci(ctx);
             }
             EEPROM..=EEPROM_END => {
                 if let Some(b) = &mut self.backend {
@@ -570,6 +670,7 @@ impl IoDevice for C64Port {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 self.return_ddr();
+                self.update_uci(ctx);
                 let drive = self.backend.as_mut().and_then(|b| b.drive(0));
                 self.drive_a.write(off - DRIVE_A, val, ctx, drive);
             }
@@ -591,6 +692,11 @@ impl IoDevice for C64Port {
             CORE..=CORE_END => self.core.get(off - CORE),
             // Without a backend the window reads 0: EEPROM not dirty (10 T0).
             EEPROM..=EEPROM_END => self.backend.as_ref().map_or(0, |b| b.eeprom_read((off - EEPROM) as u16)),
+            // UCI: `uci_read` is side-effect free, so a peek is the same read (S15 §3).
+            UCI..=UCI_END => match self.backend.as_ref().filter(|b| b.has_uci()) {
+                Some(b) => b.uci_read((off - UCI) as u16),
+                None => self.uci.get(off - UCI),
+            },
             BASIC..=CHAR_END => {
                 let (rom, rel) = Self::rom_window(off);
                 match &self.backend {
@@ -613,12 +719,15 @@ impl IoDevice for C64Port {
         self.lend_ddr(ctx);
         self.sync(ctx.now);
         self.return_ddr();
+        self.update_uci(ctx);
         // W4-DRIVE: carry drive A's writes into DDR.
         let drive = self.backend.as_mut().and_then(|b| b.drive(0));
         self.drive_a.tick(ctx, drive);
     }
 
-    /// Power-on register state; an attached backend stays attached, and keys held on the keyboard stay held.
+    /// Power-on register state; an attached backend stays attached, and keys held on the keyboard stay held. The
+    /// backend's own UCI block is not reset here either: only the FPGA system reset clears it
+    /// (command_protocol.vhd:292-306), which on TRX64 is `Machine::new` (Spec 852 §2).
     fn reset(&mut self) {
         let (backend, synced, keys, cart_detect) = (self.backend.take(), self.synced, self.dma.keys, self.cart_detect.take());
         *self = C64Port::new();
@@ -656,7 +765,8 @@ pub fn install(map: &mut IoMap, _cfg: &MachineConfig) {
 mod tests {
     use super::*;
     use crate::bus::RAM_SIZE;
-    use crate::c64host::mock::{Call, Mock};
+    use crate::c64host::mock::{self, Call, Mock};
+    use crate::c64host::UciEvents;
     use crate::devices::board::rig::{cfg, Rig};
     use crate::irq::IrqState;
 
@@ -669,6 +779,34 @@ mod tests {
     const DMA_ADDR: u32 = 0x1005_0000;
     const MATRIX_ADDR: u32 = 0x1010_0300;
     const CORE_ADDR: u32 = 0x1018_0000;
+    const UCI_ADDR: u32 = 0x1004_4000;
+
+    /// Moved here from devices/iec.rs with the UCI window: without a backend that has the block, 0x10044000 is the
+    /// T0 table (00 §2 A5, 11 H6/H7/H14).
+    #[test]
+    fn a5_uci_buffer_bases() {
+        let mut rig = Rig::new(install);
+        // CommandInterface ctor (command_intf.cc:44-53).
+        rig.w8(UCI_ADDR, 0x47);
+        rig.w8(UCI_ADDR + 2, 0x87);
+        assert_eq!([4, 5, 6, 7, 8, 9].map(|o| rig.r8(UCI_ADDR + o)), [0x00, 0x6F, 0x70, 0xDF, 0xE0, 0xFF]);
+        assert_eq!((rig.r8(UCI_ADDR + 2), rig.r8(UCI_ADDR + 3)), (0, 0), "11 H7/H14");
+        assert_eq!(rig.r8(UCI_ADDR), 0x46);
+        // C3: IRQ mask clear at UCI task start, ISR mask set (command_intf.cc:85-96,117-118).
+        assert_eq!(rig.r8(UCI_ADDR + 0x0B), 0x07);
+        rig.w8(UCI_ADDR + 0x05, 0x07);
+        assert_eq!(rig.r8(UCI_ADDR + 0x0B), 0x00);
+        rig.w8(UCI_ADDR + 0x04, 0x05);
+        assert_eq!(rig.r8(UCI_ADDR + 0x0B), 0x05);
+        assert_eq!(rig.r8(UCI_ADDR + 0x04), 0x00);
+        // Bus ID write does not enable the slot.
+        rig.w8(UCI_ADDR + 0x01, 0x8B);
+        assert_eq!(rig.r8(UCI_ADDR + 0x01), 0);
+        rig.w8(UCI_ADDR + 0x01, 0x01);
+        assert_eq!(rig.r8(UCI_ADDR + 0x01), 1);
+        rig.w32(UCI_ADDR + 0xB80, 0x1234_5678);
+        assert_eq!(rig.r32(UCI_ADDR + 0xB80), 0x1234_5678);
+    }
 
     #[test]
     fn c12_stop_ack_immediate() {
@@ -975,6 +1113,50 @@ mod tests {
         assert_eq!(b.mock.leases.borrow()[1..], [lent, lent, lent, lent, lent, None], "EEPROM needs no DDR");
         assert_eq!(*b.mock.ddr.borrow(), None, "taken back after every access");
         assert_eq!(C64Port::new().peek8(EEPROM), 0, "T0: not dirty");
+    }
+
+    /// UCI (S15 §3): with a block behind the backend the firmware window is the backend's, and its lines drive ITU
+    /// low bit 4 (the firmware IRQ, a level), low bit 7 (C64 reset, an edge) and high IRQ 6 (unlock).
+    #[test]
+    fn uci_window_and_itu_bits_follow_the_backend() {
+        let mut b = Bench::new();
+        assert_eq!(b.r8(UCI_ADDR + 0x06), 0x70, "no block: the T0 table still answers");
+        *b.mock.uci.borrow_mut() = Some(mock::Uci::default());
+
+        // Registers and the 2 K RAM go to the block; a peek is the same read, because `uci_read` has no side effects.
+        b.w8(UCI_ADDR + 0x01, 0x47);
+        b.w8(UCI_ADDR + 0x800, 0x5A);
+        assert_eq!((b.r8(UCI_ADDR + 0x01), b.r8(UCI_ADDR + 0x800)), (0x47, 0x5A));
+        assert_eq!(b.port().peek8(UCI + 0x800), 0x5A);
+        assert_eq!(b.r8(UCI_ADDR + 0x06), 0, "the T0 table is out of the way");
+        assert_eq!(b.mock.take(), [Call::Uci(0x01, 0x47), Call::Uci(0x800, 0x5A)]);
+
+        // Low bit 4 is a level, recomputed after every access.
+        b.irq.mask = 0x90;
+        b.mock.uci.borrow_mut().as_mut().unwrap().irq = true;
+        b.r8(UCI_ADDR + 0x03);
+        assert_eq!(b.irq.active() & 0x10, 0x10);
+        b.mock.uci.borrow_mut().as_mut().unwrap().irq = false;
+        b.r8(UCI_ADDR + 0x03);
+        assert_eq!(b.irq.active() & 0x10, 0, "a level source follows its line");
+
+        // The events reach the ITU on the next sync, here the periodic tick.
+        b.mock.uci.borrow_mut().as_mut().unwrap().events = UciEvents { c64_reset: true, unlock: true };
+        b.now = SYNC_PERIOD;
+        b.with_ctx(STOP_ADDR, |dev, _, ctx| dev.tick(ctx));
+        assert_eq!(b.irq.active() & 0x80, 0x80, "low bit 7 latched by the C64 reset edge");
+        assert_eq!(b.irq.high_src & 1 << 6, 1 << 6, "high IRQ 6 on the unlock");
+        assert_eq!(b.mock.take(), [Call::Advance(SYNC_PERIOD)]);
+        // `unlock_irq` acks the source with `C64_POKE(0xD038, 0)` (u64_config.cc:1012-1014); the ITU has none.
+        b.w8(DMA_ADDR + 0xD038, 0);
+        assert_eq!(b.irq.high_src & 1 << 6, 0);
+        b.irq.clear(0x80);
+        assert_eq!(b.irq.active(), 0, "one edge per reset");
+
+        // Without a block nothing is driven and the T0 table is back.
+        *b.mock.uci.borrow_mut() = None;
+        b.r8(UCI_ADDR + 0x03);
+        assert_eq!(b.r8(UCI_ADDR + 0x06), 0x70);
     }
 
     #[test]

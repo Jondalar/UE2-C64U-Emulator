@@ -117,6 +117,12 @@ Decode = 5 byte stores to +0, then read +0..+3 and +4 (disk_image.cc:382-397, ie
 
 ### UltiCommand interface (`CMD_IF_BASE` = 0x10044000, iomap.h:16; command_intf.h:10-59)
 
+With the TRX64 C64 attached this is no longer a T0 table: the block is C64 hardware and lives in TRX64 (its Spec 852
+ports `command_protocol.vhd` one to one, this table included, quirks and all). The window is a `devices::c64::C64Port`
+window that reads and writes the block, ITU low bit 4 follows its firmware IRQ, low bit 7 its C64-reset event and high
+IRQ 6 its unlock (docs/specs/S15-uci.md). Without a C64 backend (`--c64 none`) the T0 table below still answers, now
+from `devices/c64.rs` instead of `devices/iec.rs`.
+
 | Abs addr | Width | R/W | Name | Meaning (command_protocol.vhd:197-290, command_if_pkg.vhd) |
 |---|---|---|---|---|
 | 0x10044000 | 8 | RW | SLOT_BASE | bits6:1 = C64 IO offset(8:3). 0x47 → $DF18–$DF1F, 0x7F → $DFF8, 0x07 → $DE18 |

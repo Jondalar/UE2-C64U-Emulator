@@ -179,7 +179,7 @@ C64_CARTRIDGE_TYPE (c64.h:125-163). "Done" means implemented after the VHDL and 
 | 6, 7, 12, 14, 16, 17, 33-35, 37-43, 45-52, 55-59, 61-63, 67-70, 72-85 | Expert, Fun Play, Rex, Magic Formel, Warpspeed, Dinamic, EasyFlash X-Bank, Capture, AR3, MMC64, MMC Replay, IDE64, SS4, IEEE 488, Game Killer, Prophet 64, Freeze Frame, … GMod3, … Magic Desk 16 | – | not done: the firmware rejects them (`CART_NOT_IMPL`, "Not implemented") |
 | C128 0, 1 | C128 Cartridge (with I/O mirror) | 0x03 / 0x63 / 0xE3 | not done: the logic serves `$8000-$FFFF` of a C128; on a C64 the bridge attaches nothing and says so once |
 | – | Boot cartridge (DMA load) | 0x41 | done (phase A, A4) |
-| – | SID Player Cartridge | 0x01 + UCI `$DFFC` | done (s01). The UCI is not modelled; sidcrt uses it only for an invalid header |
+| – | SID Player Cartridge | 0x01 + UCI `$DFFC` | done (s01). The UCI answers at `$DFFC` since S15 (TRX64 Spec 852); sidcrt uses it only for an invalid header |
 | – | MUS Player Cartridge | 0x01 + UCI `$DFFC` | done (s02) |
 | – | GeoRAM (REU setting "GeoRAM") | 0x1F | implemented (DDR `0x01000000`, unit test); not run. The size mask is taken as 16 MB (REU_SIZE is not passed on) |
 
@@ -198,7 +198,10 @@ C64_CARTRIDGE_TYPE (c64.h:125-163). "Done" means implemented after the VHDL and 
    private (c64_6510core.rs:81, 411-420). The bridge replicates the NMI check on the public `IntStatus` fields to switch
    the cart in before the instruction, and if an interrupt is taken unforeseen (an IRQ first) it switches after and
    moves PC to the cart's vector; the first KERNAL handler instruction has then run.
-4. **Four interrupt sources** (c64_6510core.rs:143-155): cartridge NMI and IRQ share source 3 with the RESTORE NMI.
+4. ~~**Four interrupt sources** (c64_6510core.rs:143-155): cartridge NMI and IRQ share source 3 with the RESTORE
+   NMI.~~ **Closed by TRX64 Spec 850:** `INT_SRC_EXPANSION` is a fifth source, driven per cycle from the port and
+   from the host's `Machine::set_expansion_lines`. The bridge puts both cartridges' IRQ and NMI there, and RESTORE
+   has source 3 to itself again (docs/specs/S15-uci.md §3.4).
 5. **The VIC view has no cartridge ROM** (`VicMemView`, vic.rs; lib.rs:2091-2126 builds it from RAM, CHARGEN, colour
    RAM): ULTIMAX carts that serve the VIC (`serve_vic`: CART_TYPE_UMAX, FC3 mode 10, KCS) show RAM instead of ROMH at
    VIC `$3000/$7000/$B000/$F000`.
@@ -215,8 +218,10 @@ C64_CARTRIDGE_TYPE (c64.h:125-163). "Done" means implemented after the VHDL and 
   KERNAL instruction. Freezing through the firmware's own C64-screen UI path is unrelated and unchanged.
 - **MATRIX_KEYB[10] as the cart freeze button** is inferred from keyboard_usb.cc:228 and freezer.vhd; the U64-II top
   level that wires it is closed.
-- **UCI** (`$DE1C`/`$DF1C`/`$DFFC`), **REU**, **ACIA** and **sampler** stay unmodelled; EasyFlash's `$DE1C` UCI is
-  therefore absent. A cartridge in the expansion port is `--cart-slot` (docs/status/cart-slot.md).
+- **UCI** (`$DE1C`/`$DF1C`/`$DFFC`) is modelled since S15, in TRX64: the block is part of its `u64` machine profile
+  (TRX64 Spec 852), and UE2 serves the firmware side at 0x10044000. Any slot base works, EasyFlash's `$DE1C`
+  included. **REU**, **ACIA** and **sampler** stay unmodelled. A cartridge in the expansion port is `--cart-slot`
+  (docs/status/cart-slot.md).
 - **GeoRAM size mask** and **TwoMegabyter**, **KCS/SS5/FC1 freezing** are implemented without a run from the firmware.
 - **Audio** comes from the SID stream (docs/status/sid-audio.md). After the wave-4 merge a cart smoke run with
   `--audio-wav run/carts.wav` holds the `s01-tune.sid` tune: peak-to-peak about 9300 in every second the SID player

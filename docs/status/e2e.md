@@ -148,6 +148,25 @@ varies between attempts (E5).
 | assembly64 | yes | FAIL | OK | 46/0/0 | H1 |
 | freezer-audio | yes | FAIL | FAIL | 0/1/0 | E2 |
 
+## UCI (`uci-targets`), after S15
+
+`tests/e2e/io/command_interface/uci_targets_test.py` drives the UCI registers `$DF1B-$DF1F` over REST
+`machine:readmem` / `machine:writemem`, which are DMA cycles on the cartridge bus, so no 6502 code is involved. It is
+the end-to-end check of `docs/specs/S15-uci.md`: the firmware's targets talk to TRX64's UCI block through the C64
+registers. Run as `[E2E_REST_SHIM=1] scripts/run-e2e.sh quick -s uci-targets`:
+
+| Run | Result |
+|---|---|
+| raw | FAIL at `[01] reset the C64 so the command interface starts idle`: `PUT http://127.0.0.1/v1/machine:reset` refused — **H1**, the suite builds that one URL without the port. All 9 scenarios then SKIP. The health sweep's REST on the forwarded port is fine in the same run (`rest=11ms`). |
+| shim | **OK — 46 checks, 38.4 s**, all three attempts unnecessary (first attempt passed). |
+
+With the shim every scenario passes: transport, control-target, palette, issue-740-matrix,
+save-reu-offset-past-end, load-reu-disabled, save-reu-disabled, softiec-single-part-reply, interface-usable-after,
+and the cleanup that hands a pending reply back and restores the settings. That covers the transport state machine
+(empty command, unregistered target, no-reply command, ERROR on a push while busy, ABORT back to Idle), the control
+target's IDENTIFY and RGB palette commands, issue #740's `CTRL_CMD_LOAD_REU` / `CTRL_CMD_SAVE_REU` matrix, and
+SoftIEC single-part reply framing.
+
 ## Triage
 
 ### H1: REST URL without the port (test assumption: the device serves port 80)

@@ -56,6 +56,10 @@ const GEORAM: u8 = 0x1F;
 /// ITU capability bit for the GMOD2 EEPROM (itu.h:71). Without it the firmware refuses GMOD2 CRTs (c64_crt.cc:214).
 pub const CAPAB_EEPROM: u32 = 0x0040_0000;
 
+/// ITU capability bit for the Ultimate Command Interface (itu.h:67). Without it the firmware starts no "UCI Server"
+/// task (command_intf.cc:44) and offers no "Command Interface" setting (c64.cc:311,328).
+pub const CAPAB_COMMAND_INTF: u32 = 0x0004_0000;
+
 /// The logic this module models. C128 carts (0x03) serve $8000-$FFFF of a C128 only; the unused codes select nothing.
 pub fn modelled(logic: u8) -> bool {
     !matches!(logic, C128 | 0x12..=0x17 | 0x1D | 0x1E)

@@ -3,6 +3,9 @@
 /target/
 .DS_Store
 /run/
+# A local TRX64 checkout patched in (README, "TRX64 dependency") lives here; never commit it.
+/.cargo/
+
 # Local agent tooling (Claude Code, GitNexus), not part of the project.
 /.claude/
 /CLAUDE.md

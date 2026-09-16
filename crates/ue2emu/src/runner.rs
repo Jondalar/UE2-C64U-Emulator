@@ -229,11 +229,18 @@ fn attach_trx64_audio(
                 spec.mode()
             );
         }
+        // S15: TRX64 carries the UCI block on its `u64` profile, so the firmware may start its UCI task.
+        let has_uci = ue2_core::c64host::C64Backend::has_uci(&c64);
         machine.attach_c64(Box::new(c64));
         // W4-CART: the bridge emulates the GMOD2 EEPROM behind 0x1004C000, which the firmware only uses with
         // CAPAB_EEPROM (itu.h:71; c64_crt.cc:214, 272, 746).
         if let Some(itu) = machine.bus.io.get_mut::<ue2_core::devices::itu::Itu>() {
             itu.capabilities |= c64_bridge::CAPAB_EEPROM;
+            // Without CAPAB_COMMAND_INTF the firmware starts no "UCI Server" task (command_intf.cc:44) and offers no
+            // "Command Interface" setting (c64.cc:311,328). `--c64 none` keeps the capability word it had.
+            if has_uci {
+                itu.capabilities |= c64_bridge::CAPAB_COMMAND_INTF;
+            }
         }
     }
     #[cfg(not(feature = "trx64"))]

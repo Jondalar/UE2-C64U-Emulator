@@ -1,10 +1,14 @@
 //! TRX64 (`trx64-core`) as the C64 behind the U64-II cart/DMA registers: [`Trx64Backend`] implements
 //! `ue2_core::c64host::C64Backend`. Spec: docs/specs/S14-c64-trx64.md.
 //!
-//! TRX64 has no API for a held 6510, a reset line, a forced ULTIMAX decode or a key-matrix bitmap, so the bridge works
-//! through its public internals: `VicII::tick` and the CIA clocks while the CPU is held (S14 §4), the cartridge slot
-//! with `memconfig_table`/`pla_index` for ULTIMAX and the cartridges (§5.2, §8, docs/status/carts.md), key names for the
-//! matrix (§6). Cargo.toml pins the TRX64 commit these internals were checked against.
+//! TRX64 has no API for a reset line, a forced ULTIMAX decode or a key-matrix bitmap, so the bridge works through its
+//! public internals: the cartridge slot with `memconfig_table`/`pla_index` for ULTIMAX and the cartridges (§5.2, §8,
+//! docs/status/carts.md), key names for the matrix (§6). Cargo.toml pins the TRX64 commit these internals were checked
+//! against.
+//!
+//! The machine is built on TRX64's `u64` profile (Spec 851), which brings the turbo registers and the UCI block
+//! (Spec 852) the firmware serves at 0x10044000 (docs/specs/S15-uci.md). A held 6510 is TRX64's own `Machine::set_hold`
+//! (Spec 850 D7), and the cartridges' IRQ/NMI sit on its expansion-port source (D6).
 
 mod cart;
 mod cart_eeprom;
@@ -20,10 +24,11 @@ use std::path::Path;
 
 use trx64_core::c64_6510core::{IK_NMI, INTERRUPT_DELAY, INT_SRC_RESTORE};
 use trx64_core::cart::CartMapper;
+use trx64_core::expansion::Hold;
 use trx64_core::keyboard::JoystickState;
-use trx64_core::vic::VicMemView;
+use trx64_core::vic::SpeedProfile;
 use trx64_core::{AccessCtx, BusKind, CpuHistoryRing, DeltaRing, Machine, Observer};
-use ue2_core::c64host::{C64Backend, C64CartSlot, C64Drive, C64Frame, C64Rom, CartSlotInfo};
+use ue2_core::c64host::{C64Backend, C64CartSlot, C64Drive, C64Frame, C64Rom, CartSlotInfo, UciEvents};
 
 use cart::{CartHandle, CartLogic, CartProxy, RunHints};
 use clock::Clock;
@@ -34,7 +39,17 @@ pub use slot::FlashDecode;
 use video::Palette;
 
 pub use sid::AudioSink;
-pub use cart::CAPAB_EEPROM;
+pub use cart::{CAPAB_COMMAND_INTF, CAPAB_EEPROM};
+
+/// C64 core config offsets the bridge acts on besides the SID and bus-sharing registers (u64.h:106,134-135). The
+/// firmware writes the enable word and the preferred speed, then strobes the update (u64_config.cc:1634-1636).
+const CORE_TURBOREGS_EN: u8 = 0x02;
+const CORE_SPEED_PREFER: u8 = 0x2D;
+const CORE_SPEED_UPDATE: u8 = 0x2E;
+/// C64_BUS_INTERNAL bits that gate the internal IO1 and IO2 ranges, and with them the UCI window (c64.cc:1536-1590;
+/// u64_config.cc:1015-1016; Spec 852 §5).
+const BUS_IO1: u8 = 0x01;
+const BUS_IO2: u8 = 0x02;
 
 /// TRX64's switch for its always-on reverse-debug rings, read in `Machine::new` (cpu_history.rs:98,
 /// delta_ring.rs:285).
@@ -84,9 +99,13 @@ pub struct Trx64Backend {
     joysticks: [u8; 2],
     /// NMI level from the port (C64_MODE bit 4, MATRIX_KEYB[9], host RESTORE).
     nmi: bool,
-    /// NMI and IRQ levels last given to TRX64's source 3: the port's NMI OR the cartridge's.
+    /// The port's NMI as last given to TRX64's RESTORE source, which carries nothing else now (Spec 850 D6).
     nmi_line: bool,
-    irq_line: bool,
+    /// C64_TURBOREGS_EN (0x02) and C64_SPEED_PREFER (0x2D), latched until the C64_SPEED_UPDATE strobe (0x2E) hands
+    /// them to TRX64 (Spec 851 §6). They start at the profile's own values — "U64 Turbo Registers" at 1 MHz with
+    /// badline timing (Spec 851 D2) — so a strobe before any write changes nothing.
+    turbo_regs_en: u8,
+    speed_prefer: u8,
     palette: Palette,
     /// Socket 1 (ARMSID) and UltiSID 1 on reSID, and the sample stream (S14 §W4-SID).
     sid: sid::Sid,
@@ -110,6 +129,9 @@ impl Trx64Backend {
             }
         }
         let mut m = Box::new(Machine::new());
+        // Spec 851 D1: this is an Ultimate, not a plain C64. The profile brings the turbo registers and the UCI block
+        // (Spec 852), and it has to be in before the power-on reset below — a cartridge probes in its boot stub.
+        m.set_machine_profile(SpeedProfile::U64);
         if rings_off {
             m.cpu_history = CpuHistoryRing::with_capacity(1);
             m.delta_ring = DeltaRing::with_capacity(1, 1);
@@ -141,7 +163,8 @@ impl Trx64Backend {
             joysticks: [0xFF; 2],
             nmi: false,
             nmi_line: false,
-            irq_line: false,
+            turbo_regs_en: 0x01,
+            speed_prefer: 0x80,
             palette: Palette::default(),
             sid,
             drive,
@@ -201,22 +224,21 @@ impl Trx64Backend {
         self.apply_interrupts();
     }
 
-    /// The port's NMI OR the cartridge's on TRX64's RESTORE source, and the cartridge's IRQ on the same source (the
-    /// run loop refreshes only sources 0-2, c64_6510core.rs:148-155; lib.rs:2081-2083).
+    /// The port's NMI on TRX64's RESTORE source — which carries only RESTORE again — and the cartridges' IRQ and NMI
+    /// on the expansion port (Spec 850 D6). TRX64 samples the port's lines per cycle and refreshes its source at each
+    /// instruction boundary, and the UCI block's own IRQ is ORed in there.
     fn apply_interrupts(&mut self) {
         // CARTSLOT: C64_BUS_INTERNAL/EXTERNAL bit 3 route each cartridge's interrupt lines (c64.cc:1539-1592).
         let cart = &self.cart;
         let (cart_nmi, cart_irq) = self.slot.with(|s| s.interrupts(cart));
-        let clk = self.m.c64_core.clk;
-        let nmi = self.nmi || cart_nmi;
-        if nmi != self.nmi_line {
-            self.nmi_line = nmi;
-            self.m.c64_int.set_nmi(INT_SRC_RESTORE, nmi, clk);
+        if self.nmi != self.nmi_line {
+            self.nmi_line = self.nmi;
+            let clk = self.m.c64_core.clk;
+            self.m.c64_int.set_nmi(INT_SRC_RESTORE, self.nmi, clk);
         }
-        if cart_irq != self.irq_line {
-            self.irq_line = cart_irq;
-            self.m.c64_int.set_irq(INT_SRC_RESTORE, cart_irq, clk);
-        }
+        // Two stores the run loop samples at the next boundary; unlike the RESTORE source there is no clk to stamp,
+        // so they are written unconditionally and a warm reset needs no re-arming.
+        self.m.set_expansion_lines(cart_irq, cart_nmi);
     }
 
     /// Whether the 6510 takes an NMI at the start of its next instruction: `interrupt_check_nmi_delay`
@@ -289,37 +311,37 @@ impl Trx64Backend {
         }
     }
 
-    /// Clock the chips up to cycle `target` with the 6510 held: the VIC always, the CIAs and SID unless the reset
-    /// is held (S14 §4). Per cycle as TRX64's `vic_cycle`, then its `process_alarms` (full_sc.rs:358-381).
-    fn run_chips(&mut self, target: u64) {
-        let m = &mut *self.m;
-        let start = m.c64_core.clk;
-        let table = m.cia_table.clone();
-        let cias = !self.reset_held;
-        while m.c64_core.clk < target {
-            let vbank = m.vic_bank_base();
-            let view = VicMemView { ram: &m.ram, char_rom: Some(&m.char_rom), color_ram: &m.io_shadow[0x800..0xC00], vbank };
-            m.vic.tick(&view);
-            m.c64_core.clk += 1;
-            if cias {
-                let clk = m.c64_core.clk;
-                (m.cia1.clk, m.cia2.clk) = (clk, clk);
-                m.cia1.tick(&table);
-                m.cia2.tick(&table);
-            }
-        }
-        let clk = m.c64_core.clk;
-        if cias {
-            m.cia1.update_to(clk, &table);
-            m.cia2.update_to(clk, &table);
-            m.sid.tick(clk - start, &m.sid_regs);
-        }
-        m.clk = clk;
+    /// Run up to cycle `target` with the 6510 held: TRX64 clocks the chips itself (Spec 850 D7), `Hold::Cpu` with the
+    /// VIC, CIAs, SID and drive 8, `Hold::Reset` with the VIC alone — the 6569 has no reset pin (S14 §4).
+    /// [`Self::apply_hold`] has put the hold in; the run then spends the whole budget without executing.
+    fn run_held(&mut self, target: u64) {
+        let start = self.m.c64_core.clk;
+        let drive_ref = self.m.drive_c64_ref;
+        self.m.run_for_full_capped(target - start, u64::MAX, &mut sid::SidTap, |_, _, _, _, _, _, _| {});
+        let clk = self.m.c64_core.clk;
         // DMA holds the Epyx capacitor while the 6510 is stopped (slot_slave.vhd:126); CARTSLOT: in both cartridges.
         let cart = &self.cart;
         self.slot.with(|s| s.hold_time(cart, clk - start));
-        // W4-DRIVE: the drive runs on while the 6510 is held, unless its lines hold it too.
-        self.drive.run_with_chips(m);
+        // W4-DRIVE: `Hold::Cpu` clocked drive 8 already, so only the write-back check is left. `Hold::Reset` leaves
+        // the drive standing and moves its reference along, but on the U64 the drive's own RESET bit 1
+        // (`use_c64_reset`, drive_registers.vhd) decides whether the C64's reset reaches it, so it is clocked here
+        // from the reference the hold skipped, exactly as before.
+        if self.reset_held {
+            self.m.drive_c64_ref = drive_ref;
+            self.drive.run_with_chips(&mut self.m);
+        } else {
+            self.drive.after_run(&mut self.m);
+        }
+    }
+
+    /// Spec 850 D7 — the hold TRX64 runs under. The reset line wins over C64_STOP: with CPU, CIAs and SID in reset
+    /// only the VIC is clocked (S14 §4).
+    fn apply_hold(&mut self) {
+        self.m.set_hold(match (self.reset_held, self.stopped) {
+            (true, _) => Some(Hold::Reset),
+            (false, true) => Some(Hold::Cpu),
+            (false, false) => None,
+        });
     }
 
     fn apply_joysticks(&mut self) {
@@ -380,7 +402,7 @@ impl C64Backend for Trx64Backend {
             return;
         }
         if self.stopped || self.reset_held {
-            self.run_chips(target);
+            self.run_held(target);
         } else {
             self.run_cpu(target);
             // W4-DRIVE: note what drive A wrote.
@@ -394,6 +416,7 @@ impl C64Backend for Trx64Backend {
     /// A held NMI is not: the 6510 only takes a new edge. The cartridge's IRQ is level-triggered and is.
     fn set_reset(&mut self, held: bool) {
         self.reset_held = held;
+        self.apply_hold();
         if held {
             self.sid.reset();
             // W4-DRIVE: drive A may follow the C64's reset.
@@ -418,14 +441,15 @@ impl C64Backend for Trx64Backend {
         self.keys.cleared();
         self.keys.apply(&mut self.m.keyboard);
         self.apply_joysticks();
-        let cart = &self.cart;
-        self.nmi_line = self.nmi || self.slot.with(|s| s.interrupts(cart).0);
-        self.irq_line = false;
+        // A held NMI is not re-applied: the 6510 only takes a new edge. The cartridges' IRQ and NMI are levels on the
+        // expansion port, which `apply_interrupts` writes again whatever they were.
+        self.nmi_line = self.nmi;
         self.apply_interrupts();
     }
 
     fn set_stopped(&mut self, stopped: bool) {
         self.stopped = stopped;
+        self.apply_hold();
         // W4-DRIVE: drive A may stop with the C64.
         self.drive.update(&mut self.m, stopped, self.reset_held);
     }
@@ -541,6 +565,21 @@ impl C64Backend for Trx64Backend {
     /// C64_BUS_EXTERNAL, which route each cartridge onto the bus from the next access on (slot.rs).
     fn core_config_write(&mut self, off: u8, val: u8) {
         self.sid.core_config(off, val);
+        match off {
+            // Spec 851 §6: the enable word and the preferred speed are latched and take effect on the update strobe,
+            // as `setCpuSpeed` writes them (u64_config.cc:1634-1636).
+            CORE_TURBOREGS_EN => self.turbo_regs_en = val,
+            CORE_SPEED_PREFER => self.speed_prefer = val,
+            CORE_SPEED_UPDATE => self.m.set_u64_turbo(self.turbo_regs_en, self.speed_prefer),
+            // Spec 852 §5: the U64 bus multiplexer decides whether the internal IO1/IO2 range — and with it the UCI
+            // window — reaches the C64 bus. `unlock_irq` sets bit 1 for exactly that (u64_config.cc:1015-1016).
+            slot::CORE_BUS_INTERNAL => {
+                if let Some(uci) = self.m.uci_mut() {
+                    uci.set_routed(val & BUS_IO1 != 0, val & BUS_IO2 != 0);
+                }
+            }
+            _ => {}
+        }
         if self.slot.with(|s| s.core_config(off, val)) {
             self.install_cart();
             self.apply_interrupts();
@@ -605,6 +644,32 @@ impl C64Backend for Trx64Backend {
         } else {
             None
         }
+    }
+
+    // ---- UCI: TRX64's own block, part of the `u64` profile (Spec 852; docs/specs/S15-uci.md) ----
+
+    fn has_uci(&self) -> bool {
+        self.m.uci().is_some()
+    }
+
+    fn uci_read(&self, off: u16) -> u8 {
+        self.m.uci().map_or(0, |u| u.fw_read(off))
+    }
+
+    fn uci_write(&mut self, off: u16, val: u8) {
+        if let Some(u) = self.m.uci_mut() {
+            u.fw_write(off, val);
+        }
+    }
+
+    fn uci_irq(&self) -> bool {
+        self.m.uci().is_some_and(|u| u.fw_irq())
+    }
+
+    /// `Machine::uci_mut` hands the block any C64 reset since the last call first, so `take_events` reports it.
+    fn uci_take_events(&mut self) -> UciEvents {
+        let events = self.m.uci_mut().map(|u| u.take_events()).unwrap_or_default();
+        UciEvents { c64_reset: events.c64_reset, unlock: events.unlock }
     }
 }
 

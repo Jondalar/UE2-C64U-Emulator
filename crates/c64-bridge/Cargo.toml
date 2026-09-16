@@ -7,10 +7,9 @@ license.workspace = true
 
 [dependencies]
 ue2-core = { path = "../ue2-core" }
-# TRX64 (GPL-3.0-or-later), pinned to main 69c9b30. The bridge drives its public internals (`VicII::tick`, the CIA
-# clocks, `memconfig_table`/`pla_index`, the cartridge slot; docs/specs/S14-c64-trx64.md §4-§8), so an upstream
-# refactor can break the build or change behaviour: re-run the tests and the C64 smokes (docs/status/c64.md) before
-# moving `rev`. Verified against a448229589d36b0f4d9af1985108c19303c32973 (branch spec-843-inspect; its three commits
-# on top of main touch only c64re_snapshot.rs, vic.rs and vic_inspect.rs, which the bridge does not call) and against
-# this rev. trx64-core's build.rs compiles vendored reSID C++.
-trx64-core = { git = "https://github.com/Jondalar/TRX64", rev = "69c9b30add4ea3ae7a46a53e81c56887585fe001" }
+# TRX64 (GPL-3.0-or-later), pinned to main 2b145c9 = v0.6.0, the release that brings the expansion port (Spec 850),
+# the `u64` machine profile (851) and the UCI block (852) this bridge uses. It also drives TRX64's public internals
+# (`memconfig_table`/`pla_index`, the cartridge slot; docs/specs/S14-c64-trx64.md §4-§8), so an upstream refactor can
+# break the build or change behaviour: re-run the tests and the C64 smokes (docs/status/c64.md) before moving `rev`.
+# trx64-core's build.rs compiles vendored reSID C++.
+trx64-core = { git = "https://github.com/Jondalar/TRX64", rev = "2b145c9398c523da73c02544cf88720ae4544468" }
