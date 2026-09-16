@@ -49,11 +49,26 @@ Three emulator gaps, in the order they cost the most:
    loads (`DMA load complete: $0801-$97C8`), then draws a black screen for 250 s emulated, where this survey
    recorded every scene. Whether the sampler causes that is open (S16 §6): two control runs proved nothing, one
    because `--caps` could not clear the capability at the time, one because the demo failed its REU check first.
-2. **A UCI DOS read of an existing 24 KB file stalls near the end.** UBoot64 writes `DMBSLT.CFG` (24480 B) on its
-   first run and reaches its menu; on every later run it reads the same file back into the REU and stops at
-   `Reading slot data to 24285` / `24289` / `24324` — within 200 bytes of the end, at a different byte each run, and
-   it never recovers (180 s emulated, §1). Three runs with the file present stalled, two without it did not.
-   Unblocks: UBoot64's menu slots, which are the program's whole point.
+2. **A UCI DOS read of an existing 24 KB file stalls near the end — diagnosed, and the cause is TRX64's.**
+   UBoot64 writes `DMBSLT.CFG` (24480 B) on its first run and reaches its menu; on every later run it reads the same
+   file back and stops at `Reading slot data to 24261` / `24270` / `24279` / `24285` / `24289` / `24324` — within
+   220 bytes of the end, at a different byte each run.
+
+   **Cause.** `Uci::c64_read` (`trx64-core/src/uci.rs`) advances the response and status pointers by
+   `stalled_on_bus + 1` per C64 read. A read that lands in a badline-stolen phase therefore skips bytes, and
+   `full.rs:665-666` passes that count on the plain bus too, not only on `full_sc`. The C64 ends up short, re-issues
+   `DOS_CMD_READ_DATA` for the full length *without* a new `OPEN_FILE`, the file is at EOF, the firmware answers
+   with a zero-length last part, and the C64 waits for ever. The RISC-V sits in the idle task: nobody is running.
+   The varying stop byte is the badline dependency showing.
+
+   **Verified**, not guessed: the firmware-side register trace shows the last exchange complete correctly
+   (`STATUSBYTE 0x11` → command accepted → `RESPONSE_LEN 0` → validate without the "more" bit), and a copy of the
+   TRX64 checkout with the advance changed to exactly one byte per read gets UBoot64 to its menu
+   (`F1 Filebrowser … Make your choice.`) with nothing else altered. Reported to TRX64 with that repro; the fix is
+   theirs, and the emulator works around nothing.
+
+   Unblocks: UBoot64's menu slots, which are the program's whole point. It does **not** explain UltimateDemo2026's
+   black screen — the same patched copy leaves that unchanged (S16 §6).
 3. **"Run Cart" leaves the keyboard with the firmware menu.** After the browser's `Run Cart` the console never
    prints `MENU HIDE / EXIT.` (the `Run` path for a PRG always does), so C64 keys reach the firmware UI instead of
    the cartridge — `key f2` built the firmware's *config* browser (`Creating config menu...`,
