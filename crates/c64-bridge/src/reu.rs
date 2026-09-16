@@ -12,7 +12,8 @@
 //! lend, and a REU access outside a lease finds nothing there.
 //!
 //! Nothing lent is not an error (854 D3): the bridge lends only around the accesses that can reach the C64 bus, so
-//! between them "not lent" is the normal state. A read then returns [`UNLENT`] and a write is dropped.
+//! between them "not lent" is the normal state. A read then returns `None` — "nothing backs this address" — and the
+//! `Reu` answers it with its own floating bus. A write is dropped.
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
@@ -30,11 +31,6 @@ pub const REU_MAX_SIZE: u32 = 0x0100_0000;
 /// mapping itself belongs where the register is decoded (`devices::c64::reu_size_kb`), and the firmware writes the
 /// size before the enable (c64.cc:315-317), so this stands only until it does.
 pub const DEFAULT_SIZE_KB: u32 = REU_MAX_SIZE / 1024;
-
-/// What a read sees with no DDR lent. TRX64 has a floating-bus value of its own for an address with no DRAM behind it,
-/// but `ExpansionRam::read` returns a plain `u8` and cannot say "nothing here", so the store has to invent one; 0xFF is
-/// the REU's own `floating_bus` default (reu.rs), which keeps the two answers equal. See docs/status/reu.md §Findings.
-pub const UNLENT: u8 = 0xFF;
 
 /// Guest DDR at [`REU_BASE`] as the REU's store, shared between the backend (which lends) and the `Reu` TRX64 holds.
 #[derive(Clone, Default)]
@@ -98,9 +94,18 @@ impl ExpansionRam for ReuRam {
         self.get().size
     }
 
-    fn read(&self, off: u32) -> u8 {
+    /// `Some` is the only **real read**: the DDR byte itself, at `REU_BASE + off`.
+    ///
+    /// `None` is "**not backed**", and the `Reu` answers it with its own floating bus (854 D3) instead of a byte this
+    /// store would have had to invent. Three states reach it, and only the first is a fact about the hardware:
+    ///
+    /// - **above the fitted size** — real, and the reason the device's answer is the right one: `C64_REU_SIZE` says no
+    ///   DRAM is soldered there, and a real REU floats the bus for exactly that address too;
+    /// - **nothing lent** and **past the end of the lease** — host-side gaps, not hardware. `C64Port` lends guest DDR
+    ///   only around the accesses that can reach the C64 bus, so between them there is no memory to read at all.
+    fn read(&self, off: u32) -> Option<u8> {
         // SAFETY: `at` returns a pointer only inside the current lease.
-        self.at(off).map_or(UNLENT, |p| unsafe { *p })
+        self.at(off).map(|p| unsafe { *p })
     }
 
     fn write(&mut self, off: u32, value: u8) {
@@ -128,11 +133,11 @@ mod tests {
     }
 
     #[test]
-    fn nothing_lent_reads_a_harmless_byte_and_drops_writes() {
+    fn nothing_lent_is_not_backed_and_drops_writes() {
         let mut ram = ReuRam::default();
         ram.set_size_kb(512);
-        assert_eq!(ram.read(0), UNLENT);
-        assert_eq!(ram.read(0x00FF_FFFF), UNLENT, "the top of a 24-bit REU address");
+        assert_eq!(ram.read(0), None);
+        assert_eq!(ram.read(0x00FF_FFFF), None, "the top of a 24-bit REU address");
         ram.write(0, 0x5A);
         ram.write(0x00FF_FFFF, 0x5A);
         assert_eq!(ram.len(), 512 * 1024, "the size stands without a lease");
@@ -145,8 +150,8 @@ mod tests {
         lent(&ram, &mut ddr);
         ddr[REU_BASE] = 0x11;
         ddr[REU_BASE + 0x7FFFF] = 0x22;
-        assert_eq!(ram.read(0), 0x11);
-        assert_eq!(ram.read(0x7FFFF), 0x22);
+        assert_eq!(ram.read(0), Some(0x11));
+        assert_eq!(ram.read(0x7FFFF), Some(0x22));
         ram.write(1, 0x33);
         assert_eq!(ddr[REU_BASE + 1], 0x33, "the write lands in the firmware's DDR");
     }
@@ -157,12 +162,12 @@ mod tests {
         ram.set_size_kb(128);
         lent(&ram, &mut ddr);
         ddr[REU_BASE + 0x20000] = 0x44;
-        assert_eq!(ram.read(0x20000), UNLENT, "128 KiB fitted, so 0x20000 has no DRAM");
+        assert_eq!(ram.read(0x20000), None, "128 KiB fitted, so 0x20000 has no DRAM");
         ram.write(0x20000, 0x55);
         assert_eq!(ddr[REU_BASE + 0x20000], 0x44, "and a write there is dropped, not wrapped");
         // Growing it makes the same DDR reachable, contents intact (854 D4).
         ram.set_size_kb(16384);
-        assert_eq!(ram.read(0x20000), 0x44);
+        assert_eq!(ram.read(0x20000), Some(0x44));
     }
 
     #[test]
@@ -171,10 +176,10 @@ mod tests {
         ram.set_size_kb(16384);
         lent(&ram, &mut short);
         short[REU_BASE + 3] = 0x66;
-        assert_eq!(ram.read(3), 0x66);
-        assert_eq!(ram.read(4), UNLENT, "one past the lease");
+        assert_eq!(ram.read(3), Some(0x66));
+        assert_eq!(ram.read(4), None, "one past the lease");
         ram.write(4, 0x77);
-        assert_eq!(ram.read(0x00FF_FFFF), UNLENT);
+        assert_eq!(ram.read(0x00FF_FFFF), None);
     }
 
     #[test]
@@ -184,10 +189,10 @@ mod tests {
         lent(&ram, &mut ddr);
         ram.write(0, 0x88);
         ram.set_ddr(None);
-        assert_eq!(ram.read(0), UNLENT, "the byte is still in DDR, but not reachable between accesses");
+        assert_eq!(ram.read(0), None, "the byte is still in DDR, but not reachable between accesses");
         ram.write(0, 0x99);
         lent(&ram, &mut ddr);
-        assert_eq!(ram.read(0), 0x88, "and the write made without a lease changed nothing");
+        assert_eq!(ram.read(0), Some(0x88), "and the write made without a lease changed nothing");
     }
 
     /// The store TRX64 holds and the one the backend lends through are the same cell.
@@ -198,10 +203,10 @@ mod tests {
         ram.set_size_kb(512);
         lent(&ram, &mut ddr);
         ddr[REU_BASE] = 0xAB;
-        assert_eq!(held.read(0), 0xAB);
+        assert_eq!(held.read(0), Some(0xAB));
         held.write(1, 0xCD);
         assert_eq!(ddr[REU_BASE + 1], 0xCD);
         ram.set_ddr(None);
-        assert_eq!(held.read(0), UNLENT);
+        assert_eq!(held.read(0), None);
     }
 }

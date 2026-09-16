@@ -443,13 +443,10 @@ impl C64Backend for Trx64Backend {
         // CARTSLOT: TRX64's reset restarts its cycle counter; the physical cartridge's flash timers go on (slot.rs).
         let clk = self.m.c64_core.clk.max(self.m.clk);
         self.slot.with(|s| s.reset_release(clk));
+        // REU: the reset carries the port's /RESET line to the device itself (`ExpansionDevice::reset`, TRX64 0.7.1),
+        // so the REC goes to power-on while the DDR keeps every byte. The bridge used to do this after the call; it
+        // does not any more.
         self.m.warm_reset();
-        // REU: the expansion port's RESET line resets the REC as it resets the cartridge (reu.c:602-615). TRX64's own
-        // reset reaches `Machine::cartridge` and not the port devices, so the REU is reset here. Its RAM is DDR and
-        // stays exactly as it was, which is what the REU does on real hardware too.
-        if let Some(reu) = self.m.reu_mut() {
-            reu.reset();
-        }
         self.m.clk = self.m.c64_core.clk;
         self.sid.reanchor(self.m.c64_core.clk);
         self.drive.after_c64_reset(&mut self.m, self.stopped);
@@ -1082,7 +1079,12 @@ mod tests {
 
     // ---- REU: the RAM Expansion Unit (TRX64 Spec 854, docs/status/reu.md) ----
 
-    use reu::{DEFAULT_SIZE_KB, REU_BASE, UNLENT};
+    use reu::{DEFAULT_SIZE_KB, REU_BASE};
+
+    /// What the `Reu` answers for an address its store says nothing backs: its own `floating_bus`, whose power-on
+    /// value is 0xFF (trx64-core `reu.rs`). The store returns `None` and the device picks the byte — which is the
+    /// whole point of `ExpansionRam::read` being an `Option` (854 D3).
+    const FLOATING_BUS: u8 = 0xFF;
 
     /// `C64Port::tick`'s shape: DDR lent around the run and taken back after it. That window is the only time the
     /// REU's store has anything behind it.
@@ -1160,7 +1162,7 @@ mod tests {
         // 854 D4: the fitted size moves without rebuilding the device or touching a byte of DDR.
         ddr[REU_BASE + 0x100] = 0x3C;
         ddr[REU_BASE + 0x10_0000] = 0x5A;
-        assert_eq!(c64.m.reu().map(|r| r.ram_byte(0x10_0000)), Some(UNLENT), "above 512 KB no DRAM is fitted");
+        assert_eq!(c64.m.reu().map(|r| r.ram_byte(0x10_0000)), Some(FLOATING_BUS), "above 512 KB no DRAM is fitted");
         c64.set_reu_size_kb(16384);
         assert_eq!(c64.m.reu().map(|r| r.ram_byte(0x10_0000)), Some(0x5A), "and the boundary moved");
         assert_eq!(c64.m.reu().map(|r| r.ram_byte(0x100)), Some(0x3C), "what was below it is still there");
@@ -1198,10 +1200,10 @@ mod tests {
         assert_eq!(back[15], 0x5A, "and the host's own byte with it, not a copy of the REU's");
     }
 
-    /// 854 D3 — a transfer with nothing lent completes, reads the store's stand-in byte, writes nothing and does not
+    /// 854 D3 — a transfer with nothing lent completes, reads the device's floating bus, writes nothing and does not
     /// panic. Between the accesses that lend, this is the normal state.
     #[test]
-    fn a_transfer_with_nothing_lent_reads_a_stand_in_and_drops_writes() {
+    fn a_transfer_with_nothing_lent_reads_the_floating_bus_and_drops_writes() {
         let Some((mut c64, mut now)) = booted() else { return };
         let (ddr, pattern) = (ddr(), (0..16u8).map(|i| 0xA0 + i).collect::<Vec<_>>());
         load(&mut c64, 0x0400, &pattern);
@@ -1218,12 +1220,19 @@ mod tests {
         c64.m.c64_core.reg_pc = 0xC000;
         run_ms(&mut c64, &mut now, 20);
         let back: Vec<u8> = (0..16).map(|i| c64.dma_read(0x0500 + i, false)).collect();
-        assert!(back.iter().all(|&b| b == UNLENT), "and the fetch read the stand-in byte: {back:?}");
+        // The floating bus is a LATCH, not a constant: `dma_host_to_reu` ends with
+        // `self.floating_bus = value`, the last byte it drove (trx64-core `reu.rs`). The stash above was dropped for
+        // want of DDR, but it still drove 0xA0..0xAF onto the bus, so the latch holds 0xAF and the fetch reads that.
+        // Until the store returned `None` this read 0xFF, because the store invented that byte and the device's own
+        // latch never got a word in — the exact silent disagreement 854 D3's `Option` was asked for.
+        let last_stashed = pattern[15];
+        assert!(back.iter().all(|&b| b == last_stashed), "the fetch read the floating-bus latch: {back:?}");
         assert!(c64.reu_attached(), "the REU is still on the port and the machine ran on");
     }
 
-    /// The expansion port's RESET line resets the REC and leaves the RAM alone (reu.c:602-615). TRX64's own reset
-    /// reaches `Machine::cartridge` and not the port devices, so the bridge does this one.
+    /// The expansion port's RESET line resets the REC and leaves the RAM alone (reu.c:602-615). TRX64 0.7.1 carries
+    /// the line to the device itself (`ExpansionDevice::reset`), so the bridge no longer resets the REU by hand —
+    /// this pins that the behaviour survived the removal, DDR contents included.
     #[test]
     fn a_c64_reset_resets_the_rec_and_keeps_the_ram() {
         let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));

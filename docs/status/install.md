@@ -50,7 +50,7 @@ scripts/smoke-all.sh                                      # release build, every
 ### TRX64 dependency
 
 `crates/c64-bridge` takes `trx64-core` from GitHub, pinned in its `Cargo.toml` to rev
-`f370a56db382a83475bb9077cdaefaa65c909b89` (TRX64 v0.7.0, `trx64-core` 0.7.0); cargo fetches it on the first
+`5f93646a9cce38bab12e0ebf96acb3c12d07628d` (TRX64 main, `trx64-core` 0.7.1; no tag for it); cargo fetches it on the first
 build. Its build.rs compiles the vendored reSID C++, so a C++ compiler is needed.
 `cargo build --release -p ue2emu --no-default-features` builds without TRX64 (`--c64 none` only). The bridge drives
 TRX64 internals, so run the tests and the C64 smokes (`docs/status/c64.md`) before moving `rev`.
@@ -63,7 +63,7 @@ trx64-core = { path = "<TRX64 checkout>/crates/trx64-core" }
 ```
 
 - The patch key must be exactly `https://github.com/Jondalar/TRX64` (no trailing slash, no `.git`), the URL in
-  `crates/c64-bridge/Cargo.toml`. The local crate's version must match the pinned one (0.7.0); if it does not, cargo
+  `crates/c64-bridge/Cargo.toml`. The local crate's version must match the pinned one (0.7.1); if it does not, cargo
   says "patch … was not used in the crate graph" and keeps the GitHub rev. `cargo update -p trx64-core` switches
   between the two.
 - `cargo tree -p c64-bridge -i trx64-core` shows the path source while the patch is active.

@@ -4,8 +4,8 @@ How far the five released programs of https://github.com/xahmol get in UE2, and 
 A survey, not a fix: nothing in `crates/` was changed for it.
 
 Binary: `target/release/ue2emu` built at the TRX64 v0.6.0 pin (`2b145c9`), run while `main` was at `0180180`. The
-pin has since moved to v0.7.0 (`f370a56`, `16348fa`); the CIA code quoted below is byte-identical in `2b145c9`,
-`69c9b30` and `f370a56`, so nothing here turns on the pin.
+pin has since moved to 0.7.1 (`5f93646`), where the CIA TOD clock is fixed; the frozen-TOD findings below were
+measured against `2b145c9`, `69c9b30` and `f370a56`, in which the CIA code is byte-identical.
 
 Firmware: `firmware/1541ultimate` V1.01 3.15 (`v3.15-9-gb617777c`). Every run is
 
@@ -28,7 +28,7 @@ releases, `share/` the USB stick the firmware sees (release layout: `idi8b/<proj
 | Project | How far it gets | Stopped by |
 |---|---|---|
 | UBoot64 v3.0.1 | Cartridge starts, UCI up, config file created on the stick, DOS version read | No C64-side REU |
-| mandelbrot-upic v1.0.3 | PRG loads and runs; nothing is ever drawn | CIA1 TOD never advances |
+| mandelbrot-upic v1.0.3 | **Runs and draws its picture** (fixed: TRX64 0.7.1 TOD) | — |
 | UltimateDemo2026 v1.0.1 | Hardware detection: UCI OK, machine type OK; REU fails | No C64-side REU |
 | heartbeat-demo v1.0.1 | Hardware detection: UCI OK, machine type OK; REU fails | No C64-side REU |
 | GeoUTools v1.1 | D64 mounts on drive A, the C64 lists it | No GEOS system disk to boot from |
@@ -38,11 +38,12 @@ Three emulator gaps, in the order they cost the most:
 1. **No REU on the C64 side.** The firmware register is there (`C64_REU_ENABLE`/`C64_REU_SIZE`, reset 0x07 in
    `crates/ue2-core/src/devices/c64.rs:117, 852`) and the firmware sets it from the menu, but no REU answers at
    `$DF00` on the C64. Three of the five projects stop there. Being built by another agent.
-2. **CIA1 TOD never advances.** `Cia::tick` bumps a free-running `tod_prescaler` and stops there — it never wraps
-   and never carries into the BCD registers; the comment says so ("the 50/60 Hz tick … out of scope"). Every wait
-   loop in Xander's libraries is a TOD loop, because TOD is the one C64 timer that keeps real time when the U64
-   runs at 16 or 64 MHz (`TURBOCONTROLMANUAL.md` §2). This alone hangs mandelbrot-upic and will misreport the speed
-   in `turbo_detect()` for the other two once the REU lands.
+2. **CIA1 TOD never advances.** ~~`Cia::tick` bumps a free-running `tod_prescaler` and stops there — it never wraps
+   and never carries into the BCD registers; the comment says so ("the 50/60 Hz tick … out of scope").~~ **Fixed in
+   TRX64 0.7.1** (`fix-cia-tod-and-port-reset` `85721a6`, VICE's `ciacore.c` ported): the clock runs, and
+   mandelbrot-upic draws (§2). Every wait loop in Xander's libraries is a TOD loop, because TOD is the one C64
+   timer that keeps real time when the U64 runs at 16 or 64 MHz (`TURBOCONTROLMANUAL.md` §2). One caveat survives
+   the fix — TOD runs ~5 % slow whenever the screen is on; see `docs/status/c64.md`, "CIA TOD".
 3. **Ultimate Audio DMA `$DF20-$DFFF` and the extra SIDs are unmodelled.** The firmware config item exists
    (`Map Ultimate Audio $DF20-DFFF` → `C64_SAMPLER_ENABLE`, `c64.cc:95, 321-323`) and the emulator answers it from
    the T0 stub table (`devices/c64.rs:751`, `docs/status/carts.md` "sampler stays unmodelled"). Neither demo
@@ -138,13 +139,30 @@ it prints `00 80`. **What the setting does in our machine:** the bridge latches 
 from `U64SpeedTable::U64II` (index 9 = 16 MHz, index 15 = 64 MHz) and `lib.rs:2277` scales the instruction budget
 by it. So turbo is modelled, and index 9 matches the cfg's `CPU Speed=16`.
 
-**It never draws anything.** After `RUN` the screen stays the BASIC screen, at 30 s, 90 s and 180 s emulated
-(`ctl/06-mandel-long.ctl`, `out/mandel-long-30s.png`, `-90s.png`, `-180s.png`; the text dump keeps
-`LOAD"MANDELUPIC",8,1 … RUN` and nothing after it). The README's "the picture builds up live, left to right"
-never starts, so no palette change can be judged either.
+**It draws its picture since TRX64 0.7.1** (the CIA TOD fix, branch `fix-cia-tod-and-port-reset` `85721a6`).
+Re-run 2026-09-16 exactly as before — "Run" from the browser, `.cfg` auto-loaded, `Speed regs: 01 89`,
+`Begin of cart init: Type: 41. REU: 00. REU_SZ: 04, UCI: 01 (DF18)`, `DMA load complete: $0801-$FFEE` — with
+screen dumps at 10, 30, 90 and 180 s emulated:
 
-**Why: CIA1 TOD is frozen.** Measured directly from BASIC (`ctl/16-tod.ctl`, `out/16-tod.log`, `out/tod.png`) —
-set the clock to zero, let 10 s of emulated time pass, read it back:
+| t | Screen |
+|---|---|
+| 10 s | the Mandelbrot is part-drawn, blue/orange, building left to right — exactly the README's "builds up live" |
+| 30 s | the picture is complete |
+| 90 s | the same picture, but in a **greyscale** ramp |
+| 180 s | complete and blue/orange again — byte-identical PNG to the 30 s dump (md5 `f8d96976ad8aba449669df4c0e12fff8`) |
+
+188.3 s emulated, 20 MIPS (the C64 is at 16 MHz turbo, so a host cycle buys less emulated time than the 130 MIPS
+of a 1 MHz run).
+
+**The palette change takes effect.** The picture is drawn in the release's own blue/orange gradient, not in stock
+C64 colours, so `uii_setpalette` over UCI reaches the U64 palette. What is *not* explained is the 90 s frame: the
+same completed picture in greyscale, with 30 s and 180 s identical to each other. Nothing in the console marks a
+palette call, and no key was pressed (`C` cycles the gradient by hand), so this is recorded as observed and not
+diagnosed.
+
+**Why it used to hang: CIA1 TOD was frozen** (TRX64 ≤ 0.7.0). Measured at the time directly from BASIC
+(`ctl/16-tod.ctl`, `out/16-tod.log`, `out/tod.png`) — set the clock to zero, let 10 s of emulated time pass, read
+it back:
 
 ```
 POKE 56331,0   POKE 56330,0   POKE 56329,0   POKE 56328,0
@@ -169,9 +187,15 @@ not involved; the next TOD wait on that path is `setpalette_retry()`'s settle de
 
 TOD matters beyond this one program: it is the only C64 timer that still measures real time at turbo speed, which
 is why `turbo_detect()` is built on it (`TURBOCONTROLMANUAL.md` §2, §7). With the tick missing,
-`benchmark_delay()` returns 0 and any caller classifies the machine as `TURBO_64MHZ` whatever the real speed.
-Related, and visible in every run here: `c64: C64_VIDEOFORMAT 0x2b asks for 60 Hz; the C64 core is PAL-only
-(S14 §13 OQ3)` — the mains frequency a TOD tick would have to be derived from.
+`benchmark_delay()` returned 0 and any caller classified the machine as `TURBO_64MHZ` whatever the real speed.
+
+**Now that the clock runs, one error is left:** TOD is 5.3 % slow while the screen is on, because TRX64's new
+divider counts `Cia::tick()` calls and the VIC's stolen badline cycles advance `clk` without one. Measured
+0:28.4 over a 30.0 s wait with the display on, 0:30.1 with it blanked — `docs/status/c64.md`, "CIA TOD", has the
+numbers and the mechanism. A timeout loop like `uii_wait_for_uci` does not care; `benchmark_delay()` would still
+misreport by 5 %. The `C64_VIDEOFORMAT` notice visible in every run here
+(`c64: C64_VIDEOFORMAT 0x2b asks for 60 Hz; the C64 core is PAL-only (S14 §13 OQ3)`) turns out **not** to reach
+the TOD rate at all: TRX64 takes the mains frequency from CIA CRA bit 7, not from the machine's region.
 
 ## 3. UltimateDemo2026 v1.0.1
 

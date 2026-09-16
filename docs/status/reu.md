@@ -33,13 +33,17 @@ implements it over guest DDR.
   second shared pointer cell of the same shape as `CartLogic::set_ddr`'s, updated on the very same lend. Every path
   that runs the C64 — every cart/DMA/UCI/drive access and `C64Port::tick` — lends first, so a transfer always has DDR
   under it.
-- **Nothing lent is not an error** (854 D3). Between those accesses the store has nothing behind it: a read returns
-  `0xFF` (the REU's own floating-bus value) and a write is dropped. Same for an address above the fitted size and for
-  an offset past the end of the lease. No panic, no out-of-bounds.
+- **Nothing lent is not an error** (854 D3). Between those accesses the store has nothing behind it, and since
+  TRX64 0.7.1 it can say so: `ExpansionRam::read` returns `Option<u8>`, and `ReuRam` answers `None` — "nothing backs
+  this address" — so the **device** supplies the byte from its own floating bus. A write is dropped. `None` covers
+  three states, and only one is a hardware fact: an address above the fitted size (a real REU has no DRAM there
+  either), against nothing lent and an offset past the end of the lease, which are host-side gaps. `Some` is the only
+  real read. No panic, no out-of-bounds.
 - **Resizing keeps the contents** (854 D4). Only the REC's idea of how much DRAM is fitted moves; the bytes are DDR
   and are not touched, so the firmware moving "Size" does not drop a preloaded image.
-- **A C64 reset resets the REC, not the RAM.** TRX64's own reset reaches `Machine::cartridge` and not the port
-  devices, so the bridge resets the REU on a reset release, as the expansion port's RESET line does (`reu.c:602-615`).
+- **A C64 reset resets the REC, not the RAM.** TRX64 0.7.1 carries the port's /RESET line to the device itself
+  (`ExpansionDevice::reset`, which `Reu` overrides), so `Machine::warm_reset` does it and **the bridge's own
+  compensation is gone**. The REC returns to power-on and the DDR keeps every byte (`reu.c:602-615`).
 - **Nothing else moves.** The UCI block is the machine profile's own device in a separate slot (Spec 852), and the
   cartridge is `Machine::cartridge`; `attach_expansion_also` / `detach_reu` touch neither.
 
@@ -67,7 +71,23 @@ back and prints them, then prints the REU status register at `$DF00`.
 | Cartridge regression, `scripts/smoke-c64-carts.ctl` (`--flash` with `--c64-roms`, `--sd` with the test CRTs, `--usb-keyboard`) | exit 0, 27/27 `… PASS`, `ACTION REPLAY FROZEN`, 2 × `Loading SID`, 2 × `Bytes loaded`, no `Time out!`. 153.6 s emulated, 134 MIPS. `lend_ddr` now also updates the REU store, and the cartridge path is unchanged |
 
 The menu path is F2 → Memory Configuration → "RAM Expansion Unit" → Enabled; "Size" sits next to it and the store
-writes both registers on save.
+writes both registers on save. In the config browser the cursor skips the blank separators and typed letters do
+**not** seek (they log `Unhandled key`), so a script navigates it with `down` alone: 4 × down reaches Memory
+Configuration, then RIGHT, then 4 × down reaches RAM Expansion Unit.
+
+### Re-verified against TRX64 0.7.1
+
+Re-run after deleting the bridge's REC reset and switching the store to `Option<u8>` (2026-09-16, TRX64
+`fix-cia-tod-and-port-reset` `85721a6`):
+
+| Check | Result |
+|---|---|
+| `cargo build --workspace` | clean, 0 warnings |
+| `cargo test --workspace` (`UE2_FIRMWARE` set) | 403 passed, 1 ignored, 0 failed |
+| `cargo build -p ue2emu --no-default-features` | clean |
+| `a_c64_reset_resets_the_rec_and_keeps_the_ram` | passes with the bridge's own reset **deleted** — TRX64's `warm_reset` puts the REC back to power-on and the DDR byte at `REU_BASE + 0x100` is still `0x77` |
+| Firmware, REU enabled through the menu, BASIC stash/fetch | ` 65  66  80` — the bytes went into the REU and came back, and `PEEK($DF00)` = `$50`. Console: `Writing config store 'C64 and Cartridge Settings' to flash..Page: 3 done.` 57.4 s emulated, 133 MIPS |
+| Cartridge regression, `scripts/smoke-c64-carts.ctl` | exit 0, 27/27 `… PASS`, 0 `FAIL`, `ACTION REPLAY FROZEN`, 2 × `Loading SID`, 2 × `Bytes loaded`, no `Time out!`. 153.588 s emulated, 130 MIPS |
 
 ### Firmware DDR is the store
 
@@ -91,18 +111,18 @@ preload does, and the C64's fetch brings that changed byte back.
 - **GeoRAM is still the cart logic's**, not TRX64's device (above), so the two cannot be enabled at once in TRX64's
   sense — which matches the firmware, where the setting is one enum.
 
-## TRX64 findings (Spec 854)
+## TRX64 findings (Spec 854) — both fixed in 0.7.1
 
-Reported upstream and **confirmed there on 2026-09-16**, with fixes planned for a 0.7.1 rather than built into 0.7.0:
+Reported upstream, confirmed there on 2026-09-16, and **fixed on TRX64 `fix-cia-tod-and-port-reset` (`19dfbd6`)**,
+which this bridge is now built against:
 
-- **The port reset is a TRX64 defect, not a design choice.** A real expansion port carries /RESET, so an REU sees a
+- **The port reset was a TRX64 defect, not a design choice.** A real expansion port carries /RESET, so an REU sees a
   C64 reset: its REC registers go back to power-on while the DRAM keeps its contents (VICE `c64carthooks.c:2412`
-  calls `reu_reset`). TRX64's `cold_reset` reaches `Machine::cartridge` only. 850's blanket "no reset calls a device"
-  is right for UCI (`command_protocol.vhd` clears that block on the FPGA reset alone) and wrong for the REU, so the
-  fix is a per-device `reset()`. **The bridge's own REC reset on a reset release is therefore temporary** — correct
-  today, redundant once 0.7.1 lands, and not something to build further on.
-- **The `Option<u8>` change below is coming**, which is a breaking change to the trait this bridge implements: one
-  signature edit here, announced before it lands.
+  calls `reu_reset`). TRX64's `cold_reset` reached `Machine::cartridge` only. 850's blanket "no reset calls a device"
+  is right for UCI (`command_protocol.vhd` clears that block on the FPGA reset alone) and wrong for the REU. The fix
+  is the per-device `ExpansionDevice::reset()` asked for: it defaults to nothing, so UCI keeps 850's behaviour, and
+  `Reu` overrides it. **The bridge's own REC reset on a reset release has been deleted** — TRX64 does it now.
+- **`fn read(&self, off) -> u8` could not say "nothing here",** and is now `Option<u8>`. One signature change here.
 
 The two findings themselves, both confirmed while building this:
 
@@ -112,17 +132,26 @@ The two findings themselves, both confirmed while building this:
    the bridge with exactly the lifetime argument the first one (the cartridge's) already carries. Worth a sentence in
    §5, because the obvious reading of D1 ("implement the trait over your own memory") suggests reusing the existing
    borrow, which does not compile.
-2. **`fn read(&self, off) -> u8` cannot say "nothing here".** With no DDR lent the store has to invent a byte, and the
-   device's own floating-bus value is right there but unreachable from the store. We return `0xFF` because that is
-   `Reu`'s `floating_bus` default, so the two agree today — but only by coincidence: if a host set a different
-   floating-bus value, or a future REU model drove something else, the store's invented byte would silently disagree
-   with the device's. `fn read(&self, off) -> Option<u8>`, with `None` meaning "not backed", would have kept D3 honest
-   and cost nothing — `read_from_reu` already has the floating-bus fallback in hand at that exact point.
+2. **`fn read(&self, off) -> u8` cannot say "nothing here".** With no DDR lent the store had to invent a byte, and the
+   device's own floating-bus value was right there but unreachable from the store. We returned `0xFF` because that is
+   `Reu`'s `floating_bus` **power-on** value, and argued the two therefore agreed. **They did not**, and switching to
+   `Option<u8>` proved it: `floating_bus` is a *latch*, not a constant — `dma_host_to_reu` ends with
+   `self.floating_bus = value`, the last byte it drove (`reu.rs`). Our own test
+   `a_transfer_with_nothing_lent_…` failed on the first build against 0.7.1, reading `0xAF` where it had asserted
+   `0xFF`: the stash of `0xA0..0xAF` was dropped for want of DDR but still drove the bus, so the device's latch held
+   `0xAF` while our invented byte still said `0xFF`. The old code was wrong, not merely fragile, and the wrong value
+   was written into a passing test. This is the exact silent disagreement the `Option` was asked for.
 
 ## Build note
 
-This needs **trx64-core 0.7.0**, which is Specs 853 and 854. It is public: TRX64 v0.7.0, rev `f370a56`, and that is
-what `crates/c64-bridge/Cargo.toml` pins, so an ordinary `cargo build` is enough and no patch is needed.
+The two changes above need **TRX64 0.7.1**, which is public on TRX64's `main` as `5f93646` — there is no tag and no
+release for it, so the pin names the rev. `crates/c64-bridge/Cargo.toml` points there, and an ordinary
+`cargo build` is enough.
+
+Building against a local TRX64 checkout instead is the usual `.cargo/config.toml` route in `docs/status/install.md`,
+"TRX64 dependency", with the same trap as before: when the local crate's version equals or differs from the pinned
+one in the wrong way, cargo keeps the git source until `cargo update -p trx64-core` switches it, and
+`cargo tree -p c64-bridge -i trx64-core` is what proves which source is in the graph.
 
 Building against a local TRX64 checkout instead (for TRX64 work) is the usual `.cargo/config.toml` route described in
 `docs/status/install.md`, "TRX64 dependency". One trap worth repeating: when the local crate's version differs from
