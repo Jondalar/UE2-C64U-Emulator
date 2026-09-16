@@ -36,7 +36,7 @@ firmware's "Load Settings" does by hand (`filetype_prg.cc:212`, `filetype_crt.cc
 | mandelbrot-upic v1.0.3 | **Runs and draws its picture** | — |
 | UltimateDemo2026 v1.0.1 | **Runs the whole demo**: UCI, REU 16 MB, turbo 64 MHz; every scene draws | Ultimate Audio `$DF20-$DFFF`: `Audio [Fail] Module not found`, no music |
 | heartbeat-demo v1.0.1 | Hardware detection: UCI, REU 16 MB, turbo all OK | Ultimate Audio: fails the check and **returns to BASIC** |
-| GeoUTools v1.1 | D64 mounts on drive A, the C64 lists it | No GEOS system disk to boot from |
+| GeoUTools v1.1 | *(3rd pass, §5)* **GEOS 1.2 boots to its DeskTop** in 30 s emulated; GeoUMount and GeoUConfig run and their UCI calls answer | No pointing device reaches the C64, so the DeskTop cannot be driven; GeoUMount finds no drive target and GeoUTime crashes after its NTP call |
 
 Three emulator gaps, in the order they cost the most:
 
@@ -58,6 +58,14 @@ Three emulator gaps, in the order they cost the most:
    `Unhandled context key: 1FC`) while UBoot64's own F2 did nothing. Pressing the menu `button` once after the cart
    starts hands the keyboard over and UBoot64's whole UI then works (§1). Whether the firmware is meant to hide the
    menu for a cartridge was not established here; it is recorded as observed, with the workaround.
+
+**A fourth gap, found when GEOS was run (§5): no pointing device reaches the C64.** `HostInput::Joystick(u8)` is
+routed to `U64Io` and `C64Port` (`crates/ue2-core/src/machine.rs:494`) but has no producer outside a unit test: the
+control language, `ue2-mcp` and the window keymap can send keys, the USB keyboard and the menu button and nothing
+else, and the USB stack models no mouse (`docs/status/usb.md`). GEOS boots and then sits there — ten key presses
+change 0 pixels of its DeskTop. Anything mouse-driven is out of reach, headless and in the window alike. A smaller
+one from the same runs: **`--usb-dir` refuses to sync back a stick that holds one file**, because a single changed
+file is 100 % of it and trips the mass-deletion guard (§5).
 
 Carried over unchanged from `docs/status/c64.md` ("CIA TOD"), neither worked around: **TOD runs 5.3 % slow while the
 screen is on**, and **the mains frequency comes from CRA bit 7 rather than from the machine**. Nothing in this
@@ -241,7 +249,7 @@ console marks a palette call.
 the clock to zero, let 10 s pass, read back ` 0` seconds and ` 0` tenths (`ctl/16-tod.ctl`, `out/16-tod.log`).
 `Cia::tick` only bumped `tod_prescaler`; the BCD registers at `$DC08-$DC0B` never advanced. Fixed in TRX64 0.7.1.
 
-## 5. GeoUTools v1.1
+## 5. GeoUTools v1.1 and GEOS 1.2
 
 `GeoUTools.d64` (171 K) and `GeoUTools.d81` (800 K). The disk holds the three GEOS applications and two GEOS
 documents and nothing else. Re-run in the second pass (`ctl/geos.ctl`, `log/geos.log`, 31 s emulated) with the same
@@ -268,11 +276,123 @@ LIST
 "Known gaps".) On a flash without a drive ROM the mount still succeeds but the drive stays off and the C64 answers
 `?DEVICE NOT PRESENT ERROR`.
 
-**Not tested: the GEOS side.** These are GEOS applications; they need a booted GEOS, and no GEOS system disk exists
-in this tree — the GeoUTools disk carries none. So GeoUTools' UCI drive detection (`uii_parse_deviceinfo` behind
-GEOS's own drive layer) was not exercised. Nothing here says it would fail: the same UCI calls work from UBoot64.
-Two of the three tools also want the REU (GEOS RAM drives) — which now exists — and `UltiDOS: Allow SetDate` for
-the clock.
+**GEOS 1.2 boots.** A system disk exists now, so the GEOS side was run in a **third run set**, `run/xander/r3/`
+(`ctl/`, `log/`, `png/`, one USB-stick share per run, the same command line as above).
+`Geos V1.2 (1985)(BS).d64` — 29 files, BAM signature `GEOS format V1.0`, 56 blocks free — was copied onto the stick
+as `GEOS12.D64`, mounted on drive A the same way as the GeoUTools disk, and started from BASIC with
+`LOAD"GEOS",8,1`. It needs no `RUN`: the boot file starts itself. From the LOAD (`ctl/geos-02.ctl`,
+`log/geos-02.log`):
+
+| t (emulated, from the LOAD) | Screen |
+|---|---|
+| 10 s | `BOOTING GEOS...` on the boot screen (`shots/geos/01-boot-screen.png`) |
+| 20 s | the GEOS desktop pattern, nothing drawn on it yet |
+| 25 s | the menu bar, the printer and the waste basket |
+| 30 s | the DeskTop: window `GEOS12`, `29 files  152 K bytes used  14 K bytes free`, eight file icons (`shots/geos/02-desktop.png`) |
+
+and nothing changes after that. The whole run — mount, boot, three minutes of idle DeskTop — is 226.9 s emulated in
+46 s wall at 125 MIPS. **`c64screen` is useless here:** GEOS runs its own RAM font, so the dump is 40×25 `?`
+(the documented guess in `docs/status/c64.md`, "Known gaps"). Only the PNGs carry the result.
+
+**The DeskTop cannot be driven: no pointing device reaches the C64.** A sweep of ten keys (`down`, `up`, `left`,
+`right`, `space`, `a`, `return`, `f1`, `runstop`, `home`, each held 1-2 s emulated) changes **0 pixels** —
+`shots/geos/03-desktop-after-key-sweep.png` is byte for byte `02-desktop.png`. So keys do not bleed into the
+joystick lines either, and no icon and no menu can be opened. What is missing:
+
+- The control language has `key`, `type`, `usbkey` and `button` and nothing else (`crates/ue2emu/src/control.rs`,
+  `docs/specs/S08-frontend-control.md`); `ue2-mcp` exposes the same set, and the window keymap adds none.
+- `HostInput::Joystick(u8)` exists and `Machine::input` routes it to `U64Io` and `C64Port`
+  (`crates/ue2-core/src/machine.rs:494`), but **nothing produces it** outside one unit test (`machine.rs:966`), and
+  `C64Port::set_joystick` drives port 2 only.
+- USB HID is a keyboard only — "**No mouse.** HID mouse and other classes (CBI, AX88772) are not modelled"
+  (`docs/status/usb.md`) — so the firmware's own `C64_JOY1/2_SWOUT` path (`joystick_output.cc`, `usb_hid.cc`) has no
+  device behind it.
+- `HostInput::Restore` has no control command either; RESTORE exists only as Page Up in the window.
+
+**Getting GeoUTools to GEOS.** Swapping the mounted image is honest but pointless: the D64 does swap, and the
+DeskTop then has to be told to read the new disk, which is a mouse click. So the tools were copied onto a working
+copy of the system disk instead. `scripts/d64tool.py` writes plain PRGs only, while a GEOS file also needs its info
+block and the GEOS directory fields, so `run/xander/r3/geoscopy.py` (new, in the gitignored run tree) copies those.
+`GEOSWORK.D64` is the system disk with geoPaint and geoWrite deleted for room (56 blocks free, the three tools need
+179) and GeoUMount, GeoUTime and GeoUConfig copied in; the DeskTop draws them with their own icons
+(`shots/geos/04-desktop-with-geoutools.png`), so file, info block and icon all arrived intact.
+
+**The settings GeoUTools needs, set once through the menu and saved** (`ctl/cfg-05.ctl`): F2 → Memory Configuration
+→ `RAM Expansion Unit  Enabled`, `Size  16 MB`, `Command Interface  Enabled`
+(`shots/geos/09-firmware-uci-reu-enabled.png`), console `Writing config store 'C64 and Cartridge Settings' to
+flash..Page: 3 done.`; every later boot on that flash prints `Begin of cart init: Type: 00. REU: 01. REU_SZ: 07,
+UCI: 01 (DF18), Mode: 04, Sampler: 00`. The key path is the one `scripts/smoke-flash-1.ctl` documents: RIGHT enters
+a store, RETURN opens an enum. `UltiDOS: Allow SetDate` was left alone — GeoUTime never reaches the clock (below).
+
+**GEOS 1.2's DeskTop ignores auto-exec files.** GeoUTime is GEOS file type 14, the auto-exec type, and did not start
+at boot; flagging GeoUMount 14 as well changed nothing (`ctl/geos-04.ctl`, the frame is pixel-identical to the plain
+DeskTop). That is the 1985 DeskTop, not the emulator. To start a tool at all, each one was stored under the name
+`DESK TOP`, which is what the GEOS KERNAL loads after the boot — a disk-side hack, recorded here so that nothing
+below reads as "started from the DeskTop".
+
+**GeoUMount runs, and its UCI side works** (`ctl/geos-05.ctl`, `shots/geos/05-geoumount-uci-browser.png`): menu bar
+`GEOS | Save REU`, `ID: ULTIMATE-II DOS V1.2`, and its file browser lists `SD`, `Flash`, `Temp` and `USB0` as
+directories. `uii_detect()`, `uii_change_dir_home()` and the DOS listing all answer from behind GEOS's own drive
+layer. **What it finds no trace of is a mount target:** `Target is drive A`, and `Drive A` to `Drive D` all say
+`No target`.
+
+**GeoUConfig states the verdict itself** (`ctl/geos-06.ctl`, `shots/geos/06-geouconfig-detection.png`):
+
+```
+GeoUMount config data:
+Detection override: No
+Autodetection of valid drives succeeded.
+Drive A: No target
+Drive B: No target
+Drive C: No target
+Drive D: No target
+Target drive: A
+
+GeoUTime config data:
+Hostname: pool.ntp.org
+UTC offset: 3600
+Update from NTP: Enabled
+Verbose: Disabled
+```
+
+The firmware therefore answers the 3.10f+ device-info command (`Checkcommandsupport()` reads UCI status `21`,
+`src/mount_common.c:120-128`) and the detection runs to its end — and matches nothing. `SetValidDrives` takes a
+drive only when GEOS's own `DRIVETYPES` entry for it is below 4 *and* the UCI device info reports that ID as an
+Ultimate drive; GEOS 1.2 predates the `DRIVETYPES` table GEOS 2.0 keeps, and the Ultimate's own emulated A/B drives
+are its SoftIEC drives, which are still T0 here (`docs/status/drive.md`). Observed, not diagnosed further.
+
+**A GEOS RAM drive was therefore never reachable** — and would not have been anyway: GEOS 1.2 has no REU RAM drive
+(that is GEOS 2.0 with Wheels or MegaPatch), and GeoUMount's mount and `Save REU` paths need a valid target. The REU
+half of GeoUTools stays untested, by GEOS's age rather than by the emulator.
+
+**GeoUTime crashes after the NTP exchange.** Started the same way it dies in a GEOS `System error near $30C6`; with
+verbose switched on in its own `GeoUTimeDat` (byte 92 of the config buffer, `src/time_common.c:127`) the window
+shows `Connecting t…`, `Sending NTP…`, `Reading resu…`, `UNIX epoch:` and then `System error near $30E0`
+(`shots/geos/07-geoutime-verbose-progress.png`, `08-geoutime-system-error.png`). The firmware's own NTP is up in the
+same run (`--> Time Received: 1789582710`). Whether this is a program built for GEOS 2.0 meeting GEOS 1.2, or
+something in the UCI network path, was not pinned down.
+
+**Writing to the disk from GEOS works.** Both GeoUTime runs created `GeoUTimeDat` (2 blocks, GEOS type 7) in the
+mounted D64: console `Writing back binary track 18...`, `Writing back binary track 32...`, and the file is in the
+directory of the image the run kept (`run/xander/r3/out-time.d64`, read out of the stick image with
+`d64tool.py sd-get`).
+
+**A second emulator gap, from that last step: `--usb-dir` cannot sync back a one-file stick.** The changed D64 never
+reached the host directory:
+
+```
+usb-dir port 1 (…/share-time): REFUSED: this sync would delete or overwrite 1 of 1 files on the host
+(limit: 25 % or 50); nothing synced, the image is kept; check the stick, then run usb-sync --force
+```
+
+With a single file on the stick every guest change is 100 % of it and always trips the mass-deletion guard
+(`docs/status/usb-dir.md`). The documented way out is `usb-sync --force`; the evidence above was read out of the
+kept image instead.
+
+Screenshots (2×, nearest-neighbour) under `run/xander/shots/geos/`: `01-boot-screen.png`, `02-desktop.png`,
+`03-desktop-after-key-sweep.png`, `04-desktop-with-geoutools.png`, `05-geoumount-uci-browser.png`,
+`06-geouconfig-detection.png`, `07-geoutime-verbose-progress.png`, `08-geoutime-system-error.png`,
+`09-firmware-uci-reu-enabled.png`.
 
 ## What the projects' own documentation says about the firmware
 
