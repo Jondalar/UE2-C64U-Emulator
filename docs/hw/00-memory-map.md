@@ -104,7 +104,7 @@ Build defines: `-DRISCV -DU64=2 -DUSB2513 -DOS -DIOBASE=0x10000000 -DU2P_IO_BASE
 | 0x10044000-0x1004400F | UCI registers | 11, 10 | +4/+5/+6/+7/+8/+9 read 0x00/0x6F/0x70/0xDF/0xE0/0xFF. HANDSHAKE and STATUS read 0. Idle read pointers: +A = 0x00 (status 0x700), +C/+D = 0x80/0x03 (response 0x380). IRQMASK reset 7 | command_protocol.vhd |
 | 0x10044800-0x10044FFF | UCI RAM (cmd 0x10044800, resp 0x10044B80, status 0x10044F00) | 11 | RAM | RAM shared with the C64 side |
 | 0x10046000-0x100467FF | CART_TIMING_BASE (== COPPER_BASE, iomap.h:17-18; copper.cc not in SRCS) | 10 | RAZ/WI | developer only |
-| 0x10048000-0x10049FFF | Sampler (256 B aliased over 8 K) | 12 | RAZ/WI (never read) | voice engine (needs a C64) |
+| 0x10048000-0x10049FFF | Sampler (256 B aliased over 8 K) | 12 | modelled since S16: even reads the IRQ status vector, odd the version 0x10 | voice engine (docs/specs/S16-ultimate-audio.md) |
 | 0x1004A000-0x1004A00A | ACIA 6551 registers | 11 | latches, irq_source 0 | acia6551.vhd |
 | 0x1004A800-0x1004A9FF / 0x1004AA00-0x1004ABFF | ACIA TX ring / RX ring RAM | 11 | RAM | RAM |
 | 0x1004C000 / 0x1004C800-0x1004CFFF | EEPROM dirty / data (GMOD2) | 10 | RAZ/WI | 93C86 model |

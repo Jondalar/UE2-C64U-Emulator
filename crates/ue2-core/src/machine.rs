@@ -33,6 +33,9 @@ pub struct MachineConfig {
     pub rom_dir: PathBuf,
     /// ITU capability word (big-endian at 0x1000000C). T0 default 0x34000222.
     pub capabilities: u32,
+    /// Whether `capabilities` came from the command line. An explicit word is the user's, so the frontend does not
+    /// OR its own feature bits into it (`--caps` is the only way to model a machine whose FPGA lacks one).
+    pub capabilities_explicit: bool,
     /// Emulated 100 MHz clocks per executed instruction.
     pub clocks_per_insn: u64,
     /// Persistent SPI flash image (created erased if missing). None = volatile flash.
@@ -56,6 +59,7 @@ impl MachineConfig {
             elf,
             rom_dir,
             capabilities: 0x3400_0222,
+            capabilities_explicit: false,
             clocks_per_insn: time::DEFAULT_CLOCKS_PER_INSN,
             flash_image: None,
             sd_image: None,

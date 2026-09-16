@@ -40,13 +40,15 @@ firmware's "Load Settings" does by hand (`filetype_prg.cc:212`, `filetype_crt.cc
 
 Three emulator gaps, in the order they cost the most:
 
-1. **Ultimate Audio DMA `$DF20-$DFFF` and the extra SIDs are unmodelled.** It is now the *first* wall for two of the
-   five, and it is **not the capability word**: with `--caps 34E40222` (the machine's own `34C40222` plus
-   `CAPAB_SAMPLER`, `itu.h:70`) the firmware arms the window — `Sampler found in FPGA... IO map: Enabled!` and
-   `Sampler: 01` in the cart-init line — and UltimateDemo2026's `audio_detect()` still answers
-   `Audio : [Fail] Module not found`. The registers behind the window are what is missing
-   (`devices/c64.rs:751`, `docs/status/carts.md` "sampler stays unmodelled"). Unblocks: heartbeat-demo entirely
-   (8 SIDs, 7 DMA channels, tick IRQ), UltimateDemo2026's music.
+1. **Ultimate Audio DMA `$DF20-$DFFF` — built since S16; the wall is down for heartbeat-demo.** The diagnosis here
+   was right: it was the registers behind the window, not the capability word. They are modelled now
+   (`docs/specs/S16-ultimate-audio.md`, `docs/status/sampler.md`) — eight voices, both register faces, the mixer and
+   the IRQ. **heartbeat-demo** reads `Audio : [ OK ]  v16`, loads its song (`Song : [ OK ] tempo 88, 8 SIDs`) and
+   **plays it**: an `--audio-wav` capture carries 40 s of sound at about 46000 peak-to-peak of 65535, where the
+   program used to fail the check and return to BASIC. **UltimateDemo2026 is not resolved.** It passes detection and
+   loads (`DMA load complete: $0801-$97C8`), then draws a black screen for 250 s emulated, where this survey
+   recorded every scene. Whether the sampler causes that is open (S16 §6): two control runs proved nothing, one
+   because `--caps` could not clear the capability at the time, one because the demo failed its REU check first.
 2. **A UCI DOS read of an existing 24 KB file stalls near the end.** UBoot64 writes `DMBSLT.CFG` (24480 B) on its
    first run and reaches its menu; on every later run it reads the same file back into the REU and stops at
    `Reading slot data to 24285` / `24289` / `24324` — within 200 bytes of the end, at a different byte each run, and
@@ -56,7 +58,9 @@ Three emulator gaps, in the order they cost the most:
    prints `MENU HIDE / EXIT.` (the `Run` path for a PRG always does), so C64 keys reach the firmware UI instead of
    the cartridge — `key f2` built the firmware's *config* browser (`Creating config menu...`,
    `Unhandled context key: 1FC`) while UBoot64's own F2 did nothing. Pressing the menu `button` once after the cart
-   starts hands the keyboard over and UBoot64's whole UI then works (§1). Whether the firmware is meant to hide the
+   starts hands the keyboard over and UBoot64's whole UI then works (§1). Confirmed a second time on
+   heartbeat-demo (`docs/status/sampler.md`): its "Press any key to start playback" ends in `READY.` without the
+   button, and starts the song with it. Whether the firmware is meant to hide the
    menu for a cartridge was not established here; it is recorded as observed, with the workaround.
 
 **A fourth gap, found when GEOS was run (§5): no pointing device reaches the C64.** `HostInput::Joystick(u8)` is

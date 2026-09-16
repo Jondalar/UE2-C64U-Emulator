@@ -157,6 +157,7 @@ fn run(a: RunArgs) -> Result<()> {
     let mut cfg = MachineConfig::new(elf, roms);
     if let Some(caps) = a.caps {
         cfg.capabilities = caps;
+        cfg.capabilities_explicit = true;
     }
     if let Some(c) = a.clocks_per_insn {
         cfg.clocks_per_insn = c;

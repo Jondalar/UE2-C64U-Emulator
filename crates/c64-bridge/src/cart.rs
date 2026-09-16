@@ -56,6 +56,10 @@ const GEORAM: u8 = 0x1F;
 /// ITU capability bit for the GMOD2 EEPROM (itu.h:71). Without it the firmware refuses GMOD2 CRTs (c64_crt.cc:214).
 pub const CAPAB_EEPROM: u32 = 0x0040_0000;
 
+/// ITU capability bit for the sampler (itu.h:70). Without it the firmware never maps `$DF20-$DFFF`, offers no
+/// "Play MOD" (filetype_reu.cc:41-45) and answers `/v1/runners:modplay` with 501 (route_runners.cc:239-243).
+pub const CAPAB_SAMPLER: u32 = 0x0020_0000;
+
 /// ITU capability bit for the Ultimate Command Interface (itu.h:67). Without it the firmware starts no "UCI Server"
 /// task (command_intf.cc:44) and offers no "Command Interface" setting (c64.cc:311,328).
 pub const CAPAB_COMMAND_INTF: u32 = 0x0004_0000;

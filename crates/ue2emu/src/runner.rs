@@ -231,15 +231,26 @@ fn attach_trx64_audio(
         }
         // S15: TRX64 carries the UCI block on its `u64` profile, so the firmware may start its UCI task.
         let has_uci = ue2_core::c64host::C64Backend::has_uci(&c64);
+        // S16: Ultimate Audio is UE2's own block, not TRX64's, but it is reached through the C64 bus, so it needs the
+        // backend all the same.
+        let has_sampler = ue2_core::c64host::C64Backend::has_sampler(&c64);
         machine.attach_c64(Box::new(c64));
         // W4-CART: the bridge emulates the GMOD2 EEPROM behind 0x1004C000, which the firmware only uses with
         // CAPAB_EEPROM (itu.h:71; c64_crt.cc:214, 272, 746).
-        if let Some(itu) = machine.bus.io.get_mut::<ue2_core::devices::itu::Itu>() {
+        // A word given with `--caps` is the user's: the bits below are not OR'd into it, so a machine whose FPGA
+        // lacks one of these features can be modelled (and a bit can be forced on by naming it in the word).
+        let own_caps = !machine.cfg.capabilities_explicit;
+        if let Some(itu) = machine.bus.io.get_mut::<ue2_core::devices::itu::Itu>().filter(|_| own_caps) {
             itu.capabilities |= c64_bridge::CAPAB_EEPROM;
             // Without CAPAB_COMMAND_INTF the firmware starts no "UCI Server" task (command_intf.cc:44) and offers no
             // "Command Interface" setting (c64.cc:311,328). `--c64 none` keeps the capability word it had.
             if has_uci {
                 itu.capabilities |= c64_bridge::CAPAB_COMMAND_INTF;
+            }
+            // Without CAPAB_SAMPLER the firmware never maps `$DF20-$DFFF` (c64.cc:319-326), offers no "Play MOD"
+            // (filetype_reu.cc:41-45) and answers `/v1/runners:modplay` with 501 (docs/specs/S16-ultimate-audio.md).
+            if has_sampler {
+                itu.capabilities |= c64_bridge::CAPAB_SAMPLER;
             }
         }
     }

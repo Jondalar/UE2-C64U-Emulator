@@ -169,6 +169,24 @@ pub trait C64Backend {
     fn uci_take_events(&mut self) -> UciEvents {
         UciEvents::default()
     }
+
+    // ---- Ultimate Audio: the sampler (docs/specs/S16-ultimate-audio.md) ----
+
+    /// Whether this backend serves the sampler. Without it the window at `SAMPLER_BASE` 0x10048000 stays RAZ/WI, which
+    /// is what it was before S16: the firmware never reads it, and its reset writes are swallowed.
+    fn has_sampler(&self) -> bool {
+        false
+    }
+    /// A read of `SAMPLER_BASE` 0x10048000 + `off`. Only bit 0 of the offset is decoded: even is the IRQ status vector,
+    /// odd the version constant 0x10 (`sampler_regs.vhd:81-87`). Side-effect free — reading clears no latch — so
+    /// `peek8` uses it too.
+    fn sampler_read(&self, _off: u16) -> u8 {
+        0
+    }
+    fn sampler_write(&mut self, _off: u16, _val: u8) {}
+    /// `C64_SAMPLER_ENABLE` (cart regs +0xE, c64.h:68): map the block at `$DF20-$DFFF` for the C64, or take it away.
+    /// The register itself stays the latch the firmware reads back (c64.cc:1362).
+    fn set_sampler_enabled(&mut self, _on: bool) {}
 }
 
 // ---- CARTSLOT: a physical cartridge in the expansion port (docs/status/cart-slot.md) ----
@@ -314,6 +332,24 @@ pub(crate) mod mock {
         }
     }
 
+    /// A stand-in for the sampler's register file: writes are kept so a test can see what reached it, and reads
+    /// follow the hardware's two decodes — even offsets the status vector, odd ones the version byte.
+    #[derive(Clone)]
+    pub(crate) struct Sampler {
+        /// The 256-byte register file, as written.
+        pub(crate) regs: Vec<u8>,
+        /// What an even offset reads back.
+        pub(crate) status: u8,
+        /// Whether `C64_SAMPLER_ENABLE` has mapped it for the C64.
+        pub(crate) enabled: bool,
+    }
+
+    impl Default for Sampler {
+        fn default() -> Self {
+            Sampler { regs: vec![0; 0x100], status: 0, enabled: false }
+        }
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum Call {
         Advance(u64),
@@ -340,6 +376,10 @@ pub(crate) mod mock {
         ReuSize(u32),
         /// UCI firmware-side write (offset, value).
         Uci(u16, u8),
+        /// Sampler firmware-side write (offset, value).
+        Sampler(u16, u8),
+        /// C64_SAMPLER_ENABLE.
+        SamplerEnable(bool),
     }
 
     /// Shared with the test after the backend moved into the device.
@@ -361,6 +401,8 @@ pub(crate) mod mock {
         pub(crate) reu: Rc<RefCell<Option<u32>>>,
         /// REU: the last `set_reu_size_kb`, which an attach takes.
         pub(crate) reu_size: Rc<RefCell<u32>>,
+        /// Sampler: `Some` when the mock has the block, so `has_sampler` is true (S16).
+        pub(crate) sampler: Rc<RefCell<Option<Sampler>>>,
     }
 
     impl Mock {
@@ -489,6 +531,25 @@ pub(crate) mod mock {
         }
         fn uci_take_events(&mut self) -> UciEvents {
             self.uci.borrow_mut().as_mut().map(|u| std::mem::take(&mut u.events)).unwrap_or_default()
+        }
+
+        fn has_sampler(&self) -> bool {
+            self.sampler.borrow().is_some()
+        }
+        fn sampler_read(&self, off: u16) -> u8 {
+            self.sampler.borrow().as_ref().map_or(0, |s| if off & 1 == 0 { s.status } else { 0x10 })
+        }
+        fn sampler_write(&mut self, off: u16, val: u8) {
+            if let Some(s) = self.sampler.borrow_mut().as_mut() {
+                s.regs[usize::from(off) & 0xFF] = val;
+            }
+            self.push(Call::Sampler(off, val));
+        }
+        fn set_sampler_enabled(&mut self, on: bool) {
+            if let Some(s) = self.sampler.borrow_mut().as_mut() {
+                s.enabled = on;
+            }
+            self.push(Call::SamplerEnable(on));
         }
     }
 }

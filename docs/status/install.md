@@ -124,7 +124,7 @@ is RESTORE.
 | `--firmware ELF` (alias `--elf`) | Firmware image: `ultimate.elf` (with symbols), `ultimate.app` or a `.ue2`; default `firmware/1541ultimate/target/u64ii/riscv/ultimate/result/ultimate.elf` |
 | `--roms DIR` | Firmware roms directory: overlay font `chars.bin`, TRX64 ROM seeds, `--c64-roms` source; default `firmware/1541ultimate/roms` |
 | `--flash FILE` | Persistent SPI flash image, created erased if missing |
-| `--caps HEX` | ITU capability word; default `34000222` |
+| `--caps HEX` | ITU capability word; default `34000222`. Given explicitly it is used as it stands, so the frontend adds none of its own bits (EEPROM, UCI, sampler) — that is how a machine without one of them is modelled |
 | `--no-overlay-ui` | Do not seed the overlay user interface into blank flash config |
 
 **C64 (TRX64)**

@@ -220,7 +220,7 @@ C64_CARTRIDGE_TYPE (c64.h:125-163). "Done" means implemented after the VHDL and 
   level that wires it is closed.
 - **UCI** (`$DE1C`/`$DF1C`/`$DFFC`) is modelled since S15, in TRX64: the block is part of its `u64` machine profile
   (TRX64 Spec 852), and UE2 serves the firmware side at 0x10044000. Any slot base works, EasyFlash's `$DE1C`
-  included. **REU**, **ACIA** and **sampler** stay unmodelled. A cartridge in the expansion port is `--cart-slot`
+  included. **ACIA** stays unmodelled; the REU is modelled (docs/status/reu.md) and Ultimate Audio since S16 (docs/specs/S16-ultimate-audio.md). A cartridge in the expansion port is `--cart-slot`
   (docs/status/cart-slot.md).
 - **GeoRAM size mask** and **TwoMegabyter**, **KCS/SS5/FC1 freezing** are implemented without a run from the firmware.
 - **Audio** comes from the SID stream (docs/status/sid-audio.md). After the wave-4 merge a cart smoke run with

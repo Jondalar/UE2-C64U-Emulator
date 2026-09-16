@@ -71,7 +71,7 @@ If the FPGA is built without `g_sampler`, the port is an `io_dummy` (slot_server
 ### Boot hazards
 - **None read-dependent.** The window is never read, so no returned value changes control flow.
 - The writes in steps 3-4 must be accepted silently. There is no bus-error exception on the real hardware (doc 01 H16), so raising an access fault on 0x10048000-0x10049FFF is wrong.
-- Capability bit21 (`CAPAB_SAMPLER`, byte 0x1000000D bit5) is the only feature switch. 0 → no "Play MOD" menu item, REST modplay answers 501, no clear/select writes. No hang either way. With bit21 = 1 and no C64/6502 + sampler model, "Play MOD" loads REU memory and starts a 16K cartridge (filetype_reu.cc:149-159, C64_START_CART, doc 10) that cannot produce audio. **T0: return bit21 = 0.**
+- Capability bit21 (`CAPAB_SAMPLER`, byte 0x1000000D bit5) is the only feature switch. 0 → no "Play MOD" menu item, REST modplay answers 501, no clear/select writes. No hang either way. With bit21 = 1 and no C64/6502 + sampler model, "Play MOD" loads REU memory and starts a 16K cartridge (filetype_reu.cc:149-159, C64_START_CART, doc 10) that cannot produce audio. **T0: return bit21 = 0.** **Superseded by S16** (docs/specs/S16-ultimate-audio.md): with the block modelled the TRX64 build sets bit21, so "Play MOD" appears and the C64 window at `$DF20-$DFFF` answers.
 - Consistency requirement on the ITU (doc 02). ITU_IRQ_ACTIVE must be masked by ITU_IRQ_ENABLE: bit7 is enabled only by `run_reset_task` (command_intf.cc:102). If an emulator reported bit7 while it is not enabled and bit18/bit9 are clear, `ResetInterruptHandlerCmdIf` would call `xSemaphoreGiveFromISR(NULL)`. That hits `configASSERT(pxQueue)` (FreeRTOS/Source/queue.c:1120) → `vAssertCalled` loops forever (system/assert.c:23-29). No race when the caps are set: the semaphore is created at ctor time, before any task runs (crt0.S:197-218, riscv_main.c:162).
 
 ### Interrupts
@@ -93,7 +93,7 @@ If the FPGA is built without `g_sampler`, the port is an `io_dummy` (slot_server
 - **Reset:** `actual_c64_reset` forces all voices to `finished` and clears IRQs, but not the registers (sampler2.vhd:229-233, sampler_regs.vhd:73-167). That is why firmware writes CONTROL = 0 per voice on each C64 reset: it moves voices to `idle` so a stale enable does not restart playback.
 
 ### Emulator model tiers
-- **T0:** decode 0x10048000-0x10049FFF, ignore writes, read 0 (never read). Capability bit21 = 0.
+- **T0 (pre-S16):** decode 0x10048000-0x10049FFF, ignore writes, read 0 (never read). Capability bit21 = 0. **Since S16** the window is `C64Port`'s and the backend's block serves it: even offsets read the IRQ status vector, odd ones the version 0x10, and writes reach the voices.
 - **T1 (needs the separate C64 emulator):** per-voice register store per the map above, reads (even → IRQ bits, odd → 0x10), the voice state machine and mix above, a DDR fetch at START+pos, IRQ → C64 /IRQ gated by 0x1004000E bit0, the C64 $DF20-$DFFF window → offsets 0x00-0xDF, and C64 reset → voices finished + IRQs cleared. Then set capability bit21 = 1 and feed L/R into the mixer model's channels 4/5.
 
 ---

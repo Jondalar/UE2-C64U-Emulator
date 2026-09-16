@@ -16,6 +16,7 @@ mod clock;
 mod drive;
 mod keys;
 mod reu;
+mod sampler;
 mod sid;
 mod slot;
 mod video;
@@ -42,7 +43,7 @@ pub use slot::FlashDecode;
 use video::Palette;
 
 pub use sid::AudioSink;
-pub use cart::{CAPAB_COMMAND_INTF, CAPAB_EEPROM};
+pub use cart::{CAPAB_COMMAND_INTF, CAPAB_EEPROM, CAPAB_SAMPLER};
 
 /// C64 core config offsets the bridge acts on besides the SID and bus-sharing registers (u64.h:106,134-135). The
 /// firmware writes the enable word and the preferred speed, then strobes the update (u64_config.cc:1634-1636).
@@ -119,6 +120,8 @@ pub struct Trx64Backend {
     /// C64_REU_SIZE in KiB, which the next attach takes. The register resets to "111" = 16 MB (c64.rs `CART_REGS`),
     /// and the firmware writes it before it writes the enable (c64.cc:315-317).
     reu_size_kb: u32,
+    /// Ultimate Audio: UE2's own block, shared with the port device TRX64 holds (sampler.rs, S16).
+    sampler: sampler::SamplerHandle,
 }
 
 impl Trx64Backend {
@@ -157,6 +160,11 @@ impl Trx64Backend {
         let sid = sid::Sid::new();
         sid.install_hook(&mut m.sid);
         let drive = drive::DriveA::new(&mut m);
+        // S16: the sampler is on the port for the life of the machine, as it is in the FPGA; `C64_SAMPLER_ENABLE`
+        // gates the window, not the block's existence. Attaching it before any REU also settles who answers
+        // `$DF20-$DFFF`: TRX64's REU mirrors its registers there, the U64's does not.
+        let sampler = sampler::SamplerHandle::default();
+        m.attach_expansion_also(Box::new(sampler.clone()));
         Trx64Backend {
             m,
             clock: None,
@@ -178,12 +186,18 @@ impl Trx64Backend {
             drive,
             reu: ReuRam::default(),
             reu_size_kb: reu::DEFAULT_SIZE_KB,
+            sampler,
         }
     }
 
     /// Send the SID's mono samples at `sample_rate` Hz to `sink`, following emulated time (S14 §W4-SID).
+    ///
+    /// S16: the sampler's voices join them on the way out. `Sid` keeps pushing whole blocks and keeps owning the
+    /// clock; the mixer renders the same number of samples from the voices and forwards the sum.
     pub fn set_audio(&mut self, sample_rate: u32, sink: Box<dyn AudioSink>) {
-        self.sid.set_audio(sample_rate, sink, self.m.c64_core.clk);
+        self.sampler.with(|s| s.set_sample_rate(sample_rate));
+        let mixed = Box::new(sampler::SamplerMix::new(self.sampler.clone(), sink));
+        self.sid.set_audio(sample_rate, mixed, self.m.c64_core.clk);
     }
 
     /// Fit the ARMSID in SID socket 1 (`true`) or leave the socket empty, the default (S14 §W4-SID).
@@ -419,6 +433,9 @@ impl C64Backend for Trx64Backend {
             self.drive.after_run(&mut self.m);
         }
         self.sid.advance(self.m.c64_core.clk);
+        // S16: the voices are FPGA-clocked, so they follow the emulator's clock rather than the C64's — and they run
+        // whether or not anyone is listening, because a finished voice sets the status bit `audio_detect()` polls.
+        self.sampler.with(|s| s.advance_to(now));
     }
 
     /// A release warm-resets through the cartridge and ULTIMAX state (S14 §7). TRX64's reset restarts its cycle
@@ -429,6 +446,9 @@ impl C64Backend for Trx64Backend {
         self.apply_hold();
         if held {
             self.sid.reset();
+            // S16: the C64 reset clears the sampler's IRQ latches and nothing else — its register file has no reset
+            // branch, which is why the firmware clears the voices in software on every reset (`sampler2.vhd:229-232`).
+            self.sampler.with(|s| s.c64_reset());
             // W4-DRIVE: drive A may follow the C64's reset.
             self.drive.update(&mut self.m, self.stopped, true);
             // CARTSLOT: the expansion port's RESET line holds the physical cartridge in its reset state, so
@@ -624,6 +644,9 @@ impl C64Backend for Trx64Backend {
         // REU: TRX64 HOLDS the store for the life of the device, while the DDR is only LENT for this access, so the
         // store cannot be the borrow — it is a second view of the very same lease (Spec 854 D3, reu.rs).
         self.reu.set_ddr(ddr.as_mut().map(|d| (d.as_mut_ptr(), d.len())));
+        // S16: the voices read the same DDR, on the same lease — but not through the REU's store, which is gated by
+        // `C64_REU_SIZE`; a voice plays with no REU fitted at all.
+        self.sampler.with(|s| s.ram()).set_ddr(ddr.as_mut().map(|d| (d.as_mut_ptr(), d.len())));
         self.cart.with(|c| c.set_ddr(ddr));
     }
 
@@ -677,6 +700,26 @@ impl C64Backend for Trx64Backend {
 
     fn reu_attached(&self) -> bool {
         self.m.reu().is_some()
+    }
+
+    // ---- Ultimate Audio: the sampler (docs/specs/S16-ultimate-audio.md) ----
+
+    fn has_sampler(&self) -> bool {
+        true
+    }
+
+    fn sampler_read(&self, off: u16) -> u8 {
+        self.sampler.with(|s| s.read(off))
+    }
+
+    fn sampler_write(&mut self, off: u16, val: u8) {
+        self.sampler.with(|s| s.write(off, val));
+    }
+
+    /// `C64_SAMPLER_ENABLE`. The block stays on the port either way — this opens or closes its `$DF20-$DFFF` window
+    /// and, with it, the IRQ into the C64 (`slot_to_io_bridge.vhd:51,85-88`).
+    fn set_sampler_enabled(&mut self, on: bool) {
+        self.sampler.with(|s| s.set_enabled(on));
     }
 
     // W4-DRIVE: drive A is TRX64's drive 8 (drive.rs); there is no drive B.

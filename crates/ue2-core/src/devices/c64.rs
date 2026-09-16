@@ -1,5 +1,5 @@
 //! C64 cart/machine control, DMA window, MATRIX_KEYB, core config, palette and ROM windows ([`C64Port`]), plus the
-//! C64-side windows that stay T0 stubs (legacy SID, sampler, EEPROM, PLD, …).
+//! C64-side windows that stay T0 stubs (legacy SID, EEPROM, PLD, …).
 //! Spec: docs/specs/S14-c64-trx64.md (T0: docs/specs/S04-board-t0.md). Registers: docs/hw/10-c64-machine.md.
 //!
 //! Without a backend [`C64Port`] is the T0 stub of doc 10 §T0. `Machine::attach_c64` plugs in a [`C64Backend`], and
@@ -43,9 +43,14 @@ const DRIVE_A_END: u32 = DRIVE_A + 0x3FFF;
 /// backend's block when it has one, else by the T0 table [`UCI_T0`] (docs/specs/S15-uci.md).
 const UCI: u32 = 0x4_4000;
 const UCI_END: u32 = UCI + 0xFFF;
+/// Ultimate Audio: `SAMPLER_BASE` 0x10048000 (iomap.h:19), the firmware side of the sampler — 256 bytes of register
+/// file aliased over 8 K. Served by the backend's block when it has one, else RAZ/WI as it was before S16
+/// (docs/specs/S16-ultimate-audio.md).
+const SAMPLER: u32 = 0x4_8000;
+const SAMPLER_END: u32 = SAMPLER + 0x1FFF;
 
 /// (offset, size) of every [`C64Port`] window.
-const WINDOWS: [(u32, u32); 11] = [
+const WINDOWS: [(u32, u32); 12] = [
     (DRIVE_A, 0x4000),
     (CART, 0x100),
     (DMA, 0x1_0000),
@@ -57,6 +62,7 @@ const WINDOWS: [(u32, u32); 11] = [
     (CHAR, 0x1000),
     (EEPROM, 0x1000),
     (UCI, 0x1000),
+    (SAMPLER, 0x2000),
 ];
 
 /// UltiCommand interface 0x10044000 without a backend that has the block (command_protocol.vhd; moved here from
@@ -150,6 +156,8 @@ const KILL_FORCE: u8 = 0x02;
 /// (c64.cc:315-317), and both are read back as the latches they are (docs/status/reu.md).
 const REU_ENABLE: u32 = 0x08;
 const REU_SIZE: u32 = 0x09;
+/// C64_SAMPLER_ENABLE (c64.h:68): bit 0 maps the sampler at `$DF20-$DFFF` for the C64 (c64.cc:310, 319-326).
+const SAMPLER_ENABLE: u32 = 0x0E;
 
 /// C64_REU_SIZE 0..7 as KiB: `128 << n`, the firmware's `reu_size` table (c64.cc:60).
 fn reu_size_kb(reg: u8) -> u32 {
@@ -474,6 +482,15 @@ impl C64Port {
                     b.set_reu_enabled(on);
                 }
             }
+            // C64_SAMPLER_ENABLE: the latch stands, because the firmware reads it back and prints it as `Sampler: %b`
+            // in both cart-init lines (c64.cc:1290-1291, 1386-1387); the backend maps or unmaps the C64 window.
+            SAMPLER_ENABLE => {
+                self.cart.set(reg, val);
+                let on = self.cart.get(SAMPLER_ENABLE) & 0x01 != 0;
+                if let Some(b) = &mut self.backend {
+                    b.set_sampler_enabled(on);
+                }
+            }
             r => self.cart.set(r, val),
         }
     }
@@ -556,6 +573,12 @@ impl C64Port {
         self.backend.as_ref().is_some_and(|b| b.has_uci())
     }
 
+    /// Ultimate Audio: whether the backend serves the sampler. Without one the window reads 0 and swallows writes,
+    /// which is what the firmware's reset writes need (S16 §3.2).
+    fn has_sampler(&self) -> bool {
+        self.backend.as_ref().is_some_and(|b| b.has_sampler())
+    }
+
     /// The UCI's lines into the ITU, after anything that may have run the C64 or reached the block (S15 §3):
     /// low bit 4 is the firmware IRQ level, recomputed every time; low bit 7 is the C64-reset edge and high IRQ 6
     /// the unlock, both taken from the block's event queue. Without a UCI nothing is driven, as before.
@@ -615,6 +638,16 @@ impl IoDevice for C64Port {
                 self.update_uci(ctx);
                 val
             }
+            // Ultimate Audio: the voices read guest DDR, so the lease is held across the call as it is for UCI, and
+            // `sampler_read` has no side effects — reading a status never clears a latch (S16 §2.1).
+            SAMPLER..=SAMPLER_END if self.has_sampler() => {
+                self.lend_ddr(ctx);
+                self.sync(ctx.now);
+                let val = self.backend.as_ref().map_or(0, |b| b.sampler_read((off - SAMPLER) as u16));
+                self.return_ddr();
+                self.update_uci(ctx);
+                val
+            }
             // W4-DRIVE: drive A.
             DRIVE_A..=DRIVE_A_END => {
                 // W4-CART: the sync may run the C64, whose cartridge reads DDR; the lease ends before DriveRegs uses ctx.
@@ -665,6 +698,17 @@ impl IoDevice for C64Port {
                 self.update_uci(ctx);
             }
             UCI..=UCI_END => self.uci.set(off - UCI, val),
+            // Ultimate Audio. Without the block the window swallows the write, as the old stub did: the firmware
+            // clears the voices on every C64 reset whether or not the FPGA has a sampler (12 Region A).
+            SAMPLER..=SAMPLER_END if self.has_sampler() => {
+                self.lend_ddr(ctx);
+                self.sync(ctx.now);
+                if let Some(b) = &mut self.backend {
+                    b.sampler_write((off - SAMPLER) as u16, val);
+                }
+                self.return_ddr();
+                self.update_uci(ctx);
+            }
             MATRIX..=MATRIX_END => {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
@@ -723,6 +767,8 @@ impl IoDevice for C64Port {
                 Some(b) => b.uci_read((off - UCI) as u16),
                 None => self.uci.get(off - UCI),
             },
+            // Ultimate Audio: `sampler_read` is side-effect free, so a peek is the same read (S16 §3.1).
+            SAMPLER..=SAMPLER_END => self.backend.as_ref().filter(|b| b.has_sampler()).map_or(0, |b| b.sampler_read((off - SAMPLER) as u16)),
             BASIC..=CHAR_END => {
                 let (rom, rel) = Self::rom_window(off);
                 match &self.backend {
@@ -773,8 +819,6 @@ pub fn install(map: &mut IoMap, _cfg: &MachineConfig) {
     add_table(map, 0x1004_2000, 0x1000, "legacy-sid", &[]);
     // CART_TIMING_BASE == COPPER_BASE (00 §1c M2): developer bus measurement only (c64.cc:1793-1852).
     add_table(map, 0x1004_6000, 0x800, "cart-timing", &[]);
-    // Sampler, 256 B aliased over 8 K: never read, reset writes only (12 Region A).
-    add_table(map, 0x1004_8000, 0x2000, "sampler", &[]);
     // C64_PLD_ACC: `release_ownership` reads 0x10181000/01 and writes 0x10181010/11 (00 §2 C32).
     add_table(map, 0x1018_1000, 0x100, "c64-pld", RAM_PAGE);
     // U64_DEBUG_REGISTER: REST / socket read-back (route_machine.cc:462-490).
@@ -1017,6 +1061,52 @@ mod tests {
         assert_eq!(rig.r8(0x1018_1010), 0x5A, "PLD");
         rig.w8(0x1018_0800, 0x5A);
         assert_eq!(rig.r8(0x1018_0800), 0, "palette is write-only");
+    }
+
+    /// S16: the firmware window at `SAMPLER_BASE`. Without a block it is RAZ/WI, which is what it was before — the
+    /// firmware clears the voices on every C64 reset whether or not the FPGA has a sampler.
+    #[test]
+    fn sampler_window_follows_the_backend() {
+        const SAMPLER_ADDR: u32 = 0x1004_8000;
+        let mut b = Bench::new();
+        b.w8(SAMPLER_ADDR, 0xFF);
+        assert_eq!(b.r8(SAMPLER_ADDR), 0, "no block: the window swallows writes and reads 0");
+        assert_eq!(b.r8(SAMPLER_ADDR + 1), 0, "not even a version byte");
+        assert_eq!(b.mock.take(), [], "and nothing reaches the backend");
+
+        *b.mock.sampler.borrow_mut() = Some(mock::Sampler::default());
+        b.w8(SAMPLER_ADDR + 0x0E, 0x01);
+        b.w8(SAMPLER_ADDR + 0x0F, 0x18);
+        assert_eq!(b.mock.take(), [Call::Sampler(0x0E, 0x01), Call::Sampler(0x0F, 0x18)]);
+        assert_eq!(b.mock.sampler.borrow().as_ref().unwrap().regs[0x0E], 0x01, "the rate's high byte, MSB first");
+
+        // Only bit 0 of the offset is decoded: even is the IRQ status vector, odd the version constant.
+        b.mock.sampler.borrow_mut().as_mut().unwrap().status = 0x05;
+        assert_eq!(b.r8(SAMPLER_ADDR), 0x05);
+        assert_eq!(b.r8(SAMPLER_ADDR + 0xE0), 0x05, "every even offset is the same vector");
+        assert_eq!(b.r8(SAMPLER_ADDR + 1), 0x10, "every odd one the version");
+        assert_eq!(b.r8(SAMPLER_ADDR + 0x0D), 0x10);
+        // A peek is the same read: `sampler_read` clears no latch.
+        assert_eq!(b.port().peek8(SAMPLER + 0x0D), 0x10);
+        assert_eq!(b.port().peek8(SAMPLER + 0x0C), 0x05);
+        // 256 bytes aliased over 8 K (`sampler_regs.vhd:58,90`).
+        assert_eq!(b.r8(SAMPLER_ADDR + 0x1FFF), 0x10);
+    }
+
+    /// C64_SAMPLER_ENABLE keeps its latch, because the firmware reads it back and prints it as `Sampler: %b`
+    /// (c64.cc:1290-1291), and the backend hears every write.
+    #[test]
+    fn the_sampler_enable_latch_reaches_the_backend() {
+        const SAMPLER_ENABLE_ADDR: u32 = 0x1004_000E;
+        let mut b = Bench::new();
+        assert_eq!(b.r8(SAMPLER_ENABLE_ADDR), 0, "cleared at the start of set_emulation_flags");
+        b.mock.take();
+        b.w8(SAMPLER_ENABLE_ADDR, 0x01);
+        assert_eq!(b.r8(SAMPLER_ENABLE_ADDR), 0x01, "the read-back the firmware prints");
+        assert_eq!(b.mock.take(), [Call::SamplerEnable(true)]);
+        b.w8(SAMPLER_ENABLE_ADDR, 0xFE);
+        assert_eq!(b.r8(SAMPLER_ENABLE_ADDR), 0, "one bit wide");
+        assert_eq!(b.mock.take(), [Call::SamplerEnable(false)]);
     }
 
     #[test]
