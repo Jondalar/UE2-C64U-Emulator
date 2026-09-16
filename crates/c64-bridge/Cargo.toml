@@ -7,9 +7,10 @@ license.workspace = true
 
 [dependencies]
 ue2-core = { path = "../ue2-core" }
-# TRX64 (GPL-3.0-or-later), pinned to main 2b145c9 = v0.6.0, the release that brings the expansion port (Spec 850),
-# the `u64` machine profile (851) and the UCI block (852) this bridge uses. It also drives TRX64's public internals
+# TRX64 (GPL-3.0-or-later), pinned to main f370a56 = v0.7.0: the expansion port (Spec 850), the `u64` machine profile
+# (851) and the UCI block (852) this bridge uses, plus the REU and its borrowed store (853, 854). It also drives
+# TRX64's public internals
 # (`memconfig_table`/`pla_index`, the cartridge slot; docs/specs/S14-c64-trx64.md §4-§8), so an upstream refactor can
 # break the build or change behaviour: re-run the tests and the C64 smokes (docs/status/c64.md) before moving `rev`.
 # trx64-core's build.rs compiles vendored reSID C++.
-trx64-core = { git = "https://github.com/Jondalar/TRX64", rev = "2b145c9398c523da73c02544cf88720ae4544468" }
+trx64-core = { git = "https://github.com/Jondalar/TRX64", rev = "f370a56db382a83475bb9077cdaefaa65c909b89" }
