@@ -251,3 +251,6 @@ stretched read advances `stalled_on_bus + 1` times, and the state lives in TRX64
    (ultimate_logic_32.vhd:531). Does anything besides the system reset clear enabled, ERROR or bus_id?
 6. **Unlock ack.** `C64_POKE(0xD038, 0)` is taken as the ack for high IRQ 6 because it is what the handler does and
    the ITU has no ack register. Whether the real source is the write or something else in the closed core is unknown.
+   TRX64 confirmed its own side (2026-09-16): both events are one-shot — `take_events` drains the struct
+   (TRX `uci.rs:435`) and nothing re-raises it, and the only level it computes is the command handshake
+   (`uci.rs:428-430`). The ITU level, and dropping it on the `$D038` write, are UE2's policy, not hardware.

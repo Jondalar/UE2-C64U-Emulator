@@ -159,6 +159,7 @@ registers. Run as `[E2E_REST_SHIM=1] scripts/run-e2e.sh quick -s uci-targets`:
 |---|---|
 | raw | FAIL at `[01] reset the C64 so the command interface starts idle`: `PUT http://127.0.0.1/v1/machine:reset` refused — **H1**, the suite builds that one URL without the port. All 9 scenarios then SKIP. The health sweep's REST on the forwarded port is fine in the same run (`rest=11ms`). |
 | shim | **OK — 46 checks, 38.4 s**, all three attempts unnecessary (first attempt passed). |
+| shim, on the public pin | Re-run after the pin moved to TRX64 v0.6.0 (`2b145c9`): **OK — 46 checks, 35.2 s**, 1 of 1 suite runs passed. |
 
 With the shim every scenario passes: transport, control-target, palette, issue-740-matrix,
 save-reu-offset-past-end, load-reu-disabled, save-reu-disabled, softiec-single-part-reply, interface-usable-after,
