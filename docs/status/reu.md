@@ -93,7 +93,18 @@ preload does, and the C64's fetch brings that changed byte back.
 
 ## TRX64 findings (Spec 854)
 
-Two things worth carrying back upstream, both confirmed while building this:
+Reported upstream and **confirmed there on 2026-09-16**, with fixes planned for a 0.7.1 rather than built into 0.7.0:
+
+- **The port reset is a TRX64 defect, not a design choice.** A real expansion port carries /RESET, so an REU sees a
+  C64 reset: its REC registers go back to power-on while the DRAM keeps its contents (VICE `c64carthooks.c:2412`
+  calls `reu_reset`). TRX64's `cold_reset` reaches `Machine::cartridge` only. 850's blanket "no reset calls a device"
+  is right for UCI (`command_protocol.vhd` clears that block on the FPGA reset alone) and wrong for the REU, so the
+  fix is a per-device `reset()`. **The bridge's own REC reset on a reset release is therefore temporary** — correct
+  today, redundant once 0.7.1 lands, and not something to build further on.
+- **The `Option<u8>` change below is coming**, which is a breaking change to the trait this bridge implements: one
+  signature edit here, announced before it lands.
+
+The two findings themselves, both confirmed while building this:
 
 1. **The trait is held; our DDR is only lent.** 854 D1 is right that a `'static` device cannot hold a `&mut [u8]`,
    but the consequence for a host that lends its memory per access is that the store cannot wrap the borrow — it has
