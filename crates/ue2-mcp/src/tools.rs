@@ -244,8 +244,8 @@ pub struct UsbSyncParams {
     pub id: String,
     /// USB hub port 1-3 (usb_dirs take ports 1.. in order). Default: every usb_dirs stick.
     pub port: Option<u8>,
-    /// Override the mass-deletion guard, which refuses a sync that would delete or overwrite more than 25 % of the
-    /// files or more than 50. Check the stick first. Not with replug.
+    /// Override the mass-deletion guard, which refuses a sync that would delete more than 25 % of the files or
+    /// more than 50. Overwrites do not count. Check the stick first. Not with replug.
     pub force: Option<bool>,
     /// Unplug the stick, sync, rebuild the volume from the host directory and plug it back in (usb-replug), so the
     /// firmware sees host changes now. On a port without usb_dirs: just unplug and plug in.
@@ -526,9 +526,10 @@ commands no dedicated tool covers; use emu_stop instead of `quit`.")]
     #[tool(description = "Sync a usb_dirs stick now: write the guest's changes to its host directory (control \
 command usb-sync). With replug=true: unplug the stick, sync, rebuild the volume from the host directory and plug it \
 back in (usb-replug), so the firmware sees host changes at once; on a port without usb_dirs this just unplugs and \
-plugs in the device. port picks a hub port 1-3, default every usb_dirs stick. A sync that would delete or overwrite \
-more than 25 % of the files (or more than 50) is refused and returns FAIL until force=true; an image that does not \
-parse (firmware crashed mid-write) is never synced. discard=true (with replug) keeps the old image aside unsynced. \
+plugs in the device. port picks a hub port 1-3, default every usb_dirs stick. A sync that would delete more than \
+25 % of the files (or more than 50) is refused and returns FAIL until force=true; overwrites do not count. An \
+image that does not parse (firmware crashed mid-write) is never synced. discard=true (with replug) keeps the old \
+image aside unsynced. \
 Returns PASS with one line per action (written, moved to .ue2-trash, conflict copies).")]
     async fn emu_usb_sync(&self, Parameters(p): Parameters<UsbSyncParams>) -> ToolResult {
         finish(self.usb_sync(p).await)

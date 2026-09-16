@@ -377,17 +377,18 @@ mounted D64: console `Writing back binary track 18...`, `Writing back binary tra
 directory of the image the run kept (`run/xander/r3/out-time.d64`, read out of the stick image with
 `d64tool.py sd-get`).
 
-**A second emulator gap, from that last step: `--usb-dir` cannot sync back a one-file stick.** The changed D64 never
-reached the host directory:
+**A second emulator gap, from that last step: `--usb-dir` could not sync back a one-file stick.** The changed D64
+never reached the host directory:
 
 ```
 usb-dir port 1 (…/share-time): REFUSED: this sync would delete or overwrite 1 of 1 files on the host
 (limit: 25 % or 50); nothing synced, the image is kept; check the stick, then run usb-sync --force
 ```
 
-With a single file on the stick every guest change is 100 % of it and always trips the mass-deletion guard
-(`docs/status/usb-dir.md`). The documented way out is `usb-sync --force`; the evidence above was read out of the
-kept image instead.
+The guard counted an overwrite as destructive, so with a single file on the stick every guest change was 100 % of
+it. **Fixed:** the guard now counts deletions only (`docs/status/usb-dir.md`), which is what it is named for and
+what the trash exists for. At the time of the run the way out was `usb-sync --force`; the evidence above was read
+out of the kept image instead.
 
 Screenshots (2×, nearest-neighbour) under `run/xander/shots/geos/`: `01-boot-screen.png`, `02-desktop.png`,
 `03-desktop-after-key-sweep.png`, `04-desktop-with-geoutools.png`, `05-geoumount-uci-browser.png`,

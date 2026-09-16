@@ -91,9 +91,10 @@ target/release/ue2emu run --flash run/flash.bin --usb-dir /path/to/share,size=2G
    valid UTF-16 is a parse error.
 2. **Plan.** `sync::plan` diffs the image tree against the manifest's **image** side, not against the host: new,
    modified (SHA-256 differs), deleted.
-3. **Guard.** `sync::guard` refuses a plan that deletes or overwrites more than 25 % of the manifest's files, or more
-   than 50. Nothing is synced, the image is kept, and automatic syncs and replugs stop until an explicit `usb-sync`
-   (`--force`) succeeds.
+3. **Guard.** `sync::guard` refuses a plan that **deletes** more than 25 % of the manifest's files, or more than 50.
+   Nothing is synced, the image is kept, and automatic syncs and replugs stop until an explicit `usb-sync`
+   (`--force`) succeeds. Overwrites do not count: writing back a file the guest changed is the purpose of the sync,
+   and counting it meant a stick with fewer than four files could never sync a single edit.
 4. **Apply.** `sync::apply` writes each change to the host with the rules below, then saves the manifest (image side
    from the snapshot, host side from the host after writing).
 5. **Incomplete.** A guest file or directory that could not be written anywhere (permissions, a full disk, a name the
@@ -163,8 +164,8 @@ target/release/ue2emu run --flash run/flash.bin --usb-dir /path/to/share,size=2G
 - **Reserved names:** a guest file or directory named `.DS_Store`, `._*`, `.ue2-trash` or `.ue2-tmp-*` is written as
   `ue2-renamed-<name>` (the host side never imports those names, so the guest's data would be lost otherwise). The
   rebuild shows it to the guest under the new name.
-- **Guard:** more than 25 % or more than 50 deleted plus overwritten files → refused until forced. It applies to
-  automatic syncs, `usb-replug` and the sync at quit; only `usb-sync --force` overrides it.
+- **Guard:** more than 25 % of the files deleted, or more than 50 → refused until forced. Overwrites are not counted.
+  It applies to automatic syncs, `usb-replug` and the sync at quit; only `usb-sync --force` overrides it.
 - **Parse check:** an image that fails it is never synced.
 - **Idempotence:** a file that already has the guest content counts as written, a missing one as deleted. A sync
   interrupted by a crash (manifest not saved) can run again without duplicates. The `unsynced` marker makes the next

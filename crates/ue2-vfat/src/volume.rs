@@ -29,7 +29,8 @@ pub const SNAPSHOT: &str = "snapshot.img";
 pub enum SyncError {
     /// The image does not parse cleanly (the guest may have crashed or been unplugged mid-write).
     Parse(String),
-    /// The mass-deletion guard refused it: destructive changes, files in the manifest.
+    /// The mass-deletion guard refused it: host files the sync would delete, files in the manifest. Overwrites are
+    /// not counted (`sync::Plan::destructive`).
     Guard { destructive: usize, files: usize },
     Io(String),
     /// Applied in part: some guest changes could not be written to the host ([`Report::failed`]). What was written
@@ -43,8 +44,8 @@ impl std::fmt::Display for SyncError {
             SyncError::Parse(e) => write!(f, "the image does not parse cleanly, nothing synced ({e}); the image is kept"),
             SyncError::Guard { destructive, files } => write!(
                 f,
-                "REFUSED: this sync would delete or overwrite {destructive} of {files} files on the host (limit: 25 % or \
-                 50); nothing synced, the image is kept; check the stick, then run usb-sync --force"
+                "REFUSED: this sync would delete {destructive} of {files} files on the host (limit: 25 % or 50); \
+                 nothing synced, the image is kept; check the stick, then run usb-sync --force"
             ),
             SyncError::Io(e) => write!(f, "sync failed: {e}"),
             SyncError::Incomplete(report) => write!(

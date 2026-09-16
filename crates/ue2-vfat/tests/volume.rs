@@ -203,6 +203,33 @@ fn host_changes_win_and_the_guest_version_becomes_a_conflict_copy() {
 }
 
 #[test]
+fn a_one_file_stick_syncs_its_only_file_back() {
+    // The guard counts deletions, not overwrites. It used to count both, so one edit on a stick with fewer than
+    // four files was always more than a quarter of them and could never be written back (docs/status/usb-dir.md).
+    let tmp = tempfile::tempdir().unwrap();
+    let (host, work) = (tmp.path().join("One File"), tmp.path().join("work"));
+    fs::create_dir_all(&host).unwrap();
+    fs::write(host.join("slots.cfg"), b"v1").unwrap();
+    let mut vol = DirVolume::open(&spec(&host), &work).unwrap();
+    let image = vol.prepare().unwrap().image;
+    assert_eq!(vol.manifest().unwrap().files(), 1);
+
+    guest(&image, |root| write_guest_file(root, "slots.cfg", b"v2 from the guest"));
+    let snap = snapshot(&image, &work);
+    let report = vol.sync(&snap, false).unwrap();
+
+    assert_eq!(report.written, 1);
+    assert_eq!(report.trashed, 0);
+    assert_eq!(fs::read(host.join("slots.cfg")).unwrap(), b"v2 from the guest");
+
+    // Deleting that one file is still a deletion of 100 %, so the guard stops it.
+    guest(&image, |root| root.remove("slots.cfg").unwrap());
+    let snap = snapshot(&image, &work);
+    assert_eq!(vol.sync(&snap, false).unwrap_err(), SyncError::Guard { destructive: 1, files: 1 });
+    assert!(host.join("slots.cfg").exists(), "nothing touched");
+}
+
+#[test]
 fn the_mass_deletion_guard_refuses_until_forced() {
     let s = setup(2);
     let mut vol = DirVolume::open(&spec(&s.host), &s.work).unwrap();

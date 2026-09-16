@@ -16,7 +16,7 @@
 //!   changed since the last sync is kept;
 //! - a guest name the host side never imports (`.DS_Store`, `._*`, `.ue2-trash`, `.ue2-tmp-*`) is written as
 //!   `ue2-renamed-<name>`;
-//! - [`guard`]: a sync that would delete or overwrite more than 25 % of the files, or more than 50, is refused
+//! - [`guard`]: a sync that would delete more than 25 % of the files, or more than 50, is refused
 //!   unless forced.
 //!
 //! A guest change that cannot be written anywhere (permissions, a full disk, ...) counts in [`Report::failed`]; the
@@ -60,9 +60,12 @@ impl Plan {
             && self.modified_files.is_empty()
     }
 
-    /// Host files this plan would delete or overwrite.
+    /// Host files this plan would delete. Overwrites are **not** counted: writing a file the guest just changed is
+    /// what a sync is for, and counting it made the guard fire on normal use — one edit on a stick with fewer than
+    /// four files is always more than a quarter of them, so such a stick could never sync at all. Deletions are the
+    /// loss this guard exists for, and they go to the trash even when it lets them through.
     pub fn destructive(&self) -> usize {
-        self.deleted_files.len() + self.modified_files.len()
+        self.deleted_files.len()
     }
 }
 
@@ -107,8 +110,8 @@ pub fn plan(manifest: &Manifest, tree: &ImageTree) -> Plan {
     plan
 }
 
-/// The mass-deletion guard: `Err((destructive, files))` when the plan deletes or overwrites more than a quarter of
-/// the manifest's `files`, or more than [`GUARD_MAX`].
+/// The mass-deletion guard: `Err((destructive, files))` when the plan deletes more than a quarter of the manifest's
+/// `files`, or more than [`GUARD_MAX`]. Overwrites are not deletions and do not count ([`Plan::destructive`]).
 pub fn guard(plan: &Plan, files: usize) -> Result<(), (usize, usize)> {
     let destructive = plan.destructive();
     if destructive > GUARD_MAX || destructive * GUARD_SHARE_DIVISOR > files {
@@ -812,6 +815,10 @@ mod tests {
     fn guard_limits() {
         let plan = |n| Plan { deleted_files: (0..n).map(|i| i.to_string()).collect(), ..Plan::default() };
         assert_eq!(guard(&plan(1), 4), Ok(()), "25 % is allowed");
+        // Overwrites are not deletions: the one file of a one-file stick may be written back.
+        let overwrites = |n| Plan { modified_files: (0..n).map(|i| i.to_string()).collect(), ..Plan::default() };
+        assert_eq!(guard(&overwrites(1), 1), Ok(()), "the only file, rewritten");
+        assert_eq!(guard(&overwrites(80), 80), Ok(()), "every file rewritten, none lost");
         assert_eq!(guard(&plan(2), 7), Err((2, 7)), "more than 25 %");
         assert_eq!(guard(&plan(50), 1000), Ok(()));
         assert_eq!(guard(&plan(51), 1000), Err((51, 1000)), "more than 50");
