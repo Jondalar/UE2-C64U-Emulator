@@ -84,7 +84,7 @@ the IRQ latches are cleared), which is why the firmware clears the voices in sof
 | Firmware console | `Sampler found in FPGA... IO map: Enabled!`, cart init `Sampler: 01` |
 | `scripts/smoke-c64-carts.ctl` | 27 PASS, 0 FAIL — the standing gate for the shared paths this work touched (`peek8`, `write8`, `set_reset`, `advance_to`), which the change analysis rates critical |
 | heartbeat-demo v1.0.1 | `Audio : [ OK ]  v16` — it passes the check that used to send it back to BASIC, and goes on to `Song : [ OK ] tempo 88, 8 SIDs` and its start prompt (`run/xander/ctl/07-heartbeat.ctl`) |
-| UltimateDemo2026 v1.0.1 | **unresolved.** Detection passes and the PRG loads, then the screen stays black for 250 s emulated and the capture is silent after the first 10 s. The earlier survey recorded every scene drawing while audio failed, so its behaviour changed; the cause is not established (S16 §6) |
+| UltimateDemo2026 v1.0.1 | runs: detection passes, the MOD loads over UCI into the REU, the scenes draw and the MOD plays (headless: sound from 20 s on, the tunnel scene at 180 s; also watched live). It drew black until TRX64 `1ce84b0` and S17; which change fixed it was not isolated (S16 §6) |
 | heartbeat-demo playback | the song plays: `--audio-wav` carries 40 s of sound at about 46000 peak-to-peak of 65535, from 70 s emulated on. The start prompt needs the menu button pressed first, because "Run Cart" leaves the keyboard with the firmware menu (an open gap of its own, `docs/status/c64.md`) |
 
 The unit tests cover the register file (big-endian assembly, the write holes, both read decodes, power-up values),

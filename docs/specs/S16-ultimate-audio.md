@@ -306,10 +306,7 @@ The default word becomes **0x34E40222** with USB, EEPROM, UCI and the sampler.
 4. **Interleave with 8-bit** is decoded (step +2) but no client uses it; untested against hardware.
 5. **Whether the firmware ever reads the block.** It does not today (`docs/hw/12-gaps.md` Region A: "Firmware
    READS: none"), so the firmware face is write-only in practice.
-6. **Why UltimateDemo2026 draws nothing.** With the block modelled it passes `audio_detect()` and loads, then shows
-   a black screen for 250 s emulated; before it, the same program drew every scene with audio failing
-   (`docs/status/xander-tests.md` §2). It is the one program whose behaviour got worse, and the cause is not
-   established — the path it now takes (load the MOD into the REU over UCI, then drive the voices) is one it never
-   entered before, so a hang there would be newly reachable rather than newly broken. Two control runs settled
-   nothing: `--caps` could not clear the capability until this work made an explicit word authoritative, and the
-   run that used it stopped at the demo's REU check.
+6. **Resolved: UltimateDemo2026's black screen.** After S16 the demo passed `audio_detect()` and loaded, then drew
+   black. With TRX64 pinned at `1ce84b0` (0.7.2's UCI response-pointer fix plus Spec 855) and S17 it loads its MOD
+   over UCI into the REU, draws its scenes and plays the MOD. Which change fixed it was not isolated; an earlier
+   test against a TRX64 copy with only the pointer fix still drew black.

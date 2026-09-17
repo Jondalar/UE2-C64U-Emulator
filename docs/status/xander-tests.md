@@ -45,11 +45,11 @@ Three emulator gaps, in the order they cost the most:
    (`docs/specs/S16-ultimate-audio.md`, `docs/status/sampler.md`) — eight voices, both register faces, the mixer and
    the IRQ. **heartbeat-demo** reads `Audio : [ OK ]  v16`, loads its song (`Song : [ OK ] tempo 88, 8 SIDs`) and
    **plays it**: an `--audio-wav` capture carries 40 s of sound at about 46000 peak-to-peak of 65535, where the
-   program used to fail the check and return to BASIC. **UltimateDemo2026 is not resolved.** It passes detection and
-   loads (`DMA load complete: $0801-$97C8`), then draws a black screen for 250 s emulated, where this survey
-   recorded every scene. Whether the sampler causes that is open (S16 §6): two control runs proved nothing, one
-   because `--caps` could not clear the capability at the time, one because the demo failed its REU check first.
-2. **A UCI DOS read of an existing 24 KB file stalls near the end — diagnosed, and the cause is TRX64's.**
+   program used to fail the check and return to BASIC. **UltimateDemo2026** runs as well: it passes detection, loads
+   its MOD over UCI into the REU, draws its scenes and plays the MOD (headless: sound from 20 s on, the tunnel scene
+   at 180 s; also watched live). It drew black after S16 until TRX64 was pinned at `1ce84b0` and S17 landed; which
+   change fixed it was not isolated (S16 §6).
+2. **A UCI DOS read of an existing 24 KB file stalled near the end — fixed in TRX64.**
    UBoot64 writes `DMBSLT.CFG` (24480 B) on its first run and reaches its menu; on every later run it reads the same
    file back and stops at `Reading slot data to 24261` / `24270` / `24279` / `24285` / `24289` / `24324` — within
    220 bytes of the end, at a different byte each run.
@@ -64,11 +64,11 @@ Three emulator gaps, in the order they cost the most:
    **Verified**, not guessed: the firmware-side register trace shows the last exchange complete correctly
    (`STATUSBYTE 0x11` → command accepted → `RESPONSE_LEN 0` → validate without the "more" bit), and a copy of the
    TRX64 checkout with the advance changed to exactly one byte per read gets UBoot64 to its menu
-   (`F1 Filebrowser … Make your choice.`) with nothing else altered. Reported to TRX64 with that repro; the fix is
-   theirs, and the emulator works around nothing.
+   (`F1 Filebrowser … Make your choice.`) with nothing else altered. Reported to TRX64 with that repro and fixed there
+   (`db882f4`, 0.7.2: one completed read consumes one byte). With the pin at `1ce84b0` UBoot64 reaches its menu on a
+   stick that already holds `DMBSLT.CFG`; the emulator works around nothing.
 
-   Unblocks: UBoot64's menu slots, which are the program's whole point. It does **not** explain UltimateDemo2026's
-   black screen — the same patched copy leaves that unchanged (S16 §6).
+   Unblocks: UBoot64's menu slots, which are the program's whole point.
 3. **"Run Cart" leaves the keyboard with the firmware menu.** After the browser's `Run Cart` the console never
    prints `MENU HIDE / EXIT.` (the `Run` path for a PRG always does), so C64 keys reach the firmware UI instead of
    the cartridge — `key f2` built the firmware's *config* browser (`Creating config menu...`,
