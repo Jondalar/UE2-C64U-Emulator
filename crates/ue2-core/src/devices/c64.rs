@@ -48,9 +48,14 @@ const UCI_END: u32 = UCI + 0xFFF;
 /// (docs/specs/S16-ultimate-audio.md).
 const SAMPLER: u32 = 0x4_8000;
 const SAMPLER_END: u32 = SAMPLER + 0x1FFF;
+/// UltiSID: `U64_AUDIO_MIXER` 0x10100500 (u64.h:16), twenty write-only bytes that reach the backend. The speaker mixer
+/// at +0x40 and the resampler at +0x80 stay write sinks, and the whole page reads 0 (docs/specs/S17-ultisid.md §2.5).
+const MIXER: u32 = 0x10_0500;
+const MIXER_END: u32 = MIXER + 0xFF;
+const MIXER_BYTES: u32 = 20;
 
 /// (offset, size) of every [`C64Port`] window.
-const WINDOWS: [(u32, u32); 12] = [
+const WINDOWS: [(u32, u32); 13] = [
     (DRIVE_A, 0x4000),
     (CART, 0x100),
     (DMA, 0x1_0000),
@@ -63,6 +68,7 @@ const WINDOWS: [(u32, u32); 12] = [
     (EEPROM, 0x1000),
     (UCI, 0x1000),
     (SAMPLER, 0x2000),
+    (MIXER, 0x100),
 ];
 
 /// UltiCommand interface 0x10044000 without a backend that has the block (command_protocol.vhd; moved here from
@@ -721,6 +727,12 @@ impl IoDevice for C64Port {
                     b.eeprom_write((off - EEPROM) as u16, val);
                 }
             }
+            // UltiSID: like the core config, the gains need no sync; they apply from the backend's next samples on.
+            MIXER..=MIXER_END => {
+                if let Some(b) = self.backend.as_mut().filter(|_| off - MIXER < MIXER_BYTES) {
+                    b.mixer_write((off - MIXER) as u8, val);
+                }
+            }
             CORE..=CORE_END => self.core_write(off - CORE, val),
             PALETTE..=PALETTE_END => {
                 if let Some(b) = self.backend.as_mut().filter(|_| off - PALETTE < PALETTE_RGB_SIZE) {
@@ -778,7 +790,7 @@ impl IoDevice for C64Port {
             }
             // W4-DRIVE: drive A.
             DRIVE_A..=DRIVE_A_END => self.drive_a.peek(off - DRIVE_A),
-            // The palette is write-only (u64_config.cc:2724-2763).
+            // The palette (u64_config.cc:2724-2763) and the mixers (1333-1334) are write-only.
             _ => 0,
         }
     }
@@ -1091,6 +1103,24 @@ mod tests {
         assert_eq!(b.port().peek8(SAMPLER + 0x0C), 0x05);
         // 256 bytes aliased over 8 K (`sampler_regs.vhd:58,90`).
         assert_eq!(b.r8(SAMPLER_ADDR + 0x1FFF), 0x10);
+    }
+
+    /// UltiSID: the first twenty bytes of the mixer page reach the backend; the rest swallows writes; all of it reads 0.
+    #[test]
+    fn mixer_writes_reach_the_backend() {
+        const MIXER_ADDR: u32 = 0x1010_0500;
+        let mut b = Bench::new();
+        b.mock.take();
+        b.w8(MIXER_ADDR, 0x5A);
+        b.w8(MIXER_ADDR + 0x13, 0x04);
+        b.w8(MIXER_ADDR + 0x14, 0x77);
+        b.w8(MIXER_ADDR + 0x40, 0x55);
+        let calls = [Call::Mixer(0x00, 0x5A), Call::Mixer(0x13, 0x04)];
+        assert_eq!(b.mock.take(), calls, "no sync, and the speaker mixer stays a sink");
+        for off in [0x00, 0x13, 0x14, 0x40, 0xFF] {
+            assert_eq!(b.r8(MIXER_ADDR + off), 0, "write-only: {off:#x}");
+        }
+        assert_eq!(b.mock.take(), [], "a read reaches nothing");
     }
 
     /// C64_SAMPLER_ENABLE keeps its latch, because the firmware reads it back and prints it as `Sampler: %b`

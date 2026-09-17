@@ -187,6 +187,12 @@ pub trait C64Backend {
     /// `C64_SAMPLER_ENABLE` (cart regs +0xE, c64.h:68): map the block at `$DF20-$DFFF` for the C64, or take it away.
     /// The register itself stays the latch the firmware reads back (c64.cc:1362).
     fn set_sampler_enabled(&mut self, _on: bool) {}
+
+    // ---- UltiSID: the audio mixer (docs/specs/S17-ultisid.md) ----
+
+    /// `U64_AUDIO_MIXER` 0x10100500 + `off`, `off` < 20: two bytes per channel, 0 UltiSID 1, 1 UltiSID 2, 2 socket 1,
+    /// 3 socket 2, 4-5 sampler, 6-7 drives, 8-9 tape (u64_config.cc:1349-1358). Write-only.
+    fn mixer_write(&mut self, _off: u8, _val: u8) {}
 }
 
 // ---- CARTSLOT: a physical cartridge in the expansion port (docs/status/cart-slot.md) ----
@@ -380,6 +386,8 @@ pub(crate) mod mock {
         Sampler(u16, u8),
         /// C64_SAMPLER_ENABLE.
         SamplerEnable(bool),
+        /// U64_AUDIO_MIXER write (offset, value).
+        Mixer(u8, u8),
     }
 
     /// Shared with the test after the backend moved into the device.
@@ -550,6 +558,10 @@ pub(crate) mod mock {
                 s.enabled = on;
             }
             self.push(Call::SamplerEnable(on));
+        }
+
+        fn mixer_write(&mut self, off: u8, val: u8) {
+            self.push(Call::Mixer(off, val));
         }
     }
 }

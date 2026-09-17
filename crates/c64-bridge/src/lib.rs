@@ -67,8 +67,8 @@ const BASIC_ROM: &str = "basic.bin";
 const KERNAL_ROM: &str = "kernal.901227-03.bin";
 const CHAR_ROM: &str = "characters.901225-01.bin";
 
-/// DMA reads here that no modelled SID decodes return 0 while I/O is mapped: socket 2 and UltiSID 2 are not modelled,
-/// so their detectors report "none" (S14 §W4-SID; doc 10 H12/H13).
+/// DMA reads here that no SID decodes return 0 while I/O is mapped: an empty socket's detector reports "none" (S14
+/// §W4-SID; doc 10 H12/H13).
 const SID_WINDOW: RangeInclusive<u16> = 0xD400..=0xD7FF;
 
 /// TRX64 access-watch table of the cartridge I/O `$DE00-$DFFF`, for carts whose lines change on reads.
@@ -111,7 +111,7 @@ pub struct Trx64Backend {
     turbo_regs_en: u8,
     speed_prefer: u8,
     palette: Palette,
-    /// Socket 1 (ARMSID) and UltiSID 1 on reSID, and the sample stream (S14 §W4-SID).
+    /// The sockets and UltiSIDs on reSID, the mixer and the sample stream (S17).
     sid: sid::Sid,
     /// W4-DRIVE: drive A on TRX64's drive 8 (drive.rs).
     drive: drive::DriveA,
@@ -157,8 +157,9 @@ impl Trx64Backend {
         }
         m.full_assembled = true;
         m.cold_reset();
-        let sid = sid::Sid::new();
-        sid.install_hook(&mut m.sid);
+        // S17: TRX64's SID write trace, host door and decode table (Spec 855); the machine keeps them across resets.
+        let mut sid = sid::Sid::new();
+        sid.install(&mut m);
         let drive = drive::DriveA::new(&mut m);
         // S16: the sampler is on the port for the life of the machine, as it is in the FPGA; `C64_SAMPLER_ENABLE`
         // gates the window, not the block's existence. Attaching it before any REU also settles who answers
@@ -203,6 +204,14 @@ impl Trx64Backend {
     /// Fit the ARMSID in SID socket 1 (`true`) or leave the socket empty, the default (S14 §W4-SID).
     pub fn set_sid_socket1(&mut self, fitted: bool) {
         self.sid.set_socket1(fitted);
+        self.update_sid_map();
+    }
+
+    /// S17: hand TRX64 the SID decode table when the decode changed it (855 D2).
+    fn update_sid_map(&mut self) {
+        if let Some(map) = self.sid.take_map() {
+            self.m.set_sid_map(map);
+        }
     }
 
     /// Plug the cartridge, under the forced ULTIMAX decode when set, into TRX64 and re-run its PLA. Without a cartridge
@@ -520,17 +529,14 @@ impl C64Backend for Trx64Backend {
         }
     }
 
-    /// A decoded SID write reaches reSID as well as TRX64's own bus (its register shadow, or the cartridge).
+    /// Through TRX64's live bus. A SID write there reaches TRX64's register files and its write trace, whose records
+    /// reach reSID at the C64's current cycle (S17 §2.3).
     fn dma_write(&mut self, addr: u16, val: u8, mem_only: bool) {
         if mem_only {
             self.m.ram[usize::from(addr)] = val;
         } else {
-            if self.m.memconfig.io && sid::Sid::window(addr) {
-                let clk = self.m.c64_core.clk;
-                self.sid.write(addr, val, clk);
-            }
             self.m.write_full(addr, val);
-            self.sid.clear_hit();
+            self.sid.dma_written(self.m.c64_core.clk);
             if self.m.cartridge.is_some() {
                 self.cart_changed();
             }
@@ -594,10 +600,16 @@ impl C64Backend for Trx64Backend {
         self.palette.set_byte(off, val);
     }
 
-    /// The SID decode and UltiSID settings (S14 §W4-SID), and CARTSLOT's C64_BUS_BRIDGE / C64_BUS_INTERNAL /
+    /// S17 §2.5: the SID channels weight reSID; the sampler, drive and tape channels are not applied.
+    fn mixer_write(&mut self, off: u8, val: u8) {
+        self.sid.mixer_write(off, val);
+    }
+
+    /// The SID decode and UltiSID settings (S17), and CARTSLOT's C64_BUS_BRIDGE / C64_BUS_INTERNAL /
     /// C64_BUS_EXTERNAL, which route each cartridge onto the bus from the next access on (slot.rs).
     fn core_config_write(&mut self, off: u8, val: u8) {
         self.sid.core_config(off, val);
+        self.update_sid_map();
         match off {
             // Spec 851 §6: the enable word and the preferred speed are latched and take effect on the update strobe,
             // as `setCpuSpeed` writes them (u64_config.cc:1634-1636).
@@ -875,7 +887,10 @@ mod tests {
             (0x0F, 0, 0),
             "UltiSID 1 (default map) on reSID: bus value of the last write, OSC3, ENV3"
         );
+        assert_eq!(c64.m.sid_chip_regs(0).map(|r| r[0x18]), Some(0x0F), "and TRX64's own register file");
         c64.core_config_write(0x0A, 0x01);
+        assert_eq!(c64.dma_read(0xD400, false), 0x0F, "UltiSID 2 is at $D400 too");
+        c64.core_config_write(0x0B, 0x01);
         assert_eq!(c64.dma_read(0xD400, false), 0, "no SID decodes $D400");
         c64.dma_write(0x0001, 0x34, false);
         c64.m.ram[0xD400] = 0x99;
@@ -883,15 +898,17 @@ mod tests {
         c64.dma_write(0x0001, 0x37, false);
     }
 
+    struct Collect(Rc<RefCell<Vec<i16>>>);
+
+    impl AudioSink for Collect {
+        fn samples(&mut self, pcm: &[i16]) {
+            self.0.borrow_mut().extend_from_slice(pcm);
+        }
+    }
+
     /// W4-SID: a 6510 program's SID writes reach reSID at their cycle; the sink gets emulated time's worth of samples.
     #[test]
     fn cpu_sid_writes_play_through_resid() {
-        struct Collect(Rc<RefCell<Vec<i16>>>);
-        impl AudioSink for Collect {
-            fn samples(&mut self, pcm: &[i16]) {
-                self.0.borrow_mut().extend_from_slice(pcm);
-            }
-        }
         let Some((mut c64, mut now)) = booted() else { return };
         let pcm = Rc::new(RefCell::new(Vec::new()));
         c64.set_audio(44_100, Box::new(Collect(Rc::clone(&pcm))));
@@ -913,6 +930,42 @@ mod tests {
         let mean = tail.iter().map(|&s| f64::from(s)).sum::<f64>() / tail.len() as f64;
         let rising = tail.windows(2).filter(|w| f64::from(w[0]) < mean && f64::from(w[1]) >= mean).count();
         assert!((495..=505).contains(&rising), "{rising} periods in 0.5 s");
+    }
+
+    /// S17 §4.3: the SID player's two-SID map, UltiSID 2 at $D420. A 6510 program's tone there plays through UltiSID 2's
+    /// reSID, and chip 0 — TRX64's own SID and UltiSID 1 — stays silent.
+    #[test]
+    fn ultisid_2_at_d420_plays_a_cpu_tone() {
+        let Some((mut c64, mut now)) = booted() else { return };
+        let pcm = Rc::new(RefCell::new(Vec::new()));
+        c64.set_audio(44_100, Box::new(Collect(Rc::clone(&pcm))));
+        // unmapAllSids, then SetSidAddress for UltiSID 1 and 2 (u64_config.cc:1886-1920, 2031).
+        for (off, val) in [(0x08, 0x01), (0x09, 0x01), (0x0A, 0x40), (0x0B, 0x42)] {
+            c64.core_config_write(off, val);
+            c64.core_config_write(off + 4, 0xFE);
+        }
+        assert_eq!(c64.m.sid_map()[1].chip, 1, "UltiSID 2 is chip 1");
+        let mut code = Vec::new();
+        for (reg, val) in [(0x18, 15), (0x05, 0), (0x06, 0xF0), (0x01, 66), (0x00, 133), (0x04, 0x21)] {
+            code.extend([0xA9, val, 0x8D, 0x20 + reg, 0xD4]);
+        }
+        let [lo, hi] = (0xC000 + code.len() as u16).to_le_bytes();
+        code.extend([0x4C, lo, hi]);
+        for (i, &b) in code.iter().enumerate() {
+            c64.dma_write(0xC000 + i as u16, b, false);
+        }
+        c64.m.c64_core.reg_pc = 0xC000;
+        run_ms(&mut c64, &mut now, 600);
+        let pcm = pcm.borrow();
+        assert!((26_440..=26_480).contains(&pcm.len()), "600 ms at 44.1 kHz: {}", pcm.len());
+        let tail = &pcm[pcm.len() - 22_050..];
+        let mean = tail.iter().map(|&s| f64::from(s)).sum::<f64>() / tail.len() as f64;
+        let rising = tail.windows(2).filter(|w| f64::from(w[0]) < mean && f64::from(w[1]) >= mean).count();
+        assert!((495..=505).contains(&rising), "{rising} periods in 0.5 s");
+        assert_eq!(c64.m.sid_chip_regs(1).map(|r| (r[0x18], r[0x04])), Some((15, 0x21)), "TRX64's chip 1");
+        assert_eq!(c64.m.sid_chip_regs(0).map(|r| (r[0x18], r[0x04])), Some((0, 0)), "chip 0 untouched");
+        assert_eq!(c64.sid.ultisid_regs(1, 0).map(|r| (r[0x18], r[0x01], r[0x00])), Some((15, 66, 133)));
+        assert!(c64.sid.ultisid_regs(0, 0).is_none_or(|r| r == [0; 0x19]), "UltiSID 1 never got a register");
     }
 
     #[test]

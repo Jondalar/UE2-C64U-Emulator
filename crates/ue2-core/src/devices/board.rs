@@ -210,8 +210,8 @@ pub fn install(map: &mut IoMap, _cfg: &MachineConfig) {
     // U64_CLOCKMEAS: no compiled user (u64.h:14,87).
     add_table(map, 0x1010_0200, 0x100, "clockmeas", &[]);
     // MATRIX_KEYB 0x10100300 feeds the C64 keyboard: devices::c64 (docs/specs/S14-c64-trx64.md §5.6).
-    // Audio mixer 0x500, speaker mixer 0x540, resampler 0x580: write-only, reads 0 (u64_config.cc:1333-1334).
-    add_table(map, 0x1010_0500, 0x100, "audio-mixer", &[]);
+    // Audio mixer 0x500, speaker mixer 0x540, resampler 0x580: devices::c64, which hands the audio mixer to the backend
+    // (docs/specs/S17-ultisid.md §2.5).
     // LED strip data/map/intensity/start (led_strip.cc:150-154): write-only.
     add_table(map, 0x1010_0600, 0x100, "led-strip", &[]);
     // Blingboard RX: BLING_RX_FLAGS 0x10100802 reads 0 = not installed (led_strip.cc:497-501).
@@ -315,9 +315,9 @@ mod tests {
     #[test]
     fn write_only_sinks_read_zero() {
         let mut rig = Rig::new(install);
-        rig.w8(0x1010_0500, 0x55);
+        rig.w8(0x1010_0600, 0x55);
         rig.w8(0x1020_00FF, 0xB3);
-        assert_eq!(rig.r8(0x1010_0500), 0);
+        assert_eq!(rig.r8(0x1010_0600), 0);
         assert_eq!(rig.r8(0x1020_00FF), 0);
         assert_eq!(rig.r8(0x1010_0802), 0, "Blingboard not installed");
     }

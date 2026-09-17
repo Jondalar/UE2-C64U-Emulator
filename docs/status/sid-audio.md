@@ -1,15 +1,17 @@
-# W4-SID status — SID socket detection and audio on TRX64's reSID
+# W4-SID / S17 status — the U64's SIDs on TRX64's reSID
 
-Spec changes: `docs/specs/S14-c64-trx64.md` §W4-SID. Code: `crates/c64-bridge/src/sid.rs`, `crates/ue2emu/src/audio.rs`.
+Specs: `docs/specs/S14-c64-trx64.md` §W4-SID, `docs/specs/S17-ultisid.md` (UltiSID, TRX64 Spec 855). Code:
+`crates/c64-bridge/src/sid.rs`, `crates/ue2-core/src/devices/c64.rs` (mixer window), `crates/ue2emu/src/audio.rs`.
 
-**Reached.** With `--sid-socket1 armsid` the unmodified firmware detects an ARMSID in socket 1, enables the socket
-and maps it. UltiSID 1 is on the same reSID, so the firmware's default map ($D400) is audible without a socket. DMA
-reads of the SID range answer from the emulated chip. The SID sample stream plays through cpal (`--audio`) and
-goes to a WAV file (`--audio-wav`). A BASIC voice typed through the control language gives a 1000.0 Hz WAV; a run
-without the POKEs is silent.
+**Reached.** UltiSID 1 and 2 with their split instances A-D and the ARMSID in socket 1 each play on their own reSID,
+routed by the firmware's decode and mixed with its mixer gains. With `--sid-socket1 armsid` the unmodified firmware
+detects an ARMSID in socket 1, enables the socket and maps it. The SID player maps a two-SID PSID onto UltiSID 1 and 2,
+and the second SID alone plays a 1000.0 Hz tone. C64 programs read OSC3/ENV3 of every SID and the ARMSID's answers.
+The sample stream plays through cpal (`--audio`) and goes to a WAV file (`--audio-wav`). A BASIC voice typed through
+the control language gives a 1000.0 Hz WAV; a run without the POKEs is silent.
 
 Firmware paths are relative to `firmware/1541ultimate/software/`; TRX64 paths to
-`<TRX64 checkout>/crates/trx64-core/` (commit `a448229`).
+`<TRX64 checkout>/crates/trx64-core/` (commit `1ce84b0`).
 
 ## Options (`ue2emu run`, with `--c64 trx64`)
 
@@ -36,6 +38,18 @@ Resulting address map: Slot1: 40/C0 (Enabled) Slot2: 40/C0 (Disabled) SlotSplit:
 `AB AB` is reSID's bus value after the FPGASID DIAG writes (sid.cc:205-209). Without the option the console keeps
 `$$ SID1 = 0. SID2 = 0` and `Slot1: 40/C0 (Disabled)`.
 
+## SID player (`scripts/smoke-sid-stereo.ctl`)
+
+```
+Trying to map SID 0 (type 6581) on logical SID 2 (type Either), at address $D400
+Trying to map SID 1 (type 6581) on logical SID 3 (type Either), at address $D420
+Resulting address map: Slot1: 01/FE (Disabled) Slot2: 01/FE (Disabled)  Emu1: 40/FE  Emu2: 42/FE
+Sid 0 was mapped to slot 2, which uses mixer channel 2 with volume setting 80. Setting pan to Left 2.
+Sid 1 was mapped to slot 3, which uses mixer channel 3 with volume setting 80. Setting pan to Right 2.
+```
+
+The player screen shows `SID #1: $D400 : 6581 / PAL` and `SID #2: $D420 : UNKNOWN / PAL`.
+
 ## Why an ARMSID
 
 - **Detection needs no timing.** `detectRemakes` writes "SID" to $D41D-$D41F and reads "NO" from $D41B/$D41C
@@ -57,7 +71,9 @@ Resulting address map: Slot1: 40/C0 (Enabled) Slot2: 40/C0 (Disabled) SlotSplit:
 ## ARMSID protocol implemented (`sid.rs` `ArmSid`)
 
 Configuration mode: "SID" in $1D/$1E/$1F; any other $1D leaves it. In it, a write to $1E or $1F runs the pair
-($1F, $1E); $1B/$1C read the last answer. Outside it every register goes to reSID.
+($1F, $1E); $1B/$1C read the last answer. Outside it every register goes to reSID. TRX64's write trace drives the
+protocol as the write happens, so a C64 program's probe reads the answer through the host door in the same run, as
+the firmware's DMA probe does.
 
 | Pair | Firmware use | Answer / effect |
 |---|---|---|
@@ -75,54 +91,82 @@ The mode starts as 6581 at every emulator start; the emulated ARMSID has no flas
 
 ## SID decode implemented (`sid.rs` `Decode`)
 
-- The bridge receives every C64 core config write (`C64Backend::core_config_write`, S14 §W4-SID).
-- A decoder answers I/O address `a` in $D400-$D7FF or $DE00-$DFFF when `((a >> 4) & MASK) == BASE`
-  (SIDx/EMUSIDx_BASE and _MASK, system/u64.h:110-117; docs/hw/10 §SID addressing). BASE bit 0 set is "Unmapped"
-  (u64_sid_offsets[0]).
-- Socket 1 also needs C64_SID1_EN and a fitted chip. It is mono, so C64_STEREO_ADDRSEL (the "B" half of a dual
-  device) is ignored and both halves reach it.
-- UltiSID 1 also needs the C64_EMUSID_SPLIT bits of `a >> 4` clear (split_bits, u64_config.cc:266, 320); set bits
-  select UltiSID 2.
-- Until the firmware writes the latches the bridge uses the firmware's default map: sockets off, UltiSID 1 and 2 at
-  40/C0, $D400-$D7FF (boot log above; auto-mirroring, u64_config.cc:2406-2465).
-- **Writes** that socket 1 or UltiSID 1 decodes go to reSID; socket 1 sees $1D-$1F first. DMA writes also go to
-  TRX64's own bus (its SID shadow, or the cartridge at $DE00-$DFFF).
-- **DMA reads:** socket 1 decodes → ARMSID answer in configuration mode, else reSID. UltiSID 1 decodes → reSID.
-  Neither → 0 in $D400-$D7FF (socket 2 and UltiSID 2 are not modelled, so their probes find nothing), TRX64's bus at
-  $DE00-$DFFF.
-- **Model:** socket 1 fitted, enabled and mapped → the ARMSID mode; else C64_EMUSID1_WAVES (0 = 6581, 1 = 8580,
-  u64_config.cc:1641-1665). A change rebuilds the engine and replays registers $00-$18.
-- reSID runs with its filter on, the external filter on and the resampling method (TRX64 `ResidConfig` defaults
-  otherwise).
+- The bridge receives every C64 core config write (`C64Backend::core_config_write`).
+- A decoder hits an address in $D400-$D7FF or $DE00-$DFFF when `((a >> 4) & MASK) == BASE` (SIDx/EMUSIDx_BASE and
+  _MASK, system/u64.h:110-117; sid_editor.cc:162-165). BASE `0x01` is "Unmapped" (u64_config.cc:202-203). A4 is not
+  decoded: every MASK the firmware writes leaves it open, so a SID occupies whole 32-byte blocks.
+- Socket 1 also needs C64_SID1_EN and a fitted chip. Socket 2 is never fitted. C64_STEREO_ADDRSEL selects the second
+  half of a dual chip; the emulated ARMSID is one chip, so both halves reach it.
+- C64_EMUSID_SPLIT picks instance A-D of both UltiSIDs from address bits: one bit set → B; 1/4 (A5,A6), (A5,A8),
+  (A7,A8) → A-D (sid_editor.cc:166-181). The instances are separate register sets, not mirrors (S17 §1.2).
+- Until the firmware writes the latches the bridge uses its default map: sockets off, all four decoders at 40/C0, so
+  UltiSID 1 and 2 both take $D400-$D7FF.
 
-## What TRX64's single SID cannot express (API gaps)
+**Routing (S17 §2.1).** Each of the 48 blocks has a set of receivers: socket 1, UltiSID 1 A-D, UltiSID 2 A-D. TRX64
+routes an address to one chip, the U64 a write to every decoder that hits, so a TRX64 chip is a group: one distinct
+receiver set. The bridge hands TRX64 a `SidMapping` per block (`Machine::set_sid_map`) whenever a decode latch changes
+the table:
 
-1. **One reSID per process.** The shim drives one global `SID g_sid` (vendor/resid/resid_shim.cc:34), and
-   `Resid::new` holds a process-wide guard for the engine's lifetime (src/resid_ffi.rs:38, 157-158). Socket 2,
-   UltiSID 2, ARM2SID and stereo tunes cannot sound. A write either decoder of SID 1 takes (UltiSID 1 parked at $D600
-   during detection, socket 1 at $D400) reaches the same engine. Parallel tests that build engines take turns.
-2. **CPU reads of $D400-$D7FF come from TRX64's fastsid** (src/full.rs:372-380 → src/sid.rs:250), not reSID. C64
-   programs see fastsid OSC3/ENV3/POT and no ARMSID identity; only the firmware's DMA reads see reSID and the ARMSID.
-   fastsid also keeps running beside reSID (src/lib.rs:2161).
-3. **The SID write hook carries neither address nor cycle.** `Sid6581::write_trace` is `FnMut(reg & 0x1F, value)`
-   (src/sid.rs:175, 232). The bridge pairs it with its `Observer::on_bus` write record, which has both
-   (src/full_sc.rs:252-256). The hook tells a real SID write from a write to RAM under I/O with `$01` banked out.
-4. **CPU writes to $DE00-$DFFF go to the cartridge** (src/full.rs:617) and never reach the SID hook: a SID mapped
-   there sounds only through DMA writes.
-5. **`ResidConfig` is fixed at construction** (src/resid_ffi.rs:157-190, no model setter). A model change rebuilds
-   the engine; oscillator and envelope phase restart.
-6. **`Resid::clock_silent` must not be used.** It is reSID's batch `SID::clock(delta)` (vendor/resid/sid.cc:745),
+- all 32 $D400-$D7FF blocks, a block nobody decodes on an empty group, so TRX64's fallback to chip 0 never fires;
+- $DE00-$DFFF blocks only when something receives them, with `ahead_of_expansion` set (unverified, 855 §7);
+- chip 0, the chip TRX64 ticks, is the first group holding UltiSID 1-A, else the first block's.
+
+**Writes.** TRX64's write trace queues `(cycle, chip, register, value)` for CPU writes, REU transfers and host pokes;
+the bridge applies each to every receiver of its chip's group. A DMA write goes through `Machine::write_full`, whose
+trace stamps a stale clock, so its records are applied at once at the C64's current cycle.
+
+**Reads.**
+- 6502, chip 0: TRX64's own SID model (855 D3).
+- 6502, chips 1 and up: TRX64 does not tick them. The bridge answers $1B/$1C through TRX64's host door (855 D5) from
+  the group's first reSID, cached after every catch-up.
+- ARMSID in configuration mode: $1B/$1C of socket 1's group through the same door, read and peek alike.
+- Firmware DMA reads: the bridge's own decode. Socket 1 decodes → ARMSID answer in configuration mode; otherwise the
+  first receiver with an engine (socket 1, UltiSID 1 A-D, UltiSID 2 A-D). Nobody decodes → 0 in $D400-$D7FF, TRX64's
+  bus at $DE00-$DFFF.
+
+**Engines (S17 §2.2).** One reSID per receiver that has received a write. Its model is C64_EMUSIDn_WAVES of its
+UltiSID (0 = 6581, 1 = 8580, u64_config.cc:1651-1656) or the ARMSID's mode for socket 1. A model change rebuilds that
+engine and replays registers $00-$18. reSID runs with its filter on, the external filter on and the resampling method
+(TRX64 `ResidConfig` defaults otherwise).
+
+## Mixer (S17 §2.5)
+
+- `C64Port` serves 0x10100500-0x101005FF. Bytes 0x00-0x13 reach the backend (`C64Backend::mixer_write`); the speaker
+  mixer (+0x40) and the resampler (+0x80) stay write sinks; the page reads 0.
+- Mono gain of a channel = (byte 2c + byte 2c+1) / 180. The firmware's 0 dB centre (`5A/5A`) is unity. Until the
+  firmware writes the mixer the boot values `5A 5A 5A 5A 79 27 27 79 …` apply.
+- Channel 0 weights UltiSID 1 A-D, channel 1 UltiSID 2 A-D, channel 2 socket 1. Pans are summed. Muting (bytes 0-7
+  zero, `u64_mute_sids`) silences all SIDs.
+- The boot map mixes UltiSID 1 and 2 playing the same writes at unity: twice one UltiSID's level, as the hardware sums
+  them. With the ARMSID fitted socket 1 adds 160/180 of it.
+
+## TRX64 API: resolved by Spec 855, and what is left
+
+Resolved at `1ce84b0`: one reSID per `Resid` (D1), the decode table (D2), a register file per chip (D3), the write
+trace with chip and cycle (D4), the host read/peek door (D5). The observer tap and the `Sid6581` hook are gone; CPU
+writes to a SID mapped at $DE00-$DFFF reach it. Left:
+
+1. **`ResidConfig` is fixed at construction** (src/resid_ffi.rs, no model setter). A model change rebuilds the
+   engine; oscillator and envelope phase restart.
+2. **`Resid::clock_silent` must not be used.** It is reSID's batch `SID::clock(delta)` (vendor/resid/sid.cc:745),
    which never updates the ENV3 latch (vendor/resid/envelope.h:118). Mixed with sampled clocking on one engine, it
    froze the envelope: ENV3 70 after 100-20 000 cycles of attack 0, 255 with sampled clocking only. The bridge always
    clocks through `emit` and drops the samples when nothing listens.
+3. **`write_full` stamps `Machine.clk`**, which is synced only after a run (855 D4). The bridge re-stamps DMA writes.
+4. **Extra chips are not ticked.** Their OSC3/ENV3 come from the bridge's reSID cache, refreshed only when reSID is
+   clocked: without an audio sink that is a DMA access.
+5. **Engines built at different times** can produce a sample more or less per call (855 §2). Each chunk takes the
+   first engine's count; the others are padded with their last sample or trimmed.
 
 ## Timing and audio path
 
-- **With a sink:** CPU writes are applied at their cycle (reSID is clocked to it first), and reSID follows every
-  `advance_to` (1 ms emulated, S14 §4). The mono samples go to the sink in emulated-time order.
+- **With a sink:** traced writes are applied at their cycle (every engine is clocked to it first), and the engines
+  follow every `advance_to` (1 ms emulated, S14 §4). Every engine gets the same cycle deltas in one loop; the mixed
+  mono samples go to the sink in emulated-time order. Before the first write no engine exists, and the sink gets
+  silence at reSID's cadence.
 - **Without a sink:** CPU writes only set registers; a DMA write or read clocks the gap, at most 1 s of cycles.
-  - C64 programs read TRX64's own SID anyway (gap 2), and the firmware's DMA reads come with the 6510 stopped, so
-    nothing observes the difference.
+  - C64 programs read chip 0 from TRX64's own SID, and the firmware's DMA reads come with the 6510 stopped, so
+    nothing observes the difference. OSC3/ENV3 of chips 1 and up stand still between DMA accesses.
   - A headless run without `--audio-wav` pays no reSID clocking, even while a program plays. The placeholder KERNAL's
     welcome jingle (u64/default_kernal.tas:98-135) cost 5 % host MIPS while every write clocked reSID.
 - While the 6510 is stopped or held in reset the chips run on; the C64 reset line clears reSID.
@@ -154,36 +198,56 @@ needs the smoke scripts to dismiss the popup, or a flash seed for the packed sto
 Setup as docs/status/c64.md (ROM image, `smoke-c64-roms.ctl` on a fresh `run/flash.bin`), then copies of that flash.
 Every run: `target/release/ue2emu run --headless --speed max $FW …`.
 
+S17 runs used copies of `run/flash.bin` with `--c64-roms`.
+
 | Run | Options and script | Result |
 |---|---|---|
-| tone, ARMSID | `--flash run/flash-tone.bin --sid-socket1 armsid --audio-wav run/sid-tone.wav --script scripts/smoke-sid-tone.ctl` | detection lines above; `scripts/wav-tone.py run/sid-tone.wav --expect 1000`: 44100 Hz, 781 590 samples, peak-to-peak 9399 (14.34 %), dominant **1000.0 Hz**, PASS |
+| tone, ARMSID | `--flash run/flash-tone.bin --sid-socket1 armsid --audio-wav run/sid-tone.wav --script scripts/smoke-sid-tone.ctl` | detection lines above; `scripts/wav-tone.py run/sid-tone.wav --expect 1000`: 44100 Hz, 781 445 samples, peak-to-peak 27 157 (41.44 %: UltiSID 1 + UltiSID 2 + 160/180 socket 1), dominant **1000.0 Hz**, PASS |
 | silence, ARMSID | `--flash run/flash-silent.bin --sid-socket1 armsid --audio-wav run/sid-silent.wav --script scripts/smoke-c64-type.ctl` | ` 42` printed; `wav-tone.py --silent`: peak-to-peak **0**, PASS |
-| tone, UltiSID 1 (default map) | `--flash run/flash-ulti.bin --audio-wav run/sid-ulti.wav --script scripts/smoke-sid-tone.ctl` | `$$ SID1 = 0`; dominant **1000.0 Hz**, peak-to-peak 9400, PASS |
-| device | `--audio on --script` (`wait 8000`) | stream opened on the Mac's default device, no warning; 8.0 s emulated at `--speed max`, 119 MIPS last interval |
+| tone, default map | `--flash run/flash-ulti.bin --audio-wav run/sid-ulti.wav --script scripts/smoke-sid-tone.ctl` | `$$ SID1 = 0`; 781 794 samples, peak-to-peak 18 799 (28.69 %: UltiSID 1 + 2), dominant **1000.0 Hz**, PASS |
+| two-SID PSID, SID player | `--flash run/flash-stereo.bin --sd run/sid-stereo.img --usb-keyboard --audio-wav run/sid-stereo.wav --script scripts/smoke-sid-stereo.ctl` | player lines above; 822 893 samples, peak-to-peak 8981 (13.70 %: one UltiSID at 172/180), dominant **1000.0 Hz**, PASS |
+| cartridges and players | `--sd run/carts.img --usb-keyboard --script scripts/smoke-c64-carts.ctl` (docs/status/carts.md) | 27 `<NAME> PASS`, no FAIL/BAD, `ACTION REPLAY FROZEN`, both `Bytes loaded`, no `Time out!`; 153.6 s emulated, 32 s wall |
+| device | `--audio on --script` (`wait 8000`) | W4-SID: stream opened on the Mac's default device, no warning; 8.0 s emulated at `--speed max`, 119 MIPS last interval. Not re-run for S17 |
 
 `smoke-sid-tone.ctl` types `poke 54296,15:poke 54277,0:poke 54278,240` and `poke 54273,66:poke 54272,133:poke
 54276,33`: volume 15, attack 0, sustain 15, F = 17029 (1000.1 Hz at PAL), sawtooth + gate. `wav-tone.py` takes the
 last 32768 samples (mean removed, Hann window, FFT, parabolic peak); pure Python.
 
-**No regressions:** `cargo test --workspace` green (c64-bridge 21, ue2-core 187, ue2emu 52, …); `scripts/smoke-all.sh`
-all pass; C64 A2-A5 pass with default options (A2 READY and menu dump, A3 ` 42`, A4 `DMA load complete: $0801-$081C`
-and `Cart got disabled`, A5 `Frozen on Bad line`); `cargo build -p ue2emu --no-default-features` without warnings.
-The window was not started (no GUI in this workflow).
+`scripts/make-stereo-sid.py run/sid-stereo/s03-stereo.sid` writes the PSID v3 for `smoke-sid-stereo.ctl`: header
+$7A = $42, init writes the same voice to $D420-$D438 and leaves SID 1 alone, play is an RTS. The image is
+`scripts/make-sd-image.sh run/sid-stereo.img` plus `scripts/add-sd-files.sh run/sid-stereo.img
+run/sid-stereo/s03-stereo.sid`.
 
-## Tests added
+**No regressions (S17):** `UE2_FIRMWARE=… cargo test --workspace` green, 429 tests (c64-bridge 75, ue2-core 202,
+ue2emu 75, ue2-net 20, ue2-vfat 12 + 20, rv32 13 + 1, ue2-mcp 11), no warnings; `cargo build -p ue2emu
+--no-default-features` clean. `scripts/smoke-all.sh` and C64 A2-A5 were last run at W4-SID. The window was not
+started (no GUI in this workflow).
 
-- `sid.rs`: decode (base/mask/enable/split/unmapped), the ARMSID probe and readParams/set-mode/set-filter sequences,
-  socket 1 reads (ARMSID then reSID ENV3, empty socket, model from mode and from UltiSID waves), the observer tap
-  (only hook-confirmed writes, DummyWrite included), CPU writes clocked only with a sink, audio (48 kHz count for
-  985 000 cycles, 1000 Hz).
-- `lib.rs`: DMA reads of the default map (bus value, OSC3, ENV3; unmapped → 0); a 6510 program at $C000 writing the
-  tone plays 600 ms → 26 460 samples, 500 periods in 0.5 s.
-- `c64.rs`: core config writes reach the backend, unsynced, still latched.
+## Tests
+
+- `sid.rs`: the boot map (both UltiSIDs on every $D400-$D7FF block, nothing at $DE00); the SID player's 1- and 2-SID
+  maps; splits 1/2 and 1/4 (all three bit pairs); socket enable and fitting; group numbering and chip 0 (UltiSID 1-A
+  away from $D400, nothing mapped, UltiSID 2 at $DE00 listed ahead of the port); write fan-out; per-UltiSID model with
+  registers kept; the ARMSID probe and readParams/set-mode/set-filter sequences; DMA reads of socket 1 (ARMSID, then
+  reSID ENV3, the ARMSID's mode picks its engine's model); CPU writes clocked only with a sink; audio (silence before
+  the first write, 48 kHz count for 985 000 cycles, 1000 Hz with two engines); mixer gains (padding and trimming,
+  saturation, half gain, channel separation, mute); on a TRX64 machine: ENV3 of chip 1 through the door (peek and bus
+  read) and the ARMSID's answer through the door.
+- `lib.rs`: DMA reads of the default map (bus value, OSC3, ENV3; UltiSID 2 still at $D400; unmapped → 0); a 6510
+  program writing the tone plays 600 ms → 26 460 samples, 500 periods in 0.5 s; with UltiSID 2 at $D420 a 6510 tone
+  there plays the same, reaches TRX64's chip 1 and leaves chip 0 and UltiSID 1 untouched.
+- `c64.rs`: core config writes reach the backend, unsynced, still latched; mixer bytes 0x00-0x13 reach the backend,
+  the rest of the page swallows writes, all of it reads 0.
 - `audio.rs`: WAV bytes and header sizes, ring pre-roll/drop/underrun, option defaults.
 
 ## Performance
 
-A6 method (docs/status/c64.md): `wait 60000`, `--log unmapped`, fresh flash, `--speed max`, one run at a time,
+**S17** (one run each, twice, host load average about 3): `wait 60000` on a fresh flash, `--log unmapped`,
+`--speed max`. Default options: 121.2 and 120.5 host MIPS (12.4 s wall). `--audio-wav` + `--sid-socket1 armsid`: 92.9
+and 93.7 host MIPS (16.0 s wall). The boot map puts socket 1 and both UltiSIDs at $D400, so the jingle runs three reSIDs
+where W4-SID ran one: about 3.6 s wall per 60 s emulated instead of 1.4 s.
+
+**W4-SID.** A6 method (docs/status/c64.md): `wait 60000`, `--log unmapped`, fresh flash, `--speed max`, one run at a time,
 variants interleaved. Host MIPS = instructions / wall seconds of the whole process. The fresh flash runs the
 placeholder KERNAL, whose welcome jingle writes the SID. Baseline is main `9b2b7a8` built from the same sources.
 
@@ -205,12 +269,17 @@ placeholder KERNAL, whose welcome jingle writes the SID. Baseline is main `9b2b7
 
 ## Known gaps
 
-- Socket 2, UltiSID 2, ARM2SID and stereo: one reSID (gap 1). Their probes find nothing, and their writes are
-  dropped.
-- Mixer gains (U64_AUDIO_MIXER, pan, the freezer mute) and UltiSID filter curves, resonance and digi level are
-  ignored. C64_VOICE_ADSR still reads 0, so the LED strip sees no envelopes.
+- Socket 2 and the second SID of a dual chip in a socket (ARM2SID) are not built; their probes find nothing.
+- Stereo: pan pairs are summed to the mono sink. The speaker mixer and the sampler, drive and tape mixer channels are
+  not applied.
+- UltiSID filter curves, resonance and digi level have no reSID equivalent and are ignored (855 D7). C64_VOICE_ADSR
+  still reads 0, so the LED strip sees no envelopes.
+- Chip 0's OSC3/ENV3 for C64 programs come from TRX64's fastsid, not reSID. Chips 1 and up read reSID only as of its
+  last clocking: without an audio sink, the last DMA access.
+- Unverified: a SID at $DE00-$DFFF answers reads ahead of the expansion port (855 §7); which receiver answers a read
+  several decode (S17 §5 Q1); whether the FPGA builds four instances per UltiSID (Q2). Monitor peeks of $DE00-$DFFF
+  show the cartridge.
 - ARMSID filter settings are stored and read back but do not change reSID. The mode is not kept across emulator
   starts.
-- C64 programs read SID registers from fastsid (gap 2). A SID at $DE00-$DFFF is silent for CPU writes (gap 4).
 - PAL clock only (reSID at 985 248 Hz), like the rest of S14.
 - The window's default `--audio on` was not heard by the agent; the device path was checked headless on silence.
