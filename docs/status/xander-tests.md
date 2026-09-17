@@ -216,6 +216,14 @@ IO map: Enabled!` and `Begin of cart init: Type: 41. REU: 01. REU_SZ: 07, UCI: 0
 and the C64 still reads `Audio : [Fail] Module not found`. The gap is the register block itself, not the
 capability word. `4ev.mod` is therefore never loaded into the REU by the demo.
 
+**Speed (TRX64 Spec 856).** In its 64 MHz turbo the demo ran below realtime at TRX64 `1ce84b0`: 0.85, 0.77, 0.72
+and 0.98 of realtime in four 15 s windows (headless, realtime, audio on, Apple M4), with the emulation thread at
+100 % of one core and the audio crackling from underruns. About 90 % of that thread was the C64 side, most of it
+work TRX64 did once per 6510 instruction rather than once per PHI2 cycle. Spec 856 (`a6e0465`) runs instructions that
+only touch RAM back to back inside one PHI2 cycle. The same windows now hold realtime (1.000, 0.999, 0.999, 0.997)
+at 69-97 % of one core, and the audio is clean. `TRX64_TURBO_FASTPATH=0` switches the fast path off. The largest
+item left is the CIA update, 12-16 % of the thread.
+
 ## 3. heartbeat-demo v1.0.1
 
 `idi8b/heartbeat-demo/{heartbeat-demo.prg,maniac.reu,Knight Rider Theme.reu}` with the shipped
