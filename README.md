@@ -24,6 +24,23 @@ overlay. The C64 core is replaced by [TRX64](https://github.com/Jondalar/TRX64) 
 with SID sound, cartridges and a 1541 drive. An MCP server lets Claude Code sessions start and drive emulator
 instances for automated tests.
 
+```mermaid
+flowchart LR
+    fw["Firmware application, unmodified<br/>ultimate.elf or .ue2<br/>menu · file browser · REST · web UI · UCI server"]
+    subgraph ue2["UE2: the board around it, in place of the FPGA"]
+        cpu["RISC-V CPU"]
+        io["flash · SD card · USB · network<br/>menu overlay · UART"]
+        port["C64 register interface<br/>cart · DMA · core config<br/>UCI window · Ultimate Audio"]
+    end
+    subgraph trx["TRX64: the C64"]
+        c64["6510 · VIC-II · SID · CIA<br/>1541 drive · cartridges<br/>UCI block · REU"]
+    end
+    fw --> cpu
+    cpu --> io
+    cpu --> port
+    port <-->|"register reads and writes · DMA · IRQ"| c64
+```
+
 ## Install
 
 ```sh
