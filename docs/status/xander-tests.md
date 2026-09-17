@@ -221,8 +221,10 @@ and 0.98 of realtime in four 15 s windows (headless, realtime, audio on, Apple M
 100 % of one core and the audio crackling from underruns. About 90 % of that thread was the C64 side, most of it
 work TRX64 did once per 6510 instruction rather than once per PHI2 cycle. Spec 856 (`a6e0465`) runs instructions that
 only touch RAM back to back inside one PHI2 cycle. The same windows now hold realtime (1.000, 0.999, 0.999, 0.997)
-at 69-97 % of one core, and the audio is clean. `TRX64_TURBO_FASTPATH=0` switches the fast path off. The largest
-item left is the CIA update, 12-16 % of the thread.
+at 69-97 % of one core, and the audio is clean. `TRX64_TURBO_FASTPATH=0` switches the fast path off. TRX64 Spec 857
+then made the CIA alarm a comparison, which took the CIA update (12-16 %) out of the profile: 66/74/59/81 %. With
+the idle skip (S19) and the SID worker (S20) the four windows end at **58/65/50/72 %** on the shipped 0.3.2
+build.
 
 **Idle skip (S19).** In the demo the firmware idles: 0.7 C64-window accesses a second and no writes into DDR the C64
 uses. With the FreeRTOS idle loop fast-forwarded, 97.6 % of the RISC-V instructions are skipped (140 M executed, 5 840 M
