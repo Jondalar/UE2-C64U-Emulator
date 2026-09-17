@@ -138,6 +138,7 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
     };
     let running = RunningFlag(ctl.running.clone());
     let (net_opts, c64, armsid) = (opts.net.clone(), opts.c64, opts.audio.armsid);
+    let sid_thread = !opts.audio.no_sid_thread;
     let (usb_dirs, usb_dir_work, cart_slot) = (opts.usb_dirs.clone(), opts.usb_dir_work.clone(), opts.cart_slot.clone());
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
 
@@ -145,7 +146,7 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
         .name("emulation".into())
         .spawn(move || {
             let _running = running;
-            match build(cfg, net_opts.as_ref(), c64, sink, armsid, &usb_dirs, &usb_dir_work, cart_slot) {
+            match build(cfg, net_opts.as_ref(), c64, sink, armsid, sid_thread, &usb_dirs, &usb_dir_work, cart_slot) {
                 Ok((machine, net, dirs, cart)) => {
                     let _ = ready_tx.send(Ok(()));
                     emu.run(machine, net, dirs, cart, &command_rx, gdb.map(GdbServer::new))
@@ -181,13 +182,14 @@ fn build(
     c64: bool,
     sink: Option<audio::Sink>,
     armsid: bool,
+    sid_thread: bool,
     usb_dirs: &[DirSpec],
     usb_dir_work: &std::path::Path,
     cart_slot: Option<CartSlotSpec>,
 ) -> Result<(Machine, Option<net::Backend>, UsbDirs, CartSlot)> {
     let mut machine = Machine::new(cfg)?;
     if c64 {
-        attach_trx64_audio(&mut machine, sink, armsid, cart_slot.as_ref())?;
+        attach_trx64_audio(&mut machine, sink, armsid, sid_thread, cart_slot.as_ref())?;
     }
     let cart = CartSlot::new(cart_slot, &mut machine);
     let net = net.map(|opts| net::attach(&mut machine, opts)).transpose()?;
@@ -200,7 +202,7 @@ fn build(
 /// with `cart_slot`'s cartridge in the expansion port. `c64_selected` in main.rs allows it only with the `trx64`
 /// feature; without it this does nothing.
 pub fn attach_trx64(machine: &mut Machine, cart_slot: Option<&CartSlotSpec>) -> Result<()> {
-    attach_trx64_audio(machine, None, false, cart_slot)
+    attach_trx64_audio(machine, None, false, false, cart_slot)
 }
 
 /// [`attach_trx64`], with the SID's samples going to `sink` when given and an ARMSID in socket 1 when `armsid`
@@ -209,6 +211,7 @@ fn attach_trx64_audio(
     machine: &mut Machine,
     sink: Option<audio::Sink>,
     armsid: bool,
+    sid_thread: bool,
     cart_slot: Option<&CartSlotSpec>,
 ) -> Result<()> {
     #[cfg(feature = "trx64")]
@@ -216,7 +219,13 @@ fn attach_trx64_audio(
         let mut c64 = c64_bridge::Trx64Backend::new(&machine.cfg.rom_dir);
         c64.set_sid_socket1(armsid);
         if let Some(sink) = sink {
-            c64.set_audio(sink.rate(), Box::new(sink));
+            // S20: with a device listening the engines, the mixing and the sink move to the SID worker.
+            let rate = sink.rate();
+            if sid_thread && sink.has_device() {
+                c64.set_audio_threaded(rate, Box::new(sink));
+            } else {
+                c64.set_audio(rate, Box::new(sink));
+            }
         }
         if let Some(spec) = cart_slot {
             let decode = c64_bridge::FlashDecode::parse(&spec.flash_decode).map_err(|e| anyhow!("--cart-slot: {e}"))?;
@@ -259,7 +268,7 @@ fn attach_trx64_audio(
         }
     }
     #[cfg(not(feature = "trx64"))]
-    let _ = (machine, sink, armsid, cart_slot);
+    let _ = (machine, sink, armsid, sid_thread, cart_slot);
     Ok(())
 }
 

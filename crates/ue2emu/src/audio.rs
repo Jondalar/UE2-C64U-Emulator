@@ -47,6 +47,10 @@ pub struct AudioArgs {
     /// saved it yet it asks to review the settings in the menu [default: none]
     #[arg(long, value_enum, value_name = "CHIP")]
     sid_socket1: Option<Socket>,
+    /// Run the reSID engines on the emulation thread instead of their own, also when an audio device listens
+    /// (docs/specs/S20-sid-thread.md)
+    #[arg(long)]
+    no_sid_thread: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -62,6 +66,8 @@ pub struct AudioOptions {
     pub wav: Option<PathBuf>,
     /// An ARMSID in SID socket 1.
     pub armsid: bool,
+    /// Keep the reSID engines on the emulation thread even with a device (`--no-sid-thread`, S20 §5).
+    pub no_sid_thread: bool,
 }
 
 pub fn configure(args: AudioArgs, headless: bool) -> AudioOptions {
@@ -69,6 +75,7 @@ pub fn configure(args: AudioArgs, headless: bool) -> AudioOptions {
         device: args.audio.map_or(!headless, |a| a == OnOff::On),
         wav: args.audio_wav,
         armsid: args.sid_socket1 == Some(Socket::Armsid),
+        no_sid_thread: args.no_sid_thread,
     }
 }
 
@@ -109,6 +116,12 @@ pub struct Sink {
 impl Sink {
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    /// Whether an audio device listens, as opposed to a WAV file alone. Only then do the engines get their own
+    /// thread (S20 §5).
+    pub fn has_device(&self) -> bool {
+        self.ring.is_some()
     }
 
     pub fn push(&mut self, pcm: &[i16]) {
@@ -353,7 +366,7 @@ mod tests {
 
     #[test]
     fn audio_defaults_follow_the_frontend() {
-        let args = |audio| AudioArgs { audio, audio_wav: None, sid_socket1: None };
+        let args = |audio| AudioArgs { audio, audio_wav: None, sid_socket1: None, no_sid_thread: false };
         assert!(configure(args(None), false).device, "window: on");
         assert!(!configure(args(None), true).device, "headless: off");
         assert!(!configure(args(None), false).armsid, "socket 1 empty by default");

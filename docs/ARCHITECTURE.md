@@ -528,7 +528,9 @@ The emulation thread runs `Machine::run` in slices of 100 000 instructions (4 ms
 instruction), cut short at the next timed input. After each slice it drains the console to stdout, processes queued
 `Command`s, publishes the `DisplaySnapshot` every 20 ms emulated, pumps the network backend and paces
 ([S02](specs/S02-core.md), [tooling.md](status/tooling.md)). Other threads: the cpal stream, the web UI proxy (one
-accept thread, one per connection direction), and the `--usb-dir` worker and host watcher.
+accept thread, one per connection direction), and the `--usb-dir` worker and host watcher. With an audio device the
+reSID engines, the mixing and the sink run on the SID worker ([S20](specs/S20-sid-thread.md)); the emulation thread
+sends it the SID writes with their cycle.
 
 #### Machine loop
 
@@ -1026,6 +1028,7 @@ sampler behind it; S17 keeps `run_cpu` and `run_held` unchanged (CRITICAL, 25 sy
 | Q12 | Build without TRX64 | `cargo build -p ue2emu --no-default-features` clean; `cargo test -p ue2-core` without a C++ toolchain | [c64.md](status/c64.md) |
 | Q13 | Realtime, C64 turbo 64 MHz | UltimateDemo2026, four 15 s windows on an Apple M4: realtime in each (1.000 to 0.997) at 69-97 % of one core; before TRX64 856, 0.72 to 0.98 of realtime at 100 % | [xander-tests.md](status/xander-tests.md) §2 |
 | Q14 | Idle skip changes nothing but speed | Firmware 60 s emulated, with and without TRX64: console, registers, CSRs, `now`, all DDR and the C64 frame identical with the skip on and off; 96.8 % of instructions skipped. UltimateDemo2026 at `--speed max`: 129.0 s CPU instead of 153.3 s | [S19](specs/S19-idle-skip.md), [xander-tests.md](status/xander-tests.md) §2 |
+| Q15 | reSID on its own thread | heartbeat-demo (8 SIDs, 64 MHz turbo) at `--speed max`: 102.2 s wall instead of 116.6 s for 131 s emulated, CPU time 118.6 against 116.3 s | [S20](specs/S20-sid-thread.md) §9 |
 
 Other numbers: the CPU interpreter targets ≥ 150 MIPS ([S01](specs/S01-cpu-rv32.md)); the trace ring costs about 3 %;
 realtime with 2004 host forwards keeps 25 MIPS at about 24 % of one core ([e2e.md](status/e2e.md)).

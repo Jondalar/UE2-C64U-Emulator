@@ -14,7 +14,7 @@
 
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use trx64_core::expansion::{Access, ExpansionDevice, PortLines};
 
@@ -202,8 +202,40 @@ pub struct Sampler {
     now: u64,
     /// Half-ticks elapsed but not yet turned into output samples.
     avail: u64,
-    /// Samples waiting for the sink, oldest first.
-    queue: VecDeque<i16>,
+    /// Samples waiting for the sink, oldest first. Shared, because the sink may drain it on the SID worker thread
+    /// while the voices fill it on the emulation thread (S20 §4).
+    queue: SampleQueue,
+}
+
+/// The sampler's output samples between the voices and the sink: filled by [`Sampler::advance_to`], taken by
+/// [`SamplerMix`]. Both sides touch it once per block, so one mutex costs nothing (S20 §4).
+#[derive(Clone, Default)]
+pub struct SampleQueue(Arc<Mutex<VecDeque<i16>>>);
+
+impl SampleQueue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<i16>> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Append `samples`; what nobody drained falls off the back at [`QUEUE_CAP`].
+    fn push(&self, samples: &[i16]) {
+        let mut q = self.lock();
+        q.extend(samples);
+        let over = q.len().saturating_sub(QUEUE_CAP);
+        q.drain(..over);
+    }
+
+    fn clear(&self) {
+        self.lock().clear();
+    }
+
+    /// Take `n` samples, padding with silence when the voices are behind.
+    pub fn drain(&self, out: &mut Vec<i16>, n: usize) {
+        let mut q = self.lock();
+        for _ in 0..n {
+            out.push(q.pop_front().unwrap_or(0));
+        }
+    }
 }
 
 impl Default for Sampler {
@@ -223,10 +255,15 @@ impl Sampler {
             per_sample: 0,
             now: 0,
             avail: 0,
-            queue: VecDeque::new(),
+            queue: SampleQueue::default(),
         };
         s.set_sample_rate(DEFAULT_RATE);
         s
+    }
+
+    /// The output queue, for the sink that drains it.
+    pub fn queue(&self) -> SampleQueue {
+        self.queue.clone()
     }
 
     /// The store to lend guest DDR through, shared with whatever holds the device.
@@ -339,6 +376,7 @@ impl Sampler {
         }
         self.avail += elapsed / CLOCKS_PER_HALF_TICK;
         let ram = self.ram.clone();
+        let mut rendered = Vec::new();
         loop {
             let next = self.frac + self.per_sample;
             let want = next >> 16;
@@ -347,19 +385,9 @@ impl Sampler {
             }
             self.frac = next & 0xFFFF;
             self.avail -= want;
-            let sample = self.mix(&ram, want);
-            if self.queue.len() == QUEUE_CAP {
-                self.queue.pop_front();
-            }
-            self.queue.push_back(sample);
+            rendered.push(self.mix(&ram, want));
         }
-    }
-
-    /// Take `n` queued samples for the sink, padding with silence if the voices are behind.
-    pub fn drain(&mut self, out: &mut Vec<i16>, n: usize) {
-        for _ in 0..n {
-            out.push(self.queue.pop_front().unwrap_or(0));
-        }
+        self.queue.push(&rendered);
     }
 
     /// One output sample: every voice advanced by `halves` half-ticks, time-averaged over the interval, then through
@@ -503,23 +531,23 @@ impl ExpansionDevice for SamplerHandle {
 /// Mixing here rather than inside `Sid::catch_up` is deliberate (S16 §3.4): that function turns cycles into samples
 /// for the whole machine — impact rates it CRITICAL, seven processes deep — so reSID keeps owning the clock and the
 /// only thing that changes is what the sink is.
-pub struct SamplerMix {
-    sampler: SamplerHandle,
-    sink: Box<dyn AudioSink>,
+pub struct SamplerMix<S> {
+    queue: SampleQueue,
+    sink: S,
     voices: Vec<i16>,
     mixed: Vec<i16>,
 }
 
-impl SamplerMix {
-    pub fn new(sampler: SamplerHandle, sink: Box<dyn AudioSink>) -> Self {
-        SamplerMix { sampler, sink, voices: Vec::new(), mixed: Vec::new() }
+impl<S: AudioSink> SamplerMix<S> {
+    pub fn new(queue: SampleQueue, sink: S) -> Self {
+        SamplerMix { queue, sink, voices: Vec::new(), mixed: Vec::new() }
     }
 }
 
-impl AudioSink for SamplerMix {
+impl<S: AudioSink> AudioSink for SamplerMix<S> {
     fn samples(&mut self, pcm: &[i16]) {
         self.voices.clear();
-        self.sampler.with(|s| s.drain(&mut self.voices, pcm.len()));
+        self.queue.drain(&mut self.voices, pcm.len());
         self.mixed.clear();
         self.mixed.extend(pcm.iter().zip(&self.voices).map(|(&sid, &voice)| sid.saturating_add(voice)));
         self.sink.samples(&self.mixed);
@@ -780,7 +808,7 @@ mod tests {
         program(&mut s, 0, 0x0100_0000, 8, 1, CTRL_ENABLE | CTRL_IRQ);
         let (mut now, mut out) = (0, Vec::new());
         run(&mut s, &mut now, 8);
-        s.drain(&mut out, 8);
+        s.queue().drain(&mut out, 8);
         assert!(out.iter().all(|&v| v == 0), "nothing lent, nothing to play");
         assert_eq!(s.read(0x00) & 1, 1, "the voice still reached its end");
     }

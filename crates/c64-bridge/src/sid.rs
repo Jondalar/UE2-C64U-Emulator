@@ -18,6 +18,10 @@
 //!   access clocks the gap.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 
 use trx64_core::resid_ffi::{MODEL_6581, MODEL_8580, PAL_CLOCK_FREQ};
 use trx64_core::sid::SidMapping;
@@ -26,6 +30,12 @@ use trx64_core::{BusKind, Machine, Observer, Resid, ResidConfig};
 /// The mono sample stream of the emulated SIDs, in emulated-time order at the rate given to [`Sid::set_audio`].
 pub trait AudioSink {
     fn samples(&mut self, pcm: &[i16]);
+}
+
+impl<T: AudioSink + ?Sized> AudioSink for Box<T> {
+    fn samples(&mut self, pcm: &[i16]) {
+        (**self).samples(pcm);
+    }
 }
 
 /// Core config offsets (0x10180000 + off, u64.h:110-128).
@@ -352,6 +362,275 @@ enum Clocking {
     At(u64),
 }
 
+/// The engines, the gains and the sink: everything that turns writes and cycles into samples (S20 §1). It runs on the
+/// emulation thread, or on the SID worker when a device listens.
+struct Engines {
+    engines: [Option<Engine>; RECEIVERS],
+    /// Receivers with an engine, in the order the engines were built. The first one's sample count is each chunk's.
+    order: Vec<usize>,
+    sample_rate: u32,
+    /// C64 cycle the engines have been clocked to.
+    clk: u64,
+    /// Cycles × sample rate not yet turned into silence while no engine runs.
+    pace: u64,
+    /// Mono gain per receiver in 1/[`UNITY`] steps.
+    gains: [i32; RECEIVERS],
+    audio: Option<Box<dyn AudioSink>>,
+    /// $1B/$1C per receiver as of the last clocking, bit 16 set where an engine answers. Cached rather than read on
+    /// demand: a reSID read of $1B/$1C sets the bus value the write-only registers read back (sid.cc `read`), so it
+    /// may only happen where it did before S20 — right after clocking, never after a write.
+    cache: [u32; RECEIVERS],
+}
+
+impl Engines {
+    fn new(sample_rate: u32) -> Self {
+        Engines {
+            engines: Default::default(),
+            order: Vec::new(),
+            sample_rate,
+            clk: 0,
+            pace: 0,
+            gains: [UNITY; RECEIVERS],
+            audio: None,
+            cache: [0; RECEIVERS],
+        }
+    }
+
+    fn listening(&self) -> bool {
+        self.audio.is_some()
+    }
+
+    /// Build receiver `rx`'s engine, or rebuild it with its registers when its model changed.
+    fn ensure(&mut self, rx: usize, model: i32) {
+        match self.engines[rx].as_ref().map(|e| (e.model, e.regs)) {
+            Some((built, _)) if built == model => {}
+            Some((_, regs)) => self.engines[rx] = Some(Engine::build(model, self.sample_rate, regs)),
+            None => {
+                self.engines[rx] = Some(Engine::build(model, self.sample_rate, [0; 0x19]));
+                self.order.push(rx);
+            }
+        }
+        self.cache[rx] = 1 << 16;
+    }
+
+    fn drop_engine(&mut self, rx: usize) {
+        self.engines[rx] = None;
+        self.order.retain(|&r| r != rx);
+        self.cache[rx] = 0;
+    }
+
+    /// One traced write to every receiver in `mask`.
+    fn write(&mut self, mask: u16, reg: u8, val: u8) {
+        for rx in (0..RECEIVERS).filter(|&rx| mask & bit(rx) != 0) {
+            if let Some(e) = self.engines[rx].as_mut() {
+                if let Some(r) = e.regs.get_mut(usize::from(reg)) {
+                    *r = val;
+                }
+                e.resid.write(reg, val);
+            }
+        }
+    }
+
+    /// Clock every engine to cycle `clk` with the same deltas: all of it into the sink, or at most
+    /// [`SILENT_CATCH_UP`] cycles without one.
+    fn clock_to(&mut self, clk: u64) {
+        if clk <= self.clk {
+            return;
+        }
+        let mut delta = clk - self.clk;
+        self.clk = clk;
+        let listening = self.listening();
+        if !listening {
+            delta = delta.min(SILENT_CATCH_UP);
+        }
+        // Always the sampled (per-cycle) clock, samples discarded without a sink: reSID's batch `clock(delta)`
+        // (`Resid::clock_silent`) leaves the ENV3 latch alone (envelope.h:118) and, mixed with sampled clocking on
+        // one engine, froze the envelope counter (ENV3 70 for 20 ms of attack 0; S14 §W4-SID).
+        while delta > 0 {
+            let n = delta.min(CHUNK);
+            delta -= n;
+            let mut mixed = Vec::new();
+            for i in 0..self.order.len() {
+                let rx = self.order[i];
+                let gain = self.gains[rx];
+                let pcm = self.engines[rx].as_mut().expect("ordered engines exist").resid.emit(n as u32);
+                if listening {
+                    if i == 0 {
+                        mixed = vec![0; pcm.len()];
+                    }
+                    mix_into(&mut mixed, &pcm, gain);
+                }
+            }
+            if !listening {
+                continue;
+            }
+            let pcm = if self.order.is_empty() { vec![0; self.silence(n)] } else { mixed_down(&mixed) };
+            if let Some(sink) = &mut self.audio {
+                sink.samples(&pcm);
+            }
+        }
+        self.cache_readback();
+    }
+
+    /// Refresh [`Engines::cache`] from the engines.
+    fn cache_readback(&mut self) {
+        for rx in 0..RECEIVERS {
+            self.cache[rx] = self.engines[rx]
+                .as_ref()
+                .map_or(0, |e| 1 << 16 | u32::from(e.resid.read(0x1B)) << 8 | u32::from(e.resid.read(0x1C)));
+        }
+    }
+
+    /// Samples in `n` cycles while no engine runs, at reSID's cadence.
+    fn silence(&mut self, n: u64) -> usize {
+        self.pace += n * u64::from(self.sample_rate);
+        let samples = self.pace / CLOCK_HZ;
+        self.pace %= CLOCK_HZ;
+        samples as usize
+    }
+
+    fn set_rate(&mut self, sample_rate: u32) {
+        if sample_rate == self.sample_rate {
+            return;
+        }
+        self.sample_rate = sample_rate;
+        for e in self.engines.iter_mut().flatten() {
+            *e = Engine::build(e.model, sample_rate, e.regs);
+        }
+    }
+
+    /// The C64 reset line: every engine clears its registers.
+    fn reset(&mut self) {
+        for e in self.engines.iter_mut().flatten() {
+            e.regs = [0; 0x19];
+            e.resid.reset();
+        }
+        self.cache_readback();
+    }
+
+    /// The first receiver in `mask` that has an engine.
+    fn first(&self, mask: u16) -> Option<&Engine> {
+        (0..RECEIVERS).filter(|&r| mask & bit(r) != 0).find_map(|r| self.engines[r].as_ref())
+    }
+
+    fn read(&self, mask: u16, reg: u8) -> u8 {
+        self.first(mask).map_or(0, |e| e.resid.read(reg))
+    }
+
+    /// $1B/$1C of every engine as of the last clocking, for the host door (855 D5).
+    fn readback(&self) -> [u32; RECEIVERS] {
+        self.cache
+    }
+}
+
+/// What the emulation thread asks the engines to do, in order (S20 §2).
+enum Cmd {
+    Ensure { rx: usize, model: i32 },
+    Drop(usize),
+    /// Clock to `at` first when it is given (the write's traced cycle), then write.
+    Write { at: Option<u64>, mask: u16, reg: u8, val: u8 },
+    ClockTo(u64),
+    Gains([i32; RECEIVERS]),
+    Reset,
+    Reanchor(u64),
+    /// A firmware DMA read: the answer goes back before the emulation thread continues (S20 §3).
+    Read { mask: u16, reg: u8, clk: u64, reply: SyncSender<u8> },
+}
+
+/// Where the engines live: on this thread, or on the SID worker.
+enum Host {
+    Inline(Engines),
+    Worker(Worker),
+}
+
+/// The engines on their way to the worker. `Resid` is a raw handle and the sink is the audio device's; both are
+/// touched by the worker alone once it owns them, and by nobody else afterwards (S20 §5).
+struct SendEngines(Engines);
+
+// SAFETY: the value is moved into the worker thread and never shared. `set_audio_threaded` takes a `Send` sink, and
+// the engines are built and used on one thread at a time.
+unsafe impl Send for SendEngines {}
+
+/// The SID worker's end: the command channel, the batch being filled, and the readback it publishes.
+struct Worker {
+    tx: Option<SyncSender<Vec<Cmd>>>,
+    batch: Vec<Cmd>,
+    readback: Arc<[AtomicU32; RECEIVERS]>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Worker {
+    /// Batches the worker may be behind before the emulation thread waits for it.
+    const QUEUED_BATCHES: usize = 256;
+
+    fn start(engines: Engines) -> Self {
+        let engines = SendEngines(engines);
+        let (tx, rx) = mpsc::sync_channel::<Vec<Cmd>>(Self::QUEUED_BATCHES);
+        let readback: Arc<[AtomicU32; RECEIVERS]> = Arc::new(std::array::from_fn(|_| AtomicU32::new(0)));
+        let published = Arc::clone(&readback);
+        let join = thread::Builder::new()
+            .name("ue2-sid".into())
+            .spawn(move || {
+                // The whole wrapper is captured, so the closure is `Send` (field-precise capture would take the
+                // engines themselves).
+                let mut engines = engines;
+                let engines = &mut engines.0;
+                for batch in rx {
+                    for cmd in batch {
+                        match cmd {
+                            Cmd::Ensure { rx, model } => engines.ensure(rx, model),
+                            Cmd::Drop(rx) => engines.drop_engine(rx),
+                            Cmd::Write { at, mask, reg, val } => {
+                                if let Some(at) = at {
+                                    engines.clock_to(at);
+                                }
+                                engines.write(mask, reg, val);
+                            }
+                            Cmd::ClockTo(clk) => engines.clock_to(clk),
+                            Cmd::Gains(gains) => engines.gains = gains,
+                            Cmd::Reset => engines.reset(),
+                            Cmd::Reanchor(clk) => engines.clk = clk,
+                            Cmd::Read { mask, reg, clk, reply } => {
+                                engines.clock_to(clk);
+                                let _ = reply.send(engines.read(mask, reg));
+                            }
+                        }
+                    }
+                    for (slot, value) in published.iter().zip(engines.readback()) {
+                        slot.store(value, Ordering::Relaxed);
+                    }
+                }
+            })
+            .expect("spawning the SID worker");
+        Worker { tx: Some(tx), batch: Vec::new(), readback, join: Some(join) }
+    }
+
+    fn push(&mut self, cmd: Cmd) {
+        self.batch.push(cmd);
+    }
+
+    /// Hand the batch over. Blocks while the worker is [`Self::QUEUED_BATCHES`] batches behind.
+    fn flush(&mut self) {
+        if self.batch.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.batch);
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(batch);
+        }
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.flush();
+        self.tx = None;
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 /// The SIDs behind the U64's decoders, their reSID engines and the mixer.
 pub struct Sid {
     decode: Decode,
@@ -362,16 +641,14 @@ pub struct Sid {
     /// The table TRX64 routes by (855 D2), and whether it changed since [`Sid::take_map`].
     map: Vec<SidMapping>,
     map_changed: bool,
-    engines: [Option<Engine>; RECEIVERS],
-    /// Receivers with an engine, in the order the engines were built. The first one's sample count is each chunk's.
-    order: Vec<usize>,
-    sample_rate: u32,
-    /// C64 cycle the engines have been clocked to.
-    clk: u64,
-    /// Cycles × sample rate not yet turned into silence while no engine runs.
-    pace: u64,
+    /// The model of every engine that exists, mirrored here because the engines may be on the worker.
+    built: [Option<i32>; RECEIVERS],
+    /// The registers written to every engine, for a debugger's peek.
+    regs: [[u8; 0x19]; RECEIVERS],
     mixer: [u8; MIXER_BYTES],
-    audio: Option<Box<dyn AudioSink>>,
+    /// Whether a sink listens: without one the engines are not clocked to the C64.
+    listening: bool,
+    host: Host,
 }
 
 impl Sid {
@@ -386,13 +663,11 @@ impl Sid {
             groups: Vec::new(),
             map: Vec::new(),
             map_changed: false,
-            engines: Default::default(),
-            order: Vec::new(),
-            sample_rate: Self::SILENT_RATE,
-            clk: 0,
-            pace: 0,
+            built: [None; RECEIVERS],
+            regs: [[0; 0x19]; RECEIVERS],
             mixer: MIXER_DEFAULT,
-            audio: None,
+            listening: false,
+            host: Host::Inline(Engines::new(Self::SILENT_RATE)),
         };
         sid.route();
         sid
@@ -415,25 +690,46 @@ impl Sid {
     pub fn set_socket1(&mut self, fitted: bool) {
         self.drain(self.clocking());
         self.socket1 = fitted;
-        if !fitted {
-            self.engines[SOCKET1_RX] = None;
-            self.order.retain(|&rx| rx != SOCKET1_RX);
+        if !fitted && self.built[SOCKET1_RX].take().is_some() {
+            self.command(Cmd::Drop(SOCKET1_RX));
         }
         self.route();
     }
 
-    /// Send samples at `sample_rate` Hz to `sink` from cycle `clk` on. Without a sink the engines lag the C64, so they
-    /// first catch up silently: the stream starts at `clk`, not with the backlog.
+    /// Send samples at `sample_rate` Hz to `sink` from cycle `clk` on, from this thread. Without a sink the engines
+    /// lag the C64, so they first catch up silently: the stream starts at `clk`, not with the backlog.
     pub fn set_audio(&mut self, sample_rate: u32, sink: Box<dyn AudioSink>, clk: u64) {
-        self.catch_up(clk);
-        self.clk = self.clk.max(clk);
-        if sample_rate != self.sample_rate {
-            self.sample_rate = sample_rate;
-            for e in self.engines.iter_mut().flatten() {
-                *e = Engine::build(e.model, sample_rate, e.regs);
-            }
+        let engines = self.engines_for_audio(clk);
+        engines.set_rate(sample_rate);
+        engines.audio = Some(sink);
+        self.listening = true;
+        self.gains();
+        self.refresh_readback();
+    }
+
+    /// [`Sid::set_audio`] with the engines on their own thread (S20). The sink must be `Send`; a device sink is.
+    pub fn set_audio_threaded(&mut self, sample_rate: u32, sink: Box<dyn AudioSink + Send>, clk: u64) {
+        let engines = self.engines_for_audio(clk);
+        engines.set_rate(sample_rate);
+        engines.audio = Some(sink);
+        let Host::Inline(engines) = std::mem::replace(&mut self.host, Host::Inline(Engines::new(sample_rate))) else {
+            unreachable!("inline above");
+        };
+        self.host = Host::Worker(Worker::start(engines));
+        self.listening = true;
+        self.gains();
+    }
+
+    /// Catch the engines up to `clk` before a sink is attached, and hand them out for it.
+    fn engines_for_audio(&mut self, clk: u64) -> &mut Engines {
+        self.drain(self.clocking());
+        if let Host::Worker(_) = self.host {
+            panic!("the SID worker is already running");
         }
-        self.audio = Some(sink);
+        let Host::Inline(engines) = &mut self.host else { unreachable!("checked above") };
+        engines.clock_to(clk);
+        engines.clk = engines.clk.max(clk);
+        engines
     }
 
     /// The observer for a CPU run. Writes come from TRX64's trace now (S17 §2.3); it stays so the run calls do not
@@ -449,15 +745,17 @@ impl Sid {
     /// no reSID clocking.
     pub fn advance(&mut self, clk: u64) {
         self.drain(self.clocking());
-        if self.audio.is_some() {
-            self.catch_up(clk);
+        if self.listening {
+            self.command(Cmd::ClockTo(clk));
         }
+        self.finish();
     }
 
     /// Apply, at cycle `clk`, the writes a firmware DMA write just made through `Machine::write_full`: that path's trace
     /// stamps `Machine.clk`, which is stale between runs (855 D4). Clocks the gap, as any DMA access does.
     pub fn dma_written(&mut self, clk: u64) {
         self.drain(Clocking::At(clk));
+        self.finish();
     }
 
     /// A C64 core config latch changed (0x10180000 + `off`). A decode change rebuilds the table and the engines whose
@@ -473,6 +771,7 @@ impl Sid {
         self.decode = decode;
         self.route();
         self.remodel();
+        self.finish();
     }
 
     /// U64_AUDIO_MIXER byte `off` (0x10100500 + `off`); the gains apply from the next samples on.
@@ -480,6 +779,8 @@ impl Sid {
         if let Some(byte) = self.mixer.get_mut(usize::from(off)) {
             *byte = val;
         }
+        self.gains();
+        self.finish();
     }
 
     /// Whether `addr` is in a range a SID can be mapped to.
@@ -490,43 +791,70 @@ impl Sid {
     /// A firmware DMA read at cycle `clk` (I/O mapped) through UE2's own decode: the ARMSID's answer, else the first
     /// receiver's reSID (S17 §5 Q1). None when no SID decodes `addr`.
     pub fn read(&mut self, addr: u16, clk: u64) -> Option<u8> {
-        let (rx, reg) = (self.receivers(addr), (addr & 0x1F) as u8);
-        if rx == 0 {
+        let (mask, reg) = (self.receivers(addr), (addr & 0x1F) as u8);
+        if mask == 0 {
             return None;
         }
-        if let Some(v) = Self::armsid_answer(rx, reg) {
+        if let Some(v) = Self::armsid_answer(mask, reg) {
             return Some(v);
         }
-        self.catch_up(clk);
-        Some(self.first_engine(rx).map_or(0, |e| e.resid.read(reg)))
+        Some(match &mut self.host {
+            Host::Inline(engines) => {
+                engines.clock_to(clk);
+                let val = engines.read(mask, reg);
+                self.refresh_readback();
+                val
+            }
+            // S20 §3: the worker answers behind the writes already sent.
+            Host::Worker(worker) => {
+                let (tx, rx) = mpsc::sync_channel(1);
+                worker.push(Cmd::Read { mask, reg, clk, reply: tx });
+                worker.flush();
+                rx.recv().unwrap_or(0)
+            }
+        })
     }
 
-    /// [`Sid::read`] for a debugger: no clocking.
+    /// [`Sid::read`] for a debugger: no clocking. With the worker running, $1B/$1C come from the published readback and
+    /// the other registers read 0, as reSID answers them (S20 §3).
     pub fn peek(&self, addr: u16) -> Option<u8> {
-        let (rx, reg) = (self.receivers(addr), (addr & 0x1F) as u8);
-        let resid = || self.first_engine(rx).map_or(0, |e| e.resid.read(reg));
-        (rx != 0).then(|| Self::armsid_answer(rx, reg).unwrap_or_else(resid))
+        let (mask, reg) = (self.receivers(addr), (addr & 0x1F) as u8);
+        if mask == 0 {
+            return None;
+        }
+        if let Some(v) = Self::armsid_answer(mask, reg) {
+            return Some(v);
+        }
+        Some(match &self.host {
+            Host::Inline(engines) => engines.read(mask, reg),
+            Host::Worker(worker) => match reg {
+                0x1B | 0x1C => (0..RECEIVERS)
+                    .filter(|&rx| mask & bit(rx) != 0)
+                    .find_map(|rx| Self::published(worker, rx))
+                    .map_or(0, |r| r[usize::from(reg) - 0x1B]),
+                _ => 0,
+            },
+        })
     }
 
     /// The C64 reset line was asserted: the chips clear their registers; the ARMSID leaves configuration mode but keeps
     /// its mode.
     pub fn reset(&mut self) {
         self.drain(self.clocking());
-        for e in self.engines.iter_mut().flatten() {
-            e.regs = [0; 0x19];
-            e.resid.reset();
-        }
+        self.regs = [[0; 0x19]; RECEIVERS];
+        self.command(Cmd::Reset);
         DOOR.with(|door| door.borrow_mut().armsid.config = false);
-        self.refresh_readback();
+        self.finish();
     }
 
     /// TRX64 restarted its cycle counter at `clk` (warm reset, c64_6510core.rs:677).
     pub fn reanchor(&mut self, clk: u64) {
-        self.clk = clk;
+        self.command(Cmd::Reanchor(clk));
+        self.finish();
     }
 
     fn clocking(&self) -> Clocking {
-        if self.audio.is_some() {
+        if self.listening {
             Clocking::Traced
         } else {
             Clocking::Untimed
@@ -583,32 +911,23 @@ impl Sid {
         }
     }
 
-    /// Receiver `rx`'s engine: built at its first write, rebuilt with its registers when its model changed.
-    fn engine(&mut self, rx: usize) -> &mut Engine {
+    /// Build receiver `rx`'s engine at its first write, or rebuild it when its model changed.
+    fn ensure(&mut self, rx: usize) {
         let model = self.wanted_model(rx);
-        match self.engines[rx].as_ref().map(|e| (e.model, e.regs)) {
-            Some((built, _)) if built == model => {}
-            Some((_, regs)) => self.engines[rx] = Some(Engine::build(model, self.sample_rate, regs)),
-            None => {
-                self.engines[rx] = Some(Engine::build(model, self.sample_rate, [0; 0x19]));
-                self.order.push(rx);
-            }
+        if self.built[rx] == Some(model) {
+            return;
         }
-        self.engines[rx].as_mut().expect("built above")
+        self.built[rx] = Some(model);
+        self.command(Cmd::Ensure { rx, model });
     }
 
     /// Rebuild every engine whose model no longer matches its settings.
     fn remodel(&mut self) {
         for rx in 0..RECEIVERS {
-            if self.engines[rx].is_some() {
-                self.engine(rx);
+            if self.built[rx].is_some() {
+                self.ensure(rx);
             }
         }
-    }
-
-    /// The first receiver among `rx` that has an engine.
-    fn first_engine(&self, rx: u16) -> Option<&Engine> {
-        (0..RECEIVERS).filter(|&r| rx & bit(r) != 0).find_map(|r| self.engines[r].as_ref())
     }
 
     /// Mono gain of receiver `rx` in 1/[`UNITY`] steps: the sum of its mixer channel's two bytes.
@@ -621,25 +940,29 @@ impl Sid {
         i32::from(self.mixer[2 * ch]) + i32::from(self.mixer[2 * ch + 1])
     }
 
+    /// Hand the gains of the current mixer bytes to the engines.
+    fn gains(&mut self) {
+        let gains = std::array::from_fn(|rx| self.gain(rx));
+        self.command(Cmd::Gains(gains));
+    }
+
     /// Apply the queued traced writes in order, each to every receiver of its chip's group.
     fn drain(&mut self, clocking: Clocking) {
         let mut writes = DOOR.with(|door| std::mem::take(&mut door.borrow_mut().writes));
         if !writes.is_empty() {
             if let Clocking::At(clk) = clocking {
-                self.catch_up(clk);
+                self.command(Cmd::ClockTo(clk));
             }
             for &(at, chip, reg, val) in &writes {
-                if let Clocking::Traced = clocking {
-                    self.catch_up(at);
-                }
-                let group = self.groups.get(usize::from(chip)).copied().unwrap_or(0);
-                for rx in (0..RECEIVERS).filter(|&rx| group & bit(rx) != 0) {
-                    let e = self.engine(rx);
-                    if let Some(r) = e.regs.get_mut(usize::from(reg)) {
+                let at = matches!(clocking, Clocking::Traced).then_some(at);
+                let mask = self.groups.get(usize::from(chip)).copied().unwrap_or(0);
+                for rx in (0..RECEIVERS).filter(|&rx| mask & bit(rx) != 0) {
+                    self.ensure(rx);
+                    if let Some(r) = self.regs[rx].get_mut(usize::from(reg)) {
                         *r = val;
                     }
-                    e.resid.write(reg, val);
                 }
+                self.command(Cmd::Write { at, mask, reg, val });
             }
             writes.clear();
         }
@@ -652,70 +975,79 @@ impl Sid {
         });
     }
 
-    /// Clock every engine to cycle `clk` with the same deltas: all of it into the sink, or at most [`SILENT_CATCH_UP`]
-    /// cycles without one. Then refresh the readback the door answers from.
-    fn catch_up(&mut self, clk: u64) {
-        if clk <= self.clk {
-            return;
-        }
-        let mut delta = clk - self.clk;
-        self.clk = clk;
-        let listening = self.audio.is_some();
-        if !listening {
-            delta = delta.min(SILENT_CATCH_UP);
-        }
-        // Always the sampled (per-cycle) clock, samples discarded without a sink: reSID's batch `clock(delta)`
-        // (`Resid::clock_silent`) leaves the ENV3 latch alone (envelope.h:118) and, mixed with sampled clocking on
-        // one engine, froze the envelope counter (ENV3 70 for 20 ms of attack 0; S14 §W4-SID).
-        while delta > 0 {
-            let n = delta.min(CHUNK);
-            delta -= n;
-            let mut mixed = Vec::new();
-            for i in 0..self.order.len() {
-                let rx = self.order[i];
-                let gain = self.gain(rx);
-                let pcm = self.engines[rx].as_mut().expect("ordered engines exist").resid.emit(n as u32);
-                if listening {
-                    if i == 0 {
-                        mixed = vec![0; pcm.len()];
+    /// Run one command: inline straight away, else into the worker's batch.
+    fn command(&mut self, cmd: Cmd) {
+        match &mut self.host {
+            Host::Inline(engines) => match cmd {
+                Cmd::Ensure { rx, model } => engines.ensure(rx, model),
+                Cmd::Drop(rx) => engines.drop_engine(rx),
+                Cmd::Write { at, mask, reg, val } => {
+                    if let Some(at) = at {
+                        engines.clock_to(at);
                     }
-                    mix_into(&mut mixed, &pcm, gain);
+                    engines.write(mask, reg, val);
                 }
-            }
-            if !listening {
-                continue;
-            }
-            let pcm = if self.order.is_empty() { vec![0; self.silence(n)] } else { mixed_down(&mixed) };
-            if let Some(sink) = &mut self.audio {
-                sink.samples(&pcm);
-            }
+                Cmd::ClockTo(clk) => engines.clock_to(clk),
+                Cmd::Gains(gains) => engines.gains = gains,
+                Cmd::Reset => engines.reset(),
+                Cmd::Reanchor(clk) => engines.clk = clk,
+                Cmd::Read { mask, reg, clk, reply } => {
+                    engines.clock_to(clk);
+                    let _ = reply.send(engines.read(mask, reg));
+                }
+            },
+            Host::Worker(worker) => worker.push(cmd),
+        }
+    }
+
+    /// End of a batch: hand it to the worker and refresh the door's readback.
+    fn finish(&mut self) {
+        if let Host::Worker(worker) = &mut self.host {
+            worker.flush();
         }
         self.refresh_readback();
     }
 
-    /// Samples in `n` cycles while no engine runs, at reSID's cadence.
-    fn silence(&mut self, n: u64) -> usize {
-        self.pace += n * u64::from(self.sample_rate);
-        let samples = self.pace / CLOCK_HZ;
-        self.pace %= CLOCK_HZ;
-        samples as usize
+    /// The published $1B/$1C of receiver `rx`, or None while it has no engine.
+    fn published(worker: &Worker, rx: usize) -> Option<[u8; 2]> {
+        let value = worker.readback[rx].load(Ordering::Relaxed);
+        (value & 1 << 16 != 0).then(|| [(value >> 8) as u8, value as u8])
     }
 
+    /// The door answers $1B/$1C of chips 1 and up from here (855 D5): the first engine of each group as of the last
+    /// clocking, or of the worker's last published batch.
     fn refresh_readback(&self) {
+        let cached = |value: u32| (value & 1 << 16 != 0).then(|| [(value >> 8) as u8, value as u8]);
+        let first = |mask: u16| {
+            (0..RECEIVERS).filter(|&rx| mask & bit(rx) != 0).find_map(|rx| match &self.host {
+                Host::Inline(engines) => cached(engines.cache[rx]),
+                Host::Worker(worker) => Self::published(worker, rx),
+            })
+        };
         DOOR.with(|door| {
             let mut door = door.borrow_mut();
             door.readback.clear();
-            door.readback.extend(self.groups.iter().enumerate().map(|(chip, &rx)| {
-                self.first_engine(rx).filter(|_| chip > 0).map(|e| [e.resid.read(0x1B), e.resid.read(0x1C)])
-            }));
+            door.readback
+                .extend(self.groups.iter().enumerate().map(|(chip, &mask)| first(mask).filter(|_| chip > 0)));
         });
+    }
+
+    /// The engines themselves, for the tests: they all run the inline host.
+    #[cfg(test)]
+    fn inline(&self) -> &Engines {
+        match &self.host {
+            Host::Inline(engines) => engines,
+            Host::Worker(_) => panic!("the SID worker owns the engines"),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn ultisid_regs(&self, n: usize, instance: usize) -> Option<[u8; 0x19]> {
-        self.engines[ultisid_rx(n, instance)].as_ref().map(|e| e.regs)
+        let rx = ultisid_rx(n, instance);
+        self.built[rx].is_some().then(|| self.regs[rx])
     }
 }
+
 
 impl Default for Sid {
     fn default() -> Self {
@@ -902,16 +1234,16 @@ mod tests {
         poke(&sid, 0xD501, 66, 0);
         sid.advance(1000);
         for rx in [SOCKET1_RX, ULTISID1_A, ultisid_rx(1, 0)] {
-            assert_eq!(sid.engines[rx].as_ref().map(|e| e.regs[0x18]), Some(0x0F), "an engine per receiver: {rx}");
+            assert_eq!(sid.inline().engines[rx].as_ref().map(|e| e.regs[0x18]), Some(0x0F), "an engine per receiver: {rx}");
         }
-        assert_eq!(sid.engines[SOCKET1_RX].as_ref().map(|e| e.regs[0x01]), Some(0), "$D501 is not socket 1's");
+        assert_eq!(sid.inline().engines[SOCKET1_RX].as_ref().map(|e| e.regs[0x01]), Some(0), "$D501 is not socket 1's");
         assert_eq!(sid.ultisid_regs(1, 0).map(|r| r[0x01]), Some(66), "the UltiSIDs mirror through $D7FF");
         assert!(sid.ultisid_regs(0, 1).is_none(), "no write, no engine");
 
         player_map(&mut sid, [(0x40, 0xFE), (0x42, 0xFE)]);
         poke(&sid, 0xD440, 0x55, 0);
         sid.advance(2000);
-        assert_eq!(sid.order.len(), 3, "a write nobody decodes builds nothing");
+        assert_eq!(sid.inline().order.len(), 3, "a write nobody decodes builds nothing");
     }
 
     #[test]
@@ -919,7 +1251,7 @@ mod tests {
         let mut sid = Sid::new();
         poke(&sid, 0xD414, 0xF0, 0);
         sid.advance(0);
-        let model = |sid: &Sid, rx: usize| sid.engines[rx].as_ref().map(|e| (e.model, e.regs[0x14]));
+        let model = |sid: &Sid, rx: usize| sid.inline().engines[rx].as_ref().map(|e| (e.model, e.regs[0x14]));
         sid.core_config(EMUSID2_WAVES, 1);
         assert_eq!(model(&sid, ULTISID1_A), Some((MODEL_6581, 0xF0)));
         assert_eq!(model(&sid, ultisid_rx(1, 0)), Some((MODEL_8580, 0xF0)), "rebuilt with its registers");
@@ -996,14 +1328,14 @@ mod tests {
         dma(&mut sid, 0x12, 0x21, clk);
         clk += 20_000;
         assert_eq!(sid.read(0xD41C, clk), Some(0xFF), "ENV3 from reSID after 20 ms of attack 0");
-        assert_eq!(sid.engines[SOCKET1_RX].as_ref().map(|e| e.model), Some(MODEL_6581));
+        assert_eq!(sid.inline().engines[SOCKET1_RX].as_ref().map(|e| e.model), Some(MODEL_6581));
         for (reg, val) in [(0x1D, b'S'), (0x1E, b'I'), (0x1F, b'D'), (0x1E, b'E'), (0x1F, b'8')] {
             dma(&mut sid, reg, val, clk);
         }
-        let socket1 = sid.engines[SOCKET1_RX].as_ref().map(|e| (e.model, e.regs[0x14]));
+        let socket1 = sid.inline().engines[SOCKET1_RX].as_ref().map(|e| (e.model, e.regs[0x14]));
         assert_eq!(socket1, Some((MODEL_8580, 0xF0)), "the ARMSID's mode, registers kept");
         sid.set_socket1(false);
-        assert!(sid.engines[SOCKET1_RX].is_none() && !sid.order.contains(&SOCKET1_RX), "the chip left the socket");
+        assert!(sid.inline().engines[SOCKET1_RX].is_none() && !sid.inline().order.contains(&SOCKET1_RX), "the chip left the socket");
     }
 
     #[test]
@@ -1014,14 +1346,14 @@ mod tests {
         }
         sid.advance(1000);
         let regs = sid.ultisid_regs(0, 0).unwrap();
-        assert_eq!((sid.clk, regs[0x18], regs[0x12]), (0, 0x0F, 0x21), "registers set, reSID not clocked");
+        assert_eq!((sid.inline().clk, regs[0x18], regs[0x12]), (0, 0x0F, 0x21), "registers set, reSID not clocked");
         assert_eq!(sid.read(0xD41C, 50_000), Some(0xFF), "a DMA read clocks the gap: ENV3 after attack 0, sustain 15");
-        assert_eq!(sid.clk, 50_000);
+        assert_eq!(sid.inline().clk, 50_000);
         sid.set_audio(48_000, Box::new(Collect::default()), 50_000);
         poke(&sid, 0xD418, 0x00, 60_000);
         sid.advance(70_000);
         let regs = sid.ultisid_regs(0, 0).unwrap();
-        assert_eq!((sid.clk, regs[0x18]), (70_000, 0x00), "with a sink, writes and advances are clocked");
+        assert_eq!((sid.inline().clk, regs[0x18]), (70_000, 0x00), "with a sink, writes and advances are clocked");
     }
 
     #[derive(Default)]
@@ -1047,6 +1379,73 @@ mod tests {
         crossings as f64 * rate / pcm.len() as f64 * (985_248.0 / 985_000.0)
     }
 
+    /// A sink the SID worker can own (S20 §5).
+    #[derive(Clone, Default)]
+    struct SendCollect(std::sync::Arc<std::sync::Mutex<Vec<i16>>>);
+
+    impl AudioSink for SendCollect {
+        fn samples(&mut self, pcm: &[i16]) {
+            self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend_from_slice(pcm);
+        }
+    }
+
+    /// S20 §8.3: the worker plays what the inline engines play. Not sample for sample: two reSID instances built the
+    /// same way do not render bit-identical streams, inline against inline either (checked below). What must match is
+    /// what the engines were asked to do — the length of the stream, the tone, and the mixer change.
+    #[test]
+    fn the_sid_worker_plays_what_the_inline_engines_play() {
+        let play = |threaded: bool| {
+            let mut sid = Sid::new();
+            // UltiSID 1 at $D400, UltiSID 2 at $D420 (the SID player's two-SID map).
+            player_map(&mut sid, [(0x40, 0xFE), (0x42, 0xFE)]);
+            let out = SendCollect::default();
+            let pcm = out.0.clone();
+            if threaded {
+                sid.set_audio_threaded(48_000, Box::new(out), 0);
+            } else {
+                sid.set_audio(48_000, Box::new(out), 0);
+            }
+            let mut clk = 0;
+            tone(&sid, 0xD400, clk);
+            for ms in 1..=300u64 {
+                clk = ms * 985;
+                if ms == 100 {
+                    tone(&sid, 0xD420, clk);
+                }
+                if ms == 200 {
+                    // The mixer mutes UltiSID 2 while it plays (S17 §2.5).
+                    sid.mixer_write(2, 0);
+                    sid.mixer_write(3, 0);
+                }
+                sid.advance(clk);
+            }
+            // Dropping the worker joins it, so everything it had to play is in the sink.
+            drop(sid);
+            let out = pcm.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            out
+        };
+        let (inline, again, threaded) = (play(false), play(false), play(true));
+        assert!(inline.len() > 14_000, "300 ms at 48 kHz: {}", inline.len());
+        assert_eq!((inline.len(), again.len()), (threaded.len(), threaded.len()), "same number of samples");
+        // 48 samples per emulated millisecond; the phases are one SID, two SIDs, and one SID muted.
+        let phase = |pcm: &[i16], from: usize, to: usize| {
+            let (a, b) = (48 * from, (48 * to).min(pcm.len()));
+            (level(&pcm[a..b]), hz(&pcm[a..b], 48_000.0).round())
+        };
+        for (from, to, what) in [(20, 90, "UltiSID 1"), (120, 190, "both"), (220, 290, "UltiSID 2 muted")] {
+            let (want, spread, got) = (phase(&inline, from, to), phase(&again, from, to), phase(&threaded, from, to));
+            assert!((want.1 - got.1).abs() <= 2.0 && (spread.1 - got.1).abs() <= 2.0, "{what}: {} Hz against {} Hz inline", got.1, want.1);
+            let off = |a: f64, b: f64| (a - b).abs() / a.max(1.0);
+            assert!(off(want.0, got.0) < 0.05, "{what}: level {} against {} inline ({})", got.0, want.0, spread.0);
+        }
+        assert!(
+            phase(&threaded, 120, 190).0 > 1.5 * phase(&threaded, 220, 290).0,
+            "the worker applies the mixer: both {} against muted {}",
+            phase(&threaded, 120, 190).0,
+            phase(&threaded, 220, 290).0
+        );
+    }
+
     /// RMS around the mean: steadier than peak-to-peak, whose extremes fall on a different sample every window.
     fn level(pcm: &[i16]) -> f64 {
         let mean = pcm.iter().map(|&s| f64::from(s)).sum::<f64>() / pcm.len() as f64;
@@ -1067,7 +1466,7 @@ mod tests {
         for ms in 2..=1000u64 {
             sid.advance(ms * 985);
         }
-        assert_eq!(sid.order.len(), 2);
+        assert_eq!(sid.inline().order.len(), 2);
         let pcm = pcm.borrow();
         assert!((47_900..=48_000).contains(&pcm.len()), "985 000 cycles at 48 kHz: {}", pcm.len());
         let hz = hz(&pcm[24_000..], 48_000.0);

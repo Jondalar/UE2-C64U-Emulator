@@ -196,9 +196,22 @@ impl Trx64Backend {
     /// S16: the sampler's voices join them on the way out. `Sid` keeps pushing whole blocks and keeps owning the
     /// clock; the mixer renders the same number of samples from the voices and forwards the sum.
     pub fn set_audio(&mut self, sample_rate: u32, sink: Box<dyn AudioSink>) {
-        self.sampler.with(|s| s.set_sample_rate(sample_rate));
-        let mixed = Box::new(sampler::SamplerMix::new(self.sampler.clone(), sink));
+        let mixed = self.mix_with_sampler(sample_rate, sink);
         self.sid.set_audio(sample_rate, mixed, self.m.c64_core.clk);
+    }
+
+    /// [`Trx64Backend::set_audio`] with the reSID engines, the mixing and the sink on their own thread (S20). For a
+    /// live device: the sink must be `Send`, and reads of a SID register cost a round trip.
+    pub fn set_audio_threaded(&mut self, sample_rate: u32, sink: Box<dyn AudioSink + Send>) {
+        let mixed = self.mix_with_sampler(sample_rate, sink);
+        self.sid.set_audio_threaded(sample_rate, mixed, self.m.c64_core.clk);
+    }
+
+    /// The sampler's voices in front of `sink` (S16 §3.4).
+    fn mix_with_sampler<S: AudioSink>(&mut self, sample_rate: u32, sink: S) -> Box<sampler::SamplerMix<S>> {
+        self.sampler.with(|s| s.set_sample_rate(sample_rate));
+        let queue = self.sampler.with(|s| s.queue());
+        Box::new(sampler::SamplerMix::new(queue, sink))
     }
 
     /// Fit the ARMSID in SID socket 1 (`true`) or leave the socket empty, the default (S14 §W4-SID).
