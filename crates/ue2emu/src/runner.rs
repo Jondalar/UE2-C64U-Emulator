@@ -91,8 +91,10 @@ pub struct ControlHandle {
 
 pub struct EmuHandle {
     pub ctl: ControlHandle,
-    /// Emulated MIPS of the last pacing interval.
+    /// Executed MIPS of the last interval: host work, which the idle skip lowers (S19 §5).
     pub mips: Arc<AtomicU64>,
+    /// Emulated time against wall time over the last interval, in percent (S19 §5).
+    pub speed_pct: Arc<AtomicU64>,
     pub join: JoinHandle<Result<()>>,
     /// The audio device stream; it plays until this is dropped.
     pub audio: Output,
@@ -125,11 +127,13 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
         rom_dir: cfg.rom_dir.clone(),
     };
     let mips = Arc::new(AtomicU64::new(0));
+    let speed_pct = Arc::new(AtomicU64::new(0));
     let emu = EmuThread {
         display: ctl.display.clone(),
         now_ms: ctl.now_ms.clone(),
         console: ctl.console.clone(),
         mips: mips.clone(),
+        speed_pct: speed_pct.clone(),
         speed: opts.speed,
     };
     let running = RunningFlag(ctl.running.clone());
@@ -156,7 +160,7 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
         .context("starting the emulation thread")?;
 
     match ready_rx.recv() {
-        Ok(Ok(())) => Ok(EmuHandle { ctl, mips, join, audio }),
+        Ok(Ok(())) => Ok(EmuHandle { ctl, mips, speed_pct, join, audio }),
         Ok(Err(e)) => {
             let _ = join.join();
             Err(e.context("building the machine"))
@@ -267,7 +271,11 @@ pub fn run_headless(cfg: MachineConfig, opts: RunOptions) -> Result<()> {
     let driven = drive(&emu.ctl, &opts);
     let _ = emu.ctl.commands.send(Command::Quit);
     let finished = emu.join.join().map_err(|_| anyhow!("the emulation thread panicked"))?;
-    eprintln!("{} MIPS (last interval)", emu.mips.load(Ordering::Relaxed));
+    eprintln!(
+        "{} MIPS, {} % of realtime (last interval)",
+        emu.mips.load(Ordering::Relaxed),
+        emu.speed_pct.load(Ordering::Relaxed)
+    );
     finished.and(driven)
 }
 
@@ -300,6 +308,7 @@ struct EmuThread {
     now_ms: Arc<AtomicU64>,
     console: Arc<Mutex<ConsoleLog>>,
     mips: Arc<AtomicU64>,
+    speed_pct: Arc<AtomicU64>,
     speed: Speed,
 }
 
@@ -315,7 +324,7 @@ impl EmuThread {
     ) -> Result<()> {
         let mut pacer = Pacer::new(machine.now_ms());
         let mut next_display_ms = 0;
-        let mut mips_mark = (Instant::now(), machine.cpu.insns);
+        let mut mips_mark = (Instant::now(), machine.cpu.insns, machine.now_ms());
         let mut stdout = std::io::stdout();
         let mut inputs = InputTimeline::default();
         // Emulated ms of the quit request: the machine keeps running while a --usb-dir guest write is recent.
@@ -389,10 +398,12 @@ impl EmuThread {
 
             let elapsed = mips_mark.0.elapsed();
             if elapsed >= MIPS_INTERVAL {
-                let insns = machine.cpu.insns;
+                let (insns, now_ms) = (machine.cpu.insns, machine.now_ms());
                 let mips = (insns - mips_mark.1) as f64 / elapsed.as_secs_f64() / 1e6;
                 self.mips.store(mips.round() as u64, Ordering::Relaxed);
-                mips_mark = (Instant::now(), insns);
+                let pct = (now_ms - mips_mark.2) as f64 / elapsed.as_secs_f64() / 10.0;
+                self.speed_pct.store(pct.round() as u64, Ordering::Relaxed);
+                mips_mark = (Instant::now(), insns, now_ms);
             }
         }
     }
@@ -474,5 +485,50 @@ mod tests {
         assert_eq!(pacer.anchor_emu_ms, 0);
         assert_eq!(pacer.delay_at(10, Duration::from_millis(500)), None);
         assert_eq!(pacer.anchor_emu_ms, 10, "backlog dropped");
+    }
+
+    /// S19 §8.4: with TRX64 attached the firmware and the C64 run to the same state with the idle skip on and off.
+    /// `UE2_IDLE_SKIP_SECONDS` sets the emulated length (default 3).
+    #[cfg(feature = "trx64")]
+    #[test]
+    fn idle_skip_leaves_a_run_with_the_c64_unchanged() {
+        use ue2_core::devices::c64::C64Port;
+
+        let root = std::env::var_os("UE2_FIRMWARE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../firmware/1541ultimate"));
+        let elf = root.join("target/u64ii/riscv/ultimate/result/ultimate.elf");
+        if !elf.is_file() || !root.join("roms").is_dir() {
+            eprintln!("skipping: firmware ELF or roms not found under {}", root.display());
+            return;
+        }
+        let secs: u64 = std::env::var("UE2_IDLE_SKIP_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let run = |skip: bool| {
+            let mut cfg = MachineConfig::new(elf.clone(), root.join("roms"));
+            cfg.idle_skip = skip;
+            let mut m = Machine::new(cfg).unwrap();
+            attach_trx64(&mut m, None).unwrap();
+            // The RTC counts host seconds; hold it so both runs read the same time (byte 0 locks).
+            for off in 0..3 {
+                rv32::Bus::write8(&mut m.bus, 0x1006_0400 + off, 0);
+            }
+            let mut console = Vec::new();
+            let mut left = secs * 1000 * 100_000 / m.cfg.clocks_per_insn;
+            while left > 0 {
+                let slice = left.min(100_000);
+                assert_eq!(m.run(slice), RunExit::Budget);
+                console.extend(m.drain_console());
+                left -= slice;
+            }
+            (m, console)
+        };
+        let ((on, on_console), (off, off_console)) = (run(true), run(false));
+        assert_eq!(String::from_utf8_lossy(&on_console), String::from_utf8_lossy(&off_console));
+        assert_eq!((on.cpu.pc, on.cpu.x, &on.cpu.csr), (off.cpu.pc, off.cpu.x, &off.cpu.csr));
+        assert_eq!((on.bus.now, on.cpu.insns + on.idle_insns), (off.bus.now, off.cpu.insns));
+        assert!(on.bus.ram == off.bus.ram, "DDR differs");
+        let frame = |m: &Machine| m.bus.io.get::<C64Port>().and_then(C64Port::frame);
+        assert!(frame(&on).is_some() && frame(&on) == frame(&off), "C64 frame differs");
+        eprintln!("{secs} s emulated with TRX64: {} executed, {} skipped", on.cpu.insns, on.idle_insns);
     }
 }

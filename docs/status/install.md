@@ -184,6 +184,7 @@ option.
 | `--log LIST` | Logging: `unmapped`, `io`, `irq`, comma separated |
 | `--no-halt` | Keep running when a firmware fault hook fires |
 | `--trace` | Record the last 256 PCs, printed when a fault hook halts the machine (implied by `--gdb`; about 3 % MIPS) |
+| `--no-idle-skip` | Execute idle loops instruction by instruction instead of fast-forwarding them to the next device event (S19) |
 
 ### Examples
 

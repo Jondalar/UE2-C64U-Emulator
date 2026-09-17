@@ -32,4 +32,5 @@ gdbstub_arch = "0.3"
 cpal = "0.15"
 
 [dev-dependencies]
+rv32 = { path = "../rv32" }
 tempfile = "3"

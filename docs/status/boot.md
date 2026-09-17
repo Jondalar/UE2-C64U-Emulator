@@ -168,5 +168,6 @@ Open questions from `docs/hw` that still affect what the boot shows:
 - **SD card:** no image by default ("No media"); `--sd <image>` attaches one (S09).
 - **Overlay rendering** follows the open chargen IP; palette path, `pixel_opaque`, X_ON/Y_ON origin and big-font
   height are open (05 Q2-Q5).
-- **Time mapping** is a fixed 4 clocks per instruction with no idle fast-forward (00 Q-D1).
+- **Time mapping** is a fixed 4 clocks per instruction. Since S19, loops at a fixed point (the FreeRTOS idle loop) are
+  fast-forwarded to the next device event without changing the result (`docs/specs/S19-idle-skip.md`).
 - **Debugging:** the GDB stub and the CPU trace ring exist since S11 (`docs/ARCHITECTURE.md` §Debugging).

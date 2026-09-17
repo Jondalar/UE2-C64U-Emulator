@@ -86,7 +86,7 @@ pub mod csr {
 /// The only `mstatus` bits rvlite stores; everything else reads 0 (csr.vhd:104-106; doc 01 CSR table).
 const MSTATUS_STORED: u32 = csr::MSTATUS_MIE | csr::MSTATUS_MPIE;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Csrs {
     pub mstatus: u32,
     pub mie: u32,

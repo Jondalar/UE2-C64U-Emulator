@@ -51,6 +51,8 @@ pub struct MachineConfig {
     /// Record the CPU trace ring ([`TraceRing`]).
     pub trace: bool,
     pub log: LogFlags,
+    /// Fast-forward loops that cannot change anything until the next device event (docs/specs/S19-idle-skip.md).
+    pub idle_skip: bool,
 }
 
 impl MachineConfig {
@@ -68,6 +70,7 @@ impl MachineConfig {
             halt_on_fault: true,
             trace: false,
             log: LogFlags::default(),
+            idle_skip: true,
         }
     }
 }
@@ -213,6 +216,23 @@ pub struct Machine {
     irqs: u64,
     /// PC of the last breakpoint or hook stop. The next `run` executes that instruction instead of stopping again.
     resume_pc: Option<u32>,
+    /// The loop the idle skip is watching (S19 §3).
+    idle: IdleSlot,
+    /// Instructions the idle skip did not execute; `cpu.insns` counts the executed ones (S19 §5).
+    pub idle_insns: u64,
+}
+
+/// One loop head the idle skip watches: the machine state at the last arrival there (S19 §3).
+#[derive(Clone, Debug, Default)]
+struct IdleSlot {
+    head: u32,
+    /// `cpu.insns` at the last arrival.
+    insns: u64,
+    irqs: u64,
+    x: [u32; 32],
+    csr: rv32::Csrs,
+    /// Executed instructions between the last two arrivals; 0 until there have been two.
+    period: u64,
 }
 
 impl Machine {
@@ -255,17 +275,25 @@ impl Machine {
             next_deadline,
             irqs: 0,
             resume_pc: None,
+            idle: IdleSlot { head: u32::MAX, ..IdleSlot::default() },
+            idle_insns: 0,
         }
     }
 
-    /// Run at most `max_insns` instructions (an interrupt entry uses one step of the budget).
+    /// Run at most `max_insns` instructions (an interrupt entry uses one step of the budget). Instructions the idle
+    /// skip fast-forwards count against the budget like executed ones (S19 §4).
     pub fn run(&mut self, max_insns: u64) -> RunExit {
         let hooks = self.hooks;
         let breakpoints = !self.breakpoints.is_empty();
         let check_pc = breakpoints || hooks.armed();
         let trace = self.cfg.trace;
+        let idle_skip = self.cfg.idle_skip && !breakpoints && !trace && !self.cfg.log.io;
+        // The host may have changed RAM or devices since the last run (S19 §3).
+        self.bus.idle_dirty = true;
         let mut resume = self.resume_pc.take();
-        for _ in 0..max_insns {
+        let mut left = max_insns;
+        while left > 0 {
+            left -= 1;
             if check_pc {
                 let pc = self.cpu.pc;
                 // `stop_at` only for a hook address or while breakpoints are set; the stop being resumed is skipped.
@@ -280,9 +308,14 @@ impl Machine {
             if trace {
                 self.trace.push(self.cpu.pc);
             }
+            let pc_before = self.cpu.pc;
             self.pre_step();
             let exit = self.cpu.step(&mut self.bus);
             self.post_step();
+            // A loop head is where a backward branch or jump lands, `j .` included (S19 §3).
+            if idle_skip && exit == rv32::Exit::Stepped && self.cpu.pc <= pc_before {
+                left -= self.idle_arrival(left);
+            }
             match exit {
                 rv32::Exit::Stepped | rv32::Exit::Wfi | rv32::Exit::Ebreak => {}
                 rv32::Exit::Interrupt => {
@@ -301,6 +334,39 @@ impl Machine {
             }
         }
         RunExit::Budget
+    }
+
+    /// Arrival at a loop head with `left` instructions of budget left. When the loop has reached a fixed point, i.e.
+    /// since the last arrival here nothing was written, no IO was accessed, no device ticked, no interrupt was taken
+    /// and registers, CSRs and the period are unchanged, every further pass is the same pass until the next device
+    /// event: skip whole passes up to it and return the instructions skipped (S19 §3-§4).
+    #[inline(never)]
+    fn idle_arrival(&mut self, left: u64) -> u64 {
+        let clean = !std::mem::replace(&mut self.bus.idle_dirty, false);
+        let (pc, insns, irqs) = (self.cpu.pc, self.cpu.insns, self.irqs);
+        let slot = &mut self.idle;
+        if slot.head != pc {
+            *slot = IdleSlot { head: pc, insns, irqs, x: self.cpu.x, csr: self.cpu.csr.clone(), period: 0 };
+            return 0;
+        }
+        let period = insns - slot.insns;
+        let fixed = clean
+            && irqs == slot.irqs
+            && period == slot.period
+            && self.cpu.x == slot.x
+            && self.cpu.csr == slot.csr;
+        (slot.insns, slot.irqs, slot.period) = (insns, irqs, period);
+        if !fixed {
+            slot.x = self.cpu.x;
+            slot.csr = self.cpu.csr.clone();
+            return 0;
+        }
+        let clocks = period * self.cfg.clocks_per_insn;
+        let passes = (left / period).min(self.next_deadline.saturating_sub(self.bus.now) / clocks);
+        let skipped = passes * period;
+        self.bus.now += skipped * self.cfg.clocks_per_insn;
+        self.idle_insns += skipped;
+        skipped
     }
 
     /// Before a step: tick due devices, then drive `meip` from the ITU line, so an edge raised by a tick is
@@ -584,8 +650,9 @@ impl Machine {
     /// One-line run statistics.
     pub fn stats(&self) -> String {
         format!(
-            "{} instructions, {:.3} s emulated, {} IRQs taken, pc {}",
+            "{} instructions, {} skipped idle, {:.3} s emulated, {} IRQs taken, pc {}",
             self.cpu.insns,
+            self.idle_insns,
             self.bus.now as f64 / time::CLOCK_HZ as f64,
             self.irqs,
             self.symbols.format(self.cpu.pc)
@@ -944,7 +1011,7 @@ mod tests {
         let mut m = machine(cfg(), Vec::new(), Symbols::empty());
         m.bus.now = 3 * time::CLOCK_HZ / 2;
         m.irqs = 2;
-        assert_eq!(m.stats(), "0 instructions, 1.500 s emulated, 2 IRQs taken, pc 0x00030000");
+        assert_eq!(m.stats(), "0 instructions, 0 skipped idle, 1.500 s emulated, 2 IRQs taken, pc 0x00030000");
         m.input(HostInput::MenuButton(true));
         let snap = m.display();
         assert_eq!((snap.screen.len(), snap.color.len(), snap.palette.len(), snap.now_ms), (4096, 4096, 64, 1500));
@@ -1010,5 +1077,132 @@ mod tests {
         // get_mem(unsigned int) @0x43294: `sw ra,28(sp)`, `j .` at 0x432C4.
         assert_eq!((m.hooks.panic_loop, m.hooks.panic_ra_slot), (0x432C4, 28));
         assert_eq!(m.symbols.format(0x33700), "freertos_risc_v_trap_handler");
+    }
+
+    // ---- S19 idle skip ----
+
+    const J_BACK_4: u32 = 0xFFDF_F06F; // jal x0, -4
+    const J_SELF: u32 = 0x0000_006F; // jal x0, 0
+
+    /// A machine running `program` at 0x30000, the skip on or off, with a timer ticking every 1000 clocks.
+    fn idle_machine(program: &[u32], skip: bool) -> Machine {
+        let mut config = cfg();
+        config.idle_skip = skip;
+        let mut m = machine(config, vec![timer(1, 1000, Some(1000))], Symbols::empty());
+        for (i, word) in (0u32..).zip(program) {
+            m.bus.write32(0x30000 + 4 * i, *word);
+        }
+        m
+    }
+
+    /// Everything a skip must leave as it was, and the instructions counted either way.
+    fn idle_state(m: &Machine) -> (u32, [u32; 32], rv32::Csrs, u64, u64, u64, Vec<u64>) {
+        let executed_or_skipped = m.cpu.insns + m.idle_insns;
+        (m.cpu.pc, m.cpu.x, m.cpu.csr.clone(), m.bus.now, m.irqs, executed_or_skipped, timer_at(m, 0).ticks.clone())
+    }
+
+    #[test]
+    fn idle_skip_fast_forwards_a_fixed_loop_to_the_same_state() {
+        // addi a1,x0,5 ; j -4
+        let program = [0x0050_0593, J_BACK_4];
+        let (mut on, mut off) = (idle_machine(&program, true), idle_machine(&program, false));
+        for _ in 0..7 {
+            assert_eq!(on.run(3_333), RunExit::Budget);
+            assert_eq!(off.run(3_333), RunExit::Budget);
+            assert_eq!(idle_state(&on), idle_state(&off));
+        }
+        assert_eq!(on.cpu.insns + on.idle_insns, 7 * 3_333, "skipped instructions count against the budget");
+        assert!(on.idle_insns > on.cpu.insns, "most of the loop was skipped: {} of {}", on.idle_insns, on.cpu.insns);
+        assert_eq!(off.idle_insns, 0);
+        assert_eq!(timer_at(&on, 0).ticks.len(), 93, "the timer ticked at every deadline");
+    }
+
+    #[test]
+    fn idle_skip_takes_an_interrupt_at_the_same_clock_and_pc() {
+        // 0x30000: addi a1,x0,5 ; j -4        0x30100 (mtvec): j .
+        let mut program = vec![0u32; 0x41];
+        (program[0], program[1], program[0x40]) = (0x0050_0593, J_BACK_4, J_SELF);
+        let (mut on, mut off) = (idle_machine(&program, true), idle_machine(&program, false));
+        for m in [&mut on, &mut off] {
+            m.bus.irq.global_en = true;
+            m.bus.irq.mask = 0x01;
+            m.cpu.csr.mtvec = 0x30100;
+            m.cpu.csr.mie = rv32::csr::MIE_MEIE;
+            m.cpu.csr.mstatus = rv32::csr::MSTATUS_MIE;
+        }
+        assert_eq!(on.run(5_000), RunExit::Budget);
+        assert_eq!(off.run(5_000), RunExit::Budget);
+        assert_eq!(on.irqs, 1);
+        assert_eq!(idle_state(&on), idle_state(&off), "same clock, mepc and handler loop");
+        assert!(on.idle_insns > 0, "the handler's `j .` is skipped too");
+    }
+
+    #[test]
+    fn idle_skip_leaves_loops_alone_that_change_something() {
+        let io_base_lui = 0x1000_0737; // lui a4, 0x10000
+        let loops: [(&str, Vec<u32>); 3] = [
+            ("writes RAM", vec![0x0004_0637, 0x00B6_2023, J_BACK_4]), // lui a2,0x40 ; sw a1,0(a2) ; j -4
+            ("reads IO", vec![io_base_lui, 0x0007_2683, J_BACK_4]), // lui a4,0x10000 ; lw a3,0(a4) ; j -4
+            ("counts", vec![0x0015_8593, J_BACK_4]),              // addi a1,a1,1 ; j -4
+        ];
+        for (what, program) in loops {
+            let mut m = idle_machine(&program, true);
+            assert_eq!(m.run(20_000), RunExit::Budget);
+            assert_eq!(m.idle_insns, 0, "a loop that {what}");
+        }
+    }
+
+    #[test]
+    fn idle_skip_is_off_for_debugging_and_when_disabled() {
+        let program = [0x0050_0593, J_BACK_4];
+        let cases: [(&str, fn(&mut Machine)); 4] = [
+            ("disabled", |m| m.cfg.idle_skip = false),
+            ("breakpoints", |m| m.breakpoints.push(0x50000)),
+            ("trace", |m| m.cfg.trace = true),
+            ("--log io", |m| m.cfg.log.io = true),
+        ];
+        for (what, set) in cases {
+            let mut m = idle_machine(&program, true);
+            set(&mut m);
+            assert_eq!(m.run(20_000), RunExit::Budget);
+            assert_eq!((m.idle_insns, m.cpu.insns), (0, 20_000), "{what}");
+        }
+    }
+
+    /// S19 §8.3: the firmware runs to the same state with the skip on and off. `UE2_IDLE_SKIP_SECONDS` sets the
+    /// emulated length (default 3).
+    #[test]
+    fn idle_skip_leaves_the_firmware_run_unchanged() {
+        let Some(root) = firmware_root() else { return };
+        let secs: u64 = std::env::var("UE2_IDLE_SKIP_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let run = |skip: bool| {
+            let mut config = MachineConfig::new(root.join(FIRMWARE_ELF), root.join("roms"));
+            config.idle_skip = skip;
+            let mut m = Machine::new(config).unwrap();
+            // The RTC counts host seconds; hold it so both runs read the same time (byte 0 locks, misc.rs).
+            for off in 0..3 {
+                m.bus.write8(0x1006_0400 + off, 0);
+            }
+            let mut console = Vec::new();
+            let mut left = secs * time::CLOCK_HZ / m.cfg.clocks_per_insn;
+            while left > 0 {
+                let slice = left.min(100_000);
+                assert_eq!(m.run(slice), RunExit::Budget);
+                console.extend(m.drain_console());
+                left -= slice;
+            }
+            (m, console)
+        };
+        let ((on, on_console), (off, off_console)) = (run(true), run(false));
+        assert_eq!(String::from_utf8_lossy(&on_console), String::from_utf8_lossy(&off_console));
+        assert_eq!((on.cpu.pc, on.cpu.x, &on.cpu.csr), (off.cpu.pc, off.cpu.x, &off.cpu.csr));
+        assert_eq!((on.bus.now, on.irqs, on.cpu.insns + on.idle_insns), (off.bus.now, off.irqs, off.cpu.insns));
+        assert!(on.bus.ram == off.bus.ram, "DDR differs");
+        eprintln!(
+            "{secs} s emulated: {} executed, {} skipped ({:.1} %)",
+            on.cpu.insns,
+            on.idle_insns,
+            100.0 * on.idle_insns as f64 / off.cpu.insns as f64
+        );
     }
 }

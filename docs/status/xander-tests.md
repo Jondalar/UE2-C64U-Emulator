@@ -224,6 +224,11 @@ only touch RAM back to back inside one PHI2 cycle. The same windows now hold rea
 at 69-97 % of one core, and the audio is clean. `TRX64_TURBO_FASTPATH=0` switches the fast path off. The largest
 item left is the CIA update, 12-16 % of the thread.
 
+**Idle skip (S19).** In the demo the firmware idles: 0.7 C64-window accesses a second and no writes into DDR the C64
+uses. With the FreeRTOS idle loop fast-forwarded, 97.6 % of the RISC-V instructions are skipped (140 M executed, 5 840 M
+skipped over 239 s). The same four windows stay at realtime, at 45, 52, 35 and 36 % host CPU by `ps` (69-97 % before).
+At `--speed max` with audio off, 231 s of the demo take 129.0 s CPU instead of 153.3 s with `--no-idle-skip`, 16 % less.
+
 ## 3. heartbeat-demo v1.0.1
 
 `idi8b/heartbeat-demo/{heartbeat-demo.prg,maniac.reu,Knight Rider Theme.reu}` with the shipped

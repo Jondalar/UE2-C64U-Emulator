@@ -71,6 +71,9 @@ pub struct SystemBus {
     pub accesses: Vec<Access>,
     /// Unmapped access counts by address (filled only while `log_unmapped`).
     pub unmapped: BTreeMap<u32, UnmappedCount>,
+    /// Set by every CPU write to DDR, every IO access and every device tick; the idle skip clears it where it looks
+    /// for a loop that cannot change anything (docs/specs/S19-idle-skip.md §3).
+    pub idle_dirty: bool,
 }
 
 impl Default for SystemBus {
@@ -123,6 +126,7 @@ impl SystemBus {
             log_unmapped: false,
             accesses: Vec::new(),
             unmapped: BTreeMap::new(),
+            idle_dirty: true,
         }
     }
 
@@ -133,6 +137,8 @@ impl SystemBus {
 
     /// Tick, in install order, every device whose `next_event()` is due at `now`.
     pub fn tick_due(&mut self) {
+        // A device may write DDR through `IoCtx::ram` (S19 §3).
+        self.idle_dirty = true;
         let now = self.now;
         for dev in &mut self.io.devices {
             if dev.next_event().is_some_and(|t| t <= now) {
@@ -145,6 +151,7 @@ impl SystemBus {
 
     fn io_read8(&mut self, addr: u32) -> u8 {
         self.io_touched = true;
+        self.idle_dirty = true;
         match self.io.resolve(addr) {
             Some((dev, off)) => {
                 let mut ctx = IoCtx {
@@ -171,6 +178,7 @@ impl SystemBus {
 
     fn io_write8(&mut self, addr: u32, val: u8) {
         self.io_touched = true;
+        self.idle_dirty = true;
         match self.io.resolve(addr) {
             Some((dev, off)) => {
                 let mut ctx = IoCtx {
@@ -240,7 +248,10 @@ impl rv32::Bus for SystemBus {
     #[inline]
     fn write8(&mut self, addr: u32, val: u8) {
         match region(addr) {
-            Region::Ram(i) => self.ram[i] = val,
+            Region::Ram(i) => {
+                self.ram[i] = val;
+                self.idle_dirty = true;
+            }
             Region::Io => self.io_write8(addr, val),
             Region::Open => {
                 if self.log_unmapped {
@@ -272,7 +283,10 @@ impl rv32::Bus for SystemBus {
     #[inline]
     fn write16(&mut self, addr: u32, val: u16) {
         match ram_span(addr, 2) {
-            Some(i) => self.ram[i..i + 2].copy_from_slice(&val.to_le_bytes()),
+            Some(i) => {
+                self.ram[i..i + 2].copy_from_slice(&val.to_le_bytes());
+                self.idle_dirty = true;
+            }
             None => {
                 self.write8(addr, val as u8);
                 self.write8(addr.wrapping_add(1), (val >> 8) as u8);
@@ -283,7 +297,10 @@ impl rv32::Bus for SystemBus {
     #[inline]
     fn write32(&mut self, addr: u32, val: u32) {
         match ram_span(addr, 4) {
-            Some(i) => self.ram[i..i + 4].copy_from_slice(&val.to_le_bytes()),
+            Some(i) => {
+                self.ram[i..i + 4].copy_from_slice(&val.to_le_bytes());
+                self.idle_dirty = true;
+            }
             None => {
                 for (k, byte) in (0u32..).zip(val.to_le_bytes()) {
                     self.write8(addr.wrapping_add(k), byte);

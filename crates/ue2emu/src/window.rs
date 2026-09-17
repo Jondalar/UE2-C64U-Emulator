@@ -55,7 +55,7 @@ pub fn run_window(cfg: MachineConfig, opts: RunOptions) -> Result<()> {
     let started = Instant::now();
     let usb_keys = cfg.usb.keyboard.then(UsbKeys::default);
     // `_audio` keeps the SID audio stream (`--audio`, on by default here) playing until the window has closed.
-    let EmuHandle { ctl, mips, join, audio: _audio } = runner::spawn(cfg, &opts)?;
+    let EmuHandle { ctl, mips, speed_pct, join, audio: _audio } = runner::spawn(cfg, &opts)?;
     if let Some(addr) = &opts.control {
         if let Err(e) = control::serve(ctl.clone(), addr) {
             let _ = ctl.commands.send(Command::Quit);
@@ -76,6 +76,7 @@ pub fn run_window(cfg: MachineConfig, opts: RunOptions) -> Result<()> {
     let mut app = App {
         ctl: ctl.clone(),
         mips: mips.clone(),
+        speed_pct,
         renderer: Renderer::new(&font),
         pixels: Vec::new(),
         held: HeldKeys::default(),
@@ -112,6 +113,7 @@ pub fn run_window(cfg: MachineConfig, opts: RunOptions) -> Result<()> {
 struct App {
     ctl: ControlHandle,
     mips: Arc<AtomicU64>,
+    speed_pct: Arc<AtomicU64>,
     renderer: Renderer,
     pixels: Vec<u32>,
     held: HeldKeys,
@@ -169,8 +171,9 @@ impl App {
     fn update_title(&self) {
         if let Some(window) = &self.window {
             window.set_title(&format!(
-                "ue2emu — {:.1} s — {} MIPS",
+                "ue2emu — {:.1} s — {} % — {} MIPS",
                 self.ctl.now_ms.load(Ordering::Relaxed) as f64 / 1000.0,
+                self.speed_pct.load(Ordering::Relaxed),
                 self.mips.load(Ordering::Relaxed)
             ));
         }

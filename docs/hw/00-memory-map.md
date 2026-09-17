@@ -457,7 +457,7 @@ Order is derived from: crt0.S:53-218, the `.init_array` order (ELF), riscv_main.
 
 ### D. Emulator design questions
 
-1. **Q-D1: Time mapping.** Instruction→emulated-time mapping, idle detection (no WFI, no MTIME), and whether busy-wait fast-forward is acceptable given tick collapse. (01 Q10; 02 §Tick collapse)
+1. **Q-D1: Time mapping.** Instruction→emulated-time mapping, idle detection (no WFI, no MTIME), and whether busy-wait fast-forward is acceptable given tick collapse. (01 Q10; 02 §Tick collapse) Answered for loops at a fixed point by S19: they are skipped up to the next device event, so no tick collapses. Busy-waits that poll IO are not skipped.
 2. **Q-D2: Overlay UI config.** Cleanest way to get `CFG_USERIF_ITYPE=1`: pre-seeded flash config page vs REST config route. (05 Q9)
 3. **Q-D3: Boot ROM.** Only relevant if the boot ROM is run instead of loading the ELF: its register state and the `.app` size limit (`length < 0x180000`). (01 Q6, Q7)
 4. **Q-D4: Unused regions.** Owner of `__updater_start` 0x03000000-0x03BFFFFF (no compiled user). (01 Q8)

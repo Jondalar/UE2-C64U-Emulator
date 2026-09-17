@@ -103,7 +103,8 @@ Status:
 
 - **CPU:** rvlite RV32IM (the firmware uses no DIV/REM), M-mode only, direct-mode traps. One external
   interrupt line from the ITU (`mcause 0x8000000B`). No CLINT/MTIME. The idle task spins without WFI, so
-  **emulated time advances per executed instruction**.
+  **emulated time advances per executed instruction**, and a loop that cannot change anything is fast-forwarded to
+  the next device event ([S19](specs/S19-idle-skip.md)).
 - **Memory:** 64 MB DDR at 0 (bit 28 = 0, mirrored modulo 64 MB), except `0x8000xxxx`, which is the rvlite boot
   BRAM (bus_converter.vhd:96,118). Instruction fetches ignore bit 28 (rvlite_wrapper.vhd:101-106). 8-bit IO bus
   `0x10000000-0x10FFFFFF`. 16/32-bit IO accesses are little-endian byte sequences, each byte with its own side effects.
@@ -542,6 +543,11 @@ accept thread, one per connection direction), and the `--usb-dir` worker and hos
    `vAssertCalled`, `C_exception_handler`, `__crt0_dummy_trap_handler`, or the `j .` of the `get_mem` PANIC loop
    (found in the loaded code of `_Z7get_memj`; the halt names the caller from the saved `ra`). An absent hook is
    `NO_HOOK` (`u32::MAX`, never a PC), so the per-step check is four inlined compares ([fixes.md](status/fixes.md)).
+5. Idle skip ([S19](specs/S19-idle-skip.md)): where a backward branch or jump lands, `idle_arrival` compares the state
+   with the last arrival there. When nothing was written, no IO was accessed, no device ticked, no interrupt was
+   taken and registers, CSRs and the period are unchanged, it skips whole passes up to `next_deadline` or the end of
+   the budget. The skipped instructions count against the budget and in `idle_insns`, not in `cpu.insns`. Off with
+   breakpoints, trace, `--log io` or `--no-idle-skip`.
 
 #### Pacing
 
@@ -793,7 +799,8 @@ The workspace version is 0.2.0 ([Cargo.toml](../Cargo.toml)).
 ### Emulated time and clocking
 
 - **Master clock.** 100 MHz (`crates/ue2-core/src/time.rs`), advanced by `clocks_per_insn` per instruction (default 4,
-  25 MIPS emulated). There is no idle fast-forward (00 Q-D1).
+  25 MIPS emulated). Loops at a fixed point are fast-forwarded to the next device event, and the run ends in the same
+  state as without the skip ([S19](specs/S19-idle-skip.md)).
 - **Devices** schedule themselves through `next_event`/`tick`. The ITU IRQ timer raises edge bit 0 every
   `(reload+1)*256` clocks (0x7A0 → 499 968, the 200 Hz tick); ITU_TIMER counts 1 per 500 clocks; the ms timer is
   `now / 100 000` ([S03](specs/S03-itu-uart.md)).
@@ -963,7 +970,7 @@ sampler behind it; S17 keeps `run_cpu` and `run_held` unchanged (CRITICAL, 25 sy
 |---|---|---|
 | Run the firmware unmodified; adapt the emulator, defects included | The point is to test the real firmware | [hw/00](hw/00-memory-map.md) §"Firmware defects" |
 | Load the application straight into DDR; no boot ROM or flash boot | Loading it directly replaces the boot ROM (hw/01 §A, H18); the boot BRAM page reads 0 | [S02](specs/S02-core.md), [hw/01](hw/01-cpu-boot-memory.md) |
-| Emulated time advances per instruction, fixed clocks per instruction | The idle task spins without WFI; there is no idle fast-forward | [S02](specs/S02-core.md), [boot.md](status/boot.md) §Known gaps |
+| Emulated time advances per instruction, fixed clocks per instruction | The idle task spins without WFI. Loops that cannot change anything are skipped to the next device event, exactly (S19) | [S02](specs/S02-core.md), [S19](specs/S19-idle-skip.md) |
 | Fault hooks as plain `u32` compares with `NO_HOOK` | About 12 % faster loop than the closure check | [fixes.md](status/fixes.md) §1 |
 | TRX64 as the C64 core behind a `C64Backend` trait in ue2-core, linked by a cargo feature | ue2-core builds without C++ and TRX64, mock tests, T0-only build | [S14](specs/S14-c64-trx64.md) §2 |
 | One `C64Port` device through `IoMap::map_origin` | Several devices sharing `Rc<RefCell<backend>>` would split one state machine (STOP, MODE, cart) | [S14](specs/S14-c64-trx64.md) §2 |
@@ -1018,6 +1025,7 @@ sampler behind it; S17 keeps `run_cpu` and `run_held` unchanged (CRITICAL, 25 sy
 | Q11 | Guest deletes files on a `--usb-dir` stick | Moved to `.ue2-trash`; more than 25 % or more than 50 deletions refused until forced | [usb-dir.md](status/usb-dir.md) |
 | Q12 | Build without TRX64 | `cargo build -p ue2emu --no-default-features` clean; `cargo test -p ue2-core` without a C++ toolchain | [c64.md](status/c64.md) |
 | Q13 | Realtime, C64 turbo 64 MHz | UltimateDemo2026, four 15 s windows on an Apple M4: realtime in each (1.000 to 0.997) at 69-97 % of one core; before TRX64 856, 0.72 to 0.98 of realtime at 100 % | [xander-tests.md](status/xander-tests.md) §2 |
+| Q14 | Idle skip changes nothing but speed | Firmware 60 s emulated, with and without TRX64: console, registers, CSRs, `now`, all DDR and the C64 frame identical with the skip on and off; 96.8 % of instructions skipped. UltimateDemo2026 at `--speed max`: 129.0 s CPU instead of 153.3 s | [S19](specs/S19-idle-skip.md), [xander-tests.md](status/xander-tests.md) §2 |
 
 Other numbers: the CPU interpreter targets ≥ 150 MIPS ([S01](specs/S01-cpu-rv32.md)); the trace ring costs about 3 %;
 realtime with 2004 host forwards keeps 25 MIPS at about 24 % of one core ([e2e.md](status/e2e.md)).

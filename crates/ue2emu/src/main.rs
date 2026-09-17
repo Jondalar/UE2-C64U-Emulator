@@ -109,6 +109,10 @@ struct RunArgs {
     /// Record the last 256 PCs, printed when a fault hook halts the machine (implied by --gdb; about 3 % MIPS)
     #[arg(long)]
     trace: bool,
+    /// Execute idle loops instruction by instruction instead of fast-forwarding them to the next device event
+    /// (docs/specs/S19-idle-skip.md)
+    #[arg(long)]
+    no_idle_skip: bool,
     #[command(flatten)]
     net: net::NetArgs,
     #[command(flatten)]
@@ -167,6 +171,7 @@ fn run(a: RunArgs) -> Result<()> {
     cfg.overlay_ui = !a.no_overlay_ui;
     cfg.halt_on_fault = !a.no_halt;
     cfg.trace = a.trace || a.gdb.is_some();
+    cfg.idle_skip = !a.no_idle_skip;
     let mut log = LogFlags::default();
     for flag in &a.log {
         match flag.as_str() {
