@@ -53,6 +53,9 @@ pub struct MachineConfig {
     pub log: LogFlags,
     /// Fast-forward loops that cannot change anything until the next device event (docs/specs/S19-idle-skip.md).
     pub idle_skip: bool,
+    /// `.cfg` files whose settings go into the flash config pages before the firmware runs, in order
+    /// (docs/specs/S21-settings.md).
+    pub settings: Vec<PathBuf>,
 }
 
 impl MachineConfig {
@@ -71,6 +74,7 @@ impl MachineConfig {
             trace: false,
             log: LogFlags::default(),
             idle_skip: true,
+            settings: Vec::new(),
         }
     }
 }
@@ -243,6 +247,11 @@ impl Machine {
         let mut bus = SystemBus::new();
         devices::install_all(&mut bus.io, &cfg);
         let fw = loader::load_firmware(&cfg.elf, &mut bus.ram)?;
+        if !cfg.settings.is_empty() {
+            // After the overlay seed of `SpiFlash::from_config`, so a file's Interface Type wins (S21 §5).
+            let flash = bus.io.get_mut::<devices::flash::SpiFlash>().expect("the flash is always installed");
+            crate::settings::apply(&cfg.settings, &bus.ram, &fw.segments, flash)?;
+        }
         let symbols = match fw.format {
             loader::ImageFormat::Elf => Symbols::from_elf(&cfg.elf)?,
             format => {

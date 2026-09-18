@@ -240,7 +240,7 @@ flowchart LR
 | Timing independent of host speed | One 100 MHz emulated clock, advanced per instruction. Devices, the C64, inputs and test waits all run on it; pacing maps it to the wall clock ([Emulated time](#emulated-time-and-clocking)) |
 | Tests without a person | A control language with `expect`, PNG output, self-checking smoke scripts, an MCP server, CI, and the upstream E2E suite through port forwards |
 | Host integration without root | libslirp NAT with forwards and a web UI proxy; the bridged modes are optional |
-| The firmware owns its data formats | The emulator moves bytes: GCR tracks and CRT banks in DDR, the updater writes the flash, `--c64-roms` writes into the FAT volume the firmware formats |
+| The firmware owns its data formats | The emulator moves bytes: GCR tracks and CRT banks in DDR, the updater writes the flash, `--c64-roms` writes into the FAT volume the firmware formats, `--settings` writes config records by the definitions it reads from the firmware image |
 | Safe write-back | Debounced flash write-back, CRT backups, the `--usb-dir` sync rules |
 | Work in small, checkable steps | Specs with owned files and acceptance, built in waves; each result recorded in a status doc |
 
@@ -265,6 +265,9 @@ flowchart LR
 | [S15](specs/S15-uci.md) | Ultimate Command Interface: TRX64's block, UE2's firmware window and ITU bits | — |
 | [S16](specs/S16-ultimate-audio.md) | Ultimate Audio: the sampler's eight DMA voices | — |
 | [S17](specs/S17-ultisid.md) | UltiSID: several SIDs and the audio mixer (host side of TRX64 Spec 855) | — |
+| [S19](specs/S19-idle-skip.md) | Idle skip: loops that cannot change anything fast-forward to the next device event | — |
+| [S20](specs/S20-sid-thread.md) | The reSID engines on their own thread | — |
+| [S21](specs/S21-settings.md) | Firmware settings from a `.cfg` into the flash before boot | — |
 
 ## 5. Building Block View
 
@@ -297,11 +300,11 @@ flowchart TD
 | Crate | Content |
 |---|---|
 | `crates/rv32` | CPU interpreter, `Bus` trait. No dependencies. Verified with the official riscv-tests. |
-| `crates/ue2-core` | `SystemBus` (RAM + IO decode), `IoMap`/`IoDevice`, `IrqState` (ITU interrupt core), loader (ELF, `.app`, `.ue2`, updater records), symbolizer, `Machine` run loop, device models (`devices/*`, USB in `devices/usb/`), the C64 backend trait (`c64host`), overlay and C64 renderer (`render`), host types (`host`). No emulator dependency. |
+| `crates/ue2-core` | `SystemBus` (RAM + IO decode), `IoMap`/`IoDevice`, `IrqState` (ITU interrupt core), loader (ELF, `.app`, `.ue2`, updater records), symbolizer, settings (`.cfg` against the image's config definitions, S21), `Machine` run loop, device models (`devices/*`, USB in `devices/usb/`), the C64 backend trait (`c64host`), overlay and C64 renderer (`render`), host types (`host`). No emulator dependency. |
 | `crates/ue2-net` | Host network backends behind `host::NetBackend`: libslirp user-mode networking (hand-written FFI, links the system libslirp: `SLIRP_LIB_DIR`, else /opt/homebrew/lib when it exists, else the linker's default paths; build.rs), vmnet.framework bridged mode (`vmnet`, block2 FFI), a client of lima's socket_vmnet daemon (`socket_vmnet`), the web UI proxy (`web_proxy`). |
 | `crates/ue2-vfat` | `--usb-dir`: FAT32 volume built from a host directory (fatfs crate), snapshot parser with a structure check, guest-to-host sync with its safety rules, host watcher (notify/FSEvents), worker thread ([usb-dir.md](status/usb-dir.md)). No emulator dependency beyond `usb::block::BlockBackend`. |
 | `crates/c64-bridge` | `Trx64Backend`: TRX64 (`trx64-core`, git dependency on https://github.com/Jondalar/TRX64 pinned by rev `4ab20e5`) as a `c64host::C64Backend`: `sid` (SID decode, ARMSID identity, reSID sample stream; several engines with S17), `sampler` (Ultimate Audio, S16), `cart` and `cart_eeprom` (all_carts_v5.vhd, freezer.vhd and the GMOD2 EEPROM on guest DDR), `slot` (a cartridge in the physical expansion port: TRX64's mappers, flash boards on TRX64's flash and EEPROM chips, or `cart::CartLogic` fed from the CRT; bus sharing, bridge and CART_DETECT), `drive` (drive A on TRX64's drive 8 as a `c64host::C64Drive`), `reu` (TRX64's REU store over guest DDR), `keys`, `video`, `clock`. The rev is pinned in `crates/c64-bridge/Cargo.toml`; re-run the tests and the C64 smokes before moving it. |
-| `crates/ue2emu` | Binary, `ue2emu run` and `ue2emu install`: CLI, `--config` TOML (`config`), emulation thread + pacing (`runner`), window (`window`, `keymap`), scripted/TCP control (`control`), network wiring (`net`), USB options (`usb`), `--usb-dir` controller (`usbdir`), SID audio out (`audio`: cpal and WAV), updater install (`install`), C64 ROMs into the flash image (`c64roms`, `--c64-roms`), physical cartridge write-back and `cart-info`/`cart-save` (`cartslot`, `--cart-slot`), GDB stub (`gdb`). Cargo feature `trx64` (default) links c64-bridge. |
+| `crates/ue2emu` | Binary, `ue2emu run`, `ue2emu install` and `ue2emu settings`: CLI, `--config` TOML (`config`), emulation thread + pacing (`runner`), window (`window`, `keymap`), scripted/TCP control (`control`), network wiring (`net`), USB options (`usb`), `--usb-dir` controller (`usbdir`), SID audio out (`audio`: cpal and WAV), updater install (`install`), C64 ROMs into the flash image (`c64roms`, `--c64-roms`), physical cartridge write-back and `cart-info`/`cart-save` (`cartslot`, `--cart-slot`), GDB stub (`gdb`). Cargo feature `trx64` (default) links c64-bridge. |
 | `crates/ue2-mcp` | Binary `ue2-mcp`: stdio MCP server that starts `ue2emu` instances and drives them through the TCP control protocol ([mcp.md](status/mcp.md)). No crate dependency on the emulator. |
 
 ### Level 2: ue2-core
@@ -345,7 +348,7 @@ The devices, by module:
 | `i2c.rs` | `0x10100700` | I2C master; an EDID EEPROM on channel 0 (1080p60 HDMI); other addresses ACK and read 0xFF | [fixes.md](status/fixes.md) §5 |
 | `u64io.rs` | `0x10100400` | Keyboard matrix scan, joystick lines, HDMI HPD, CART_DETECT | [S07](specs/S07-overlay-u64io-render.md) |
 | `overlay.rs` | `0x10140000-0x1014FFFF` | Chargen registers, screen and colour RAM, palette, `snapshot` | [S07](specs/S07-overlay-u64io-render.md) |
-| `flash.rs` | `0x10060200` | S25FL128L SPI NOR, 16 MiB, persistent image, overlay-UI seed, replaceable unique ID | [S06](specs/S06-spi-flash.md), [storage.md](status/storage.md) |
+| `flash.rs` | `0x10060200` | S25FL128L SPI NOR, 16 MiB, persistent image, overlay-UI seed, `--settings` records (S21), replaceable unique ID | [S06](specs/S06-spi-flash.md), [storage.md](status/storage.md) |
 | `sdcard.rs` | `0x10060000` | SDHC in SPI mode on an image | [S09](specs/S09-sd-card.md), [storage.md](status/storage.md) |
 | `misc.rs` | RTC `0x10060100`, TRACE, RTC timer `0x10060400` (host UTC), GCR codec `0x10060500`, ICAP, audio select `0x10060700` | T0 | [S04](specs/S04-board-t0.md) |
 | `wifi.rs` | `0x10060900` | DMA UART with a u64ctrl stub, the ESP32 ROM loader for updaters, power requests (`U64Ctrl::power_event`) | [S05](specs/S05-wifi-u64ctrl.md), [install.md](status/install.md) §5 |

@@ -13,6 +13,7 @@
 #   sd          smoke-sd.ctl        --flash run/flash.bin --sd run/sd.img
 #   flash-1     smoke-flash-1.ctl   --flash run/flash-ui.bin (fresh: Color Scheme must not be C128 Style yet)
 #   flash-2     smoke-flash-2.ctl   --flash run/flash-ui.bin --no-overlay-ui
+#   settings    smoke-settings.ctl  --flash run/flash-settings.bin (fresh) --settings smoke-settings.cfg
 #   negative    an expect that cannot match; passes only when ue2emu exits non-zero and names its line
 
 set -euo pipefail
@@ -70,6 +71,8 @@ smoke menu "$repo/scripts/smoke-menu.ctl" --flash run/flash.bin
 smoke sd "$repo/scripts/smoke-sd.ctl" --flash run/flash.bin --sd run/sd.img
 smoke flash-1 "$repo/scripts/smoke-flash-1.ctl" --flash run/flash-ui.bin
 smoke flash-2 "$repo/scripts/smoke-flash-2.ctl" --flash run/flash-ui.bin --no-overlay-ui
+smoke settings "$repo/scripts/smoke-settings.ctl" --flash run/flash-settings.bin \
+    --settings "$repo/scripts/smoke-settings.cfg"
 
 printf '# must fail\nexpect "NO SUCH TEXT ON THE SCREEN" 500\nquit\n' >run/negative.ctl
 rc=0

@@ -9,6 +9,7 @@ pub mod irq;
 pub mod loader;
 pub mod machine;
 pub mod render;
+pub mod settings;
 pub mod symbols;
 pub mod time;
 

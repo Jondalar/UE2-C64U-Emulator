@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::io::{IoCtx, IoDevice, IoMap};
 use crate::machine::MachineConfig;
+use crate::settings::Record;
 use crate::time::CLOCKS_PER_MS;
 
 /// `FLASH_BASE` (iomap.h:25), one 256-byte window (ultimate_logic_32.vhd:1009-1022).
@@ -55,6 +56,8 @@ pub const UID: [u8; 8] = *b"UE2C64U\x01";
 /// Config page `p` = sector `sector_count - 24 + p` (w25q_flash.cc:261-267, s25fl_l_flash.h:9).
 const CONFIG_BASE: usize = 0xFE_8000;
 const CONFIG_PAGES: usize = 24;
+/// Logical config page, the part `ConfigPage` reads and writes (w25q_flash.cc:251-254).
+const CONFIG_PAGE_SIZE: usize = 512;
 /// `CFG_USERIF_STORE_ID` "GEN." (userinterface.h:28).
 const USERIF_STORE_ID: u32 = 0x4745_4E2E;
 /// `CFG_USERIF_ITYPE` (userinterface.h:38).
@@ -399,6 +402,68 @@ impl SpiFlash {
         true
     }
 
+    /// Put settings records into their config pages (docs/specs/S21-settings.md §5): the first page carrying the
+    /// page id, else the first erased one, as `register_store` picks (config.cc:127-167). A record of an id being
+    /// set is replaced in place and a later duplicate dropped; new ids go before the 0xFF. Only the 512-byte logical
+    /// page is written (w25q_flash.cc:251-254), the rest of the sector keeps its bytes.
+    pub fn write_settings(&mut self, records: &[Record]) -> anyhow::Result<()> {
+        let mut pages: Vec<u32> = records.iter().map(|r| r.page).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        for page in pages {
+            let wanted: Vec<&Record> = records.iter().filter(|r| r.page == page).collect();
+            let id_at = |mem: &[u8], p: usize| {
+                let at = CONFIG_BASE + p * SECTOR_SIZE;
+                u32::from_le_bytes(mem[at..at + 4].try_into().expect("4 bytes"))
+            };
+            let mem = &self.chip.mem;
+            let Some(p) = (0..CONFIG_PAGES)
+                .find(|&p| id_at(mem, p) == page)
+                .or_else(|| (0..CONFIG_PAGES).find(|&p| id_at(mem, p) == 0xFFFF_FFFF))
+            else {
+                anyhow::bail!("page {page:08x}: all {CONFIG_PAGES} config pages are taken");
+            };
+            let base = CONFIG_BASE + p * SECTOR_SIZE;
+            let old = &mem[base..base + CONFIG_PAGE_SIZE];
+            let mut placed = vec![false; wanted.len()];
+            let mut items: Vec<(u8, u8, Vec<u8>)> = Vec::new();
+            if id_at(mem, p) == page {
+                for (id, kind, payload) in page_records(old) {
+                    match wanted.iter().position(|r| r.id == id) {
+                        Some(w) if !placed[w] => {
+                            placed[w] = true;
+                            items.push((id, wanted[w].kind, wanted[w].payload.clone()));
+                        }
+                        Some(_) => {}
+                        None => items.push((id, kind, payload.to_vec())),
+                    }
+                }
+            }
+            for (w, r) in wanted.iter().enumerate() {
+                if !placed[w] {
+                    items.push((r.id, r.kind, r.payload.clone()));
+                }
+            }
+            let mut new = page.to_le_bytes().to_vec();
+            for (id, kind, payload) in &items {
+                new.extend_from_slice(&[*id, *kind, payload.len() as u8]);
+                new.extend_from_slice(payload);
+            }
+            new.push(0xFF);
+            anyhow::ensure!(
+                new.len() <= CONFIG_PAGE_SIZE,
+                "page {page:08x}: the settings need {} bytes, a config page holds {CONFIG_PAGE_SIZE}",
+                new.len()
+            );
+            new.resize(CONFIG_PAGE_SIZE, 0xFF);
+            if new != old {
+                self.chip.mem[base..base + CONFIG_PAGE_SIZE].copy_from_slice(&new);
+                self.modified(base..base + CONFIG_PAGE_SIZE, 0);
+            }
+        }
+        Ok(())
+    }
+
     /// Write every sector changed since the last write-back to the image (no-op when volatile).
     pub fn flush(&mut self) -> io::Result<()> {
         match &mut self.image {
@@ -544,6 +609,22 @@ impl Drop for SpiFlash {
             eprintln!("{e}");
         }
     }
+}
+
+/// The records of a config page as `ConfigStore::unpack` walks them (config.cc:398-424): from offset 4 up to id
+/// 0xFF, a length that does not fit ends the walk.
+fn page_records(page: &[u8]) -> Vec<(u8, u8, &[u8])> {
+    let mut records = Vec::new();
+    let mut index = 4;
+    while index + 3 <= page.len() && page[index] != 0xFF {
+        let len = usize::from(page[index + 2]);
+        if len > page.len() - index - 3 {
+            break;
+        }
+        records.push((page[index], page[index + 1], &page[index + 3..index + 3 + len]));
+        index += len + 3;
+    }
+    records
 }
 
 /// Maps the controller window. An unusable flash image aborts machine construction.
@@ -1104,5 +1185,77 @@ mod tests {
         drop(rig);
         let mut rig = Rig::new(&cfg(Some(path), true));
         assert_eq!(rig.read_dev_addr(CONFIG_BASE as u32 + 0x1000, 4), [0xFF; 4], "seeded only once");
+    }
+
+    fn record(page: u32, id: u8, kind: u8, payload: &[u8]) -> Record {
+        Record { page, id, kind, payload: payload.to_vec(), text: String::new() }
+    }
+
+    fn config_page(flash: &SpiFlash, p: usize) -> &[u8] {
+        &flash.chip.mem[CONFIG_BASE + p * SECTOR_SIZE..CONFIG_BASE + p * SECTOR_SIZE + CONFIG_PAGE_SIZE]
+    }
+
+    /// S21 §5: records land in the page with the id, replacing in place and dropping a later duplicate; new ids go
+    /// before the end marker; a store without a page gets the first erased one.
+    #[test]
+    fn settings_edit_the_existing_page_and_claim_an_erased_one() {
+        let mut flash = SpiFlash::volatile();
+        assert!(flash.seed_overlay_ui());
+        // A C64 page as the firmware writes it, with a duplicate REU record at the end.
+        let c64 = 0x4336_3420u32;
+        let base = CONFIG_BASE + SECTOR_SIZE;
+        let mut page = c64.to_le_bytes().to_vec();
+        page.extend_from_slice(&[0xC3, 0x02, 0x01, 0x00, 0xE1, 0x07, 0x03, b'a', b'b', b'c']);
+        page.extend_from_slice(&[0xC3, 0x02, 0x01, 0x00, 0xFF]);
+        flash.chip.mem[base..base + page.len()].copy_from_slice(&page);
+        flash.chip.mem[base + 0x800] = 0x5A; // beyond the logical page
+        flash
+            .write_settings(&[
+                record(c64, 0xC3, 0x02, &[1]),
+                record(c64, 0x71, 0x02, &[1]),
+                record(USERIF_STORE_ID, CFG_USERIF_ITYPE, CFG_TYPE_ENUM, &[0]),
+                record(0x4E45_5400, 0x10, 0x03, b"host"),
+            ])
+            .unwrap();
+        assert_eq!(
+            unpack(config_page(&flash, 1)),
+            vec![(0xC3, 0x02, vec![1]), (0xE1, 0x07, b"abc".to_vec()), (0x71, 0x02, vec![1])]
+        );
+        assert_eq!(flash.chip.mem[base + 0x800], 0x5A, "the rest of the sector is kept");
+        assert_eq!(unpack(config_page(&flash, 0)), vec![(CFG_USERIF_ITYPE, CFG_TYPE_ENUM, vec![0])], "file beats seed");
+        let net = config_page(&flash, 2);
+        assert_eq!(net[..4], 0x4E45_5400u32.to_le_bytes());
+        assert_eq!(unpack(net), vec![(0x10, 0x03, b"host".to_vec())]);
+        assert!(net[4 + 7..].iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn settings_that_do_not_fit_are_refused() {
+        let mut flash = SpiFlash::volatile();
+        let long = vec![b'x'; 255];
+        let records: Vec<Record> = (0..2).map(|i| record(0x4E45_5400, i, 0x03, &long)).collect();
+        let err = flash.write_settings(&records).unwrap_err().to_string();
+        assert!(err.contains("a config page holds 512"), "{err}");
+
+        for p in 0..CONFIG_PAGES {
+            flash.chip.mem[CONFIG_BASE + p * SECTOR_SIZE] = p as u8;
+        }
+        let err = flash.write_settings(&[record(0x4E45_5400, 0x10, 0x03, b"h")]).unwrap_err().to_string();
+        assert!(err.contains("all 24 config pages are taken"), "{err}");
+    }
+
+    #[test]
+    fn settings_written_to_the_image_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flash.bin");
+        let mut flash = SpiFlash::open(&path).unwrap();
+        flash.write_settings(&[record(0x4336_3420, 0xC3, 0x02, &[1])]).unwrap();
+        flash.flush().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes[CONFIG_BASE..CONFIG_BASE + 9], [0x20, 0x34, 0x36, 0x43, 0xC3, 0x02, 0x01, 0x01, 0xFF]);
+        // Writing the same again changes nothing.
+        let mut again = SpiFlash::open(&path).unwrap();
+        again.write_settings(&[record(0x4336_3420, 0xC3, 0x02, &[1])]).unwrap();
+        assert!(again.image.as_ref().unwrap().dirty.iter().all(|&d| !d));
     }
 }

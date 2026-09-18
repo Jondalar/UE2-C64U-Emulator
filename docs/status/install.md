@@ -126,6 +126,7 @@ is RESTORE.
 | `--flash FILE` | Persistent SPI flash image, created erased if missing |
 | `--caps HEX` | ITU capability word; default `34000222`. Given explicitly it is used as it stands, so the frontend adds none of its own bits (EEPROM, UCI, sampler) — that is how a machine without one of them is modelled |
 | `--no-overlay-ui` | Do not seed the overlay user interface into blank flash config |
+| `--settings FILE.cfg` | Firmware settings from a `.cfg` in the firmware's own format, written into the flash before boot at every start; only the settings to change are needed; repeatable, later files win; a bad value stops the start. `ue2emu settings [--firmware F]` prints every setting of an image with its default (`docs/specs/S21-settings.md`) |
 
 **C64 (TRX64)**
 
@@ -195,6 +196,15 @@ mkdir -p run
 # Window, realtime. --c64-roms puts the C64 KERNAL/BASIC/CHAR from the roms directory into the flash first.
 target/release/ue2emu run --flash run/flash.bin --c64-roms
 
+# REU and Command Interface on from the first boot. The file holds only what differs from the defaults:
+#   [C64 and Cartridge Settings]
+#   RAM Expansion Unit=Enabled
+#   Command Interface=Enabled
+target/release/ue2emu run --flash run/flash.bin --c64-roms --settings run/test.cfg
+
+# Every setting of a firmware image, with its default and choices, as a .cfg to copy lines from.
+target/release/ue2emu settings --firmware c64u_v1.1.0.ue2 >run/all-settings.cfg
+
 # Network on: the firmware web UI and REST API on http://127.0.0.1:8080.
 target/release/ue2emu run --flash run/flash.bin --c64-roms --net user
 
@@ -251,7 +261,7 @@ Only `run` takes `--config`. `crates/ue2emu/src/config.rs` turns the file's entr
 - **Keys** are the long flag names without `--`, spelled like the flag: `firmware`, `roms`, `flash`, `sd`, `c64`,
   `caps`, `clocks-per-insn`, `speed`, `headless`, `script`, `control`, `max-seconds`, `gdb`, `log`, `no-overlay-ui`,
   `no-halt`, `trace`, `net`, `hostfwd`, `web-port`, `usb`, `usb-dir`, `usb-dir-work`, `usb-keyboard`, `audio`,
-  `audio-wav`, `sid-socket1`, `c64-roms`, `c64-roms-force`, `cart-slot`.
+  `audio-wav`, `sid-socket1`, `c64-roms`, `c64-roms-force`, `cart-slot`, `settings`.
   - The alias `elf` works for `firmware`; setting both is an error.
   - An unknown key is an error, and so is `config`. `help` is not a key.
 - **Values** are written as on the command line:
@@ -259,9 +269,9 @@ Only `run` takes `--config`. `crates/ue2emu/src/config.rs` turns the file's entr
     `speed = "max"`).
   - A flag without a value (`headless`, `trace`, `no-halt`, `no-overlay-ui`, `usb-keyboard`, `c64-roms-force`): `true`
     gives it, `false` leaves it out.
-  - A repeatable flag (`log`, `hostfwd`, `usb`, `usb-dir`): an array, one occurrence per element; a single string or
-    number counts as one occurrence. `log` and `hostfwd` split on commas as on the command line, so `log = "io,irq"`
-    works.
+  - A repeatable flag (`log`, `hostfwd`, `usb`, `usb-dir`, `settings`): an array, one occurrence per element; a
+    single string or number counts as one occurrence. `log` and `hostfwd` split on commas as on the command line, so
+    `log = "io,irq"` works.
   - `c64-roms`: `true` is the bare `--c64-roms`, a string is `--c64-roms=DIR`, `false` leaves it out.
   - Anything else is an error: tables, datetimes, nested arrays, an array for a single-value flag, a non-boolean for a
     flag without a value.

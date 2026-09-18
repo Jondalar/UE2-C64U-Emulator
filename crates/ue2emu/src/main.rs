@@ -35,6 +35,17 @@ enum Cmd {
     Run(Box<RunArgs>),
     /// Run a .ue2 updater to populate a flash image, as on hardware (docs/status/install.md).
     Install(install::InstallArgs),
+    /// Print every setting of a firmware image as a .cfg with its defaults, for `run --settings`
+    /// (docs/specs/S21-settings.md).
+    Settings(SettingsArgs),
+}
+
+#[derive(Args)]
+struct SettingsArgs {
+    /// Firmware image: ultimate.elf, ultimate.app or a .ue2 update file
+    /// [default: firmware/1541ultimate/target/u64ii/riscv/ultimate/result/ultimate.elf]
+    #[arg(long = "firmware", visible_alias = "elf")]
+    elf: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -103,6 +114,10 @@ struct RunArgs {
     /// Do not seed the overlay user interface into blank flash config
     #[arg(long)]
     no_overlay_ui: bool,
+    /// Firmware settings from a .cfg file (the firmware's own format), written into the flash before the firmware
+    /// runs, at every start; repeatable, later files win (docs/specs/S21-settings.md)
+    #[arg(long, value_name = "FILE.cfg")]
+    settings: Vec<PathBuf>,
     /// Keep running when a firmware fault hook fires
     #[arg(long)]
     no_halt: bool,
@@ -150,13 +165,28 @@ fn main() -> Result<()> {
     match Cli::parse_from(argv).cmd {
         Cmd::Run(args) => run(*args),
         Cmd::Install(args) => install::install(args),
+        Cmd::Settings(args) => settings(args),
     }
 }
 
+fn default_firmware() -> PathBuf {
+    repo_root().join("firmware/1541ultimate/target/u64ii/riscv/ultimate/result/ultimate.elf")
+}
+
+/// `ue2emu settings`: the image's settings as a .cfg on stdout.
+fn settings(a: SettingsArgs) -> Result<()> {
+    let elf = a.elf.unwrap_or_else(default_firmware);
+    let mut ram = vec![0; ue2_core::bus::RAM_SIZE];
+    let fw = ue2_core::loader::load_firmware(&elf, &mut ram)?;
+    let tables = ue2_core::settings::tables(&ram, &fw.segments);
+    let stores = ue2_core::settings::stores(&tables);
+    print!("{}", ue2_core::settings::template(&stores, &elf.display().to_string()));
+    Ok(())
+}
+
 fn run(a: RunArgs) -> Result<()> {
-    let fw = repo_root().join("firmware/1541ultimate");
-    let elf = a.elf.unwrap_or_else(|| fw.join("target/u64ii/riscv/ultimate/result/ultimate.elf"));
-    let roms = a.roms.unwrap_or_else(|| fw.join("roms"));
+    let elf = a.elf.unwrap_or_else(default_firmware);
+    let roms = a.roms.unwrap_or_else(|| repo_root().join("firmware/1541ultimate/roms"));
 
     let mut cfg = MachineConfig::new(elf, roms);
     if let Some(caps) = a.caps {
@@ -172,6 +202,7 @@ fn run(a: RunArgs) -> Result<()> {
     cfg.halt_on_fault = !a.no_halt;
     cfg.trace = a.trace || a.gdb.is_some();
     cfg.idle_skip = !a.no_idle_skip;
+    cfg.settings = a.settings;
     let mut log = LogFlags::default();
     for flag in &a.log {
         match flag.as_str() {

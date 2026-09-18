@@ -19,6 +19,10 @@ flash = "run/flash.bin"
 # roms directory, a string names a directory.
 c64-roms = true
 
+# Firmware settings written into the flash before every boot; the files hold only what differs from the defaults
+# (`ue2emu settings` lists them all).
+# settings = ["run/test.cfg"]
+
 # Host directories as USB sticks, PATH[,size=SIZE][,ro]; the guest's changes are written back.
 usb-dir = ["~/c64/usb"]
 
