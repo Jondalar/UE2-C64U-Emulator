@@ -45,15 +45,16 @@ jobs:
           echo "SLIRP_LIB_DIR=$VCPKG_INSTALLATION_ROOT\\installed\\x64-windows\\lib" >> "$GITHUB_ENV"
           echo "$VCPKG_INSTALLATION_ROOT\\installed\\x64-windows\\bin" >> "$GITHUB_PATH"
 
-      # dumpbin and VCToolsRedistDir for the import check and the VC runtime.
-      - uses: ilammy/msvc-dev-cmd@v1
-
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-windows-x86_64
 
       - name: Build
         run: cargo build --release --locked -p ue2emu -p ue2-mcp
+
+      # dumpbin and VCToolsRedistDir for the import check and the VC runtime. After the build: with VCINSTALLDIR set,
+      # rustc links with the first link.exe on PATH, which in Git Bash is coreutils' /usr/bin/link.exe.
+      - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Version
         id: version
