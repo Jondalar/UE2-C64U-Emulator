@@ -186,6 +186,9 @@ mod tests {
         m.get_many::<PathBuf>(id).map(|v| v.cloned().collect()).unwrap_or_default()
     }
 
+    /// An absolute path on the host.
+    const ABS: &str = if cfg!(windows) { "C:/abs" } else { "/abs" };
+
     fn home() -> PathBuf {
         std::env::home_dir().expect("a home directory")
     }
@@ -253,10 +256,10 @@ mod tests {
 
     #[test]
     fn paths_resolve_against_the_file_and_home() {
-        let file = "flash = 'run/flash.bin'\nsd = '/abs/sd.img'\nfirmware = '~/c64u/x.ue2'\nroms = '~'\nscript = '../s.txt'\n";
-        let (m, dir) = parse(file, &["--audio-wav", "out.wav"]).unwrap();
+        let file = format!("flash = 'run/flash.bin'\nsd = '{ABS}/sd.img'\nfirmware = '~/c64u/x.ue2'\nroms = '~'\nscript = '../s.txt'\n");
+        let (m, dir) = parse(&file, &["--audio-wav", "out.wav"]).unwrap();
         assert_eq!(paths(&m, "flash"), [dir.join("run/flash.bin")]);
-        assert_eq!(paths(&m, "sd"), [PathBuf::from("/abs/sd.img")]);
+        assert_eq!(paths(&m, "sd"), [PathBuf::from(format!("{ABS}/sd.img"))]);
         assert_eq!((paths(&m, "elf"), paths(&m, "roms")), (vec![home().join("c64u/x.ue2")], vec![home()]));
         assert_eq!(paths(&m, "script"), [dir.join("../s.txt")]);
         assert_eq!(paths(&m, "audio_wav"), [PathBuf::from("out.wav")], "command-line values stay");
@@ -264,14 +267,16 @@ mod tests {
 
     #[test]
     fn spec_paths_resolve() {
-        let file = "cart-slot = 'games/a,1.crt,save=out/b.crt,flash-decode=15'\nusb-dir = ['sticks/one,size=512M,ro', '/two']\n\
-                    net = 'socket-vmnet:vmnet.sock'\n";
-        let (m, dir) = parse(file, &[]).unwrap();
+        let file = format!(
+            "cart-slot = 'games/a,1.crt,save=out/b.crt,flash-decode=15'\nusb-dir = ['sticks/one,size=512M,ro', '{ABS}/two']\n\
+             net = 'socket-vmnet:vmnet.sock'\n"
+        );
+        let (m, dir) = parse(&file, &[]).unwrap();
         let cart = m.get_one::<CartSlotSpec>("cart_slot").unwrap();
         assert_eq!(cart.path, dir.join("games/a,1.crt"));
         assert_eq!((cart.target(), cart.flash_decode.as_str()), (Some(dir.join("out/b.crt").as_path()), "15"));
         let dirs: Vec<_> = m.get_many::<DirSpec>("dirs").unwrap().collect();
-        assert_eq!((&dirs[0].path, dirs[0].read_only, &dirs[1].path), (&dir.join("sticks/one"), true, &PathBuf::from("/two")));
+        assert_eq!((&dirs[0].path, dirs[0].read_only, &dirs[1].path), (&dir.join("sticks/one"), true, &PathBuf::from(format!("{ABS}/two"))));
         assert_eq!(m.get_one::<NetMode>("net"), Some(&NetMode::SocketVmnet(dir.join("vmnet.sock"))));
     }
 

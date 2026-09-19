@@ -105,7 +105,7 @@ fn trash_files(host: &Path) -> Vec<String> {
             if p.is_dir() {
                 walk(&p, base, out);
             } else {
-                out.push(p.strip_prefix(base).unwrap().to_string_lossy().into_owned());
+                out.push(p.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/"));
             }
         }
     }
@@ -609,7 +609,7 @@ fn temporary_files_of_an_interrupted_sync_are_removed_at_start() {
     fs::write(s.host.join(".ue2-trash/20260101-000000/.ue2-tmp-1-1"), b"in the trash").unwrap();
     let mut vol = DirVolume::open(&spec(&s.host), &s.work).unwrap();
     let prepared = vol.prepare().unwrap();
-    assert!(prepared.lines[0].starts_with("removed ") && prepared.lines[0].contains("games/.ue2-tmp-47779-0"), "{:?}", prepared.lines);
+    assert!(prepared.lines[0].starts_with("removed ") && prepared.lines[0].contains(&*Path::new("games").join(".ue2-tmp-47779-0").to_string_lossy()), "{:?}", prepared.lines);
     assert!(!s.host.join("games/.ue2-tmp-47779-0").exists());
     assert!(s.host.join(".ue2-tmp-notes").exists());
     assert!(s.host.join(".ue2-trash/20260101-000000/.ue2-tmp-1-1").exists());

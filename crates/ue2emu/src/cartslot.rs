@@ -10,6 +10,7 @@
 //! - `,flash-decode=11|15|both`: the command addresses a flash cartridge decodes (default `both`).
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::mpsc::Sender;
@@ -135,7 +136,13 @@ pub fn write_crt(path: &Path, bytes: &[u8], keep_bak: bool) -> Result<()> {
     tmp_name.push(name);
     tmp_name.push(format!(".tmp-{}", std::process::id()));
     let tmp = path.with_file_name(tmp_name);
-    let written = fs::write(&tmp, bytes).and_then(|()| fs::File::open(&tmp)?.sync_all()).and_then(|()| fs::rename(&tmp, path));
+    // sync_all on the handle that wrote: Windows refuses FlushFileBuffers on a read-only handle.
+    let written = fs::File::create(&tmp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&tmp, path));
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
