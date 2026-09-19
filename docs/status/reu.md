@@ -28,6 +28,17 @@ implements it over guest DDR.
 - **Enable.** `C64_REU_ENABLE` 1 attaches `Reu::new_with_store` with `Machine::attach_expansion_also`, 0 detaches with
   `Machine::detach_reu`. Both at runtime: `set_emulation_flags` (`c64.cc:309-318`) runs from `effectuate_settings`
   whenever the setting changes, not only at reboot. Size first, then enable — the order the firmware writes them.
+- **Enable toggle.** `set_emulation_flags` writes the enable 0 and then 1 within microseconds on every cartridge
+  change, and `restoreCart` does that after a PRG start while the program already runs (`c64_subsys.cc`, "Resuming.."
+  before "Cart got disabled, now restoring"). A program that probes the REU at once, as UltimateDemo2026 does at
+  16 MHz turbo, is in the middle of a transfer then. The bridge is lenient here:
+  - the REU stays on the bus for 10 ms after a 0 (`REU_OFF_GRACE`), so the firmware's pulse never takes it away. On
+    hardware the enable gates the decode, a gap a program rarely hits;
+  - an REU off for longer is kept (`detach_reu` returns it) and comes back with its REC registers when switched on, as
+    the FPGA's gated REU would; a C64 reset while it is off still resets it.
+
+  Before UE2 0.3.5 the toggle built a new REU with reset registers, and such a program reported "REU too small" or
+  "REU not detected".
 - **The store is the lease, doubled.** TRX64 *holds* the store for the life of the device, while `C64Port` only
   *lends* guest DDR for the duration of one access (`C64Backend::lend_ddr`). A borrow cannot be held, so `ReuRam` is a
   second shared pointer cell of the same shape as `CartLogic::set_ddr`'s, updated on the very same lend. Every path

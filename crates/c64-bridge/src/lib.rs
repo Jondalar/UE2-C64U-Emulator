@@ -83,6 +83,12 @@ static IO_WATCH: [u8; 0x1_0000] = {
 };
 
 /// A TRX64 `Machine` driven by the U64 firmware's C64 registers.
+/// How long the REU stays on the bus after C64_REU_ENABLE goes to 0, in firmware clocks: 10 ms. The firmware writes
+/// 0 then 1 within microseconds on every cartridge change (`set_emulation_flags`, c64.cc:297-305), while a program may
+/// already be using the REU; on hardware that is a short decode gap a program rarely hits, here it is none. A setting
+/// that switches the REU off takes effect 10 ms later (docs/status/reu.md, "Enable toggle").
+const REU_OFF_GRACE: u64 = 10 * ue2_core::time::CLOCKS_PER_MS;
+
 pub struct Trx64Backend {
     m: Box<Machine>,
     /// Emulator clock → C64 cycles; anchored by the first `advance_to` and after every reset.
@@ -120,6 +126,12 @@ pub struct Trx64Backend {
     /// C64_REU_SIZE in KiB, which the next attach takes. The register resets to "111" = 16 MB (c64.rs `CART_REGS`),
     /// and the firmware writes it before it writes the enable (c64.cc:315-317).
     reu_size_kb: u32,
+    /// The REU while C64_REU_ENABLE is 0, kept with its REC registers. The FPGA's enable only gates the decode, and
+    /// the firmware toggles it 0 → 1 on every cartridge change (`set_emulation_flags`, c64.cc:297-305), also while a
+    /// program already runs and uses the REU (docs/status/reu.md, "Enable toggle").
+    parked_reu: Option<Box<dyn trx64_core::expansion::ExpansionDevice>>,
+    /// When C64_REU_ENABLE went to 0 with the REU still on the bus ([`REU_OFF_GRACE`]).
+    reu_off_since: Option<u64>,
     /// Ultimate Audio: UE2's own block, shared with the port device TRX64 holds (sampler.rs, S16).
     sampler: sampler::SamplerHandle,
 }
@@ -187,6 +199,8 @@ impl Trx64Backend {
             drive,
             reu: ReuRam::default(),
             reu_size_kb: reu::DEFAULT_SIZE_KB,
+            parked_reu: None,
+            reu_off_since: None,
             sampler,
         }
     }
@@ -442,6 +456,10 @@ impl C64Backend for Trx64Backend {
     /// Whole 6510 instructions up to the target cycle; the overshoot carries into the next call (S14 §4).
     fn advance_to(&mut self, now: u64) {
         self.now = now;
+        if self.reu_off_since.is_some_and(|since| now.saturating_sub(since) >= REU_OFF_GRACE) {
+            self.reu_off_since = None;
+            self.parked_reu = self.m.detach_reu();
+        }
         let clk = self.m.c64_core.clk;
         let target = self.clock.get_or_insert(Clock::new(now, clk)).cycles(now);
         if target <= clk {
@@ -489,6 +507,10 @@ impl C64Backend for Trx64Backend {
         // so the REC goes to power-on while the DDR keeps every byte. The bridge used to do this after the call; it
         // does not any more.
         self.m.warm_reset();
+        // A parked REU is on the same /RESET line.
+        if let Some(reu) = self.parked_reu.as_mut() {
+            reu.reset();
+        }
         self.m.clk = self.m.c64_core.clk;
         self.sid.reanchor(self.m.c64_core.clk);
         self.drive.after_c64_reset(&mut self.m, self.stopped);
@@ -701,10 +723,21 @@ impl C64Backend for Trx64Backend {
     /// the cartridge, which is `Machine::cartridge`.
     fn set_reu_enabled(&mut self, on: bool) {
         match (on, self.m.reu().is_some()) {
+            // Switched back on within the grace time: it never left.
+            (true, true) => self.reu_off_since = None,
             (true, false) => {
                 self.reu.set_size_kb(self.reu_size_kb);
-                // The store is guest DDR, so an REU that comes back finds the image the firmware preloaded there
-                // (reu_preloader.cc:104) and everything the last one wrote.
+                // The REU that was switched off comes back as it was: its REC registers too, so a transfer the C64
+                // was setting up when the firmware toggled the enable goes on (the "REU too small" of UltimateDemo2026
+                // at 16 MHz). The store is guest DDR either way, so the bytes, a preloaded image among them
+                // (reu_preloader.cc:104), were never lost.
+                if let Some(reu) = self.parked_reu.take() {
+                    self.m.attach_expansion_also(reu);
+                    if let Some(reu) = self.m.reu_mut() {
+                        reu.set_size_kb(self.reu_size_kb);
+                    }
+                    return;
+                }
                 match Reu::new_with_store(self.reu_size_kb, Box::new(self.reu.clone())) {
                     Some(reu) => self.m.attach_expansion_also(Box::new(reu)),
                     // `128 << n` is always a size TRX64 builds, so the register cannot reach this.
@@ -712,7 +745,7 @@ impl C64Backend for Trx64Backend {
                 }
             }
             (false, true) => {
-                self.m.detach_reu();
+                self.reu_off_since.get_or_insert(self.now);
             }
             _ => {}
         }
@@ -1282,6 +1315,8 @@ mod tests {
         assert_eq!(c64.m.reu().map(|r| r.ram_byte(0x100)), Some(0x3C), "what was below it is still there");
 
         c64.set_reu_enabled(false);
+        assert!(c64.reu_attached(), "for the grace time it stays on the bus");
+        c64.advance_to(c64.now + REU_OFF_GRACE);
         assert!(!c64.reu_attached() && c64.m.reu().is_none());
         assert!(c64.has_uci() && c64.cart_active(), "detaching took only the REU (854 §7)");
         assert_eq!(c64.m.expansion_snoop_registered(0xFF00), ff00_before, "and its snoop with it");
@@ -1364,6 +1399,53 @@ mod tests {
         c64.set_reset(false);
         assert_eq!(c64.m.reu().unwrap().snapshot_registers(), fresh, "the RESET line reset the REC");
         assert_eq!(c64.m.reu().unwrap().ram_byte(0x100), 0x77, "and left the RAM, which is the firmware's DDR");
+        c64.lend_ddr(None);
+    }
+
+    /// The firmware's enable toggle during a cartridge change leaves the REC as it was, as the FPGA's decode gate
+    /// does; a C64 reset while it is off still resets it.
+    #[test]
+    fn an_enable_toggle_keeps_the_rec_and_a_reset_still_clears_it() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        let mut ddr = ddr();
+        c64.lend_ddr(Some(&mut ddr));
+        c64.advance_to(0);
+        c64.set_reu_size_kb(512);
+        c64.set_reu_enabled(true);
+        // A transfer being set up: C64 address $C000, REU address $1234, the rest as the REC has it.
+        let mut regs = c64.m.reu().unwrap().snapshot_registers();
+        regs[2..6].copy_from_slice(&[0x00, 0xC0, 0x34, 0x12]);
+        c64.m.reu_mut().unwrap().restore_registers(&regs);
+        let set_up = c64.m.reu().unwrap().snapshot_registers();
+
+        // The firmware's 0 then 1 within the grace time: the REU never leaves the bus.
+        c64.set_reu_enabled(false);
+        c64.advance_to(c64.now + REU_OFF_GRACE / 2);
+        assert!(c64.m.reu().is_some(), "a short pulse leaves it on the bus");
+        c64.set_reu_enabled(true);
+        c64.advance_to(c64.now + REU_OFF_GRACE);
+        assert_eq!(c64.m.reu().unwrap().snapshot_registers(), set_up, "and the REC as it was");
+
+        // Switched off for longer it leaves the bus, and comes back with the REC it had.
+        c64.set_reu_enabled(false);
+        c64.advance_to(c64.now + REU_OFF_GRACE);
+        assert!(c64.m.reu().is_none(), "switched off, the REU is off the bus");
+        c64.set_reu_enabled(true);
+        assert_eq!(c64.m.reu().unwrap().snapshot_registers(), set_up, "the REC kept the transfer being set up");
+
+        c64.set_reu_enabled(false);
+        c64.advance_to(c64.now + REU_OFF_GRACE);
+        c64.set_reu_size_kb(16384);
+        c64.set_reu_enabled(true);
+        assert_eq!(c64.m.reu().unwrap().size_kb(), 16384, "a size written while it was off applies");
+
+        c64.set_reu_enabled(false);
+        c64.advance_to(c64.now + REU_OFF_GRACE);
+        c64.set_reset(true);
+        c64.set_reset(false);
+        c64.set_reu_enabled(true);
+        let fresh = Reu::new(16384).unwrap().snapshot_registers();
+        assert_eq!(c64.m.reu().unwrap().snapshot_registers(), fresh, "a reset while it was off reset the REC");
         c64.lend_ddr(None);
     }
 }
