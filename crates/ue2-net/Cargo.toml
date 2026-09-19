@@ -6,11 +6,28 @@ version.workspace = true
 license.workspace = true
 links = "slirp"
 
+[features]
+default = ["slirp"]
+# libslirp user-mode networking (`UserNet`): links the system libslirp (build.rs).
+slirp = []
+
 [dependencies]
 ue2-core = { path = "../ue2-core" }
 anyhow = "1"
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
+
+[build-dependencies]
+cc = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Completion and event handlers of vmnet.framework are blocks (the version winit already brings in).
 block2 = "0.5"
+
+[[example]]
+name = "mock_socket_vmnet"
+required-features = ["slirp"]

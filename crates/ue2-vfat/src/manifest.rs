@@ -5,7 +5,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, Metadata};
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -24,7 +23,8 @@ pub struct HostStat {
 
 impl HostStat {
     pub fn of(meta: &Metadata) -> HostStat {
-        HostStat { size: meta.len(), mtime_s: meta.mtime(), mtime_ns: meta.mtime_nsec() as u32, ino: meta.ino() }
+        let (mtime_s, mtime_ns, ino) = crate::os::mtime_ino(meta);
+        HostStat { size: meta.len(), mtime_s, mtime_ns, ino }
     }
 }
 

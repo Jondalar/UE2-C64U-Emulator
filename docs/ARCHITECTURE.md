@@ -96,7 +96,7 @@ Status:
 | TRX64 is a git dependency pinned by rev | `crates/c64-bridge/Cargo.toml` names the rev (TRX64 v0.7.3 `4ab20e5`, with Spec 855's several SIDs, 856's turbo fast path and 857's CIA alarm check). Cargo fetches it on the first build. The bridge drives TRX64 internals, so the tests and the C64 smokes run before `rev` moves. A local checkout is patched in through an untracked `.cargo/config.toml` | [install.md](status/install.md) "TRX64 dependency" |
 | C++ compiler | `trx64-core` compiles the vendored reSID (default feature `trx64`). `--no-default-features` builds without TRX64, `--c64 none` only | [install.md](status/install.md) §1 |
 | libslirp system library, 4.7 API | `crates/ue2-net/build.rs` searches `SLIRP_LIB_DIR`, else `/opt/homebrew/lib`, else the linker's default paths | [install.md](status/install.md) §1 |
-| Platforms | macOS is the main platform (Apple silicon). Linux builds and passes CI but is not used interactively. Windows is not supported: `ue2-vfat`, `ue2-mcp`, `ue2-net` and `c64roms.rs` use Unix APIs. `--net vmnet-bridged` is macOS only | [install.md](status/install.md) "Platforms" |
+| Platforms | macOS is the main platform (Apple silicon). Linux builds and passes CI but is not used interactively. Windows (MSVC) builds and tests in CI and ships as a release zip; its networking is `--net user` only ([S22](specs/S22-windows.md)). `--net vmnet-bridged` is macOS only, `socket-vmnet` Unix only | [install.md](status/install.md) "Platforms" |
 | Rust stable | Built and tested with rustc 1.98.1. The dev profile uses opt-level 1, because the interpreter is unusably slow at 0 | [install.md](status/install.md) §1, [Cargo.toml](../Cargo.toml) |
 
 ### Hardware facts that shape the design
@@ -268,6 +268,7 @@ flowchart LR
 | [S19](specs/S19-idle-skip.md) | Idle skip: loops that cannot change anything fast-forward to the next device event | — |
 | [S20](specs/S20-sid-thread.md) | The reSID engines on their own thread | — |
 | [S21](specs/S21-settings.md) | Firmware settings from a `.cfg` into the flash before boot | — |
+| [S22](specs/S22-windows.md) | Windows port: MSVC build, `--net user` through vcpkg's libslirp, release zip | — |
 
 ## 5. Building Block View
 
@@ -792,7 +793,7 @@ flowchart LR
 |---|---|---|
 | Checkout | `cargo build --release -p ue2emu -p ue2-mcp`; prerequisites Rust stable, a C++ compiler, libslirp, network on the first build; optional `firmware/1541ultimate` and `tools/bin` for `scripts/build-firmware.sh`. `UE2_FIRMWARE=… cargo test --workspace`, `scripts/smoke-all.sh` | [install.md](status/install.md) §1 |
 | Homebrew | `brew install jondalar/ue2emu/ue2emu` builds the tagged release from source with Homebrew's Rust and libslirp and installs `ue2emu` and `ue2-mcp` (tap https://github.com/Jondalar/homebrew-ue2emu). An installed `ue2emu` always needs `--roms`; an installed `ue2-mcp` starts the `ue2emu` next to it and keeps instances in `~/.ue2emu/run/mcp/` | [install.md](status/install.md) §1, §6 |
-| CI | [ci.yml](../.github/workflows/ci.yml) on pushes to main, pull requests and by hand: macos-latest (libslirp from Homebrew) and ubuntu-latest (`libslirp-dev`, `libasound2-dev`, `pkg-config`); `cargo build --workspace --locked`, `cargo test --workspace --locked`. No firmware and no ROMs, so those tests skip | [install.md](status/install.md) "Platforms" |
+| CI | [ci.yml](../.github/workflows/ci.yml) on pushes to main, pull requests and by hand: macos-latest (libslirp from Homebrew), ubuntu-latest (`libslirp-dev`, `libasound2-dev`, `pkg-config`) and windows-latest (libslirp from vcpkg, cached); `cargo build --workspace --locked`, `cargo test --workspace --locked`. No firmware and no ROMs, so those tests skip. [release-binaries.yml](../.github/workflows/release-binaries.yml) builds the Windows zip for a published release | [install.md](status/install.md) "Platforms" |
 | MCP beside the emulator | `ue2-mcp` registered in the project that uses the emulator (`.mcp.json` or `claude mcp add`); env `UE2_REPO`, `UE2EMU_BIN`, `UE2_FIRMWARE_TREE`, `UE2_MCP_RUN`. Each instance is a child `ue2emu run --headless --control 127.0.0.1:<port>` with its own run directory and free localhost ports; several servers share `run/mcp` through claim files | [mcp.md](status/mcp.md) |
 | E2E | `scripts/run-e2e.sh` boots a realtime emulator with forwards (REST 18080, FTP 18021, Telnet 18023, DMA 18064, passive FTP 51000-52999) and runs the firmware tree's `run-tests` with `U64_*_PORT`; `E2E_REST_SHIM=1` for suites that ignore the port | [e2e.md](status/e2e.md) |
 | Network modes | `user`: no privileges, guest 10.0.2.15. `vmnet-bridged`: root or the vm.networking entitlement. `socket-vmnet`: a socket_vmnet daemon running as root | [network.md](status/network.md) |

@@ -178,6 +178,7 @@ fn walk(root: &Path, dir: &Path, rel_dir: &str, depth: usize, scan: &mut Scan) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     use super::*;
@@ -196,6 +197,7 @@ mod tests {
         assert!(is_temp_name(".ue2-tmp-47779-0") && !is_temp_name(".ue2-tmp-12") && !is_temp_name(".ue2-tmp-1-x"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn scan_imports_the_tree_and_skips_what_fat_cannot_hold() {
         let tmp = tempfile::tempdir().unwrap();

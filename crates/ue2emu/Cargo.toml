@@ -6,14 +6,17 @@ version.workspace = true
 license.workspace = true
 
 [features]
-default = ["trx64"]
+default = ["trx64", "net"]
 # TRX64 as the C64 behind the cart/DMA registers (docs/specs/S14-c64-trx64.md): needs the TRX64 checkout and a C++
 # toolchain. Without it `--c64 none`, the T0 register stub, is the only choice.
 trx64 = ["dep:c64-bridge"]
+# `--net user` through libslirp (crates/ue2-net/build.rs links it). Without it `--net user` reports that it is missing;
+# the other modes are unaffected (docs/specs/S22-windows.md).
+net = ["ue2-net/slirp"]
 
 [dependencies]
 ue2-core = { path = "../ue2-core" }
-ue2-net = { path = "../ue2-net" }
+ue2-net = { path = "../ue2-net", default-features = false }
 ue2-vfat = { path = "../ue2-vfat" }
 c64-bridge = { path = "../c64-bridge", optional = true }
 # --c64-roms writes into the flash disk's FAT volume (the version ue2-vfat uses).

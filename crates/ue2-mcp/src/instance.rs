@@ -1,6 +1,5 @@
 //! One emulator instance: a headless `ue2emu run` child with its own run directory, control port and forwards.
 
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,6 +15,7 @@ use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
 
 use crate::ctl::{screen_text, CtlConn};
+use crate::proc::{self, Stop};
 use crate::ring::Ring;
 
 /// Retained firmware console (the full log is also written to `console.log`).
@@ -91,12 +91,6 @@ impl Instance {
     /// Start the emulator and connect to its control port (within `ready_timeout`).
     pub async fn spawn(id: String, run_dir: PathBuf, launch: Launch, ready_timeout: Duration) -> Result<Arc<Instance>> {
         std::fs::create_dir_all(run_dir.join("shots")).with_context(|| format!("create {}", run_dir.display()))?;
-        // `png` reads the font from $UE2_FIRMWARE/roms (control.rs default_rom_dir), not from --roms.
-        let fwroot = run_dir.join("fwroot");
-        std::fs::create_dir_all(&fwroot)?;
-        let link = fwroot.join("roms");
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&launch.roms, &link).with_context(|| format!("symlink {}", link.display()))?;
 
         let p = free_ports(if launch.net { 5 } else { 1 })?;
         let ports = Ports {
@@ -151,14 +145,12 @@ impl Instance {
 
         let mut cmd = Command::new(&launch.emulator);
         cmd.args(&argv)
-            .env("UE2_FIRMWARE", &fwroot)
             .current_dir(&run_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            // Own process group: a Ctrl-C aimed at the MCP client must not kill it before a clean `quit`.
-            .process_group(0);
+            .kill_on_drop(true);
+        proc::detach(&mut cmd);
         let mut child = cmd.spawn().with_context(|| format!("start {}", launch.emulator.display()))?;
         let pid = child.id().ok_or_else(|| anyhow!("the emulator exited immediately"))?;
 
@@ -176,7 +168,7 @@ impl Instance {
             })
             .await;
             let info = match status {
-                Ok(s) => ExitInfo { code: s.code(), signal: s.signal(), description: s.to_string() },
+                Ok(s) => ExitInfo { code: s.code(), signal: proc::exit_signal(&s), description: s.to_string() },
                 Err(e) => ExitInfo { code: None, signal: None, description: format!("wait failed: {e}") },
             };
             let _ = exit_tx.send(Some(info));
@@ -217,7 +209,7 @@ impl Instance {
                 break;
             }
             if Instant::now() >= deadline {
-                inst.kill(libc::SIGKILL);
+                inst.kill(Stop::Kill);
                 bail!(
                     "the emulator did not open its control port within {} ms; stderr:\n{}",
                     ready_timeout.as_millis(),
@@ -229,7 +221,7 @@ impl Instance {
         match tokio::time::timeout(Duration::from_secs(5), CtlConn::connect(inst.ports.control)).await {
             Ok(Ok(conn)) => *inst.ctl.lock().await = Some(conn),
             other => {
-                inst.kill(libc::SIGKILL);
+                inst.kill(Stop::Kill);
                 let why = match other {
                     Ok(Err(e)) => format!("{e:#}"),
                     _ => "timed out".into(),
@@ -250,12 +242,10 @@ impl Instance {
         self.exited()
     }
 
-    fn kill(&self, sig: i32) {
+    /// Stop our own child, which is not reaped while `exited()` is None.
+    fn kill(&self, how: Stop) {
         if self.exited().is_none() {
-            // SAFETY: plain kill(2) on our own child's pid, which is not reaped while `exited()` is None.
-            unsafe {
-                libc::kill(self.pid as i32, sig);
-            }
+            proc::stop(self.pid, how);
         }
     }
 
@@ -351,15 +341,12 @@ impl Instance {
         let quit = self.control("quit", Duration::from_secs(5)).await;
         let mut forced = Value::Null;
         let mut exit = self.wait_exit(timeout).await;
-        if exit.is_none() {
-            self.kill(libc::SIGTERM);
-            forced = "SIGTERM".into();
-            exit = self.wait_exit(Duration::from_secs(2)).await;
-        }
-        if exit.is_none() {
-            self.kill(libc::SIGKILL);
-            forced = "SIGKILL".into();
-            exit = self.wait_exit(Duration::from_secs(3)).await;
+        for (how, wait) in [(Stop::Term, 2), (Stop::Kill, 3)] {
+            if exit.is_none() {
+                self.kill(how);
+                forced = how.name().into();
+                exit = self.wait_exit(Duration::from_secs(wait)).await;
+            }
         }
         json!({
             "id": self.id,
@@ -432,22 +419,18 @@ fn free_ports(n: usize) -> Result<Vec<u16>> {
     listeners.iter().map(|l| Ok(l.local_addr()?.port())).collect()
 }
 
-/// A detached shell that stops the emulator when this server dies without cleaning up (SIGKILL, crash).
-///
-/// macOS has no parent-death signal and ue2emu does not watch stdin, so the shell blocks reading a pipe whose
-/// write end only this server holds (Rust pipes are close-on-exec). A clean `emu_stop` writes `done`; any other
-/// end of the pipe (EOF because the server died, even while it is an unreaped zombie) makes the shell quit the
-/// emulator through its control port (flash is saved), then SIGTERM/SIGKILL it if it is still there.
+/// A detached `ue2-mcp --watchdog PID PORT` that stops the emulator when this server dies without cleaning up
+/// (killed, crashed); see `proc::watchdog`. Returns the write end of its stdin.
 fn spawn_watchdog(child: u32, control_port: u16) -> Option<tokio::process::ChildStdin> {
-    let script = format!(
-        "read -r line; [ \"$line\" = done ] && exit 0; \
-         kill -0 {child} 2>/dev/null || exit 0; \
-         printf 'quit\\n' | nc -w 3 127.0.0.1 {control_port} >/dev/null 2>&1; \
-         for i in 1 2 3 4 5 6; do kill -0 {child} 2>/dev/null || exit 0; sleep 0.5; done; \
-         kill -TERM {child} 2>/dev/null; sleep 2; kill -KILL {child} 2>/dev/null; exit 0"
-    );
-    let mut cmd = Command::new("/bin/sh");
-    cmd.arg("-c").arg(script).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
+    let exe = std::env::current_exe().ok()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("--watchdog")
+        .arg(child.to_string())
+        .arg(control_port.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    proc::detach(&mut cmd);
     let mut c = cmd.spawn().ok()?;
     let stdin = c.stdin.take();
     tokio::spawn(async move {
@@ -456,20 +439,10 @@ fn spawn_watchdog(child: u32, control_port: u16) -> Option<tokio::process::Child
     stdin
 }
 
-fn pid_alive(pid: i64) -> bool {
-    if pid <= 0 || pid > i32::MAX as i64 {
-        return false;
-    }
-    // SAFETY: signal 0 only checks for existence. EPERM means it exists but belongs to someone else.
-    // errno through std: libc names its accessor `__error` on macOS and `__errno_location` on Linux.
-    let exists = unsafe { libc::kill(pid as i32, 0) == 0 };
-    exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 /// True when `dir/instance.json` names a live process (an emulator another server started still owns it).
 pub fn dir_in_use(dir: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(dir.join("instance.json")) else { return false };
-    serde_json::from_str::<Value>(&text).ok().and_then(|v| v["pid"].as_i64()).is_some_and(pid_alive)
+    serde_json::from_str::<Value>(&text).ok().and_then(|v| v["pid"].as_i64()).is_some_and(proc::alive)
 }
 
 fn claim_path(run_base: &Path, id: &str) -> PathBuf {
@@ -491,7 +464,7 @@ pub fn claim(run_base: &Path, id: &str, server_pid: u32) -> bool {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let holder = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<i64>().ok());
                 match holder {
-                    Some(pid) if pid != server_pid as i64 && pid_alive(pid) => return false,
+                    Some(pid) if pid != server_pid as i64 && proc::alive(pid) => return false,
                     // Stale, ours, or still being written by its creator: take it over only if unreadable twice.
                     None if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) => return false,
                     _ => {

@@ -20,8 +20,7 @@
 //!   Region contents that are neither a volume nor erased are refused.
 
 use std::fs::OpenOptions;
-use std::io::{self, Cursor, Read, Write};
-use std::os::unix::fs::FileExt;
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -189,17 +188,21 @@ pub fn write_roms(flash: &Path, capabilities: u32, dir: &Path, force: bool) -> R
     if changed.is_empty() && full_size {
         lines.push(format!("flash image {} unchanged", flash.display()));
     } else {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
             .open(flash)
             .with_context(|| format!("opening flash image {}", flash.display()))?;
+        let mut write_at = |data: &[u8], at: usize| {
+            file.seek(SeekFrom::Start(at as u64))?;
+            file.write_all(data)
+        };
         let written = if full_size {
-            changed.iter().try_for_each(|&s| file.write_all_at(&image[s * SECTOR..(s + 1) * SECTOR], (s * SECTOR) as u64))
+            changed.iter().try_for_each(|&s| write_at(&image[s * SECTOR..(s + 1) * SECTOR], s * SECTOR))
         } else {
             // Missing or short: the whole image, erased where nothing is stored, as `SpiFlash::open` pads it.
-            file.write_all_at(&image, 0)
+            write_at(&image, 0)
         };
         written.with_context(|| format!("writing flash image {}", flash.display()))?;
         lines.push(format!("flash image {}: {} changed 4 KiB sector(s) written", flash.display(), changed.len()));

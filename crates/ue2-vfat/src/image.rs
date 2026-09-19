@@ -5,7 +5,6 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -44,7 +43,7 @@ impl Read for Partition {
         if n == 0 {
             return Ok(0);
         }
-        let got = self.file.read_at(&mut buf[..n], self.start + self.pos)?;
+        let got = crate::os::read_at(&self.file, &mut buf[..n], self.start + self.pos)?;
         if got == 0 {
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "image file shorter than its partition"));
         }
@@ -59,7 +58,7 @@ impl Write for Partition {
         if n == 0 && !buf.is_empty() {
             return Err(io::Error::new(ErrorKind::WriteZero, "write past the end of the partition"));
         }
-        let put = self.file.write_at(&buf[..n], self.start + self.pos)?;
+        let put = crate::os::write_at(&self.file, &buf[..n], self.start + self.pos)?;
         self.pos += put as u64;
         Ok(put)
     }
@@ -90,7 +89,7 @@ impl Seek for Partition {
 pub fn read_partition(file: &File) -> std::result::Result<(u64, u64), String> {
     let file_len = file.metadata().map_err(|e| e.to_string())?.len();
     let mut mbr = [0; 512];
-    file.read_exact_at(&mut mbr, 0).map_err(|e| format!("reading the MBR: {e}"))?;
+    crate::os::read_exact_at(file, &mut mbr, 0).map_err(|e| format!("reading the MBR: {e}"))?;
     if mbr[510..] != [0x55, 0xAA] {
         return Err("no MBR signature".into());
     }
@@ -221,7 +220,7 @@ pub fn build(root: &Path, image: &Path, size: Option<u64>, label: [u8; 11]) -> R
     mbr[0x1C6..0x1CA].copy_from_slice(&(PARTITION_START as u32).to_le_bytes());
     mbr[0x1CA..0x1CE].copy_from_slice(&((sectors - PARTITION_START) as u32).to_le_bytes());
     mbr[510..].copy_from_slice(&[0x55, 0xAA]);
-    file.write_all_at(&mbr, 0)?;
+    crate::os::write_all_at(&file, &mbr, 0)?;
 
     let start = PARTITION_START * SECTOR;
     let volume_id = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs() as u32);

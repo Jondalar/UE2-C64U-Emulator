@@ -43,9 +43,25 @@ scripts/smoke-all.sh                                      # release build, every
 - **macOS:** the main platform, developed on Apple silicon.
 - **Linux:** builds and passes the tests in CI on Ubuntu 24.04, not used interactively yet. It needs the libslirp
   development package, version 4.7 or newer (Debian 12, Ubuntu 24.04). `--net vmnet-bridged` is macOS only.
-  `ue2-mcp` stops an emulator through `nc`; without `nc` the stop falls back to SIGTERM after about 3 seconds.
-- **Windows:** not supported. Besides libslirp, the code uses Unix APIs in `ue2-vfat` (`--usb-dir`), `ue2-mcp`
-  (instance control), `ue2-net` and `crates/ue2emu/src/c64roms.rs`.
+- **Windows** (x86-64, MSVC; [S22](../specs/S22-windows.md)): built and tested in CI on `windows-latest`; releases
+  carry `ue2emu-X.Y.Z-windows-x86_64.zip` (the two exes, the libslirp DLLs and the VC runtime: unzip and run). Networking
+  is `--net user` only; `socket-vmnet` and `vmnet-bridged` need macOS. A guest file name Windows refuses (`CON`,
+  `NUL`, `COM1`, ...) is reported by the `--usb-dir` sync and not written.
+
+### Building on Windows
+
+Visual Studio 2022 with the C++ tools (reSID, libslirp), rustup, and vcpkg for libslirp (it brings glib; the first
+build takes 20-30 minutes). From a Git Bash:
+
+```sh
+vcpkg install libslirp:x64-windows
+export SLIRP_LIB_DIR="$VCPKG_ROOT\installed\x64-windows\lib"   # build.rs links slirp from here
+export PATH="$VCPKG_ROOT/installed/x64-windows/bin:$PATH"          # the DLLs, for running and the tests
+cargo build --release -p ue2emu -p ue2-mcp
+```
+
+Without vcpkg, `cargo build --release -p ue2emu --no-default-features --features trx64` builds everything but
+`--net user`.
 
 ### TRX64 dependency
 

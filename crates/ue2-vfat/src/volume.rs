@@ -4,14 +4,13 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
 
 use crate::fatread;
+use crate::os;
 use crate::image;
 use crate::manifest::{self, Manifest, Skipped};
 use crate::scan;
@@ -58,38 +57,34 @@ impl std::fmt::Display for SyncError {
     }
 }
 
-/// `flock`s that keep two sticks from syncing into the same files. Nothing is written into the shared directory.
+/// Directory locks that keep two sticks from syncing into the same files (`os::lock_dir`). Nothing is written into
+/// the shared directory.
 struct DirLock(#[allow(dead_code, reason = "held for the lock")] Vec<File>);
-
-fn flock(file: &File, op: libc::c_int) -> bool {
-    // SAFETY: flock(2) on a descriptor the caller owns.
-    unsafe { libc::flock(file.as_raw_fd(), op | libc::LOCK_NB) == 0 }
-}
 
 impl DirLock {
     /// Lock the shared directory `dir`: exclusively for a read-write stick, shared for a read-only one. A read-write
     /// stick also takes a shared lock on every ancestor it can open, so no read-write stick of this or another
     /// ue2emu shares a directory inside or around it (flock conflicts between descriptors of one process too).
     fn acquire(dir: &Path, read_only: bool) -> Result<DirLock> {
-        let file = File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
-        if !flock(&file, if read_only { libc::LOCK_SH } else { libc::LOCK_EX }) {
+        let lock = os::lock_dir(dir, !read_only).with_context(|| format!("locking {}", dir.display()))?;
+        let Some(file) = lock else {
             bail!(
                 "{} is in use by another --usb-dir of this or another ue2emu (the same directory, or a read-write one \
                  inside it)",
                 dir.display()
             );
-        }
+        };
         let mut files = vec![file];
         if !read_only {
             for ancestor in dir.ancestors().skip(1) {
-                let Ok(file) = File::open(ancestor) else { continue };
-                if !flock(&file, libc::LOCK_SH) {
+                let Ok(lock) = os::lock_dir(ancestor, false) else { continue };
+                let Some(file) = lock else {
                     bail!(
                         "{} is inside {}, which a read-write --usb-dir of this or another ue2emu shares",
                         dir.display(),
                         ancestor.display()
                     );
-                }
+                };
                 files.push(file);
             }
         }
@@ -98,10 +93,10 @@ impl DirLock {
 
     /// Lock the work subdirectory exclusively: one stick per work directory.
     fn work(work: &Path) -> Result<DirLock> {
-        let file = File::open(work).with_context(|| format!("opening {}", work.display()))?;
-        if !flock(&file, libc::LOCK_EX) {
+        let lock = os::lock_dir(work, true).with_context(|| format!("locking {}", work.display()))?;
+        let Some(file) = lock else {
             bail!("the work directory {} is in use by another --usb-dir (the same directory shared twice?)", work.display());
-        }
+        };
         Ok(DirLock(vec![file]))
     }
 }
@@ -164,7 +159,7 @@ impl DirVolume {
         if !root.is_dir() {
             bail!("--usb-dir {}: not a directory", spec.path.display());
         }
-        let home = std::env::var_os("HOME").and_then(|h| fs::canonicalize(h).ok());
+        let home = std::env::home_dir().and_then(|h| fs::canonicalize(h).ok());
         if let Some(why) = refused_root(&root, home.as_deref()) {
             bail!("--usb-dir: {why}");
         }
@@ -387,7 +382,7 @@ impl DirVolume {
         let scan = scan::scan(&self.root)?;
         let mut hasher = Hasher::default();
         let mut add = |rel: &str, meta: Option<fs::Metadata>| {
-            let m = meta.map(|m| (m.mode(), m.size(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec(), m.ino()));
+            let m = meta.map(|m| os::fingerprint(&m));
             hasher.update(format!("{rel}\0{m:?}\n").as_bytes());
         };
         add("", fs::symlink_metadata(&self.root).ok());

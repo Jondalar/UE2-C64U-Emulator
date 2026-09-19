@@ -6,12 +6,12 @@ mod ctl;
 mod http;
 mod img;
 mod instance;
+mod proc;
 mod ring;
 mod tools;
 
 use anyhow::Result;
 use rmcp::ServiceExt;
-use tokio::signal::unix::{signal, SignalKind};
 
 const USAGE: &str = "\
 ue2-mcp — MCP server (JSON-RPC over stdio) for the UE2-C64U-Emulator.
@@ -42,6 +42,10 @@ async fn main() -> Result<()> {
         println!("ue2-mcp {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // Started by `instance::spawn_watchdog`, one per emulator instance.
+    if args.first().is_some_and(|a| a == "--watchdog") {
+        std::process::exit(proc::watchdog(&args[1..]));
+    }
     if let Some(a) = args.first() {
         eprintln!("ue2-mcp: unexpected argument {a:?}; configuration is by environment (see --help)");
         std::process::exit(2);
@@ -58,20 +62,45 @@ async fn main() -> Result<()> {
     let server = tools::Emu::new(cfg);
     let state = server.state();
 
-    let mut term = signal(SignalKind::terminate())?;
-    let mut int = signal(SignalKind::interrupt())?;
-    let mut hup = signal(SignalKind::hangup())?;
     let serve = async move {
         server.serve(rmcp::transport::stdio()).await?.waiting().await?;
         anyhow::Ok(())
     };
     tokio::select! {
         r = serve => if let Err(e) = r { eprintln!("ue2-mcp: {e:#}") },
-        _ = term.recv() => eprintln!("ue2-mcp: SIGTERM"),
-        _ = int.recv() => eprintln!("ue2-mcp: SIGINT"),
-        _ = hup.recv() => eprintln!("ue2-mcp: SIGHUP"),
+        name = stop_request()? => eprintln!("ue2-mcp: {name}"),
     }
     state.shutdown().await;
     // tokio's stdin reader sits in a blocking thread that would hold up runtime shutdown.
     std::process::exit(0);
+}
+
+/// Resolves when the process is asked to stop: SIGTERM, SIGINT or SIGHUP; Ctrl-C, Ctrl-Break or the console
+/// closing on Windows. Returns the name of what arrived.
+fn stop_request() -> Result<impl std::future::Future<Output = &'static str>> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let (mut term, mut int, mut hup) =
+            (signal(SignalKind::terminate())?, signal(SignalKind::interrupt())?, signal(SignalKind::hangup())?);
+        Ok(async move {
+            tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = int.recv() => "SIGINT",
+                _ = hup.recv() => "SIGHUP",
+            }
+        })
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close};
+        let (mut c, mut brk, mut close) = (ctrl_c()?, ctrl_break()?, ctrl_close()?);
+        Ok(async move {
+            tokio::select! {
+                _ = c.recv() => "Ctrl-C",
+                _ = brk.recv() => "Ctrl-Break",
+                _ = close.recv() => "console closed",
+            }
+        })
+    }
 }

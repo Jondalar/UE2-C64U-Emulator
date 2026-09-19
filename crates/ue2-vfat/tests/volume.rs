@@ -1,11 +1,16 @@
 //! Build, guest edits and sync on scratch directories: the safety rules of docs/status/usb-dir.md end to end.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions, Permissions};
+use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::Permissions;
 use std::io::{Read, Write};
-use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::AtomicU64;
+#[cfg(unix)]
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -14,8 +19,28 @@ use tempfile::TempDir;
 use ue2_vfat::fatread::read_image;
 use ue2_vfat::image::{self, Partition};
 use ue2_vfat::volume::SyncError;
+#[cfg(unix)]
 use ue2_vfat::worker::{Reply, Request, Worker};
 use ue2_vfat::{DirSpec, DirVolume};
+/// Positional reads and writes on every platform (the tests only).
+trait At {
+    fn read_exact_at(&self, buf: &mut [u8], at: u64) -> std::io::Result<()>;
+    fn write_all_at(&self, buf: &[u8], at: u64) -> std::io::Result<()>;
+}
+
+impl At for File {
+    fn read_exact_at(&self, buf: &mut [u8], at: u64) -> std::io::Result<()> {
+        let mut f = self;
+        std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(at))?;
+        f.read_exact(buf)
+    }
+
+    fn write_all_at(&self, buf: &[u8], at: u64) -> std::io::Result<()> {
+        let mut f = self;
+        std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(at))?;
+        f.write_all(buf)
+    }
+}
 
 const D64: usize = 174_848;
 
@@ -261,17 +286,17 @@ fn a_corrupt_image_is_never_synced() {
     let file = OpenOptions::new().read(true).write(true).open(&snap).unwrap();
     let (start, _) = image::read_partition(&file).unwrap();
     let mut boot = [0u8; 512];
-    std::os::unix::fs::FileExt::read_exact_at(&file, &mut boot, start).unwrap();
+    At::read_exact_at(&file, &mut boot, start).unwrap();
     let reserved = u64::from(u16::from_le_bytes([boot[14], boot[15]]));
     let fat = start + reserved * 512;
     let mut entries = vec![0u8; 4096];
-    std::os::unix::fs::FileExt::read_exact_at(&file, &mut entries, fat).unwrap();
+    At::read_exact_at(&file, &mut entries, fat).unwrap();
     let long_chain = (3..1024).find(|&c| {
         let next = u32::from_le_bytes(entries[c * 4..c * 4 + 4].try_into().unwrap()) & 0x0FFF_FFFF;
         next == c as u32 + 1
     });
     let c = long_chain.expect("a multi-cluster chain");
-    std::os::unix::fs::FileExt::write_all_at(&file, &[0, 0, 0, 0], fat + c as u64 * 4).unwrap();
+    At::write_all_at(&file, &[0, 0, 0, 0], fat + c as u64 * 4).unwrap();
     drop(file);
     match vol.sync(&snap, true) {
         Err(SyncError::Parse(msg)) => assert!(msg.contains("free cluster"), "{msg}"),
@@ -382,8 +407,10 @@ fn only_named(dir: &Path, prefix: &str) -> PathBuf {
 }
 
 /// Gives a directory its permissions back when the test ends, also on a failure, so the temporary tree can go.
+#[cfg(unix)]
 struct Writable(PathBuf);
 
+#[cfg(unix)]
 impl Drop for Writable {
     fn drop(&mut self) {
         let _ = fs::set_permissions(&self.0, Permissions::from_mode(0o755));
@@ -412,6 +439,7 @@ fn a_directory_the_host_renamed_under_unsynced_guest_writes_is_created_again() {
     assert!(tree.contains_key("games/lostdisk.d64") && tree.contains_key("games2/demo.d64"), "{:?}", tree.keys());
 }
 
+#[cfg(unix)]
 #[test]
 fn guest_data_the_host_cannot_take_keeps_the_image_until_a_sync_writes_it() {
     let s = setup(8);
@@ -548,6 +576,7 @@ fn a_host_name_with_u_fffd_is_skipped_and_short_names_decode_as_code_page_437() 
     assert_eq!(fs::read(s.host.join("odd\u{FFFD}name.txt")).unwrap(), b"odd");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_directory_replaced_by_a_symlink_to_outside_the_share_is_never_followed() {
     let s = setup(8);
@@ -586,6 +615,7 @@ fn temporary_files_of_an_interrupted_sync_are_removed_at_start() {
     assert!(s.host.join(".ue2-trash/20260101-000000/.ue2-tmp-1-1").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn an_in_place_host_edit_that_keeps_size_mtime_and_inode_is_a_conflict() {
     let s = setup(8);
@@ -670,6 +700,7 @@ fn xattr(path: &Path, name: &str, value: Option<&[u8]>) -> Option<Vec<u8>> {
     (len >= 0).then(|| buf[..len as usize].to_vec())
 }
 
+#[cfg(unix)]
 #[test]
 fn a_replaced_host_file_keeps_its_permissions_and_extended_attributes() {
     let s = setup(8);

@@ -254,7 +254,11 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::KeyboardInput { event, .. } => self.key(&event),
+            WindowEvent::KeyboardInput { event, is_synthetic, .. } => {
+                if accepts(is_synthetic, event.state.is_pressed()) {
+                    self.key(&event);
+                }
+            }
             WindowEvent::Focused(false) => self.release_all(),
             WindowEvent::Resized(_) => {
                 if let Some(window) = &self.window {
@@ -376,9 +380,24 @@ fn blit(src: &[u32], sw: usize, sh: usize, dst: &mut [u32], dw: usize, dh: usize
     }
 }
 
+/// May this key event reach the machine? winit on Windows synthesises the whole keyboard state on focus changes:
+/// `Pressed` for every key held when the window gains focus, `Released` for all on focus loss. A synthetic release
+/// must pass (a key held while switching away would otherwise stay down); a synthetic press must not, it replays
+/// keys the user never struck. macOS synthesises nothing (after TRX64 `trx64-cli` window.rs `accepts`).
+const fn accepts(is_synthetic: bool, pressed: bool) -> bool {
+    !(is_synthetic && pressed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthetic_presses_are_dropped_and_releases_pass() {
+        assert!(accepts(false, true) && accepts(false, false), "real key events");
+        assert!(accepts(true, false), "a synthetic release frees a key held while focus left");
+        assert!(!accepts(true, true), "a synthetic press on focus gain is no keystroke");
+    }
 
     fn key(row: u8, col: u8, down: bool) -> HostInput {
         HostInput::Key { row, col, down }

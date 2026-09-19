@@ -218,6 +218,21 @@ pub fn conflict_name(name: &str, stamp: &str, n: usize) -> String {
     }
 }
 
+/// A hard link from `src` to the new name `dst`; where the file system has none (FAT, exFAT, some network shares), a
+/// copy with `src`'s modification time. Either fails when `dst` exists.
+fn link_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
+    match fs::hard_link(src, dst) {
+        Err(e) if e.kind() != ErrorKind::AlreadyExists && !dst.exists() => {
+            let mut from = File::open(src)?;
+            let mut to = fs::OpenOptions::new().write(true).create_new(true).open(dst)?;
+            io::copy(&mut from, &mut to)?;
+            to.set_modified(from.metadata()?.modified()?)?;
+            to.sync_all()
+        }
+        other => other,
+    }
+}
+
 /// `name (ue2 conflict <stamp>)` for a directory: the extension is not split off.
 fn conflict_dir_name(name: &str, stamp: &str, n: usize) -> String {
     if n == 0 {
@@ -308,7 +323,7 @@ impl Applier<'_> {
                 Ok(meta) if meta.is_dir() => {}
                 Ok(_) => return Ok(Parents::NotDir),
                 Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Parents::Missing),
-                Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) => return Ok(Parents::NotDir),
+                Err(e) if crate::os::not_a_directory(&e) => return Ok(Parents::NotDir),
                 Err(e) => return Err(e),
             }
         }
@@ -463,7 +478,7 @@ impl Applier<'_> {
 
     /// Link `tmp` to `dst` only if `dst` does not exist, then drop the temporary name.
     fn link_new(tmp: &Path, dst: &Path) -> io::Result<()> {
-        fs::hard_link(tmp, dst)?;
+        link_or_copy(tmp, dst)?;
         fs::remove_file(tmp)
     }
 
@@ -490,11 +505,10 @@ impl Applier<'_> {
     }
 }
 
-/// Give `out` the permission bits and (on macOS) the extended attributes and ACL of the host file `like`.
+/// Give `out` the permission bits (Unix) and (on macOS) the extended attributes and ACL of the host file `like`.
 fn copy_metadata(like: &Path, out: &File) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     let meta = fs::symlink_metadata(like)?;
-    out.set_permissions(fs::Permissions::from_mode(meta.permissions().mode() & 0o777))?;
+    crate::os::copy_permissions(&meta, out)?;
     #[cfg(target_os = "macos")]
     {
         use std::os::fd::AsRawFd;
@@ -708,7 +722,7 @@ fn apply_plan(a: &mut Applier, fs_image: &fatfs::FileSystem<image::Partition>, e
             Host::Missing => Applier::link_new(&tmp, &path).map(|()| (format!("wrote {shown}"), false)),
             _ if replace => (|| {
                 let backup = a.trash_path(rel)?;
-                fs::hard_link(&path, &backup)?;
+                link_or_copy(&path, &backup)?;
                 fs::rename(&tmp, &path)?;
                 Ok((format!("wrote {shown} (previous version: {})", backup.display()), false))
             })(),

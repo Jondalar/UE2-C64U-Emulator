@@ -15,7 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use ue2_core::host::NetBackend;
 
 /// Socket of the Homebrew `socket_vmnet` setup (`${HOMEBREW_PREFIX}/var/run/socket_vmnet`, socket_vmnet README).
-pub const DEFAULT_SOCKET: &str = "/opt/homebrew/var/run/socket_vmnet";
+pub use crate::DEFAULT_SOCKET_VMNET as DEFAULT_SOCKET;
 
 /// Length prefix of every frame.
 const HEADER_LEN: usize = 4;

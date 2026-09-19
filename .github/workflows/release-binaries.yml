@@ -1,0 +1,128 @@
+# Windows binaries for a published release (docs/specs/S22-windows.md §5): ue2emu-X.Y.Z-windows-x86_64.zip with
+# ue2emu.exe, ue2-mcp.exe, the libslirp DLLs, the VC runtime and the licences, plus a .sha256 next to it.
+#
+# A published release uploads the zip to it. Run by hand (workflow_dispatch) on a branch, it builds, checks and keeps
+# the zip as a workflow artifact only.
+
+name: release-binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: vcpkg
+        id: vcpkg
+        run: |
+          root=$(cygpath -u "$VCPKG_INSTALLATION_ROOT")
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+          echo "installed=$VCPKG_INSTALLATION_ROOT\\installed" >> "$GITHUB_OUTPUT"
+          echo "rev=$(git -C "$root" rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: libslirp cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.vcpkg.outputs.installed }}
+          key: vcpkg-libslirp-x64-windows-${{ steps.vcpkg.outputs.rev }}
+
+      - name: libslirp
+        run: |
+          set -eu
+          "${{ steps.vcpkg.outputs.root }}/vcpkg" install libslirp:x64-windows
+          echo "SLIRP_LIB_DIR=$VCPKG_INSTALLATION_ROOT\\installed\\x64-windows\\lib" >> "$GITHUB_ENV"
+          echo "$VCPKG_INSTALLATION_ROOT\\installed\\x64-windows\\bin" >> "$GITHUB_PATH"
+
+      # dumpbin and VCToolsRedistDir for the import check and the VC runtime.
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows-x86_64
+
+      - name: Build
+        run: cargo build --release --locked -p ue2emu -p ue2-mcp
+
+      - name: Version
+        id: version
+        run: |
+          set -eu
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "${{ github.event_name }}" = release ] && [ "v$v" != "${{ github.event.release.tag_name }}" ]; then
+            echo "Cargo.toml says $v, the release is ${{ github.event.release.tag_name }}"
+            exit 1
+          fi
+          [ "$(target/release/ue2emu.exe --version)" = "ue2emu $v" ]
+          [ "$(target/release/ue2-mcp.exe --version)" = "ue2-mcp $v" ]
+          echo "v=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        run: |
+          set -eu
+          name="ue2emu-${{ steps.version.outputs.v }}-windows-x86_64"
+          out="dist/$name"
+          mkdir -p "$out"
+          cp target/release/ue2emu.exe target/release/ue2-mcp.exe "$out/"
+          vcbin=$(cygpath -u "$VCPKG_INSTALLATION_ROOT")/installed/x64-windows/bin
+          redist=$(cygpath -u "$VCToolsRedistDir")/x64
+          imports() { MSYS_NO_PATHCONV=1 dumpbin /nologo /dependents "$1" | tr -d '\r' \
+            | awk '/following dependencies/{f=1; next} /Summary/{f=0} f && NF == 1 {print tolower($1)}'; }
+          # Add what the exes and the added DLLs import from vcpkg or the VC runtime, until nothing new comes.
+          while :; do
+            added=0
+            for pe in "$out"/*.exe "$out"/*.dll; do
+              [ -e "$pe" ] || continue
+              for dll in $(imports "$pe"); do
+                [ -e "$out/$dll" ] && continue
+                src=$(find "$vcbin" "$redist"/Microsoft.VC*.CRT -maxdepth 1 -iname "$dll" 2>/dev/null | head -n 1)
+                if [ -n "$src" ]; then cp "$src" "$out/$dll"; added=1; fi
+              done
+            done
+            [ "$added" = 1 ] || break
+          done
+          # Every import must be in the zip or part of Windows; the VC runtime never counts as part of Windows.
+          missing=0
+          for pe in "$out"/*.exe "$out"/*.dll; do
+            for dll in $(imports "$pe"); do
+              if [ -e "$out/$dll" ]; then continue; fi
+              case "$dll" in
+                vcruntime*|msvcp*|concrt*|vccorlib*) ;;
+                *) [ -e "$(cygpath -u "$SYSTEMROOT")/System32/$dll" ] && continue ;;
+              esac
+              echo "$(basename "$pe") imports $dll, which is neither in the zip nor part of Windows"
+              missing=1
+            done
+          done
+          [ "$missing" = 0 ]
+          cp LICENSE "$out/LICENSE.txt"
+          share=$(cygpath -u "$VCPKG_INSTALLATION_ROOT")/installed/x64-windows/share
+          for port in libslirp glib gettext-libintl libiconv pcre2 libffi zlib; do
+            [ -f "$share/$port/copyright" ] && cp "$share/$port/copyright" "$out/COPYING-$port.txt"
+          done
+          ls -l "$out"
+          (cd dist && 7z a -tzip "$name.zip" "$name" >/dev/null && sha256sum "$name.zip" > "$name.zip.sha256")
+          echo "ZIP=dist/$name.zip" >> "$GITHUB_ENV"
+
+      - name: Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*.zip*
+
+      - name: Release asset
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "$ZIP" "$ZIP.sha256" --clobber

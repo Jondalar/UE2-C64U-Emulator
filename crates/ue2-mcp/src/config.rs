@@ -24,7 +24,7 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Config {
         let exe = std::env::current_exe().ok().map(|e| e.canonicalize().unwrap_or(e));
-        let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+        let home = std::env::home_dir().filter(|h| !h.as_os_str().is_empty());
         let (repo, emulator) = defaults(env_path("UE2_REPO"), exe.as_deref(), home.as_deref());
         Config {
             emulator: env_path("UE2EMU_BIN").unwrap_or(emulator),
@@ -49,22 +49,23 @@ fn defaults(repo: Option<PathBuf>, exe: Option<&Path>, home: Option<&Path>) -> (
     let repo = repo.or_else(|| exe.and_then(|e| e.ancestors().skip(1).find(|d| is_repo(d))).map(Path::to_path_buf));
     match repo {
         Some(repo) => {
-            let emulator = repo.join("target/release/ue2emu");
+            let emulator = repo.join(format!("target/release/ue2emu{}", std::env::consts::EXE_SUFFIX));
             (repo, emulator)
         }
         None => {
             let base = home.map_or_else(|| PathBuf::from(".ue2emu"), |h| h.join(".ue2emu"));
-            let emulator = exe.and_then(Path::parent).map_or_else(|| PathBuf::from("ue2emu"), |d| d.join("ue2emu"));
+            let name = format!("ue2emu{}", std::env::consts::EXE_SUFFIX);
+            let emulator = exe.and_then(Path::parent).map_or_else(|| PathBuf::from(&name), |d| d.join(&name));
             (base, emulator)
         }
     }
 }
 
-/// A path argument: `~/` expands to $HOME, relative paths are relative to the server's working directory
+/// A path argument: `~/` expands to the home directory, relative paths are relative to the server's working directory
 /// (the directory the MCP client started it in).
 pub fn resolve(p: &str) -> PathBuf {
     let expanded = match p.strip_prefix("~/") {
-        Some(rest) => std::env::var_os("HOME").map(|h| PathBuf::from(h).join(rest)).unwrap_or_else(|| PathBuf::from(p)),
+        Some(rest) => std::env::home_dir().map(|h| h.join(rest)).unwrap_or_else(|| PathBuf::from(p)),
         None => PathBuf::from(p),
     };
     if expanded.is_absolute() {
@@ -103,8 +104,8 @@ mod tests {
 
     #[test]
     fn resolve_expands_home_and_relative_paths() {
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(resolve("~/x/y"), PathBuf::from(home).join("x/y"));
+        let home = std::env::home_dir().unwrap();
+        assert_eq!(resolve("~/x/y"), home.join("x/y"));
         assert_eq!(resolve("/abs/p"), PathBuf::from("/abs/p"));
         assert_eq!(resolve("rel/p"), std::env::current_dir().unwrap().join("rel/p"));
     }
@@ -116,16 +117,17 @@ mod tests {
         std::fs::create_dir_all(checkout.join("crates/ue2emu")).unwrap();
         std::fs::write(checkout.join("crates/ue2emu/Cargo.toml"), "").unwrap();
         let home = dir.join("home");
+        let emu = format!("ue2emu{}", std::env::consts::EXE_SUFFIX);
 
         let built = checkout.join("target/release/ue2-mcp");
-        assert_eq!(defaults(None, Some(&built), Some(&home)), (checkout.clone(), checkout.join("target/release/ue2emu")));
+        assert_eq!(defaults(None, Some(&built), Some(&home)), (checkout.clone(), checkout.join("target/release").join(&emu)));
 
         let installed = dir.join("Cellar/ue2emu/0.1.0/bin/ue2-mcp");
-        let expected = (home.join(".ue2emu"), dir.join("Cellar/ue2emu/0.1.0/bin/ue2emu"));
+        let expected = (home.join(".ue2emu"), dir.join("Cellar/ue2emu/0.1.0/bin").join(&emu));
         assert_eq!(defaults(None, Some(&installed), Some(&home)), expected, "installed outside a checkout");
 
         let repo = dir.join("elsewhere");
-        let expected = (repo.clone(), repo.join("target/release/ue2emu"));
+        let expected = (repo.clone(), repo.join("target/release").join(&emu));
         assert_eq!(defaults(Some(repo.clone()), Some(&installed), Some(&home)), expected, "UE2_REPO wins");
         std::fs::remove_dir_all(&dir).unwrap();
     }

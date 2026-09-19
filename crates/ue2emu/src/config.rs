@@ -145,11 +145,12 @@ fn resolve(arg: &Arg, dir: &Path, value: &str) -> OsString {
     s
 }
 
-/// `~` and `~/...` under $HOME, a relative path under `dir`; absolute and empty paths as they are.
+/// `~` and `~/...` under the home directory (`$HOME`, on Windows the user profile), a relative path under `dir`;
+/// absolute and empty paths as they are.
 fn resolve_path(dir: &Path, s: &str) -> PathBuf {
-    match (s.strip_prefix('~'), std::env::var_os("HOME")) {
-        (Some(""), Some(home)) => home.into(),
-        (Some(rest), Some(home)) if rest.starts_with('/') => Path::new(&home).join(&rest[1..]),
+    match (s.strip_prefix('~'), std::env::home_dir()) {
+        (Some(""), Some(home)) => home,
+        (Some(rest), Some(home)) if rest.starts_with(['/', std::path::MAIN_SEPARATOR]) => home.join(&rest[1..]),
         _ if s.is_empty() => PathBuf::new(),
         _ => dir.join(s),
     }
@@ -186,7 +187,7 @@ mod tests {
     }
 
     fn home() -> PathBuf {
-        std::env::var_os("HOME").expect("HOME").into()
+        std::env::home_dir().expect("a home directory")
     }
 
     #[test]

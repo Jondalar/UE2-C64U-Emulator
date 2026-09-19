@@ -7,7 +7,6 @@
 //! ends, and shares no cluster with another chain; every file's chain has exactly the clusters its size needs.
 
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 
 /// Counts of what the directory tree holds, for comparison with the fatfs walk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -64,7 +63,7 @@ impl Volume<'_> {
 pub fn check_fat32(file: &File, start: u64, len: u64) -> Result<Totals, String> {
     let io = |e: std::io::Error| format!("reading the image: {e}");
     let mut boot = [0u8; 512];
-    file.read_exact_at(&mut boot, start).map_err(io)?;
+    crate::os::read_exact_at(file, &mut boot, start).map_err(io)?;
     let u16_at = |i: usize| u16::from_le_bytes([boot[i], boot[i + 1]]);
     let u32_at = |i: usize| u32::from_le_bytes(boot[i..i + 4].try_into().unwrap());
     if boot[510..] != [0x55, 0xAA] {
@@ -98,7 +97,7 @@ pub fn check_fat32(file: &File, start: u64, len: u64) -> Result<Totals, String> 
         return Err("the FAT is too small for the cluster count".into());
     }
     let mut fat = vec![0; (clusters as usize + 2) * 4];
-    file.read_exact_at(&mut fat, start + u64::from(reserved) * 512).map_err(io)?;
+    crate::os::read_exact_at(file, &mut fat, start + u64::from(reserved) * 512).map_err(io)?;
     let mut vol = Volume {
         file,
         data_start: start + data_sectors * 512,
@@ -119,7 +118,7 @@ pub fn check_fat32(file: &File, start: u64, len: u64) -> Result<Totals, String> 
         for (i, &cluster) in chain.iter().enumerate() {
             let at = vol.data_start + u64::from(cluster - 2) * vol.cluster_bytes;
             let chunk = &mut data[i * vol.cluster_bytes as usize..][..vol.cluster_bytes as usize];
-            vol.file.read_exact_at(chunk, at).map_err(io)?;
+            crate::os::read_exact_at(vol.file, chunk, at).map_err(io)?;
         }
         for e in data.chunks_exact(32) {
             if e[0] == 0 {

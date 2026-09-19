@@ -141,13 +141,15 @@ impl c64_bridge::AudioSink for Sink {
     }
 }
 
-/// The default output device at its own rate when that is 44.1 or 48 kHz, else at 48 or 44.1 kHz; mono is copied to
-/// every channel.
+/// The default output device at its own rate when that is 44.1 or 48 kHz, else at 48 or 44.1 kHz, else at its own rate
+/// whatever it is (WASAPI in shared mode takes only the device's mix rate, often 96 or 192 kHz; the engines render at
+/// any rate); mono is copied to every channel.
 fn open_device() -> Result<(cpal::Stream, Arc<Ring>, u32)> {
     let device = cpal::default_host().default_output_device().ok_or_else(|| anyhow!("no default output device"))?;
     let default = device.default_output_config().context("no default output config")?;
     let mut rates: Vec<u32> = Vec::new();
-    for rate in std::iter::once(default.sample_rate().0).filter(|r| DEVICE_RATES.contains(r)).chain(DEVICE_RATES) {
+    let own = default.sample_rate().0;
+    for rate in std::iter::once(own).filter(|r| DEVICE_RATES.contains(r)).chain(DEVICE_RATES).chain([own]) {
         if !rates.contains(&rate) {
             rates.push(rate);
         }

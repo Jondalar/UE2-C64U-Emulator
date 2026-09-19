@@ -29,6 +29,10 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-latest
             container: ''
+          # MSVC; libslirp 4.9 and its glib from vcpkg (docs/specs/S22-windows.md §4-5).
+          - name: windows-x86_64
+            os: windows-latest
+            container: ''
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
@@ -45,6 +49,33 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq libslirp-dev libasound2-dev pkg-config
+
+      - name: vcpkg (Windows)
+        id: vcpkg
+        if: runner.os == 'Windows'
+        run: |
+          root=$(cygpath -u "$VCPKG_INSTALLATION_ROOT")
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+          echo "installed=$VCPKG_INSTALLATION_ROOT\\installed" >> "$GITHUB_OUTPUT"
+          echo "rev=$(git -C "$root" rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # A cold build of glib takes 20-30 minutes; the installed tree only changes with vcpkg itself.
+      - name: libslirp cache (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.vcpkg.outputs.installed }}
+          key: vcpkg-libslirp-x64-windows-${{ steps.vcpkg.outputs.rev }}
+
+      - name: System libraries (Windows)
+        # crates/ue2-net/build.rs links slirp from SLIRP_LIB_DIR and compiles its layout check against the header in
+        # the include directory next to it; the DLLs must be on PATH for the tests.
+        if: runner.os == 'Windows'
+        run: |
+          set -eu
+          "${{ steps.vcpkg.outputs.root }}/vcpkg" install libslirp:x64-windows
+          echo "SLIRP_LIB_DIR=$VCPKG_INSTALLATION_ROOT\\installed\\x64-windows\\lib" >> "$GITHUB_ENV"
+          echo "$VCPKG_INSTALLATION_ROOT\\installed\\x64-windows\\bin" >> "$GITHUB_PATH"
 
       - name: Toolchain
         run: |

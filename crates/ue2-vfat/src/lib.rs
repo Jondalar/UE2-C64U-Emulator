@@ -17,6 +17,7 @@ pub mod cp437;
 pub mod fatread;
 pub mod image;
 pub mod manifest;
+mod os;
 pub mod scan;
 pub mod spec;
 pub mod sync;

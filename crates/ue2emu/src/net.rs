@@ -5,8 +5,6 @@
 //! there too). Pumping between run slices never blocks, so realtime pacing is unaffected; frames wait at most one
 //! slice. The web UI proxy of `--net user` runs on its own threads (`ue2_net::web_proxy`).
 
-use std::net::{Ipv4Addr, TcpListener};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::SystemTime;
@@ -18,9 +16,8 @@ use ue2_core::devices::flash::SpiFlash;
 use ue2_core::devices::rmii::{Rmii, CAPAB_ETH_RMII};
 use ue2_core::host::NetBackend;
 use ue2_core::machine::{Machine, MachineConfig};
-use ue2_net::socket_vmnet::{SocketVmnet, DEFAULT_SOCKET};
 use ue2_net::web_proxy::{DEFAULT_WEB_PORT, WEB_GUEST_PORT};
-use ue2_net::{HostFwd, UserNet, DEFAULT_HOSTFWD, GUEST};
+use ue2_net::{HostFwd, DEFAULT_HOSTFWD, DEFAULT_SOCKET_VMNET as DEFAULT_SOCKET};
 
 /// `--net MODE`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,8 +71,10 @@ pub struct NetArgs {
 pub struct NetOptions {
     pub mode: NetMode,
     /// Port forwards of `--net user`.
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
     pub hostfwd: Vec<HostFwd>,
     /// Host port of the web UI proxy of `--net user`; `None` runs none.
+    #[cfg_attr(not(feature = "net"), allow(dead_code))]
     pub web_port: Option<u16>,
     /// Flash unique ID for the bridged modes, where the guest shares a LAN with other devices; `None` keeps the
     /// flash model's own.
@@ -128,42 +127,9 @@ pub type Backend = Box<dyn NetBackend>;
 /// bridged modes the flash unique ID is replaced first, which gives the guest its own MAC.
 pub fn attach(machine: &mut Machine, opts: &NetOptions) -> Result<Backend> {
     let backend: Backend = match &opts.mode {
-        NetMode::User => {
-            // Bound before libslirp starts, so a taken web port is reported as such.
-            let web = opts
-                .web_port
-                .map(|port| {
-                    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).with_context(|| {
-                        format!(
-                            "--web-port {port}: cannot listen on 127.0.0.1:{port} (port in use? choose another \
-                             --web-port, or 0 for none)"
-                        )
-                    })
-                })
-                .transpose()?;
-            let mut net = UserNet::new(&opts.hostfwd).context("--net user")?;
-            let forwards: Vec<String> =
-                opts.hostfwd.iter().map(|f| format!("{}:{} -> {}", f.host_addr, f.host_port, f.guest_port)).collect();
-            eprintln!(
-                "net: libslirp {} user network, guest {GUEST} by DHCP, forwards {}",
-                UserNet::version(),
-                forwards.join(", ")
-            );
-            if let Some(listener) = web {
-                let (addr, via) = net.start_web_proxy(listener).context("--web-port")?;
-                eprintln!(
-                    "net: web UI http://{addr}/ (proxy to guest port {WEB_GUEST_PORT} through 127.0.0.1:{via}; \
-                     location.hostname becomes location.host in HTML and JavaScript)"
-                );
-            }
-            Box::new(net)
-        }
+        NetMode::User => user(opts)?,
         NetMode::VmnetBridged(iface) => bridged(iface.as_deref())?,
-        NetMode::SocketVmnet(path) => {
-            let net = SocketVmnet::connect(path).context("--net socket-vmnet")?;
-            eprintln!("net: socket_vmnet daemon at {}", path.display());
-            Box::new(net)
-        }
+        NetMode::SocketVmnet(path) => socket_vmnet(path)?,
     };
     let io = &mut machine.bus.io;
     if let Some(uid) = opts.unique_id {
@@ -172,6 +138,60 @@ pub fn attach(machine: &mut Machine, opts: &NetOptions) -> Result<Backend> {
     }
     io.get_mut::<U2pio>().context("--net: no U2PIO page installed")?.phy.set_link(true);
     Ok(backend)
+}
+
+/// `--net user`: libslirp with the forwards and the web UI proxy.
+#[cfg(feature = "net")]
+fn user(opts: &NetOptions) -> Result<Backend> {
+    use std::net::{Ipv4Addr, TcpListener};
+
+    use ue2_net::{UserNet, GUEST};
+
+    // Bound before libslirp starts, so a taken web port is reported as such.
+    let web = opts
+        .web_port
+        .map(|port| {
+            TcpListener::bind((Ipv4Addr::LOCALHOST, port)).with_context(|| {
+                format!(
+                    "--web-port {port}: cannot listen on 127.0.0.1:{port} (port in use? choose another \
+                     --web-port, or 0 for none)"
+                )
+            })
+        })
+        .transpose()?;
+    let mut net = UserNet::new(&opts.hostfwd).context("--net user")?;
+    let forwards: Vec<String> =
+        opts.hostfwd.iter().map(|f| format!("{}:{} -> {}", f.host_addr, f.host_port, f.guest_port)).collect();
+    eprintln!(
+        "net: libslirp {} user network, guest {GUEST} by DHCP, forwards {}",
+        UserNet::version(),
+        forwards.join(", ")
+    );
+    if let Some(listener) = web {
+        let (addr, via) = net.start_web_proxy(listener).context("--web-port")?;
+        eprintln!(
+            "net: web UI http://{addr}/ (proxy to guest port {WEB_GUEST_PORT} through 127.0.0.1:{via}; \
+             location.hostname becomes location.host in HTML and JavaScript)"
+        );
+    }
+    Ok(Box::new(net))
+}
+
+#[cfg(not(feature = "net"))]
+fn user(_opts: &NetOptions) -> Result<Backend> {
+    bail!("--net user: this ue2emu was built without libslirp (cargo feature `net`, docs/specs/S22-windows.md)")
+}
+
+#[cfg(unix)]
+fn socket_vmnet(path: &Path) -> Result<Backend> {
+    let net = ue2_net::socket_vmnet::SocketVmnet::connect(path).context("--net socket-vmnet")?;
+    eprintln!("net: socket_vmnet daemon at {}", path.display());
+    Ok(Box::new(net))
+}
+
+#[cfg(not(unix))]
+fn socket_vmnet(_path: &Path) -> Result<Backend> {
+    bail!("--net socket-vmnet needs a Unix host (the socket_vmnet daemon listens on a Unix domain socket)")
 }
 
 #[cfg(target_os = "macos")]
@@ -205,7 +225,8 @@ pub fn pump(machine: &mut Machine, net: &mut Backend) {
 /// hash sits in bytes 1..=3 with 5..=7 zero, so it becomes MAC octets 3..=5 (rmii_interface.cc:126-128).
 fn instance_unique_id(flash: Option<&Path>) -> Result<[u8; 8]> {
     let seed = match flash {
-        Some(path) => std::path::absolute(path).context("--flash path")?.as_os_str().as_bytes().to_vec(),
+        // The same bytes as `OsStrExt::as_bytes` on Unix, so a flash keeps its MAC.
+        Some(path) => std::path::absolute(path).context("--flash path")?.as_os_str().as_encoded_bytes().to_vec(),
         None => format!("{}:{:?}", std::process::id(), SystemTime::now()).into_bytes(),
     };
     // FNV-1a: stable across Rust releases, unlike `DefaultHasher`.
