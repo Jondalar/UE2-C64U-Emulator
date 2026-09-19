@@ -215,7 +215,8 @@ mod tests {
         let req = Request { port, method: "POST", path: "/v1/x", headers: &[], body: b"ab" };
         let r = send(&req, Duration::from_secs(5)).await.unwrap();
         assert_eq!((r.status, r.body.as_slice()), (200, &b"{}"[..]));
-        assert!(r.attempts >= 2, "attempts {}", r.attempts);
+        // Windows retransmits a SYN that found no listener, so its first attempt can reach the late server itself.
+        assert!(r.attempts >= 2 || cfg!(windows), "attempts {}", r.attempts);
         let seen = server.await.unwrap();
         assert!(seen.starts_with("POST /v1/x HTTP/1.1\r\n") && seen.contains("Content-Length: 2\r\n"), "{seen}");
         assert!(seen.ends_with("\r\n\r\nab"), "{seen}");

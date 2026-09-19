@@ -106,7 +106,9 @@ mod tests {
     fn resolve_expands_home_and_relative_paths() {
         let home = std::env::home_dir().unwrap();
         assert_eq!(resolve("~/x/y"), home.join("x/y"));
-        assert_eq!(resolve("/abs/p"), PathBuf::from("/abs/p"));
+        // Absolute on every platform ("/abs/p" is not on Windows, which wants a drive).
+        let abs = std::env::temp_dir().join("abs");
+        assert_eq!(resolve(abs.to_str().unwrap()), abs);
         assert_eq!(resolve("rel/p"), std::env::current_dir().unwrap().join("rel/p"));
     }
 

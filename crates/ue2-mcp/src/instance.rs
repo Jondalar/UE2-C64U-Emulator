@@ -496,8 +496,8 @@ mod tests {
         let me = std::process::id();
         assert!(claim(&base, "emu1", me));
         assert!(claim(&base, "emu1", me), "own claim is taken over (in-memory state decides)");
-        // A live foreign holder: pid 1 (launchd) always exists.
-        std::fs::write(base.join("emu2.claim"), "1").unwrap();
+        // A live foreign holder: pid 1 (launchd, init) always exists, on Windows pid 4 (System).
+        std::fs::write(base.join("emu2.claim"), if cfg!(windows) { "4" } else { "1" }).unwrap();
         assert!(!claim(&base, "emu2", me));
         // A dead holder is stale.
         std::fs::write(base.join("emu3.claim"), "999999999").unwrap();
