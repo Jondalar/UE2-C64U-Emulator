@@ -93,13 +93,16 @@ jobs:
             done
             [ "$added" = 1 ] || break
           done
-          # Every import must be in the zip or part of Windows; the VC runtime never counts as part of Windows.
+          # Every import must be in the zip or part of Windows; the VC runtime never counts as part of Windows. API set
+          # names (api-ms-win-*, the UCRT among them) are resolved by the loader and ship with Windows 10 and later,
+          # but need not exist as files in System32.
           missing=0
           for pe in "$out"/*.exe "$out"/*.dll; do
             for dll in $(imports "$pe"); do
               if [ -e "$out/$dll" ]; then continue; fi
               case "$dll" in
                 vcruntime*|msvcp*|concrt*|vccorlib*) ;;
+                api-ms-win-*|ext-ms-win-*) continue ;;
                 *) [ -e "$(cygpath -u "$SYSTEMROOT")/System32/$dll" ] && continue ;;
               esac
               echo "$(basename "$pe") imports $dll, which is neither in the zip nor part of Windows"
