@@ -4,7 +4,7 @@ members = ["crates/rv32", "crates/ue2-core", "crates/ue2-net", "crates/ue2-vfat"
 
 [workspace.package]
 edition = "2021"
-version = "0.3.3"
+version = "0.3.4"
 license = "GPL-3.0-or-later"
 
 # The interpreter is unusably slow at opt-level 0; tests run the real firmware.
