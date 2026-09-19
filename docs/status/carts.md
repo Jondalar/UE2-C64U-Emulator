@@ -11,7 +11,7 @@ paths to `<TRX64 checkout>/crates/trx64-core/src/` (commit `a448229`).
 
 ## How it works
 
-**Firmware side (unchanged).** `C64_CRT::read_crt` copies each CHIP packet to DDR `0x03C00000 + bank × 16 K`
+**Firmware side (unchanged).** `C64_CRT::read_crt` copies each CHIP packet to DDR `__cart_rom_start + bank × 16 K`
 (+0x2000 for `$A000`/`$E000` chips), mirrors to 64 banks and picks the FPGA type/variant (c64_crt.cc:226-337, 339-358,
 466-676). `start_cartridge` holds the C64 in reset, writes C64_CARTRIDGE_TYPE and releases the reset
 (c64.cc:1154-1224, 1242-1391). GMOD2 EEPROM data goes to EEPROM_BASE `0x1004C800` (c64.cc:1640-1660). The SID and MUS
@@ -19,7 +19,8 @@ player carts are CART_TYPE_16K images built at start-up (filetype_sid.cc:65-96).
 
 **Bridge (`crates/c64-bridge/src/cart.rs`, `cart_eeprom.rs`).**
 - `CartLogic` ports the clocked process of `cart_slot/vhdl_source/all_carts_v5.vhd` for the U64-II generics: ROM at
-  DDR `0x03C00000` with 22 cart bits (u2p_riscv_lattice.vhd:603-604), cart RAM at `0x00EF0000`, GeoRAM at `0x01000000`.
+  DDR `0x03C00000` with 22 cart bits (u2p_riscv_lattice.vhd:603-604; before 3.15 `0x00F00000` with 20, below), cart
+  RAM at `0x00EF0000`, GeoRAM at `0x01000000`.
   Bank and mode registers, `rom_mode`, `addr_map`/`allow_write`, the IO1/IO2 register reads (`slot_resp`), `cart_en`,
   the reset/force branch (all_carts_v5.vhd:182-197) and `cart_kill` (654-658) follow the VHDL line by line. EXROM/GAME
   reach the C64 gated by `cart_en` (slot_server_v4.vhd:1083-1098); memory reads are served only while `cart_en`, writes
@@ -51,6 +52,18 @@ TRX64's run where lines can change and recomputes the memconfig:
 `set_freeze_button` with no-op defaults. `C64Port` lends DDR around CART/DMA/MATRIX accesses and ticks, maps the
 EEPROM window (the T0 stub table there is gone; without a backend it still reads 0) and forwards MATRIX_KEYB[10].
 `runner::attach_trx64` sets CAPAB_EEPROM (itu.h:71), which the firmware requires for GMOD2 (c64_crt.cc:213-219).
+
+**Cartridge ROM in DDR.** The FPGA reads the internal cartridge's ROM at `g_rom_base_cart`, and the firmware puts it at
+`__cart_rom_start`; the two come together in one update. 3.15 moved it ("Large cart support", 1541ultimate
+`2e5c9e05`, linker.x:269-287): 4 MB at `0x03C00000` (22 cart bits) instead of 1 MB at `0x00F00000` (20 bits, ending
+where the REU starts). The C64 Ultimate 1.x firmware is built on 3.14 and keeps the old place. `fwlayout::cart_rom`
+reads it from the loaded image: `C64::set_cartridge` loads the address with a `lui` shortly before its message
+"Copying %d bytes from array %p to mem addr %p" (0x0C and 0xB8-0xC0 bytes before it in 3.14, 3.15 and C64U 1.1.0).
+`Machine::new` gives it to `C64Port`, which hands it to the backend (`C64Backend::set_cart_rom`); `CartLogic` then
+serves the ROM from there with the bank bits of that size. Without it (GitHub issue #1) every PRG start from the file
+browser on firmware before 3.15 ended at `READY.`: the boot cartridge the firmware DMA-loads through
+(`c64_subsys.cc:550ff`) was empty, `dma_load` gave up after 60 handshake polls and reset the C64 with `init_cartridge`.
+An image that does not show the address gets 3.15's, with a warning.
 
 `set_cart` now distinguishes the two ways the FPGA takes a type: with the reset line held the cart comes up enabled;
 the C64_CARTRIDGE_KILL bit 1 force alone leaves it disabled until a freeze (all_carts_v5.vhd:192). `restoreCart` after a

@@ -31,7 +31,7 @@ use trx64_core::keyboard::JoystickState;
 use trx64_core::reu::Reu;
 use trx64_core::vic::SpeedProfile;
 use trx64_core::{AccessCtx, BusKind, CpuHistoryRing, DeltaRing, Machine, Observer};
-use ue2_core::c64host::{C64Backend, C64CartSlot, C64Drive, C64Frame, C64Rom, CartSlotInfo, UciEvents};
+use ue2_core::c64host::{C64Backend, C64CartSlot, C64Drive, C64Frame, C64Rom, CartRom, CartSlotInfo, UciEvents};
 
 use cart::{CartHandle, CartLogic, CartProxy, RunHints};
 use clock::Clock;
@@ -598,6 +598,11 @@ impl C64Backend for Trx64Backend {
         self.cart.with(|c| c.configure(type_variant, reset, clk));
         self.install_cart();
         self.apply_interrupts();
+    }
+
+    /// Before 3.15 the internal cartridge's ROM is 1 MB at 0x00F00000 (docs/status/carts.md, "Cartridge ROM in DDR").
+    fn set_cart_rom(&mut self, rom: CartRom) {
+        self.cart.with(|c| c.set_cart_rom(rom));
     }
 
     fn kill_cart(&mut self) {

@@ -3,6 +3,7 @@
 pub mod bus;
 pub mod c64host;
 pub mod devices;
+pub mod fwlayout;
 pub mod host;
 pub mod io;
 pub mod irq;

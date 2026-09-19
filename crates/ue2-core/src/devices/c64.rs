@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use crate::c64host::{C64Backend, C64CartSlot, C64Frame, C64Rom};
+use crate::c64host::{C64Backend, C64CartSlot, C64Frame, C64Rom, CartRom};
 use crate::devices::board::{add_table, at, span, Reg, RegTable, Span, RAM, RAM_PAGE};
 use crate::devices::drives::DriveRegs;
 use crate::io::{IoCtx, IoDevice, IoMap, IO_BASE};
@@ -170,9 +170,8 @@ fn reu_size_kb(reg: u8) -> u32 {
     128 << (reg & 0x07)
 }
 
-/// `__cart_rom_start` in DDR (linker.x:269-287): the ROM of the CART_TYPE_NORMAL family, 16 K
-/// (`set_cartridge` memcpy, c64.cc:1285-1288).
-const CART_ROM_DDR: usize = 0x03C0_0000;
+/// What `set_cart` hands the backend from `__cart_rom_start` ([`CartRom`]): the ROM of the CART_TYPE_NORMAL family,
+/// 16 K (`set_cartridge` memcpy, c64.cc:1285-1288).
 const CART_ROM_SIZE: usize = 0x4000;
 
 /// C64 core config 0x10180000 (u64.h:104-154): RAM-like latches (10 H16), CORE_VERSION constant.
@@ -307,6 +306,8 @@ pub struct C64Port {
     cart_detect: Option<Arc<AtomicU8>>,
     /// UCI 0x10044000 while the backend has no block of its own (S15).
     uci: RegTable,
+    /// Where this firmware keeps the cartridge ROM (`Machine::new` reads it from the image).
+    cart_rom: CartRom,
 }
 
 impl Default for C64Port {
@@ -337,15 +338,26 @@ impl C64Port {
             drive_a: DriveRegs::new(0),
             cart_detect: None,
             uci: RegTable::new("uci", UCI_T0),
+            cart_rom: CartRom::LARGE,
         }
     }
 
     /// Attach the C64 at clock `now`, which anchors its clock (S14 §3).
     pub fn attach(&mut self, mut backend: Box<dyn C64Backend>, now: u64) {
+        backend.set_cart_rom(self.cart_rom);
         backend.advance_to(now);
         self.synced = now;
         self.backend = Some(backend);
         self.refresh_cart_detect();
+    }
+
+    /// Where this firmware keeps the cartridge ROM (docs/status/carts.md, "Cartridge ROM in DDR"); passed on to the
+    /// backend now and on every attach.
+    pub fn set_cart_rom(&mut self, rom: CartRom) {
+        self.cart_rom = rom;
+        if let Some(b) = &mut self.backend {
+            b.set_cart_rom(rom);
+        }
     }
 
     /// CARTSLOT: share U64_CART_DETECT with `U64Io`; the port keeps it at the backend's physical cartridge lines
@@ -438,12 +450,12 @@ impl C64Port {
                     self.mode = (self.mode & MODE_RESET) | (val & (MODE_ULTIMAX | MODE_NMI));
                 }
                 let changed = old ^ self.mode;
-                let cart_type = self.cart.get(CARTRIDGE_TYPE);
+                let (cart_type, rom) = (self.cart.get(CARTRIDGE_TYPE), self.cart_rom);
                 if let Some(b) = &mut self.backend {
                     if changed & MODE_RESET != 0 {
                         // S14 §7: a release rebuilds the cartridge from DDR, then warm-resets.
                         if self.mode & MODE_RESET == 0 {
-                            b.set_cart(cart_type, cart_rom(ram));
+                            b.set_cart(cart_type, cart_rom(ram, rom));
                         }
                         b.set_reset(self.mode & MODE_RESET != 0);
                     }
@@ -462,13 +474,13 @@ impl C64Port {
                 }
             }
             CARTRIDGE_KILL => {
-                let cart_type = self.cart.get(CARTRIDGE_TYPE);
+                let (cart_type, rom) = (self.cart.get(CARTRIDGE_TYPE), self.cart_rom);
                 if let Some(b) = &mut self.backend {
                     if val & KILL_CART != 0 {
                         b.kill_cart();
                     }
                     if val & KILL_FORCE != 0 {
-                        b.set_cart(cart_type, cart_rom(ram));
+                        b.set_cart(cart_type, cart_rom(ram, rom));
                     }
                 }
             }
@@ -602,9 +614,9 @@ impl C64Port {
     }
 }
 
-/// The cart ROM area of DDR.
-fn cart_rom(ram: &[u8]) -> &[u8] {
-    &ram[CART_ROM_DDR..CART_ROM_DDR + CART_ROM_SIZE]
+/// The first 16 K of the cart ROM area of DDR.
+fn cart_rom(ram: &[u8], rom: CartRom) -> &[u8] {
+    &ram[rom.base..rom.base + CART_ROM_SIZE]
 }
 
 impl IoDevice for C64Port {
@@ -1168,7 +1180,7 @@ mod tests {
             install(&mut map, &cfg());
             let mock = Mock::default();
             map.get_mut::<C64Port>().unwrap().attach(Box::new(mock.clone()), 0);
-            assert_eq!(mock.take(), [Call::Advance(0)], "attach anchors the clock");
+            assert_eq!(mock.take(), [Call::CartRom(CartRom::LARGE), Call::Advance(0)], "attach anchors the clock");
             Bench { map, irq: IrqState::new(), ram: vec![0; RAM_SIZE], console: Vec::new(), now: 0, mock }
         }
 
@@ -1236,7 +1248,7 @@ mod tests {
     fn mode_edges_drive_reset_ultimax_and_nmi() {
         let mut b = Bench::new();
         b.w8(TYPE_ADDR, 0x41);
-        (b.ram[CART_ROM_DDR], b.ram[CART_ROM_DDR + CART_ROM_SIZE - 1]) = (0x09, 0xC3);
+        (b.ram[CartRom::LARGE.base], b.ram[CartRom::LARGE.base + CART_ROM_SIZE - 1]) = (0x09, 0xC3);
         b.w8(MODE_ADDR, 0x04);
         assert_eq!(b.r8(CLOCK_DETECT_ADDR), 0x11, "RESET sense while held");
         b.w8(MODE_ADDR, 0x04);
@@ -1259,7 +1271,7 @@ mod tests {
     #[test]
     fn kill_strobes_and_active() {
         let mut b = Bench::new();
-        b.ram[CART_ROM_DDR] = 0x55;
+        b.ram[CartRom::LARGE.base] = 0x55;
         b.w8(TYPE_ADDR, 0x01);
         b.w8(KILL_ADDR, 0x02);
         b.w8(KILL_ADDR, 0x01);
@@ -1268,6 +1280,17 @@ mod tests {
         *b.mock.active.borrow_mut() = true;
         assert_eq!(b.r8(KILL_ADDR), 1, "CARTRIDGE_ACTIVE from the backend");
         assert_eq!(b.r8(TYPE_ADDR), 0x01);
+    }
+
+    /// Firmware before 3.15 keeps the cartridge ROM at 0x00F00000 (docs/status/carts.md, "Cartridge ROM in DDR").
+    #[test]
+    fn the_cart_rom_is_read_where_this_firmware_puts_it() {
+        let mut b = Bench::new();
+        b.port().set_cart_rom(CartRom::SMALL);
+        (b.ram[CartRom::SMALL.base], b.ram[CartRom::SMALL.base + CART_ROM_SIZE - 1]) = (0x09, 0xC3);
+        b.w8(TYPE_ADDR, 0x41);
+        b.w8(KILL_ADDR, 0x02);
+        assert_eq!(b.mock.take(), [Call::CartRom(CartRom::SMALL), Call::Cart(0x41, 0x09, 0xC3, CART_ROM_SIZE)]);
     }
 
     #[test]
@@ -1294,7 +1317,7 @@ mod tests {
             ]
         );
         let lent = Some(RAM_SIZE);
-        assert_eq!(b.mock.leases.borrow()[1..], [lent, lent, lent, lent, lent, None], "EEPROM needs no DDR");
+        assert_eq!(b.mock.leases.borrow()[2..], [lent, lent, lent, lent, lent, None], "EEPROM needs no DDR");
         assert_eq!(*b.mock.ddr.borrow(), None, "taken back after every access");
         assert_eq!(C64Port::new().peek8(EEPROM), 0, "T0: not dirty");
     }

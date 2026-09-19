@@ -13,6 +13,23 @@ pub enum C64Rom {
     Char,
 }
 
+/// Where the firmware puts the internal cartridge's ROM in DDR (`__cart_rom_start`) and how far the cart address bits
+/// reach: the FPGA's `g_rom_base_cart` and `g_max_cart_bits`, which come with the firmware (docs/status/carts.md,
+/// "Cartridge ROM in DDR"). [`crate::fwlayout::cart_rom`] reads it from the loaded image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CartRom {
+    pub base: usize,
+    pub size: usize,
+}
+
+impl CartRom {
+    /// 3.15 and later ("Large cart support", 1541ultimate 2e5c9e05, linker.x:269-287): 4 MB at 0x03C00000, 22 cart
+    /// bits.
+    pub const LARGE: CartRom = CartRom { base: 0x03C0_0000, size: 0x40_0000 };
+    /// Before 3.15, C64 Ultimate 1.x included: 1 MB at 0x00F00000, 20 cart bits, ending where the REU starts.
+    pub const SMALL: CartRom = CartRom { base: 0x00F0_0000, size: 0x10_0000 };
+}
+
 /// The character set the VIC draws the text screen with, which decides how `render::c64_text_dump` reads it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum C64Charset {
@@ -74,8 +91,10 @@ pub trait C64Backend {
     fn rom_write(&mut self, rom: C64Rom, off: u16, val: u8);
     fn rom_read(&self, rom: C64Rom, off: u16) -> u8;
     /// (Re)build the cartridge from C64_CARTRIDGE_TYPE (type | variant, c64.h:115-163) and the cart ROM copied to
-    /// DDR 0x03C00000 (`rom`, 16 K). The cartridge starts enabled.
+    /// DDR at the [`CartRom`] base (`rom`, 16 K). The cartridge starts enabled.
     fn set_cart(&mut self, type_variant: u8, rom: &[u8]);
+    /// Where the cartridge ROM is in DDR for this firmware; given on attach and before any [`C64Backend::set_cart`].
+    fn set_cart_rom(&mut self, _rom: CartRom) {}
     /// C64_CARTRIDGE_KILL bit 0: disable the cartridge.
     fn kill_cart(&mut self);
     /// C64_CARTRIDGE_ACTIVE bit 0.
@@ -318,7 +337,7 @@ pub(crate) mod mock {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use super::{C64Backend, C64Frame, C64Rom, UciEvents};
+    use super::{C64Backend, C64Frame, C64Rom, CartRom, UciEvents};
 
     /// A stand-in for TRX64's UCI block: the firmware window reads back what was written, and the test drives the
     /// IRQ level and the events by hand.
@@ -368,6 +387,7 @@ pub(crate) mod mock {
         RomWrite(C64Rom, u16, u8),
         /// Type, first and last byte and length of the cart ROM.
         Cart(u8, u8, u8, usize),
+        CartRom(CartRom),
         Kill,
         Palette(u8, u8),
         Key(u8, u8, bool),
@@ -461,6 +481,9 @@ pub(crate) mod mock {
         }
         fn set_cart(&mut self, type_variant: u8, rom: &[u8]) {
             self.push(Call::Cart(type_variant, rom[0], rom[rom.len() - 1], rom.len()));
+        }
+        fn set_cart_rom(&mut self, rom: CartRom) {
+            self.push(Call::CartRom(rom));
         }
         fn kill_cart(&mut self) {
             self.push(Call::Kill);

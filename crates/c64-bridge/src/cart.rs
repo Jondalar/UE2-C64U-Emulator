@@ -1,7 +1,8 @@
 //! The U64 cartridge logic behind C64_CARTRIDGE_TYPE as a TRX64 cartridge mapper (docs/status/carts.md, S14 §W4-CART).
 //!
 //! [`CartLogic`] ports `fpga/cart_slot/vhdl_source/all_carts_v5.vhd` with the U64-II generics: ROM banks in DDR at
-//! 0x03C00000 (22 cart bits, 4 MB; u2p_riscv_lattice.vhd:603-604), cart RAM at 0x00EF0000 (64 K), GeoRAM at 0x01000000,
+//! 0x03C00000 (22 cart bits, 4 MB; u2p_riscv_lattice.vhd:603-604), or with firmware before 3.15 at 0x00F00000 (20 cart
+//! bits, 1 MB; [`CartRom`], docs/status/carts.md), cart RAM at 0x00EF0000 (64 K), GeoRAM at 0x01000000,
 //! the GMOD2 EEPROM ([`Eeprom`], microwire_eeprom.vhd) and the freezer state machine of `freezer.vhd`. It reads and
 //! writes that memory in guest DDR, lent by `C64Port` for each access (`C64Backend::lend_ddr`), where the firmware's CRT
 //! loader put it (c64_crt.cc:291-358, linker.x:274-287). EXROM/GAME are gated by `cart_en` as `slot_server_v4.vhd`
@@ -20,6 +21,7 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use trx64_core::cart::{BankInfo, CartLines, CartMapper, CartState, MapperType};
+use ue2_core::c64host::CartRom;
 
 use crate::cart_eeprom::Eeprom;
 use crate::slot::SlotHandle;
@@ -69,13 +71,12 @@ pub fn modelled(logic: u8) -> bool {
     !matches!(logic, C128 | 0x12..=0x17 | 0x1D | 0x1E)
 }
 
-/// DDR placement: `g_rom_base_cart`, `g_ram_base_cart`, `g_ram_base_reu` (u2p_riscv_lattice.vhd:603-604;
-/// ultimate_logic_32.vhd:37, 849; linker.x:274-287).
-const ROM_BASE: usize = 0x03C0_0000;
+/// DDR placement: `g_rom_base_cart` (3.15 on, [`CartRom::LARGE`]), `g_ram_base_cart`, `g_ram_base_reu`
+/// (u2p_riscv_lattice.vhd:603-604; ultimate_logic_32.vhd:37, 849; linker.x:274-287).
+#[cfg(test)]
+const ROM_BASE: usize = CartRom::LARGE.base;
 const RAM_BASE: usize = 0x00EF_0000;
 const GEORAM_BASE: usize = 0x0100_0000;
-/// `rom_addr(g_max_cart_bits-1 downto 13) <= bank_bits(...)` with 22 cart bits.
-const ROM_BANK_MASK: u32 = 0x003F_E000;
 /// ROM the 22 cart bits address, and the 64 K of cart RAM (`g_ram_base_cart`, linker.x:274-287).
 pub const ROM_SIZE: usize = 0x40_0000;
 pub const RAM_SIZE: usize = 0x1_0000;
@@ -84,15 +85,28 @@ pub const RAM_SIZE: usize = 0x1_0000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub rom: usize,
+    /// `rom_addr(g_max_cart_bits-1 downto 13) <= bank_bits(...)`: the bank bits the cart ROM's size leaves.
+    pub rom_bank_mask: u32,
     pub ram: usize,
     pub geo: usize,
 }
 
 impl Layout {
-    /// Guest DDR of the U64-II, where the firmware's CRT loader puts the internal cartridge (u2p_riscv_lattice.vhd:603-604).
-    pub const GUEST: Layout = Layout { rom: ROM_BASE, ram: RAM_BASE, geo: GEORAM_BASE };
-    /// A cartridge's own memory (CARTSLOT, slot.rs): ROM from 0, cart RAM after it, no GeoRAM.
-    pub const OWN: Layout = Layout { rom: 0, ram: ROM_SIZE, geo: ROM_SIZE + RAM_SIZE };
+    /// Guest DDR of the U64-II, where the firmware's CRT loader puts the internal cartridge: 3.15 and later.
+    pub const GUEST: Layout = Layout::guest(CartRom::LARGE);
+    /// A cartridge's own memory (CARTSLOT, slot.rs): ROM from 0 with 22 cart bits, cart RAM after it, no GeoRAM.
+    pub const OWN: Layout =
+        Layout { rom: 0, rom_bank_mask: bank_mask(ROM_SIZE), ram: ROM_SIZE, geo: ROM_SIZE + RAM_SIZE };
+
+    /// Guest DDR with the cartridge ROM where this firmware puts it (docs/status/carts.md, "Cartridge ROM in DDR").
+    pub const fn guest(rom: CartRom) -> Layout {
+        Layout { rom: rom.base, rom_bank_mask: bank_mask(rom.size), ram: RAM_BASE, geo: GEORAM_BASE }
+    }
+}
+
+/// The bank bits (13 and up) of a cart ROM of `size` bytes.
+const fn bank_mask(size: usize) -> u32 {
+    (size as u32 - 1) & !0x1FFF
 }
 
 /// `rom_mode(14 downto 13)`: which of address bits 14 and 13 come from the bus instead of the bank register.
@@ -196,6 +210,11 @@ impl CartLogic {
     /// No cartridge (type 0), serving from guest DDR.
     pub fn new() -> Self {
         Self::with_layout(Layout::GUEST)
+    }
+
+    /// The internal cartridge's ROM moves where this firmware keeps it; cart RAM and GeoRAM stay.
+    pub fn set_cart_rom(&mut self, rom: CartRom) {
+        self.layout = Layout::guest(rom);
     }
 
     /// No cartridge (type 0), with ROM, cart RAM and GeoRAM at `layout` in the memory given to `set_ddr`.
@@ -552,7 +571,7 @@ impl CartLogic {
         let a = u32::from(addr);
         match map {
             Map::Rom => {
-                let mut off = (self.bank & ROM_BANK_MASK) | (a & 0x1FFF);
+                let mut off = (self.bank & self.layout.rom_bank_mask) | (a & 0x1FFF);
                 if rom_mode & 1 != 0 {
                     off = (off & !0x2000) | (a & 0x2000);
                 }
@@ -967,6 +986,27 @@ pub(crate) mod tests {
         assert_eq!(g.bus_read(0xDE00, 0), Some(0x80), "EEPROM DO idles high in bit 7");
         g.bus_write(0xDE00, 0x40, 0, false);
         assert_eq!(lines(&g), (1, 1), "CS high disables the ROM");
+    }
+
+    /// Firmware before 3.15 (docs/status/carts.md, "Cartridge ROM in DDR"): the ROM is 1 MB at 0x00F00000 and the bank
+    /// bits above it wrap, as 20 cart bits do.
+    #[test]
+    fn a_small_cart_rom_is_served_from_its_own_place() {
+        let masks = (Layout::GUEST.rom_bank_mask, Layout::guest(CartRom::SMALL).rom_bank_mask);
+        assert_eq!(masks, (0x003F_E000, 0x000F_E000));
+        let mut ddr = vec![0u8; 0x0400_0000];
+        for bank in 0..8 {
+            let base = CartRom::SMALL.base + bank * 0x4000;
+            ddr[base..base + 0x2000].fill(0x60 + bank as u8);
+        }
+        let mut c = CartLogic::new();
+        c.set_cart_rom(CartRom::SMALL);
+        c.set_ddr(Some(&mut ddr));
+        c.configure(0x08, true, 0);
+        c.bus_write(0xDE00, 0x05, 0, false);
+        assert_eq!(c.bus_read(0x8123, 0), Some(0x65), "Ocean bank 5 at 0x00F00000");
+        c.bank = 0x10_4000;
+        assert_eq!(c.bus_read(0x8123, 0), Some(0x61), "bit 20 is beyond 20 cart bits");
     }
 
     #[test]

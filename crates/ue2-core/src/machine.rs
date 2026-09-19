@@ -247,6 +247,18 @@ impl Machine {
         let mut bus = SystemBus::new();
         devices::install_all(&mut bus.io, &cfg);
         let fw = loader::load_firmware(&cfg.elf, &mut bus.ram)?;
+        // The FPGA reads the cartridge ROM where this firmware puts it (docs/status/carts.md, "Cartridge ROM in DDR").
+        let cart_rom = crate::fwlayout::cart_rom(&bus.ram, &fw.segments).unwrap_or_else(|| {
+            eprintln!("c64: the cartridge ROM address is not in the firmware image; assuming 3.15's 0x03C00000");
+            crate::c64host::CartRom::LARGE
+        });
+        if cart_rom != crate::c64host::CartRom::LARGE {
+            let (base, mb) = (cart_rom.base, cart_rom.size >> 20);
+            eprintln!("c64: cartridge ROM at {base:#010x}, {mb} MB (firmware before 3.15)");
+        }
+        if let Some(port) = bus.io.get_mut::<C64Port>() {
+            port.set_cart_rom(cart_rom);
+        }
         if !cfg.settings.is_empty() {
             // After the overlay seed of `SpiFlash::from_config`, so a file's Interface Type wins (S21 §5).
             let flash = bus.io.get_mut::<devices::flash::SpiFlash>().expect("the flash is always installed");
@@ -1048,6 +1060,7 @@ mod tests {
         assert_eq!(
             mock.take(),
             [
+                Call::CartRom(crate::c64host::CartRom::LARGE),
                 Call::Advance(1234),
                 Call::Key(1, 2, true),
                 Call::Key(1, 2, false),
