@@ -206,6 +206,17 @@ the source.
   the drive standing, while the U64's drive registers decide for themselves through RESET bit 1 (`use_c64_reset`), so
   the bridge clocks it from the reference the hold skipped.
 - **Capability.** `CAPAB_COMMAND_INTF` = 0x00040000 (itu.h:67), next to `CAPAB_EEPROM` in `cart.rs`.
+- **Event wait (issue #2).** The C64 runs in batches of up to `SYNC_PERIOD` (1 ms) behind the firmware (S14 §4), so
+  the firmware saw a PUSH_CMD, DATA_ACC or ABORT up to a millisecond late; hardware answers within microseconds.
+  UltimateDemo2026's library aborts (`uii_detect()`) and sends the next command at once; at 16 MHz the late
+  HANDSHAKE_RESET then wiped the command bytes (`Null command.`, empty reply). Now, with the block enabled, a run
+  halts after a C64 write to the control register (TRX64 access watch on $DF1C, $DFFC, $DE1C). When the write raised
+  an event bit, the C64 stands still until the firmware has cleared it or 10 ms have passed (`UCI_EVENT_WAIT`), then
+  catches up. The firmware thus answers in zero C64 cycles, a little more lenient than hardware; a command it works
+  on for longer ends the wait, and the C64 polls on.
+- **Enable toggle.** `set_emulation_flags` writes CMD_IF_SLOT_ENABLE 0 then 1 on every cartridge change, also after
+  a PRG start while the program runs. As for the REU (docs/status/reu.md), a 0 takes effect only after 10 ms
+  (`UCI_OFF_GRACE`); the firmware reads back the 0 it wrote.
 
 ### 3.5 ue2emu
 

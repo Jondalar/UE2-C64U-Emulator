@@ -41,6 +41,7 @@
 | `expect <text> [ms]` | Waits until `text_dump` contains the text; default timeout 5000 ms emulated. |
 | `expect-not <text> [ms]` | Waits until `text_dump` no longer contains the text. |
 | `expect-console <text> [ms]` | Waits until the console output after the previous `expect-console` match contains the text. |
+| `expect-c64 <text> [ms]` | Waits until the C64 text screen (`c64screen`) contains the text; a timeout prints that screen. |
 | `quit` | Quits. |
 
 - Lines starting with `#` are comments.

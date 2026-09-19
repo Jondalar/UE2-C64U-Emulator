@@ -16,6 +16,7 @@
 //! | `expect <text> [ms]` | Wait until the screen text contains `text`; timeout default 5000 ms emulated. |
 //! | `expect-not <text> [ms]` | Wait until the screen text no longer contains `text`. |
 //! | `expect-console <text> [ms]` | Wait until the console output after the previous match contains `text`. |
+//! | `expect-c64 <text> [ms]` | Wait until the C64 text screen (`c64screen`) contains `text`. |
 //! | `usb-sync [--force] [port]` | Write a `--usb-dir` stick's guest changes back to the host now (all sticks without a port); `--force` overrides the mass-deletion guard (docs/status/usb-dir.md). |
 //! | `usb-replug [--discard] [port]` | Unplug a USB device and plug it back in; a `--usb-dir` stick is synced and rebuilt from the host in between (`--discard`: its old image is kept aside, not synced). |
 //! | `cart-info` | Print the physical expansion port's cartridge (`--cart-slot`) as `key: value` lines: type, banks, lines, bus sharing, flash decode, dirty flag (docs/status/cart-slot.md). |
@@ -98,6 +99,8 @@ pub enum ControlCmd {
     ExpectNot(String, u64),
     /// Text that must appear in the console output, after the previous match, within the timeout (ms).
     ExpectConsole(String, u64),
+    /// Text that must appear on the C64 text screen within the timeout (ms).
+    ExpectC64(String, u64),
     /// `usb-sync [--force] [port]`.
     UsbSync { port: Option<u8>, force: bool },
     /// `usb-replug [--discard] [port]`.
@@ -207,7 +210,7 @@ pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
             }
             ControlCmd::Png(PathBuf::from(rest.trim()))
         }
-        "expect" | "expect-not" | "expect-console" => {
+        "expect" | "expect-not" | "expect-console" | "expect-c64" => {
             let (text, after) = split_text(rest)?;
             if text.is_empty() {
                 return Err(format!("'{word}' needs text"));
@@ -222,6 +225,7 @@ pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
             match word {
                 "expect" => ControlCmd::Expect(text, timeout),
                 "expect-not" => ControlCmd::ExpectNot(text, timeout),
+                "expect-c64" => ControlCmd::ExpectC64(text, timeout),
                 _ => ControlCmd::ExpectConsole(text, timeout),
             }
         }
@@ -348,6 +352,12 @@ pub fn execute(t: &mut dyn Target, cmd: &ControlCmd, out: &mut dyn Write) -> Res
             if !poll_until(t, *ms, |t| Ok(t.console_match(text)))? {
                 print_screen(t, out)?;
                 bail!("expect-console {text:?}: not in the console output within {ms} ms emulated");
+            }
+        }
+        ControlCmd::ExpectC64(text, ms) => {
+            if !poll_until(t, *ms, |t| Ok(t.c64_text()?.contains(text.as_str())))? {
+                print_block(out, "c64", &t.c64_text()?)?;
+                bail!("expect-c64 {text:?}: not on the C64 screen within {ms} ms emulated");
             }
         }
         ControlCmd::UsbSync { port, force } => {
@@ -876,6 +886,7 @@ mod tests {
         assert_eq!(ok(r#"expect "SD      SD Card  Ready" 3000"#), Some(Expect("SD      SD Card  Ready".into(), 3000)));
         assert_eq!(ok(r#"expect-not "a \"q\" \\ b""#), Some(ExpectNot(r#"a "q" \ b"#.into(), 5000)));
         assert_eq!(ok(r#"expect-console "Page: 0 done." 800"#), Some(ExpectConsole("Page: 0 done.".into(), 800)));
+        assert_eq!(ok(r#"expect-c64 "UCI OK" 2000"#), Some(ExpectC64("UCI OK".into(), 2000)));
         assert_eq!(ok(r##"expect "#1""##), Some(Expect("#1".into(), 5000)));
         assert_eq!(ok("quit\r"), Some(Quit));
         assert_eq!(ok("  \twait 1  "), Some(Wait(1)));
@@ -1085,6 +1096,16 @@ mod tests {
         let (r, out) = run(&mut fake, "expect-not MENU 20");
         assert_eq!(format!("{:#}", r.unwrap_err()), "line 1: expect-not \"MENU\": still on the screen after 20 ms emulated");
         assert_eq!(out, "--- screen ---\nMENU\n--- screen ---\n");
+    }
+
+    #[test]
+    fn expect_c64_reads_the_c64_screen() {
+        let mut fake = Fake { screen: "MENU\n".into(), c64: "\n READY.\n".into(), ..Fake::default() };
+        run(&mut fake, "expect-c64 READY. 0\n").0.unwrap();
+        let (r, out) = run(&mut fake, "expect-c64 MENU 50\n");
+        let msg = format!("{:#}", r.unwrap_err());
+        assert_eq!(msg, "line 1: expect-c64 \"MENU\": not on the C64 screen within 50 ms emulated");
+        assert_eq!(out, "--- c64 ---\n\n READY.\n--- c64 ---\n", "the C64 screen, not the menu");
     }
 
     #[test]

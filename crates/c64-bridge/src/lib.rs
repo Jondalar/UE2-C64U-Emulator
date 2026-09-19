@@ -82,12 +82,66 @@ static IO_WATCH: [u8; 0x1_0000] = {
     table
 };
 
+/// TRX64 access-watch table of the UCI control register at each slot base the firmware sets: $DF1C, $DFFC and $DE1C
+/// (`CMD_IF_SLOT_BASE` 0x47, 0x7F, 0x07; c64.cc:1305-1320).
+static UCI_WATCH: [u8; 0x1_0000] = {
+    let mut table = [0; 0x1_0000];
+    table[0xDF1C] = 1;
+    table[0xDFFC] = 1;
+    table[0xDE1C] = 1;
+    table
+};
+
+/// The UCI control register addresses of [`UCI_WATCH`].
+fn is_uci_control(addr: u16) -> bool {
+    matches!(addr, 0xDF1C | 0xDFFC | 0xDE1C)
+}
+
+/// How long the C64 waits for the firmware after a UCI event (PUSH_CMD, DATA_ACC, ABORT), in firmware clocks: 10 ms.
+/// The C64 runs in batches of up to `SYNC_PERIOD` behind the firmware (S14 §4), so without the wait the firmware saw an
+/// event up to a millisecond late, while hardware answers within microseconds. A program that aborts and then sends
+/// at once (`uii_detect()` then a command, at 16 MHz) had its command bytes wiped by the late HANDSHAKE_RESET
+/// (issue #2, `Null command.` on the console). A command the firmware takes longer for ends the wait after 10 ms,
+/// and the C64 polls on as it would on hardware (docs/specs/S15-uci.md).
+const UCI_EVENT_WAIT: u64 = 10 * ue2_core::time::CLOCKS_PER_MS;
+/// The status byte's event bits the firmware clears once it has handled them: b0 new command, b1 data accepted, b2
+/// abort (TRX64 `uci.rs` `handshake_in`).
+const UCI_EVENTS: u8 = 0x07;
+
+/// The TRX64 observer for runs without cartridge hints: halts after a C64 write to the UCI control register.
+struct UciObserver;
+
+impl Observer for UciObserver {
+    #[inline(always)]
+    fn on_instruction(&mut self, _: u16, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u8, _: u64) {}
+
+    #[inline(always)]
+    fn on_bus(&mut self, _: BusKind, _: u16, _: u8, _: u16, _: u64, _: u8) {}
+
+    #[inline(always)]
+    fn on_interrupt(&mut self, _: u16, _: u64) {}
+
+    fn on_access(&mut self, kind: BusKind, addr: u16, _: u8, _: AccessCtx) -> bool {
+        kind == BusKind::Write && is_uci_control(addr)
+    }
+}
+
 /// A TRX64 `Machine` driven by the U64 firmware's C64 registers.
 /// How long the REU stays on the bus after C64_REU_ENABLE goes to 0, in firmware clocks: 10 ms. The firmware writes
 /// 0 then 1 within microseconds on every cartridge change (`set_emulation_flags`, c64.cc:297-305), while a program may
 /// already be using the REU; on hardware that is a short decode gap a program rarely hits, here it is none. A setting
 /// that switches the REU off takes effect 10 ms later (docs/status/reu.md, "Enable toggle").
 const REU_OFF_GRACE: u64 = 10 * ue2_core::time::CLOCKS_PER_MS;
+
+/// The same grace for the UCI: `set_emulation_flags` writes CMD_IF_SLOT_ENABLE 0 then 1 (c64.cc:311-331) after a DMA
+/// load has already started the program, and a program that sends its first command at once (at 16 MHz) wrote its
+/// bytes into the gap and got an empty reply (issue #2, `Null command.` on the console). A setting that switches the
+/// command interface off takes effect 10 ms later (docs/specs/S15-uci.md).
+const UCI_OFF_GRACE: u64 = REU_OFF_GRACE;
+/// CMD_IF_SLOT_ENABLE, a firmware register of the UCI block (command_protocol.vhd; TRX64 `uci.rs`): bit 7 clear
+/// writes the enable (bit 0), bit 7 set the C64 bus ID. The registers repeat every 16 bytes below the RAM at 0x800.
+const UCI_SLOT_ENABLE: u16 = 0x1;
+const UCI_FW_RAM: u16 = 0x800;
 
 pub struct Trx64Backend {
     m: Box<Machine>,
@@ -132,6 +186,10 @@ pub struct Trx64Backend {
     parked_reu: Option<Box<dyn trx64_core::expansion::ExpansionDevice>>,
     /// When C64_REU_ENABLE went to 0 with the REU still on the bus ([`REU_OFF_GRACE`]).
     reu_off_since: Option<u64>,
+    /// When CMD_IF_SLOT_ENABLE went to 0 with the UCI block still answering at $DF1C ([`UCI_OFF_GRACE`]).
+    uci_off_since: Option<u64>,
+    /// The C64 waits for the firmware to handle a UCI event: since when, and which event bits ([`UCI_EVENT_WAIT`]).
+    uci_wait: Option<(u64, u8)>,
     /// Ultimate Audio: UE2's own block, shared with the port device TRX64 holds (sampler.rs, S16).
     sampler: sampler::SamplerHandle,
 }
@@ -201,6 +259,8 @@ impl Trx64Backend {
             reu_size_kb: reu::DEFAULT_SIZE_KB,
             parked_reu: None,
             reu_off_since: None,
+            uci_off_since: None,
+            uci_wait: None,
             sampler,
         }
     }
@@ -316,21 +376,37 @@ impl Trx64Backend {
     fn run_cpu(&mut self, target: u64) {
         // W4-SID: the SID tap records the CPU's SID writes with their cycle in every run.
         let plain = |m: &mut Machine, budget| m.run_for_full_capped(budget, u64::MAX, &mut sid::SidTap, |_, _, _, _, _, _, _| {});
-        if self.m.cartridge.is_none() {
+        // UCI: with the block on the bus, a run halts after a C64 write to its control register, so the C64 can wait
+        // for the firmware to handle the event ([`UCI_EVENT_WAIT`]).
+        let uci = self.m.uci().is_some_and(|u| u.status().enabled);
+        let with_uci = |m: &mut Machine, budget| {
+            m.run_for_full_capped_dbg(budget, u64::MAX, None, None, Some(&UCI_WATCH), &mut UciObserver, |_, _, _, _, _, _, _| {});
+        };
+        if self.m.cartridge.is_none() && !uci {
             let clk = self.m.c64_core.clk;
             plain(&mut self.m, target - clk);
             return;
         }
         loop {
             let clk = self.m.c64_core.clk;
-            if clk >= target {
+            if clk >= target || self.uci_wait.is_some() {
                 break;
+            }
+            let events = self.uci_events();
+            if self.m.cartridge.is_none() {
+                with_uci(&mut self.m, target - clk);
+                self.wait_for_uci(events);
+                continue;
             }
             // CARTSLOT: the hints of the internal and the physical cartridge (slot.rs).
             let cart = &self.cart;
             let hints = self.slot.with(|s| s.run_hints(cart, clk));
             if hints == RunHints::default() {
-                plain(&mut self.m, target - clk);
+                if uci {
+                    with_uci(&mut self.m, target - clk);
+                } else {
+                    plain(&mut self.m, target - clk);
+                }
             } else {
                 // freezer.vhd switches the cart in after the three stack pushes, before the vector fetch.
                 if hints.freeze_pending && self.nmi_due() {
@@ -346,7 +422,11 @@ impl Trx64Backend {
                     vector: None,
                     sid: self.sid.tap(),
                 };
-                let watch = hints.watch_io.then_some(&IO_WATCH);
+                let watch = if hints.watch_io {
+                    Some(&IO_WATCH)
+                } else {
+                    uci.then_some(&UCI_WATCH)
+                };
                 let budget = end.saturating_sub(clk).max(1);
                 self.m.run_for_full_capped_dbg(budget, max, None, None, watch, &mut obs, |_, _, _, _, _, _, _| {});
                 if let Some(vector) = obs.vector.filter(|_| self.cart.with(|c| c.run_hints().freeze_pending)) {
@@ -356,6 +436,22 @@ impl Trx64Backend {
             let (cart, clk) = (&self.cart, self.m.c64_core.clk);
             self.slot.with(|s| s.set_clk(cart, clk));
             self.cart_changed();
+            self.wait_for_uci(events);
+        }
+    }
+
+    /// The UCI event bits waiting for the firmware ([`UCI_EVENTS`]).
+    fn uci_events(&self) -> u8 {
+        self.m.uci().map_or(0, |u| u.status().status_byte & UCI_EVENTS)
+    }
+
+    /// After a run: an event the C64 raised in it (`before` = the bits pending at its start) makes the C64 wait for the
+    /// firmware. Only new bits count, so a command the firmware is still working on after the wait does not hold the C64
+    /// again.
+    fn wait_for_uci(&mut self, before: u8) {
+        let new = self.uci_events() & !before;
+        if new != 0 {
+            self.uci_wait = Some((self.now, new));
         }
     }
 
@@ -440,9 +536,10 @@ impl Observer for CartObserver {
         self.vector = Some(vector);
     }
 
-    fn on_access(&mut self, _: BusKind, _: u16, _: u8, _: AccessCtx) -> bool {
+    fn on_access(&mut self, kind: BusKind, addr: u16, _: u8, _: AccessCtx) -> bool {
         let (cart, forced) = (&self.cart, self.forced_ultimax);
-        self.slot.with(|s| s.lines_changed(cart, forced))
+        let lines = self.slot.with(|s| s.lines_changed(cart, forced));
+        lines || (kind == BusKind::Write && is_uci_control(addr))
     }
 }
 
@@ -460,6 +557,20 @@ impl C64Backend for Trx64Backend {
             self.reu_off_since = None;
             self.parked_reu = self.m.detach_reu();
         }
+        if self.uci_off_since.is_some_and(|since| now.saturating_sub(since) >= UCI_OFF_GRACE) {
+            self.uci_off_since = None;
+            if let Some(u) = self.m.uci_mut() {
+                u.fw_write(UCI_SLOT_ENABLE, 0);
+            }
+        }
+        // UCI: the C64 stands still until the firmware has handled the event it raised, or the wait is over; then it
+        // catches up.
+        if let Some((since, bits)) = self.uci_wait {
+            let pending = self.uci_events() & bits != 0;
+            if !pending || now.saturating_sub(since) >= UCI_EVENT_WAIT || self.stopped || self.reset_held {
+                self.uci_wait = None;
+            }
+        }
         let clk = self.m.c64_core.clk;
         let target = self.clock.get_or_insert(Clock::new(now, clk)).cycles(now);
         if target <= clk {
@@ -467,7 +578,7 @@ impl C64Backend for Trx64Backend {
         }
         if self.stopped || self.reset_held {
             self.run_held(target);
-        } else {
+        } else if self.uci_wait.is_none() {
             self.run_cpu(target);
             // W4-DRIVE: note what drive A wrote.
             self.drive.after_run(&mut self.m);
@@ -484,6 +595,7 @@ impl C64Backend for Trx64Backend {
     fn set_reset(&mut self, held: bool) {
         self.reset_held = held;
         self.apply_hold();
+        self.uci_wait = None;
         if held {
             self.sid.reset();
             // S16: the C64 reset clears the sampler's IRQ latches and nothing else — its register file has no reset
@@ -813,14 +925,27 @@ impl C64Backend for Trx64Backend {
         self.m.uci().is_some()
     }
 
+    /// During the grace time the firmware reads back the 0 it wrote to CMD_IF_SLOT_ENABLE.
     fn uci_read(&self, off: u16) -> u8 {
+        if off < UCI_FW_RAM && off & 0xf == UCI_SLOT_ENABLE && self.uci_off_since.is_some() {
+            return 0;
+        }
         self.m.uci().map_or(0, |u| u.fw_read(off))
     }
 
+    /// Switching the block off waits [`UCI_OFF_GRACE`]; switching it back on within that time means it never left.
     fn uci_write(&mut self, off: u16, val: u8) {
-        if let Some(u) = self.m.uci_mut() {
-            u.fw_write(off, val);
+        let Some(u) = self.m.uci_mut() else { return };
+        if off < UCI_FW_RAM && off & 0xf == UCI_SLOT_ENABLE && val & 0x80 == 0 {
+            if val & 0x01 == 0 {
+                if u.status().enabled {
+                    self.uci_off_since.get_or_insert(self.now);
+                }
+                return;
+            }
+            self.uci_off_since = None;
         }
+        u.fw_write(off, val);
     }
 
     fn uci_irq(&self) -> bool {
@@ -1447,5 +1572,36 @@ mod tests {
         let fresh = Reu::new(16384).unwrap().snapshot_registers();
         assert_eq!(c64.m.reu().unwrap().snapshot_registers(), fresh, "a reset while it was off reset the REC");
         c64.lend_ddr(None);
+    }
+
+    /// Issue #2: the firmware's 0-then-1 on CMD_IF_SLOT_ENABLE during a cartridge change leaves the block answering
+    /// at $DF1C; a longer 0 switches it off; the bus ID write (bit 7) is not an enable.
+    #[test]
+    fn a_uci_enable_toggle_keeps_the_block_on_the_bus() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        c64.advance_to(0);
+        let enabled = |c64: &Trx64Backend| c64.m.uci().unwrap().status().enabled;
+        c64.uci_write(UCI_SLOT_ENABLE, 1);
+        assert!(enabled(&c64));
+
+        c64.uci_write(UCI_SLOT_ENABLE, 0);
+        assert_eq!(c64.uci_read(UCI_SLOT_ENABLE), 0, "the firmware reads back what it wrote");
+        c64.advance_to(c64.now + UCI_OFF_GRACE / 2);
+        assert!(enabled(&c64), "a short pulse leaves it on the bus");
+        c64.uci_write(UCI_SLOT_ENABLE, 1);
+        c64.advance_to(c64.now + UCI_OFF_GRACE);
+        assert!(enabled(&c64), "switched back on in time, it never left");
+        assert_eq!(c64.uci_read(UCI_SLOT_ENABLE), 1);
+
+        c64.uci_write(UCI_SLOT_ENABLE, 0x80 | 8);
+        assert!(enabled(&c64), "a bus ID write is no enable");
+        assert_eq!(c64.m.uci().unwrap().status().bus_id, 8);
+
+        c64.uci_write(UCI_SLOT_ENABLE, 0);
+        c64.advance_to(c64.now + UCI_OFF_GRACE);
+        assert!(!enabled(&c64), "switched off for longer, it is off");
+        assert_eq!(c64.uci_read(UCI_SLOT_ENABLE), 0);
+        c64.uci_write(UCI_SLOT_ENABLE, 1);
+        assert!(enabled(&c64));
     }
 }

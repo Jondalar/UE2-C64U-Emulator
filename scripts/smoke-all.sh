@@ -14,6 +14,8 @@
 #   flash-1     smoke-flash-1.ctl   --flash run/flash-ui.bin (fresh: Color Scheme must not be C128 Style yet)
 #   flash-2     smoke-flash-2.ctl   --flash run/flash-ui.bin --no-overlay-ui
 #   settings    smoke-settings.ctl  --flash run/flash-settings.bin (fresh) --settings smoke-settings.cfg
+#   uci         smoke-uci.ctl       --flash run/flash-uci.bin (fresh) --c64-roms --settings smoke-uci.cfg
+#                                   --usb-dir run/uci (uci-probe.prg from make-uci-probe.py)
 #   negative    an expect that cannot match; passes only when ue2emu exits non-zero and names its line
 
 set -euo pipefail
@@ -73,6 +75,10 @@ smoke flash-1 "$repo/scripts/smoke-flash-1.ctl" --flash run/flash-ui.bin
 smoke flash-2 "$repo/scripts/smoke-flash-2.ctl" --flash run/flash-ui.bin --no-overlay-ui
 smoke settings "$repo/scripts/smoke-settings.ctl" --flash run/flash-settings.bin \
     --settings "$repo/scripts/smoke-settings.cfg"
+mkdir run/uci
+python3 "$repo/scripts/make-uci-probe.py" run/uci/uci-probe.prg
+smoke uci "$repo/scripts/smoke-uci.ctl" --flash run/flash-uci.bin --c64-roms --settings "$repo/scripts/smoke-uci.cfg" \
+    --usb-dir run/uci --usb-dir-work run/uci-work
 
 printf '# must fail\nexpect "NO SUCH TEXT ON THE SCREEN" 500\nquit\n' >run/negative.ctl
 rc=0
