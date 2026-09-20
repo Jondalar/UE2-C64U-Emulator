@@ -29,12 +29,18 @@ pub const TARGET_DOS: u8 = 2;
 const DOS_CMD_OPEN_FILE: u8 = 0x02;
 const DOS_CMD_CLOSE_FILE: u8 = 0x03;
 const DOS_CMD_WRITE_DATA: u8 = 0x05;
+const DOS_CMD_CHANGE_DIR: u8 = 0x11;
+const DOS_CMD_OPEN_DIR: u8 = 0x13;
+const DOS_CMD_READ_DIR: u8 = 0x14;
 /// `FA_WRITE | FA_CREATE_ALWAYS` (ff.h): write over whatever is there.
 const FA_WRITE_ALWAYS: u8 = 0x0A;
 /// The longest command the block takes: the firmware writes its own NUL at `message[length]`, so one byte of the
 /// 896-byte buffer stays free (dos.cc:112, command_if_pkg.vhd:33-41). A longer command would be clamped by the
 /// block's pointer and arrive truncated.
 const COMMAND_MAX: usize = 895;
+/// Reply chunks one command may take before we stop believing it: a directory is one entry per chunk, and a
+/// medium with more files than this is not what the monitor is for.
+const PARTS_MAX: usize = 4096;
 /// What one `DOS_CMD_WRITE_DATA` carries. The data starts at `message[4]` (dos.cc:483), so the buffer would hold
 /// far more — but it must stay UNDER one 512-byte sector, and this is why.
 ///
@@ -96,6 +102,15 @@ impl Reply {
 /// `bytes` is the message as the target sees it: the target id, the command byte, then the command's own arguments
 /// (command_intf.cc:157-183).
 pub fn command(m: &mut Machine, bytes: &[u8]) -> Result<Reply, String> {
+    let (parts, status) = command_parts(m, bytes)?;
+    Ok(Reply { data: parts.concat(), status })
+}
+
+/// The same command, with the firmware's reply chunks kept apart.
+///
+/// A target that answers in parts means something by the split: the DOS target sends one directory entry per
+/// chunk (dos.cc:806-820), so joining them would lose where each entry ends.
+pub fn command_parts(m: &mut Machine, bytes: &[u8]) -> Result<(Vec<Vec<u8>>, String), String> {
     if bytes.len() > COMMAND_MAX {
         return Err(format!("a command of {} bytes does not fit the block's buffer", bytes.len()));
     }
@@ -113,7 +128,7 @@ pub fn command(m: &mut Machine, bytes: &[u8]) -> Result<Reply, String> {
     write(m, window + SLOT_CONTROL, CMD_NEW_COMMAND)?;
 
     let deadline = m.now_ms() + TIMEOUT_MS;
-    let (mut data, mut text) = (Vec::new(), Vec::new());
+    let (mut parts, mut text) = (Vec::new(), Vec::new());
     loop {
         let mut s = status(m)?;
         while s.state & STATE_VALID == 0 {
@@ -134,20 +149,27 @@ pub fn command(m: &mut Machine, bytes: &[u8]) -> Result<Reply, String> {
             s = status(m)?;
         }
         // Each read takes one byte and advances the block's pointer, exactly as a client's `LDA` does.
-        while status(m)?.response_valid && data.len() < RESPONSE_MAX {
-            data.push(read(m, window + SLOT_RESPONSE)?);
+        let mut part = Vec::new();
+        while status(m)?.response_valid && part.len() < RESPONSE_MAX {
+            part.push(read(m, window + SLOT_RESPONSE)?);
         }
         while status(m)?.status_valid && text.len() < STATUS_MAX {
             text.push(read(m, window + SLOT_STATUS)?);
+        }
+        if !part.is_empty() {
+            parts.push(part);
         }
         let more = s.state & STATE_MORE != 0;
         write(m, window + SLOT_CONTROL, CMD_DATA_ACCEPTED)?;
         if !more {
             break;
         }
+        if parts.len() > PARTS_MAX {
+            return Err(format!("the firmware sent more than {PARTS_MAX} parts"));
+        }
     }
     let status: String = text.iter().map(|&b| char::from(b)).collect();
-    Ok(Reply { data, status: status.trim_end_matches(['\0', ' ']).to_string() })
+    Ok((parts, status.trim_end_matches(['\0', ' ']).to_string()))
 }
 
 /// The block, or the sentence that says why there is none.
@@ -215,4 +237,35 @@ fn check(path: &str, what: &str, reply: Reply) -> Result<(), String> {
         true => Ok(()),
         false => Err(format!("{what} {path}: {}", reply.status)),
     }
+}
+
+/// The entries of a directory inside the machine, as `[attributes, name…]` per entry (dos.cc:806-820).
+///
+/// Three commands, because the DOS target's directory is its own current path: `CHANGE_DIR` moves it there,
+/// `OPEN_DIR` reads it, `READ_DIR` streams the entries one reply chunk each.
+pub fn directory(m: &mut Machine, path: &str) -> Result<Vec<(u8, String)>, String> {
+    if !path.is_ascii() {
+        return Err("the firmware's paths are ASCII".into());
+    }
+    let mut cd = vec![TARGET_DOS, DOS_CMD_CHANGE_DIR];
+    cd.extend(path.as_bytes());
+    cd.push(0);
+    check(path, "opening", command(m, &cd)?)?;
+    let opened = command(m, &[TARGET_DOS, DOS_CMD_OPEN_DIR])?;
+    // An empty directory is its own status, and it is not an error (dos.cc:455-459).
+    if !opened.ok() && !opened.status.contains("EMPTY") {
+        return Err(format!("reading {path}: {}", opened.status));
+    }
+    if !opened.ok() {
+        return Ok(Vec::new());
+    }
+    let (parts, status) = command_parts(m, &[TARGET_DOS, DOS_CMD_READ_DIR])?;
+    if !status.starts_with("00,") && !status.is_empty() {
+        return Err(format!("reading {path}: {status}"));
+    }
+    Ok(parts
+        .into_iter()
+        .filter(|part| part.len() > 1)
+        .map(|part| (part[0], part[1..].iter().map(|&b| char::from(b)).collect()))
+        .collect())
 }

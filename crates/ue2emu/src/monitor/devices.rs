@@ -13,7 +13,7 @@ use ue2_core::devices::rmii::Rmii;
 use ue2_core::devices::sdcard::SdCard;
 use ue2_core::devices::usb::Usb;
 
-use super::Host;
+use super::{uci, Host};
 use crate::gdb::peek8;
 
 /// `ITU_BASE` and `C64_CARTREGS_BASE` (iomap.h:10, u64.h).
@@ -42,6 +42,13 @@ const CLOCK_DETECT: [&str; 6] = ["phi2", "vcc", "exrom", "game", "reset", "nmi"]
 
 /// The verbs of this file, or `None` when the line is not one of them.
 pub(super) fn verb(host: &mut Host, verb: &str, args: &[&str]) -> Option<Result<String, String>> {
+    if verb == "dir" {
+        return Some(match args {
+            [] => dir(host, "/"),
+            [path] => dir(host, path),
+            _ => Err("dir: usage: dir [path in the emulated machine]".into()),
+        });
+    }
     if !args.is_empty() {
         return match verb {
             "itu" | "cart" | "flash" | "sd" | "usb" | "net" | "audio" => {
@@ -71,6 +78,7 @@ pub(super) const HELP: &str = concat!(
     "  usb               the hub ports and what is on them\n",
     "  net               the Ethernet MAC: the address, the filter and the queues\n",
     "  audio             the SIDs the firmware built and the windows it routes to them\n",
+    "  dir [PATH]        what is on a medium, read by the firmware itself\n",
 );
 
 /// `itu` — the interrupt controller as the ISR sees it, and the timers the firmware runs on.
@@ -228,6 +236,32 @@ fn audio(host: &mut Host) -> String {
         Some(backend) => backend.sid_summary(),
         None => "  no C64: the SIDs are the C64's, and this machine has none\n".to_string(),
     }
+}
+
+/// `dir [path]` — what is on a medium, as the firmware's own file manager sees it.
+///
+/// The listing is the firmware's, not ours: it reads the directory through its DOS target over the same UCI
+/// transport `config` writes through (S23 §6), so every mount works — `/flash`, `/Usb0`, `/Temp`, the SD card —
+/// and what comes back is exactly what the firmware would show in its menu. A bare `dir` lists the mounts.
+fn dir(host: &mut Host, path: &str) -> Result<String, String> {
+    let entries = uci::directory(host.m, path)?;
+    if entries.is_empty() {
+        return Ok(format!("  {path}  empty\n"));
+    }
+    let mut out = String::new();
+    for (attributes, name) in &entries {
+        // FatFs attribute bits (ff.h): 0x10 directory, 0x01 read-only, 0x02 hidden, 0x04 system.
+        let kind = if attributes & 0x10 != 0 { "dir " } else { "    " };
+        let flags = [(0x01, "ro"), (0x02, "hidden"), (0x04, "system")]
+            .iter()
+            .filter(|(bit, _)| attributes & bit != 0)
+            .map(|(_, name)| *name)
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!("  {kind}{name}{}{flags}\n", if flags.is_empty() { "" } else { "   " }));
+    }
+    out.push_str(&format!("  {} entries in {path}\n", entries.len()));
+    Ok(out)
 }
 
 /// The set bits of `value` by name, or the word for none.

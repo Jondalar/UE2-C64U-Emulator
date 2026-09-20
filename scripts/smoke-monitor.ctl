@@ -35,6 +35,10 @@ monitor fw step 3
 monitor fw go
 monitor status
 
+# The firmware's own directory listing, over the same transport `config` writes through.
+monitor dir
+monitor dir /flash
+
 monitor config flash
 monitor config "C64 and Cartridge Settings" "REU Size"
 

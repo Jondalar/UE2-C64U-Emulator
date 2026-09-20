@@ -30,6 +30,7 @@ one-way.
 | `flash` | The image behind the chip, sectors not written out yet, config pages in use. |
 | `sd` | The card: sectors, size, write protect. |
 | `usb` | The hub ports and what is on each. |
+| `dir [path]` | What is on a medium — `/`, `/flash`, `/Usb0`, `/Temp`, the SD card — read by the firmware itself. |
 | `net` | The MAC the firmware programmed, the RX filter, the buffer queues, the TX register. |
 | `audio` | Socket 1, the engines built with their model, and the address windows routed to each chip. |
 
@@ -151,6 +152,7 @@ library (`on_stop` has no caller yet).
 | `monitor c64 halt` on a booted 3.15 | `c64  stopped at $f04a` — read back out of `C64_STOP`, and the cycle keeps advancing because only the 6510 is held |
 | `monitor c64 step 4` | `4 instruction(s), 16 cycles`, PC $f04a → $f079, the firmware's clock untouched |
 | `monitor fw halt` / `status` | `fw   held at 00035db8  prvIdleTask+0x3c  (the monitor asked)` plus the line that the C64 stands with it; `fw step 3` retires three, `fw go` brings both back |
+| `monitor dir` on a booted 3.15 | `/` lists the four mounts (`SD`, `Flash`, `Temp`, `USB0`), `/flash` its `config` directory, `/Usb0` the files on the stick |
 | `monitor net` / `audio` | no MAC programmed and RX off on a machine without `--net`; socket 1 empty, engines 1 and 5 as 6581, one window line `$d400-$d7ff -> chip 0` (48 mirrors collapsed) |
 | TRX64 repin 0.7.3 → 0.8.2 | no code change needed; `smoke-all.sh` 7/7, `smoke-c64-carts.ctl` 27/27 with the freeze and both SID loads, UltimateDemo2026 detection all `[ OK ]` |
 

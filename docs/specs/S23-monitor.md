@@ -108,6 +108,7 @@ this emulator — the dependency stays one-way, and their port audit stays their
 | `itu` | interrupt controller by source name, the timers, the capability word |
 | `cart` | the firmware's C64 register file at 0x10040000: mode, stop, cartridge type and variant, the cart ROM window, KERNAL, REU enable and size, sampler, serve-while-stopped, the clock-detect lines, and the command interface (today's `cart-info` is the physical cartridge only) |
 | `flash` | SPI flash: the image behind it, what is not written out yet, how many config pages are in use (`config` reads their contents) |
+| `dir [path]` | What is on a medium, read by the firmware's own file manager over the UCI transport, so every mount works and the answer is what its menu would show |
 | `sd` | the card: sectors, size, write protect |
 | `usb` | the hub ports and what is on each |
 | `net` | the MAC the firmware programmed, the RX filter, the buffer queues, the TX register |
@@ -224,11 +225,10 @@ needs costs observer calls that answer false, never correctness.
 
 ## 10. Open
 
-- **What the device verbs still do not reach.** Three things live outside the machine or outside what the hardware
-  keeps, and each would be its own piece of work: the filesystem inside `/flash` and on the SD card (a FAT listing,
-  which the firmware's own `DOS_CMD_OPEN_DIR` could answer over the same UCI transport `config` uses); the
-  `--usb-dir` sync state and the network backend's forwards, which belong to the run loop, not to a device; and the
-  audio mixer's gains, which are write-only registers the model does not store.
+- **What the device verbs still do not reach.** Two things live outside the machine or outside what the hardware
+  keeps: the `--usb-dir` sync state and the network backend's forwards, which belong to the run loop and not to a
+  device; and the audio mixer's gains, which are write-only registers the model does not store. (The filesystems
+  were the third and are done: `dir [path]` reads them through the firmware's own DOS target.)
 - ~~**A bound on a halt.**~~ Answered by §3: because the monitor's halt is the machine's own stop, the bridge's
   UCI event wait already gates on it, so the firmware does not wait forever for a C64 that stands. No release
   timer; if a firmware path is found that still hangs, it comes back as a real question.

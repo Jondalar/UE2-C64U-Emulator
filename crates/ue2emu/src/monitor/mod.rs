@@ -567,6 +567,13 @@ mod tests {
         assert_eq!(exec(&mut m, &mut s, &mut st, "usb").unwrap_err(), "this machine has no USB host");
         assert_eq!(exec(&mut m, &mut s, &mut st, "cart x").unwrap_err(), "cart: takes no arguments");
 
+        // `dir` is the firmware's own listing, so on a machine with no firmware it says the door is shut.
+        assert!(exec(&mut m, &mut s, &mut st, "dir a b").unwrap_err().contains("usage"));
+        assert!(
+            exec(&mut m, &mut s, &mut st, "dir /flash").unwrap_err().starts_with("the firmware's command interface"),
+            "the listing goes through the command interface"
+        );
+
         let audio = run(&mut m, &mut st, "audio");
         assert!(audio.contains("socket 1      empty"), "no ARMSID in this machine: {audio}");
         // The firmware programs one 32-byte window per mirror; a run that reaches one chip is one line.
