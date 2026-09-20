@@ -402,10 +402,6 @@ impl SpiFlash {
         true
     }
 
-    /// Put settings records into their config pages (docs/specs/S21-settings.md §5): the first page carrying the
-    /// page id, else the first erased one, as `register_store` picks (config.cc:127-167). A record of an id being
-    /// set is replaced in place and a later duplicate dropped; new ids go before the 0xFF. Only the 512-byte logical
-    /// page is written (w25q_flash.cc:251-254), the rest of the sector keeps its bytes.
     /// The records stored for one config page, as the firmware would unpack them (S23 §6, the monitor's `config`).
     /// `None` when no page carries that id.
     pub fn config_page(&self, page: u32) -> Option<Vec<(u8, u8, Vec<u8>)>> {
@@ -432,6 +428,10 @@ impl SpiFlash {
             .collect()
     }
 
+    /// Put settings records into their config pages (docs/specs/S21-settings.md §5): the first page carrying the
+    /// page id, else the first erased one, as `register_store` picks (config.cc:127-167). A record of an id being
+    /// set is replaced in place and a later duplicate dropped; new ids go before the 0xFF. Only the 512-byte logical
+    /// page is written (w25q_flash.cc:251-254), the rest of the sector keeps its bytes.
     pub fn write_settings(&mut self, records: &[Record]) -> anyhow::Result<()> {
         let mut pages: Vec<u32> = records.iter().map(|r| r.page).collect();
         pages.sort_unstable();

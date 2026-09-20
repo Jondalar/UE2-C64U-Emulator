@@ -440,13 +440,16 @@ impl EmuThread {
 pub struct MonitorState {
     #[cfg(feature = "trx64")]
     session: trx64_monitor::MonitorSession,
+    /// What our own verbs keep between lines (S23 §6: `config set` before `config write`).
+    #[cfg(feature = "trx64")]
+    ours: crate::monitor::State,
 }
 
 impl MonitorState {
     /// One line, answered as the monitor prints it.
     #[cfg(feature = "trx64")]
     fn exec(&mut self, machine: &mut Machine, line: &str) -> Result<String, String> {
-        crate::monitor::exec(machine, &mut self.session, line)
+        crate::monitor::exec(machine, &mut self.session, &mut self.ours, line)
     }
 
     #[cfg(not(feature = "trx64"))]

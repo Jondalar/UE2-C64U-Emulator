@@ -67,7 +67,9 @@ pub struct Table {
 }
 
 impl Table {
-    fn find(&self, name: &str) -> Option<&Def> {
+    /// The definition of `name`, as the firmware matches a `.cfg` line: case is ignored
+    /// (`ConfigStore::get_item_by_name`).
+    pub fn find(&self, name: &str) -> Option<&Def> {
         self.defs.iter().find(|d| d.name.eq_ignore_ascii_case(name))
     }
 }
@@ -442,6 +444,36 @@ fn choices(def: &Def) -> String {
 /// A value the page carries is decoded through the item's own type; an item the page does not carry is the
 /// firmware's default and says so. `category` and `item` narrow it, both by case-insensitive name.
 pub fn stored(stores: &Stores, flash: &SpiFlash, category: Option<&str>, item: Option<&str>) -> String {
+    emit(stores, flash, category, item, true)
+}
+
+/// The same values as a `.cfg` the firmware reads back (`ConfigIO::S_read_from_file`): no marks, every store and
+/// every item. This is what the menu's "Save to File" leaves behind, as far as UE2 can see it — the flash, and each
+/// item's own default where the flash has nothing.
+pub fn dump(stores: &Stores, flash: &SpiFlash) -> String {
+    emit(stores, flash, None, None, false)
+}
+
+/// One `[Store] Item=Value` per record, grouped into `.cfg` sections, in the firmware's own spelling (§4). A `.cfg`
+/// of exactly the items that changed is all `CTRL_CMD_LOAD_CONFIG` needs (S23 §6).
+pub fn cfg(records: &[Record]) -> String {
+    let mut out = String::new();
+    let mut section = String::new();
+    for record in records {
+        let Some((store, item)) = record.text.strip_prefix('[').and_then(|t| t.split_once("] ")) else {
+            continue;
+        };
+        if store != section {
+            out.push_str(&format!("[{store}]\n"));
+            section = store.to_string();
+        }
+        out.push_str(item);
+        out.push('\n');
+    }
+    out
+}
+
+fn emit(stores: &Stores, flash: &SpiFlash, category: Option<&str>, item: Option<&str>, mark: bool) -> String {
     let mut out = String::new();
     for store in stores.found.iter().filter(|s| category.is_none_or(|c| s.spec.name.eq_ignore_ascii_case(c))) {
         let records = flash.config_page(store.spec.page).unwrap_or_default();
@@ -455,10 +487,16 @@ pub fn stored(stores: &Stores, flash: &SpiFlash, category: Option<&str>, item: O
                 Some((_, kind, payload)) => (decode(def, *kind, payload), "flash"),
                 None => (default_text(def), "default"),
             };
-            out.push_str(&format!("{}={}   ({source})\n", def.name, value));
+            match mark {
+                true => out.push_str(&format!("{}={}   ({source})\n", def.name, value)),
+                false => out.push_str(&format!("{}={}\n", def.name, value)),
+            }
         }
     }
     if out.is_empty() {
+        if !mark {
+            return out;
+        }
         return match (category, item) {
             (Some(c), Some(i)) => format!("no item '{i}' in '{c}'\n"),
             (Some(c), None) => format!("no store '{c}' in this firmware\n"),

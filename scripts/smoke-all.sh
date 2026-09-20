@@ -14,6 +14,7 @@
 #   flash-1     smoke-flash-1.ctl   --flash run/flash-ui.bin (fresh: Color Scheme must not be C128 Style yet)
 #   flash-2     smoke-flash-2.ctl   --flash run/flash-ui.bin --no-overlay-ui
 #   settings    smoke-settings.ctl  --flash run/flash-settings.bin (fresh) --settings smoke-settings.cfg
+#   monitor     smoke-monitor.ctl   --flash run/flash-monitor.bin (fresh) --settings smoke-settings.cfg
 #   uci         smoke-uci.ctl       --flash run/flash-uci.bin (fresh) --c64-roms --settings smoke-uci.cfg
 #                                   --usb-dir run/uci (uci-probe.prg from make-uci-probe.py)
 #   negative    an expect that cannot match; passes only when ue2emu exits non-zero and names its line
@@ -75,6 +76,11 @@ smoke flash-1 "$repo/scripts/smoke-flash-1.ctl" --flash run/flash-ui.bin
 smoke flash-2 "$repo/scripts/smoke-flash-2.ctl" --flash run/flash-ui.bin --no-overlay-ui
 smoke settings "$repo/scripts/smoke-settings.ctl" --flash run/flash-settings.bin \
     --settings "$repo/scripts/smoke-settings.cfg"
+smoke monitor "$repo/scripts/smoke-monitor.ctl" --flash run/flash-monitor.bin \
+    --settings "$repo/scripts/smoke-settings.cfg"
+# The config cycle must have left the new value in the pages, which `config` reads back out of the flash.
+grep -q 'REU Size=2 MB   (flash)' run/monitor.log || fail monitor "the config pages do not hold the new REU size"
+
 mkdir run/uci
 python3 "$repo/scripts/make-uci-probe.py" run/uci/uci-probe.prg
 smoke uci "$repo/scripts/smoke-uci.ctl" --flash run/flash-uci.bin --c64-roms --settings "$repo/scripts/smoke-uci.cfg" \

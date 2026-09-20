@@ -102,14 +102,29 @@ What the menu does, from the monitor. Paths are the emulated machine's, not the 
 | Command | Effect |
 |---|---|
 | `config [category [item]]` | Show. Values are decoded from the flash config pages with the S21 code (`ue2-core/src/settings.rs`). |
-| `config set <cat> <item> <value>` | Change it in the running firmware: a delta `.cfg` is written into `/flash` (our own FAT writer, as `--c64-roms` writes the ROMs) and handed to the firmware with UCI `CTRL_CMD_LOAD_CONFIG` (0x50), which parses it and calls `effectuate()` per store. No USB stick and no network needed. |
+| `config set <cat> <item> <value>` | Change it in the running firmware: a two-line `.cfg` in `/temp` handed to the firmware with UCI `CTRL_CMD_LOAD_CONFIG` (0x50), which parses it and calls `effectuate()` per store. No USB stick and no network needed. |
 | `config write` | Permanent, where the menu puts it: the config pages in flash. |
-| `config write <path>` | The menu's "save to file": a `.cfg` at that guest path (`/Usb0/mine.cfg`, `/flash/mine.cfg`, the SD card). |
+| `config write <path>` | The menu's "save to file": a `.cfg` at that guest path (`/Usb0/mine.cfg`, `/flash/mine.cfg`, `/temp/…`, the SD card). |
 | `config read <path>` | The menu's load: that `.cfg` through UCI 0x50, so the firmware applies and effectuates it. |
 | `config flash` | The raw page decode — "what is actually stored", the question Xander's two flash images raised. |
 
 Rule, enforced and documented: `set` before `write`. Writing a page the firmware does not know about is undone the
 next time the firmware saves that page from its own copy.
+
+**The monitor does not write a guest filesystem itself.** Every `.cfg` it puts inside the machine goes in through
+the firmware's own DOS target (`DOS_CMD_OPEN_FILE`/`WRITE_DATA`/`CLOSE_FILE`, target 2), which is how the cartridge
+software does it. Two reasons, and both are decisive:
+
+- The firmware has `/flash`, the stick and the SD card mounted, and FatFs keeps one sector of each volume in a
+  window that it does not read again while it holds it (`move_window`). Bytes we change behind its back can go
+  unseen — a directory entry we add most of all. A file the firmware writes has no such problem.
+- One door serves every medium. `/temp`, `/flash`, `/Usb0` and the SD card all work with no writer of ours per
+  medium, and a `--usb-dir` stick even reaches the host directory through the existing sync.
+
+One rule comes with that door: a `DOS_CMD_WRITE_DATA` carries less than one 512-byte sector. FatFs hands a
+full sector straight to the block device instead of copying it through the file's own DDR buffer, and the USB
+controller fetches its data by physical address (`descr->memHi/memLo`) — which cannot reach the command interface's
+register RAM, so a sector-sized write puts the firmware's bus contents on the stick instead of our text.
 
 ## 7. Surfaces
 

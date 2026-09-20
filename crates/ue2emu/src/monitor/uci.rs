@@ -22,6 +22,30 @@ pub const TARGET_CONTROL: u8 = 4;
 /// firmware in `Add UCI control command to load config file`; an older build answers "UNKNOWN COMMAND".
 pub const CTRL_CMD_LOAD_CONFIG: u8 = 0x50;
 
+/// `Dos dos2(2)` (dos.cc:12-13): the second of the two file targets. A target holds one open file, and the first is
+/// the one the cartridge software uses, so the monitor takes the other.
+pub const TARGET_DOS: u8 = 2;
+/// The three file commands (dos.h:12-15).
+const DOS_CMD_OPEN_FILE: u8 = 0x02;
+const DOS_CMD_CLOSE_FILE: u8 = 0x03;
+const DOS_CMD_WRITE_DATA: u8 = 0x05;
+/// `FA_WRITE | FA_CREATE_ALWAYS` (ff.h): write over whatever is there.
+const FA_WRITE_ALWAYS: u8 = 0x0A;
+/// The longest command the block takes: the firmware writes its own NUL at `message[length]`, so one byte of the
+/// 896-byte buffer stays free (dos.cc:112, command_if_pkg.vhd:33-41). A longer command would be clamped by the
+/// block's pointer and arrive truncated.
+const COMMAND_MAX: usize = 895;
+/// What one `DOS_CMD_WRITE_DATA` carries. The data starts at `message[4]` (dos.cc:483), so the buffer would hold
+/// far more — but it must stay UNDER one 512-byte sector, and this is why.
+///
+/// The command buffer is the block's own RAM, an FPGA register window. FatFs hands a full sector straight to the
+/// block device (`f_write`, the `cc > 0` path in ff.c) instead of copying it through the file's own buffer in DDR,
+/// and the USB controller fetches its data itself, from the physical address it is given (`descr->memHi/memLo`,
+/// usb_base.cc:769-783). That address is not memory the USB block can read, so a sector-sized write put the
+/// firmware's own bus contents on the stick instead of our text. Below a sector FatFs always copies, and every
+/// medium works.
+const WRITE_CHUNK: usize = 480;
+
 /// The C64 side's four registers inside the eight-byte window (command_if_pkg.vhd:27-31).
 const SLOT_CONTROL: u16 = 4;
 const SLOT_COMMAND: u16 = 5;
@@ -72,6 +96,9 @@ impl Reply {
 /// `bytes` is the message as the target sees it: the target id, the command byte, then the command's own arguments
 /// (command_intf.cc:157-183).
 pub fn command(m: &mut Machine, bytes: &[u8]) -> Result<Reply, String> {
+    if bytes.len() > COMMAND_MAX {
+        return Err(format!("a command of {} bytes does not fit the block's buffer", bytes.len()));
+    }
     let before = status(m)?;
     if !before.enabled {
         return Err("the firmware's command interface is off ([C64 and Cartridge Settings] Command Interface)".into());
@@ -152,4 +179,40 @@ fn read(m: &mut Machine, addr: u16) -> Result<u8, String> {
     block
         .read(access(clk, addr), None)
         .ok_or_else(|| format!("{addr:#06x} is not the block's window; the firmware moved it"))
+}
+
+/// Put `data` at `path` inside the machine, the way the cartridge software does it: the firmware's own DOS target
+/// opens, writes and closes the file (dos.cc:111-134, 478-493).
+///
+/// This is why the monitor does not write a guest filesystem itself. The firmware has `/flash`, the USB stick and
+/// the SD card mounted and FatFs caches a sector of each; bytes changed behind its back can go unseen, and a file
+/// it writes for us cannot. It also means every medium the firmware can write works — `/temp`, `/flash`, `/Usb0`,
+/// the SD card — with no writer of our own per medium.
+pub fn write_file(m: &mut Machine, path: &str, data: &[u8]) -> Result<(), String> {
+    if !path.is_ascii() {
+        return Err("the firmware's paths are ASCII".into());
+    }
+    let mut open = vec![TARGET_DOS, DOS_CMD_OPEN_FILE, FA_WRITE_ALWAYS];
+    open.extend(path.as_bytes());
+    check(path, "opening", command(m, &open)?)?;
+    let mut written = Ok(());
+    for chunk in data.chunks(WRITE_CHUNK) {
+        let mut message = vec![TARGET_DOS, DOS_CMD_WRITE_DATA, 0, 0];
+        message.extend(chunk);
+        written = command(m, &message).and_then(|reply| check(path, "writing", reply));
+        if written.is_err() {
+            break;
+        }
+    }
+    // The target holds the one file until it is told to let go, whatever went wrong before.
+    let closed = command(m, &[TARGET_DOS, DOS_CMD_CLOSE_FILE]).and_then(|r| check(path, "closing", r));
+    written.and(closed)
+}
+
+/// The DOS target answers with the filesystem's own error text, which is the most useful thing to pass on.
+fn check(path: &str, what: &str, reply: Reply) -> Result<(), String> {
+    match reply.ok() {
+        true => Ok(()),
+        false => Err(format!("{what} {path}: {}", reply.status)),
+    }
 }

@@ -135,7 +135,7 @@ with its default, the choices of an enum and the range of a value in a comment l
 
 | File | Change |
 |---|---|
-| `crates/ue2-core/src/settings.rs` (new) | table scan, catalog, `.cfg` parser, resolution to records |
+| `crates/ue2-core/src/settings.rs` (new) | table scan, catalog, `.cfg` parser, resolution to records; `stored`/`dump`/`cfg` read the pages back out for the monitor (S23 §6) |
 | `crates/ue2-core/src/devices/flash.rs` | `SpiFlash::write_settings` (page edit) |
 | `crates/ue2-core/src/machine.rs` | `MachineConfig::settings`; apply in `Machine::new` |
 | `crates/ue2emu/src/main.rs` | `run --settings`, `settings` subcommand |

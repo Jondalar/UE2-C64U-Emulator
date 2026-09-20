@@ -11,13 +11,13 @@
 //!
 //! Not here yet: run control (S23 M3, the library's defaults refuse it in one sentence).
 
+mod config;
 mod uci;
 
 use c64_bridge::Trx64Backend;
 use trx64_monitor::host::{CpuView, Device, MonitorHost, Reg};
 use trx64_monitor::{addr_spans, verbs, MonitorSession};
 use ue2_core::devices::c64::C64Port;
-use ue2_core::devices::flash::SpiFlash;
 use ue2_core::machine::Machine;
 use ue2_core::settings;
 
@@ -37,13 +37,30 @@ const FW_REGS: [&str; 32] = [
 /// behind the firmware's registers.
 pub struct Host<'a> {
     m: &'a mut Machine,
+    state: &'a mut State,
 }
 
 impl<'a> Host<'a> {
     /// A host, if this machine has a C64 (`--c64 trx64`). Without one there is no monitor: every verb of the
     /// library is about `trx64_core::Machine`.
-    pub fn new(m: &'a mut Machine) -> Option<Host<'a>> {
-        trx64(m).is_some().then_some(Host { m })
+    pub fn new(m: &'a mut Machine, state: &'a mut State) -> Option<Host<'a>> {
+        trx64(m).is_some().then_some(Host { m, state })
+    }
+}
+
+/// What our own verbs keep between lines: the items `config set` changed in the running firmware, which
+/// `config write` then makes permanent. The library's own state is its `MonitorSession`, beside this one.
+#[derive(Default)]
+pub struct State {
+    staged: Vec<settings::Record>,
+}
+
+impl State {
+    /// A later `set` of the same item replaces the earlier one, as a `.cfg` with two lines for one item does
+    /// (`settings::resolve`).
+    fn stage(&mut self, record: settings::Record) {
+        self.staged.retain(|r| !(r.page == record.page && r.id == record.id));
+        self.staged.push(record);
     }
 }
 
@@ -75,7 +92,7 @@ impl Host<'_> {
         match verb {
             "fw" => Some(self.verb_fw(args)),
             "clock" => Some(Ok(self.verb_clock())),
-            "config" => Some(self.verb_config(args)),
+            "config" => Some(config::verb(self, args)),
             _ => None,
         }
     }
@@ -98,56 +115,6 @@ impl Host<'_> {
         }
     }
 
-    /// `config` — the Ultimate's settings, as the menu shows them (S23 §6). Reading only in this cut: `set`,
-    /// `write` and `read` need the firmware's own .cfg path and come next.
-    fn verb_config(&mut self, args: &[&str]) -> Result<String, String> {
-        let flash = self.m.bus.io.get::<SpiFlash>().ok_or("this machine has no flash")?;
-        if args == ["flash"] {
-            let pages = flash.config_pages();
-            let mut out = format!("  {} config pages in use\n", pages.len());
-            for page in pages {
-                let n = flash.config_page(page).map_or(0, |r| r.len());
-                // The id is four ASCII characters, most significant first ("GEN.", "C64 ", `register_store`).
-                let name = String::from_utf8_lossy(&page.to_be_bytes().map(|b| if b.is_ascii_graphic() { b } else { b'.' })).into_owned();
-                out.push_str(&format!("  {page:08x}  {name}  {n} records\n"));
-            }
-            return Ok(out);
-        }
-        if let ["read", rest @ ..] = args {
-            return match rest {
-                [path] => self.config_read(path),
-                _ => Err("config read: usage: config read <path in the emulated machine>".into()),
-            };
-        }
-        if matches!(args.first(), Some(&"set" | &"write")) {
-            return Err(format!("config {}: not in this build yet (S23 §6)", args[0]));
-        }
-        let tables = settings::tables(&self.m.bus.ram, &self.m.segments);
-        let stores = settings::stores(&tables);
-        Ok(settings::stored(&stores, flash, args.first().copied(), args.get(1).copied()))
-    }
-
-    /// `config read <path>` — the menu's "Load Settings", from the monitor: the firmware opens that `.cfg`, applies
-    /// the items it knows and effectuates every store they touched (`ControlTarget::load_config`). The path is the
-    /// emulated machine's — `/flash/...`, `/Usb0/...`, `/Temp/...`, the SD card — never the host's.
-    fn config_read(&mut self, path: &str) -> Result<String, String> {
-        if !path.is_ascii() {
-            return Err("config read: the firmware's paths are ASCII".into());
-        }
-        let mut message = vec![uci::TARGET_CONTROL, uci::CTRL_CMD_LOAD_CONFIG];
-        message.extend(path.as_bytes());
-        // No length field: the command's remainder is a C string, so it needs its terminator
-        // (control_target.cc:565-568).
-        message.push(0);
-        let reply = uci::command(self.m, &message)?;
-        // The reply data is the parse log — empty on full success, else the lines the firmware could not apply.
-        let log: String = reply.text().lines().map(|l| format!("  {l}\n")).collect();
-        if !reply.ok() {
-            return Err(format!("config read {path}: {}\n{log}", reply.status).trim_end().to_string());
-        }
-        Ok(format!("  {path}  {}\n{log}", reply.status))
-    }
-
     /// `clock` — the two clocks of this machine: the emulator's, which the firmware runs on, and the C64's.
     fn verb_clock(&mut self) -> String {
         let (now_ms, clocks) = (self.m.now_ms(), self.m.bus.now);
@@ -161,7 +128,7 @@ impl Host<'_> {
 
     /// The verbs of §5 for `help`, after the library's own list.
     fn help(&self) -> &'static str {
-        "\nthe Ultimate side (S23):\n  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n  clock             the emulator's clock, the firmware's instructions, the C64's cycle\n  config [cat [item]]  the settings, as stored in flash; `config flash` the raw pages\n  config read PATH  hand a .cfg in the emulated machine to the running firmware\n"
+        "\nthe Ultimate side (S23):\n  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n  clock             the emulator's clock, the firmware's instructions, the C64's cycle\n  config [cat [item]]  the settings, as stored in flash; `config flash` the raw pages\n  config set CAT ITEM VALUE   change it in the running firmware\n  config write [PATH]  the config pages, or a .cfg inside the machine\n  config read PATH  hand a .cfg inside the machine to the running firmware\n"
     }
 }
 
@@ -223,8 +190,13 @@ impl CpuView for Host<'_> {
 /// own comes back as `None`, and that is where our own verbs will go (S23 M2). The marked address spans
 /// (TRX64 Spec 804) stay on the library's side of this call and are stripped here, so a later caller that wants
 /// them can ask for them instead (S23 §7).
-pub fn exec(m: &mut Machine, session: &mut MonitorSession, line: &str) -> Result<String, String> {
-    let mut host = Host::new(m).ok_or("the monitor needs a C64: start with --c64 trx64")?;
+pub fn exec(
+    m: &mut Machine,
+    session: &mut MonitorSession,
+    state: &mut State,
+    line: &str,
+) -> Result<String, String> {
+    let mut host = Host::new(m, state).ok_or("the monitor needs a C64: start with --c64 trx64")?;
     let verb = line.split_whitespace().next().unwrap_or("").to_owned();
     let answer = match verbs::try_exec(session, &mut host, line) {
         // `help` is the port audit's list on both sides, so ours goes after theirs.
@@ -290,7 +262,10 @@ mod tests {
     fn the_librarys_verbs_run_against_our_host() {
         let mut m = machine();
         let mut s = MonitorSession::new();
-        let run = |m: &mut Machine, s: &mut MonitorSession, line: &str| exec(m, s, line).expect(line);
+        let mut st = State::default();
+        let run = |m: &mut Machine, s: &mut MonitorSession, line: &str| {
+            exec(m, s, &mut State::default(), line).expect(line)
+        };
 
         let r = run(&mut m, &mut s, "r");
         assert!(r.contains("ADDR"), "the register panel: {r}");
@@ -300,7 +275,7 @@ mod tests {
         assert!(!run(&mut m, &mut s, "d 0400 0400").is_empty(), "a disassembly line");
         assert!(run(&mut m, &mut s, "help").contains("monitor"), "the help text the port audit walks");
 
-        let err = exec(&mut m, &mut s, "nonsense").unwrap_err();
+        let err = exec(&mut m, &mut s, &mut st, "nonsense").unwrap_err();
         assert_eq!(err, "unknown monitor command 'nonsense'", "our dispatch takes what the library declines");
     }
 
@@ -310,7 +285,8 @@ mod tests {
         let mut m = machine();
         m.cpu.x[10] = 0x1234_5678;
         m.bus.ram[0x100] = 0x42;
-        let mut host = Host::new(&mut m).expect("a host");
+        let mut st = State::default();
+        let mut host = Host::new(&mut m, &mut st).expect("a host");
 
         assert_eq!(host.devices().len(), 3, "c64, drive8, fw");
         assert!(host.cpu(Device::C64).is_none(), "the 6502s are the machine's own");
@@ -338,16 +314,17 @@ mod tests {
         let mut m = machine();
         m.cpu.x[2] = 0x8000_1000;
         let mut s = MonitorSession::new();
+        let mut st = State::default();
 
-        let fw = exec(&mut m, &mut s, "fw").expect("fw");
+        let fw = exec(&mut m, &mut s, &mut st, "fw").expect("fw");
         assert!(fw.contains("sp   80001000"), "the firmware's registers: {fw}");
-        assert!(exec(&mut m, &mut s, "fw tasks").is_ok(), "the task list walks an unbooted kernel too");
-        assert_eq!(exec(&mut m, &mut s, "fw nonsense").unwrap_err(), "fw: usage: fw [tasks]");
+        assert!(exec(&mut m, &mut s, &mut st, "fw tasks").is_ok(), "the task list walks an unbooted kernel too");
+        assert_eq!(exec(&mut m, &mut s, &mut st, "fw nonsense").unwrap_err(), "fw: usage: fw [tasks]");
 
-        let clock = exec(&mut m, &mut s, "clock").expect("clock");
+        let clock = exec(&mut m, &mut s, &mut st, "clock").expect("clock");
         assert!(clock.contains("emulator") && clock.contains("firmware") && clock.contains("c64"), "{clock}");
 
-        let help = exec(&mut m, &mut s, "help").expect("help");
+        let help = exec(&mut m, &mut s, &mut st, "help").expect("help");
         assert!(help.contains("the Ultimate side (S23)") && help.contains("clock"), "both lists: {help}");
     }
 
@@ -358,14 +335,33 @@ mod tests {
 
         let mut m = machine();
         let mut s = MonitorSession::new();
+        let mut st = State::default();
         // A machine built from parts has no firmware image, so no settings tables: the answer says so.
-        let out = exec(&mut m, &mut s, "config").expect("config");
+        let out = exec(&mut m, &mut s, &mut st, "config").expect("config");
         assert_eq!(out, "this firmware has no settings tables\n");
-        assert!(exec(&mut m, &mut s, "config flash").expect("config flash").contains("config pages in use"));
+        assert!(exec(&mut m, &mut s, &mut st, "config flash").expect("config flash").contains("config pages in use"));
+    }
+
+    /// S23 §6: what `config set` and `config write` refuse, and why — the rule is `set` before `write`.
+    #[test]
+    fn config_set_and_write_say_what_they_will_not_do() {
+        let mut m = machine();
+        let mut s = MonitorSession::new();
+        let mut st = State::default();
+        let line = |m: &mut Machine, st: &mut State, l: &str| exec(m, &mut MonitorSession::new(), st, l).unwrap_err();
+
+        assert!(exec(&mut m, &mut s, &mut st, "config set a b").unwrap_err().contains("usage"));
         assert_eq!(
-            exec(&mut m, &mut s, "config set a b c").unwrap_err(),
-            "config set: not in this build yet (S23 §6)"
+            line(&mut m, &mut st, "config set a b c"),
+            "config set: [a] is not a store UE2 can set (S21 §3); \"b\" skipped",
+            "the value is checked against the firmware's own definition before the firmware sees it"
         );
+        assert!(
+            line(&mut m, &mut st, "config write").starts_with("config write: nothing was set in this session"),
+            "a page the firmware does not know about is overwritten from its own copy"
+        );
+        // A path on any medium is the firmware's to write; this machine has no settings to put there.
+        assert!(line(&mut m, &mut st, "config write /Usb0/mine.cfg").contains("no settings tables"));
     }
 
     /// The firmware registers the block sits behind (command_if_pkg.vhd:7-25), as `CommandInterface`'s constructor
@@ -381,17 +377,18 @@ mod tests {
     fn config_read_goes_through_the_command_interface() {
         let mut m = machine();
         let mut s = MonitorSession::new();
+        let mut st = State::default();
 
         // A firmware that never enabled the block: the answer says which setting turns it on.
-        let err = exec(&mut m, &mut s, "config read /flash/x.cfg").unwrap_err();
+        let err = exec(&mut m, &mut s, &mut st, "config read /flash/x.cfg").unwrap_err();
         assert!(err.starts_with("the firmware's command interface is off"), "{err}");
-        assert!(exec(&mut m, &mut s, "config read").unwrap_err().contains("usage"));
-        assert!(exec(&mut m, &mut s, "config read a b").unwrap_err().contains("usage"));
+        assert!(exec(&mut m, &mut s, &mut st, "config read").unwrap_err().contains("usage"));
+        assert!(exec(&mut m, &mut s, &mut st, "config read a b").unwrap_err().contains("usage"));
 
         // With the block on, the command is pushed and the firmware is run for the answer. This machine has no
         // firmware image, so the run faults at once — which is the answer, not a hang.
         enable_uci(&mut m);
-        let err = exec(&mut m, &mut s, "config read /flash/x.cfg").unwrap_err();
+        let err = exec(&mut m, &mut s, &mut st, "config read /flash/x.cfg").unwrap_err();
         assert!(err.starts_with("the firmware stopped with a command in flight"), "{err}");
 
         let wanted = b"\x04\x50/flash/x.cfg\0";
@@ -407,7 +404,8 @@ mod tests {
     #[test]
     fn run_control_is_refused_in_one_sentence() {
         let mut m = machine();
-        let mut host = Host::new(&mut m).expect("a host");
+        let mut st = State::default();
+        let mut host = Host::new(&mut m, &mut st).expect("a host");
         let err = host.resume(trx64_monitor::RunUntil::Forever).unwrap_err();
         assert!(err.contains("not available in this host"), "{err}");
         assert!(host.step(1, false).is_err());

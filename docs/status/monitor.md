@@ -18,22 +18,40 @@ its second host. Design and the division of labour: `docs/specs/S23-monitor.md`.
 
 **M2 has started.** The library sees every line first and returns `None` for what it does not own; our dispatch
 takes it from there and appends its own section to `help`. TRX64 gains no notion of this emulator — the dependency
-stays one-way. Done: `fw` (the RISC-V registers, `fw tasks` for the FreeRTOS list), `clock` (the
-emulator's clock, the firmware's instructions, the C64's cycle) and `config`'s reading half — the settings as the
-flash holds them, decoded through each item's own type and marked `flash` or `default`, plus `config flash` for the
-raw pages. `config set` and `config write` refuse with their spec reference for now. Still to come: `itu`, `cart`,
-`flash`, `sd`, `usb`, `net`, `audio`.
+stays one-way. Done: `fw` (the RISC-V registers, `fw tasks` for the FreeRTOS list), `clock` (the emulator's clock,
+the firmware's instructions, the C64's cycle) and all of `config`. Still to come: `itu`, `cart`, `flash`, `sd`,
+`usb`, `net`, `audio`.
 
-**`config read <path>` reaches the running firmware.** A verb that has to change something cannot go at the flash
-behind the firmware's back — the firmware holds its own copy of every store and would write it back over ours. So
-`config read` knocks where the cartridge software knocks: `crates/ue2emu/src/monitor/uci.rs` pushes a command into
-the UCI block (S15) as a host access, runs the firmware until the block has the reply, and reads the reply data and
-the status string back out. `CTRL_CMD_LOAD_CONFIG` (0x50, `ControlTarget::load_config`) then opens that `.cfg` in
-the *emulated* machine, applies the items it knows and effectuates every store they touched. What the firmware
-answers is what the monitor prints: `00,OK`, or the firmware's own error code as a failed line. The block is
-refused while the C64 has a command in flight, and a firmware that never enabled the command interface is named
-together with the setting that turns it on. A firmware without the command — it was added to the fork in `Add UCI
-control command to load config file` — answers `UNKNOWN COMMAND`, which reaches the caller unchanged.
+**`config` is the whole cycle** (`crates/ue2emu/src/monitor/config.rs`), and it works the way the menu works:
+
+| Line | What happens |
+|---|---|
+| `config [cat [item]]` | The settings as the flash holds them, decoded through each item's own definition and marked `flash` or `default` (S21). |
+| `config flash` | The raw page decode: which pages a store claimed, and how many records each holds. |
+| `config set <cat> <item> <value>` | Checked against the item's definition here, then handed to the running firmware as a two-line `.cfg`, which applies and effectuates it. |
+| `config write` | The items `set` changed in this session, into the config pages — where the next boot finds them. |
+| `config write <path>` | Every item of every store as a `.cfg`, at a path inside the machine: `/temp`, `/flash`, `/Usb0`, the SD card. |
+| `config read <path>` | That `.cfg` handed to the firmware, which applies and effectuates it. |
+
+Reading is ours alone; changing is not. The firmware holds its own copy of every store and writes that copy back
+over anything we put in a page, so `config set` comes before `config write` and `config write` says so when nothing
+was set.
+
+**Why the firmware writes the files.** `crates/ue2emu/src/monitor/uci.rs` pushes a command into the UCI block (S15)
+as a host access — not a C64 bus cycle, so the unlock detector and the `$FF00` trigger stay untouched — runs the
+firmware until the block has the reply, and reads the reply data and the status string back out. Every `.cfg` the
+monitor puts inside the machine goes through the firmware's own DOS target on that transport
+(`OPEN_FILE`/`WRITE_DATA`/`CLOSE_FILE`), because FatFs keeps one sector of each mounted volume in a window it will
+not read again while it holds it: a directory entry we added behind its back can simply go unseen, and that is
+exactly what happened when this was tried with our own FAT writer. Writing through the firmware also means every
+medium works with no writer of ours per medium. One rule came out of it: a write command carries less than one
+512-byte sector, because FatFs hands a full sector straight to the block device and the USB controller fetches
+that data by physical address — which cannot reach the command interface's register RAM.
+
+The block is refused while the C64 has a command in flight, a firmware that never enabled the command interface is
+named together with the setting that turns it on, and the firmware's own status string is what the monitor prints,
+so a build without `CTRL_CMD_LOAD_CONFIG` (it was added to the firmware fork in `Add UCI control command to load
+config file`) says `UNKNOWN COMMAND` instead of pretending.
 
 **Not yet:** run control — `g`, `step`, breakpoints (M3). Until then the library's own sentence answers: "run
 control is not available in this host".
@@ -42,7 +60,7 @@ control is not available in this host".
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | green (6 in `ue2emu::monitor`, 83 in ue2emu) |
+| `cargo test --workspace` | green (9 in `ue2emu::monitor`, 86 in ue2emu) |
 | `cargo clippy` on the changed crates | no new warnings |
 | Booted 3.15, `monitor r` over the control port | the register panel with the flow line, `.;e5cd 00 00 0a f3 nv-bdiZc  MAIN`, the port and vector lines |
 | `monitor m 0400 0407` | `>C:0400  20 20 …`, screen RAM |
@@ -56,6 +74,11 @@ control is not available in this host".
 | `monitor config "C64 and Cartridge Settings" "REU Size"` | `REU Size=16 MB   (flash)`, the value `--settings` wrote; an item nobody stored reads its firmware default |
 | `monitor config read /Usb0/change.cfg` on a booted fork build | `  /Usb0/change.cfg  00,OK`, and the firmware console shows `Effectuating settings of store 'C64 and Cartridge Settings' after loading.` |
 | `monitor config read` on a file that is not there | the line fails with the firmware's own `88,CANNOT OPEN CONFIG FILE` |
+| `monitor config set "C64 and Cartridge Settings" "REU Size" "2 MB"` | `[C64 and Cartridge Settings] REU Size=2 MB`, the firmware effectuates the store, and a bad value is refused here with the item's own choices |
+| `monitor config write` after it | the item in the config pages; `monitor config … "REU Size"` then reads `2 MB   (flash)` |
+| `monitor config write /temp/all.cfg` and `/Usb0/settings.cfg` | 179 items in ~4.9 KB, written by the firmware; the stick's copy reaches the host directory through the `--usb-dir` sync |
+| `monitor config read` on that dump | `00,OK` with an empty parse log: the firmware accepts its own spelling back |
+| `scripts/smoke-monitor.ctl` in `smoke-all.sh` | 8/8 (S23 §9.5); the script also greps the log for `REU Size=2 MB   (flash)` |
 | TRX64 repin 0.7.3 → 0.8.2 | no code change needed; `smoke-all.sh` 7/7, `smoke-c64-carts.ctl` 27/27 with the freeze and both SID loads, UltimateDemo2026 detection all `[ OK ]` |
 
 ### Open
