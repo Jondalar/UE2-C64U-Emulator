@@ -26,6 +26,10 @@ pub const REG_CHAR_WIDTH: usize = 0x2;
 pub const REG_CHAR_HEIGHT: usize = 0x3;
 pub const REG_CHARS_PER_LINE: usize = 0x4;
 pub const REG_ACTIVE_LINES: usize = 0x5;
+pub const REG_X_ON_HI: usize = 0x6;
+pub const REG_X_ON_LO: usize = 0x7;
+pub const REG_Y_ON_HI: usize = 0x8;
+pub const REG_Y_ON_LO: usize = 0x9;
 pub const REG_POINTER_HI: usize = 0xA;
 pub const REG_POINTER_LO: usize = 0xB;
 pub const REG_TRANSPARENCY: usize = 0xD;
@@ -87,6 +91,7 @@ impl Overlay {
             screen: self.screen.clone(),
             color: self.color.clone(),
             palette: self.palette.clone(),
+            hdmi: self.hdmi,
             now_ms,
             c64: None,
         }

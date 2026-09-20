@@ -157,7 +157,13 @@ Cell geometry written by `DetermineOverlaySettings` (u64_config.cc:2974-3007), a
 | 4 1024×768 | 674,325 | 8 | 0x90 | 8×16 | 320×400 |
 | 5 1280×1024 | 745,330 | 12 | 0x5E | 12×23 | 480×575 |
 
-X_ON/Y_ON units and origin are in the closed top level (OQ 4). The emulator can centre the grid over its C64 frame and ignore them.
+X_ON/Y_ON count in output pixels from the sync pulse: the chargen's counters restart on the rising edge of h_sync
+and v_sync (`char_generator_timing.vhd:108-113`), so the active area starts `sync + back porch` in. With the timing
+of `SetVideoMode`/`SetVideoMode1080p` (hdmi_scan.cc:34-35, :62-67) every mode above puts the 40×25 window right of
+centre and below the middle — SD PAL 386-(64+68) = 254 of 720 across, 307-(5+39) = 263 of 576 down; 1080p
+1438-(44+148) = 1246 of 1920 across. A photo of a U64 with a game running and the menu open (2026-09-20) shows
+exactly that: a window in the lower right, the game visible through it. The emulator renders the output mode as
+its canvas and places the window there (OQ 4 answered).
 
 Fonts (not in the firmware ELF; they are FPGA ROMs):
 - 8×8, 128 glyphs: `roms/chars.bin` bytes 0..1023. Verified byte-identical to `char_generator_rom_pkg.vhd` bytes 0..1023. The two files differ only at 1176-1182, which the 11-bit address `'0' & code(6:0) & row(2:0)` never reaches (slave12.vhd:188-190). Bit 7 = leftmost pixel. The same `chars.bin` is linked into the app as `_chars_bin_start`, used only by the C64 Freeze host (c64.cc:123,143; Makefile:238).
@@ -168,7 +174,7 @@ Glyph codes written: ASCII 0x20-0x7E, plus line graphics 0x01-0x13 (`CHR_*`, scr
 Colours: `default_colors[16][3]` (u64_config.cc:54-70): 0 000000, 1 F7F7F7, 2 8D2F34, 3 6AD4CD, 4 9835A4, 5 4CB442, 6 2C29B1, 7 EFEF5D, 8 984E20, 9 5B3800, A D1676D, B 4A4A4A, C 7B7B7B, D 9FEF93, E 6D6AEF, F B2B2B2. Always use the last 16×3 written to 0x10145000 (.VPL palettes are loaded via `load_palette_vpl`, u64_config.cc:1113-1118).
 
 Colour schemes `schemes[]` {border,bg,fg,sel,sel_bg,sel_rev,status,inactive,config} (userinterface.cc:203-208). CFG_USERIF_COLORSCHEME default **1** (userinterface.cc:126):
-0 "Standard Blue" {14,6,14,1,6,0,12,12,7}; 1 "Ultimate Black" {0,0,12,1,6,0,6,6,7}; 2 "C128" {13,11,15,13,0,0,15,12,7}; 3 Telnet {0,0,15,13,0,0,15,12,7}. `Overlay` does not override `set_colors`, so border/bg are not hardware (host.h:24). Cell bg is 0 by default (`Window` ctor screen.cc:374, `clear` screen.cc:353). With TRANSPARENCY=0xC0 all bg-0 pixels are transparent (OQ 3).
+0 "Standard Blue" {14,6,14,1,6,0,12,12,7}; 1 "Ultimate Black" {0,0,12,1,6,0,6,6,7}; 2 "C128" {13,11,15,13,0,0,15,12,7}; 3 Telnet {0,0,15,13,0,0,15,12,7}. `Overlay` does not override `set_colors`, so border/bg are not hardware (host.h:24). Cell bg is 0 by default (`Window` ctor screen.cc:374, `clear` screen.cc:353). With TRANSPARENCY=0xC0 all bg-0 pixels are transparent (OQ 3, answered: the photo above shows the game through the menu).
 
 Escape protocol inside the byte stream (not stored): `ESC R` reverse on, `ESC r` reverse off, `ESC B` → bg 2 (bug noted in source), `ESC x` → fg = x&15 (screen.cc:227-248).
 
@@ -240,8 +246,13 @@ Timing (keyboard_c64.cc:105-111, 286-309): the first scan that sees a key queues
 
 1. U64-II top level is closed. The firmware's addrbits=12 (ultimate.cc:125) and 12-px fonts match `char_generator_peripheral_12` with g_screen_size=12 and g_color_ram=true, but the instance and generics cannot be confirmed.
 2. Does the overlay's 4-bit pixel index go through U64II_HDMI_PALETTE (0x10145000), or through another/fixed table?
-3. Does the HDMI mixer honour `pixel_opaque`? With TRANSPARENCY=0xC0 and default scheme 1 (bg 0), open VHDL makes all background pixels transparent over the C64 picture. Not confirmable on U64-II.
-4. X_ON/Y_ON coordinate system. For 720p/1080p, x_on ≈ 2 × centred start pixel (958≈2·480, 1438≈2·720). y_on centres exactly for 720p (160) and 1080p (240, assuming 24-line cells). SD/PC values do not fit either scheme.
+3. **Answered (2026-09-20).** The HDMI mixer honours `pixel_opaque`: a photo of a U64 running Wasteland with the
+   menu open shows the game through the menu's background, only the selected row opaque. The renderer's
+   transparency is right; issue #3 was a roms directory whose `chars.bin` was the C64 character ROM.
+4. **Answered (2026-09-20).** X_ON/Y_ON are output pixels counted from the sync pulse; the active area starts
+   `sync + back porch` in (`char_generator_timing.vhd:108-113` with the mode tables of hdmi_scan.cc). The renderer
+   composes at the output size and places the window there. Open only: how exactly the scaler maps the VIC picture
+   into the active area (we stretch it; the hardware has `hscaler`/`vscaler` and the VIC cropper).
 5. CHAR_HEIGHT 0x5E → h=30 with big_font → 23 visible scanlines per cell in open VHDL (sub-row 7.2 never shown), while the macro is named `_24` and y_on=240 fits 600 lines. Is the U64-II RTL different?
 6. Semantics of 0x1010040A/0B/06 come from firmware usage only. Open points: does ROW also reflect keys injected via MATRIX_KEYB or the Blingboard? Does `own_keyboard` detach the C64 CIA from the matrix? Is read 0x10100406 (port-2 lines) really a separate function from write (swap bit)?
 7. Can the FPGA raise ITU_BUTTON1 from USB F11 (MATRIX_KEYB[10] "freeze"), a C64-keyboard combo or the case switch? No firmware path exists. Help text mentions only reset by holding the switch up (userinterface.cc:106-110).

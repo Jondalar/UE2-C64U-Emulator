@@ -36,6 +36,25 @@
     trailing spaces trimmed. Used by headless tests to read menus.
 - Add fields to `DisplaySnapshot` if the renderer needs them (e.g. timing regs); report additions.
 
+### The output mode (issue #3, 2026-09-20)
+
+`DisplaySnapshot` carries the HDMI timing registers, and the renderer composes what the device puts out rather
+than a picture of its own:
+
+- Canvas = the active area the firmware programmed (`VID_HACTIVE`/`VID_VACTIVE` with the low bits from
+  `VID_HREPETITION`, hdmi_scan.cc:6-27).
+- The C64 frame is stretched over it, as the device's scaler does.
+- The overlay is a 40×25 window drawn 1:1 at `X_ON - (hsync + hbackporch)`, `Y_ON - (vsync + vbackporch)` and
+  clipped at the edges — right of centre and below the middle in every mode (docs/hw/05, the table of
+  `DetermineOverlaySettings`). It is never a full screen.
+- Transparent cells show the C64 through, which is what the hardware does (docs/hw/05 OQ 3, answered by a photo).
+- Until the firmware programs the timing, and without a C64, the old behaviour stands: canvas covers frame and
+  grid, both centred.
+
+`render::looks_like_c64_char_rom` recognises a roms directory whose `chars.bin` is the 4 KB C64 character ROM
+instead of the firmware's 2 KB overlay font ('A' at glyph 1 rather than 0x41); `ue2emu` warns instead of drawing a
+menu in graphics symbols.
+
 ## Tests
 
 - Screen/colour RAM read-back; palette write/read.
@@ -44,6 +63,9 @@
 - Renderer: a synthetic snapshot with a known char and colour produces the expected pixels at the expected
   cell.
 - `text_dump` of a synthetic "HELLO" row.
+- With PAL SD timing and X_ON 386 / Y_ON 307 the window starts at (254, 263) of a 720×576 canvas, a transparent
+  cell shows the C64, and a window placed past the right edge is clipped.
+- The firmware's `chars.bin` is not taken for a C64 character ROM, and `characters.901225-01.bin` is.
 
 ## Acceptance
 

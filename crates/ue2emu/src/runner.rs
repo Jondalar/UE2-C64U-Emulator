@@ -21,6 +21,18 @@ use crate::gdb::{self, GdbServer};
 use crate::net::{self, NetOptions};
 use crate::usbdir::{UsbDirs, UsbDone, UsbRequest, EXPLICIT_WAIT_MS};
 
+/// Issue #3: a roms directory whose `chars.bin` is the C64 character ROM draws the whole overlay menu in graphics
+/// symbols. Say so once, with the file, instead of leaving the user with a garbled menu.
+pub fn warn_on_c64_char_rom(font: &[u8], path: &std::path::Path) {
+    if ue2_core::render::looks_like_c64_char_rom(font) {
+        eprintln!(
+            "overlay: {} is a C64 character ROM, not the firmware's overlay font; the menu will be unreadable. \
+             Point --roms at the 1541ultimate roms directory (its chars.bin is 2 KB).",
+            path.display()
+        );
+    }
+}
+
 /// Instructions per `Machine::run` slice (4 ms emulated at the default 4 clocks per instruction).
 const SLICE_INSNS: u64 = 100_000;
 /// Emulated interval between published display snapshots.

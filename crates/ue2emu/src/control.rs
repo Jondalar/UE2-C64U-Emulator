@@ -637,6 +637,7 @@ impl Target for HandleTarget {
             None => {
                 let path = self.ctl.rom_dir.join("chars.bin");
                 let font = fs::read(&path).with_context(|| format!("png: read font {}", path.display()))?;
+                crate::runner::warn_on_c64_char_rom(&font, &path);
                 Renderer::new(&font)
             }
         };

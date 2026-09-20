@@ -46,6 +46,7 @@ pub fn run_window(cfg: MachineConfig, opts: RunOptions) -> Result<()> {
     let font_path = cfg.rom_dir.join("chars.bin");
     let font =
         std::fs::read(&font_path).with_context(|| format!("window: read font {}", font_path.display()))?;
+    crate::runner::warn_on_c64_char_rom(&font, &font_path);
     let deadline = opts
         .max_seconds
         .map(|s| Duration::try_from_secs_f64(s).with_context(|| format!("--max-seconds {s}")))

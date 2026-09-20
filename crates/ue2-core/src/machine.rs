@@ -656,6 +656,7 @@ impl Machine {
                 screen: vec![0; 4096],
                 color: vec![0; 4096],
                 palette: vec![0; 64],
+                hdmi: [0; 0x1E],
                 now_ms,
                 c64: None,
             },

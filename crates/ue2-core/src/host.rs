@@ -32,6 +32,9 @@ pub struct DisplaySnapshot {
     pub color: Vec<u8>,
     /// HDMI palette 0x10145000 (16 × 4 bytes).
     pub palette: Vec<u8>,
+    /// HDMI timing registers 0x10144000 (`t_video_timing_regs`, u64.h:172-203): the output mode the firmware
+    /// programmed, which is what the overlay's X_ON/Y_ON count in.
+    pub hdmi: [u8; 0x1E],
     /// Emulated time of the snapshot.
     pub now_ms: u64,
     /// C64 frame under the overlay; None without an attached C64 (docs/specs/S14-c64-trx64.md §9).

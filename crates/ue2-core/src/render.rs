@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use crate::c64host::{C64Charset, C64Frame};
 use crate::devices::overlay::{
     REG_ACTIVE_LINES, REG_CHARS_PER_LINE, REG_CHAR_HEIGHT, REG_CHAR_WIDTH, REG_POINTER_HI, REG_POINTER_LO,
-    REG_TRANSPARENCY, TEXT_RAM_SIZE,
+    REG_TRANSPARENCY, REG_X_ON_HI, REG_X_ON_LO, REG_Y_ON_HI, REG_Y_ON_LO, TEXT_RAM_SIZE,
 };
 use crate::host::DisplaySnapshot;
 
@@ -23,6 +23,30 @@ const DEFAULT_SIZE: (usize, usize) = (320, 225);
 /// Both fonts: 128 glyphs of 8 rows, addressed by the 7-bit screen code (slave12.vhd:188-191).
 const FONT_ROWS: usize = 128 * 8;
 
+/// The video mode the firmware programmed into the HDMI timing registers (`t_video_timing_regs`, u64.h:172-203;
+/// `SetScanModeRegisters`, hdmi_scan.cc:6-27, which stores the low bits of the horizontal values in
+/// VID_HREPETITION). This is the picture the device puts out: the C64 frame scaled into it, with the overlay
+/// window on top where X_ON/Y_ON put it. The chargen's counters restart on the sync pulse
+/// (char_generator_timing.vhd:108-113), so the active area begins `sync + back porch` in.
+struct Output {
+    width: usize,
+    height: usize,
+    /// Counter value where the active area starts.
+    x0: usize,
+    y0: usize,
+}
+
+impl Output {
+    fn new(hdmi: &[u8; 0x1E]) -> Option<Output> {
+        let (v, rep) = (|i: usize| hdmi[i] as usize, hdmi[5] as usize);
+        let width = (v(3) << 3) | ((rep >> 1) & 6);
+        let height = v(11) << 3;
+        let x0 = ((v(1) << 1) | ((rep >> 1) & 1)) + ((v(2) << 2) | ((rep >> 4) & 3));
+        let y0 = v(9) + v(10);
+        (width != 0 && height != 0).then_some(Output { width, height, x0, y0 })
+    }
+}
+
 /// Chargen register latches decoded as in 05 §B (char_generator_regs.vhd:43-75).
 struct Geometry {
     cols: usize,
@@ -32,6 +56,9 @@ struct Geometry {
     big: bool,
     stretch: bool,
     pointer: usize,
+    /// X_ON/Y_ON: where the window starts, in the chargen's own counters (chargen.h:19-22).
+    x_on: usize,
+    y_on: usize,
     transparent: u8,
     visible: bool,
 }
@@ -48,6 +75,8 @@ impl Geometry {
             big: height & 0x40 != 0,
             stretch: height & 0x80 != 0,
             pointer: (((regs[REG_POINTER_HI] & 0x7F) as usize) << 8) | regs[REG_POINTER_LO] as usize,
+            x_on: ((regs[REG_X_ON_HI] as usize) << 8) | regs[REG_X_ON_LO] as usize,
+            y_on: ((regs[REG_Y_ON_HI] as usize) << 8) | regs[REG_Y_ON_LO] as usize,
             transparent: transparency & 0x0F,
             visible: transparency & 0x80 != 0,
         }
@@ -92,36 +121,52 @@ impl Renderer {
     /// registers (any of those 0) give `DEFAULT_SIZE`. Hidden (TRANSPARENCY bit 7 = 0) and transparent
     /// pixels are `BACKDROP`.
     ///
-    /// With a C64 frame (`snap.c64`, docs/specs/S14-c64-trx64.md §9) the image covers both the frame and the text
-    /// grid, both centred, and hidden or transparent overlay pixels show the C64 (05 §B, OQ3/OQ4). Canvas pixels
-    /// outside the frame are `BACKDROP`.
+    /// Once the firmware has programmed the HDMI timing ([`Output`]) the image is that output: the C64 frame
+    /// (`snap.c64`, docs/specs/S14-c64-trx64.md §9) scaled into the active area, and the overlay window 1:1 where
+    /// X_ON/Y_ON put it — a 40×25 window right of centre, not a full screen (u64_config.cc:2979-3002). Hidden and
+    /// transparent overlay pixels show the C64 through, as the chargen's `pixel_opaque` does (05 §B, OQ 3).
+    ///
+    /// Before that, and without a C64, the canvas covers frame and grid, both centred, as it always did.
     pub fn render(&mut self, snap: &DisplaySnapshot, out: &mut Vec<u32>) -> (usize, usize) {
         let geo = Geometry::new(&snap.regs);
         let lines = geo.lines();
         let (w, h) = (geo.cols * geo.char_width, geo.rows * lines.len());
         let (gw, gh) = if w == 0 || h == 0 { DEFAULT_SIZE } else { (w, h) };
-        let (cw, ch) = snap.c64.as_ref().map_or((gw, gh), |f| (f.width.max(gw), f.height.max(gh)));
+        let output = Output::new(&snap.hdmi);
+        let (cw, ch) = match &output {
+            Some(o) => (o.width, o.height),
+            None => snap.c64.as_ref().map_or((gw, gh), |f| (f.width.max(gw), f.height.max(gh))),
+        };
         out.clear();
         out.resize(cw * ch, BACKDROP);
         if let Some(frame) = &snap.c64 {
-            draw_c64(frame, out, cw, ch);
+            match &output {
+                Some(_) => draw_c64_scaled(frame, out, cw, ch),
+                None => draw_c64(frame, out, cw, ch),
+            }
         }
         if w != 0 && h != 0 && geo.visible {
-            self.draw_text(snap, &geo, &lines, out, cw, ((cw - w) / 2, (ch - h) / 2));
+            let origin = match &output {
+                Some(o) => (geo.x_on.saturating_sub(o.x0), geo.y_on.saturating_sub(o.y0)),
+                None => ((cw - w) / 2, (ch - h) / 2),
+            };
+            self.draw_text(snap, &geo, &lines, out, (cw, ch), origin);
         }
         (cw, ch)
     }
 
-    /// Draw the opaque pixels of the text grid with its top-left corner at `origin` of a `canvas_w` wide image.
+    /// Draw the opaque pixels of the text grid with its top-left corner at `origin`, clipped to the canvas: a
+    /// window placed near the right edge can reach past it (u64_config.cc:2993, 1080p X_ON 1438 + 480).
     fn draw_text(
         &self,
         snap: &DisplaySnapshot,
         geo: &Geometry,
         lines: &[usize],
         out: &mut [u32],
-        canvas_w: usize,
+        canvas: (usize, usize),
         origin: (usize, usize),
     ) {
+        let (canvas_w, canvas_h) = canvas;
         let palette: [u32; 16] = std::array::from_fn(|i| {
             let c = |k: usize| snap.palette.get(i * 4 + k).copied().unwrap_or(0) as u32;
             (c(0) << 16) | (c(1) << 8) | c(2)
@@ -134,8 +179,13 @@ impl Renderer {
                 let reverse = code & 0x80 != 0;
                 for (ly, &y) in lines.iter().enumerate() {
                     let bits = self.glyph_row(geo, (code & 0x7F) as usize, y);
-                    let start = (origin.1 + row * lines.len() + ly) * canvas_w + origin.0 + col * geo.char_width;
-                    for (x, px) in out[start..start + geo.char_width].iter_mut().enumerate() {
+                    let (px_y, px_x) = (origin.1 + row * lines.len() + ly, origin.0 + col * geo.char_width);
+                    if px_y >= canvas_h || px_x >= canvas_w {
+                        continue;
+                    }
+                    let width = geo.char_width.min(canvas_w - px_x);
+                    let start = px_y * canvas_w + px_x;
+                    for (x, px) in out[start..start + width].iter_mut().enumerate() {
                         // slave12.vhd:159-173: foreground where the glyph bit differs from reverse.
                         let fg = ((bits >> (geo.char_width - 1 - x)) & 1 != 0) != reverse;
                         let idx = if fg { attr & 0x0F } else { attr >> 4 };
@@ -169,6 +219,22 @@ impl Renderer {
     }
 }
 
+/// Palettize `frame` stretched over the whole canvas, as the device's scaler puts the VIC picture on the output
+/// (nearest neighbour; the hardware filters).
+fn draw_c64_scaled(frame: &C64Frame, out: &mut [u32], canvas_w: usize, canvas_h: usize) {
+    if frame.width == 0 || frame.height == 0 {
+        return;
+    }
+    for y in 0..canvas_h {
+        let src = (y * frame.height / canvas_h) * frame.width;
+        let dst = &mut out[y * canvas_w..][..canvas_w];
+        for (x, px) in dst.iter_mut().enumerate() {
+            let idx = frame.indices[src + x * frame.width / canvas_w];
+            *px = frame.palette[usize::from(idx & 0x0F)];
+        }
+    }
+}
+
 /// Palettize `frame` centred into the `canvas_w` × `canvas_h` image (canvas at least the frame size).
 fn draw_c64(frame: &C64Frame, out: &mut [u32], canvas_w: usize, canvas_h: usize) {
     if frame.width == 0 {
@@ -181,6 +247,16 @@ fn draw_c64(frame: &C64Frame, out: &mut [u32], canvas_w: usize, canvas_h: usize)
             *px = frame.palette[usize::from(idx & 0x0F)];
         }
     }
+}
+
+/// Whether `font` is a C64 character ROM rather than the firmware's overlay font (issue #3). The overlay font
+/// (`roms/chars.bin`, 2 KB) has its glyphs at their ASCII codes, so 'A' is glyph 0x41; the C64 ROM (4 KB) puts 'A'
+/// at screen code 1 and a graphics symbol at 0x41. A roms directory built from C64 ROMs therefore draws the whole
+/// menu in graphics symbols, which is worth saying rather than drawing.
+pub fn looks_like_c64_char_rom(font: &[u8]) -> bool {
+    /// 'A' in both fonts, at different places (chars.bin 0x41, character ROM 0x01).
+    const A: [u8; 8] = [0x18, 0x3C, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00];
+    font.len() >= 0x41 * 8 + 8 && font[8..16] == A && font[0x41 * 8..0x41 * 8 + 8] != A
 }
 
 /// Parse `fpga/ip/video/vhdl_gen/font_pkg.vhd` into `Renderer::big_font`: the 1024 36-bit `X"…"`
@@ -284,7 +360,7 @@ mod tests {
         for (i, rgb) in PAL.iter().enumerate() {
             palette[i * 4..i * 4 + 3].copy_from_slice(&rgb.to_be_bytes()[1..]);
         }
-        DisplaySnapshot { regs, screen: vec![0x20; 4096], color: vec![0; 4096], palette, now_ms: 0, c64: None }
+        DisplaySnapshot { regs, screen: vec![0x20; 4096], color: vec![0; 4096], palette, hdmi: [0; 0x1E], now_ms: 0, c64: None }
     }
 
     /// A `w` × `h` C64 frame of colour index 3 = `C64_BLUE`.
@@ -318,6 +394,42 @@ mod tests {
         assert_eq!(r.render(&s, &mut out), (16, 9), "canvas covers the grid");
         let px = |x: usize, y: usize| out[y * 16 + x];
         assert_eq!((px(5, 3), px(6, 3), px(9, 4), px(10, 4)), (BACKDROP, C64_BLUE, C64_BLUE, BACKDROP), "frame centred");
+    }
+
+    /// PAL SD as the firmware programs it: `SetVideoMode` (hdmi_scan.cc:34) 720×576 with hsync 64, back porch 68,
+    /// vsync 5, back porch 39, and the overlay at X_ON 386 / Y_ON 307 (u64_config.cc:2982).
+    fn pal_sd(regs: &mut [u8; 16], hdmi: &mut [u8; 0x1E]) {
+        hdmi[1] = 64 / 2;
+        hdmi[2] = 68 / 4;
+        hdmi[3] = (720 / 8) as u8;
+        hdmi[9] = 5;
+        hdmi[10] = 39;
+        hdmi[11] = (576 / 8) as u8;
+        (regs[REG_X_ON_HI], regs[REG_X_ON_LO]) = ((386u16 >> 8) as u8, 386u16 as u8);
+        (regs[REG_Y_ON_HI], regs[REG_Y_ON_LO]) = ((307u16 >> 8) as u8, 307u16 as u8);
+    }
+
+    /// With the HDMI timing programmed the canvas is the output, the C64 fills it, and the overlay window sits
+    /// where X_ON/Y_ON put it: 386 - (64 + 68) = 254 across, 307 - (5 + 39) = 263 down.
+    #[test]
+    fn render_places_the_window_where_the_output_mode_puts_it() {
+        let mut s = snap(40, 25, 0x09, 0x80);
+        pal_sd(&mut s.regs, &mut s.hdmi);
+        s.screen[0] = 0x41;
+        s.color[0] = 0x21; // fg 1, bg 2
+        s.c64 = Some(c64_frame(384, 272));
+        let mut out = Vec::new();
+        let mut r = Renderer::new(&font());
+        assert_eq!(r.render(&s, &mut out), (720, 576), "the canvas is the output mode");
+        let px = |x: usize, y: usize| out[y * 720 + x];
+        assert_eq!((px(0, 0), px(719, 575)), (C64_BLUE, C64_BLUE), "the C64 fills the output");
+        assert_eq!((px(254, 263), px(255, 263)), (PAL[1], PAL[2]), "the window starts at (254, 263)");
+        assert_eq!(px(253, 263), C64_BLUE, "and not a pixel earlier");
+        assert!((262..270).all(|x| px(x, 264) == C64_BLUE), "a transparent cell shows the C64 through");
+
+        // A window that reaches past the right edge is clipped, not a panic (1080p: X_ON 1438 + 480 of 1920).
+        (s.regs[REG_X_ON_HI], s.regs[REG_X_ON_LO]) = ((700u16 >> 8) as u8, 700u16 as u8);
+        assert_eq!(r.render(&s, &mut out), (720, 576));
     }
 
     #[test]
@@ -444,6 +556,18 @@ mod tests {
         Renderer::new(&std::fs::read(path).unwrap()).render(&s, &mut out);
         let row1: Vec<bool> = out[8..16].iter().map(|&p| p == PAL[1]).collect();
         assert_eq!(row1, [false, false, true, true, true, true, false, false], "chars.bin 'A' row 1 = 0x3C");
+    }
+
+    /// Issue #3: the C64 character ROM in a roms directory is the overlay's font only by name.
+    #[test]
+    fn a_c64_character_rom_is_recognised() {
+        let Some(overlay) = firmware_file("roms/chars.bin").and_then(|p| std::fs::read(p).ok()) else { return };
+        let Some(c64) = firmware_file("roms/characters.901225-01.bin").and_then(|p| std::fs::read(p).ok()) else {
+            return;
+        };
+        assert!(!looks_like_c64_char_rom(&overlay), "the firmware's own font");
+        assert!(looks_like_c64_char_rom(&c64), "the C64 character ROM");
+        assert!(!looks_like_c64_char_rom(&[]), "no font at all is someone else's error");
     }
 
     #[test]
