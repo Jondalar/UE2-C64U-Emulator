@@ -91,11 +91,18 @@ smoke uci "$repo/scripts/smoke-uci.ctl" --flash run/flash-uci.bin --c64-roms --s
 # while the client talks to it, then both are brought down.
 # The wait only has to outlast the client; the emulator is killed as soon as it is done.
 printf 'expect "F3=HELP" 10000\nwait 20000000\nquit\n' >run/vice.ctl
-emu vice run/vice.ctl --flash run/flash-vice.bin --settings "$repo/scripts/smoke-settings.cfg" --vice-monitor &
+# Started directly, not through `emu`: backgrounding the function makes $! the subshell's, and killing that leaves
+# the emulator orphaned at --speed max until its own `wait` runs out — a core at 100 % long after the suite ends.
+# $! has to be the binary itself.
+"$bin" run --headless --speed max --firmware "$elf" --roms "$fw/roms" --flash run/flash-vice.bin \
+    --settings "$repo/scripts/smoke-settings.cfg" --vice-monitor --script run/vice.ctl \
+    >run/vice.log 2>run/vice.err &
 vicepid=$!
-python3 "$repo/scripts/vice-client.py" || fail vice "the client conversation failed"
+rc=0
+python3 "$repo/scripts/vice-client.py" || rc=$?
 kill "$vicepid" 2>/dev/null || true
 wait "$vicepid" 2>/dev/null || true
+((rc == 0)) || fail vice "the client conversation failed"
 echo "PASS vice"
 
 printf '# must fail\nexpect "NO SUCH TEXT ON THE SCREEN" 500\nquit\n' >run/negative.ctl
