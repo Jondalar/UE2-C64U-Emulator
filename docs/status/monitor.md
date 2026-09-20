@@ -18,9 +18,11 @@ its second host. Design and the division of labour: `docs/specs/S23-monitor.md`.
 
 **M2 has started.** The library sees every line first and returns `None` for what it does not own; our dispatch
 takes it from there and appends its own section to `help`. TRX64 gains no notion of this emulator — the dependency
-stays one-way. Done: `fw` (the RISC-V registers, `fw tasks` for the FreeRTOS list) and `clock` (the emulator's
-clock, the firmware's instructions, the C64's cycle). Still to come: `itu`, `cart`, `flash`, `sd`, `usb`, `net`,
-`audio` and `config`.
+stays one-way. Done: `fw` (the RISC-V registers, `fw tasks` for the FreeRTOS list), `clock` (the
+emulator's clock, the firmware's instructions, the C64's cycle) and `config`'s reading half — the settings as the
+flash holds them, decoded through each item's own type and marked `flash` or `default`, plus `config flash` for the
+raw pages. `config set`, `config write` and `config read` refuse with their spec reference for now. Still to come:
+`itu`, `cart`, `flash`, `sd`, `usb`, `net`, `audio`.
 
 **Not yet:** run control — `g`, `step`, breakpoints (M3). Until then the library's own sentence answers: "run
 control is not available in this host".
@@ -39,6 +41,8 @@ control is not available in this host".
 | `monitor device` on a booted 3.15 | `device: c64   (c64 \| drive8 \| fw — anything but c64 is read-inspect r/m/d)`; `device fw` selects it |
 | `monitor fw` | the 32 registers with `pc  00035da8  prvIdleTask+0x2c` |
 | `monitor clock` | the emulator's ms and clocks, the firmware's instructions and idle skips, the C64's cycle |
+| `monitor config flash` on a `--settings` flash | 11 pages with their names (`GEN.`, `C64.`, `U64C`, …) and record counts |
+| `monitor config "C64 and Cartridge Settings" "REU Size"` | `REU Size=16 MB   (flash)`, the value `--settings` wrote; an item nobody stored reads its firmware default |
 | TRX64 repin 0.7.3 → 0.8.2 | no code change needed; `smoke-all.sh` 7/7, `smoke-c64-carts.ctl` 27/27 with the freeze and both SID loads, UltimateDemo2026 detection all `[ OK ]` |
 
 ### Open

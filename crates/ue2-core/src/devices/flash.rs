@@ -406,6 +406,32 @@ impl SpiFlash {
     /// page id, else the first erased one, as `register_store` picks (config.cc:127-167). A record of an id being
     /// set is replaced in place and a later duplicate dropped; new ids go before the 0xFF. Only the 512-byte logical
     /// page is written (w25q_flash.cc:251-254), the rest of the sector keeps its bytes.
+    /// The records stored for one config page, as the firmware would unpack them (S23 §6, the monitor's `config`).
+    /// `None` when no page carries that id.
+    pub fn config_page(&self, page: u32) -> Option<Vec<(u8, u8, Vec<u8>)>> {
+        (0..CONFIG_PAGES).find_map(|p| {
+            let at = CONFIG_BASE + p * SECTOR_SIZE;
+            let id = u32::from_le_bytes(self.chip.mem[at..at + 4].try_into().expect("4 bytes"));
+            (id == page).then(|| {
+                page_records(&self.chip.mem[at..at + CONFIG_PAGE_SIZE])
+                    .into_iter()
+                    .map(|(id, kind, payload)| (id, kind, payload.to_vec()))
+                    .collect()
+            })
+        })
+    }
+
+    /// The ids of the config pages in use, in page order (S23 §6, `config flash`).
+    pub fn config_pages(&self) -> Vec<u32> {
+        (0..CONFIG_PAGES)
+            .map(|p| {
+                let at = CONFIG_BASE + p * SECTOR_SIZE;
+                u32::from_le_bytes(self.chip.mem[at..at + 4].try_into().expect("4 bytes"))
+            })
+            .filter(|&id| id != 0xFFFF_FFFF)
+            .collect()
+    }
+
     pub fn write_settings(&mut self, records: &[Record]) -> anyhow::Result<()> {
         let mut pages: Vec<u32> = records.iter().map(|r| r.page).collect();
         pages.sort_unstable();

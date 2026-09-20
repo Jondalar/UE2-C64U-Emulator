@@ -437,6 +437,64 @@ fn choices(def: &Def) -> String {
 }
 
 /// Every setting of the image as a `.cfg` with the defaults, the choices or range in a comment above each (§6).
+/// What the flash holds, as `[Store] Item=Value` lines (S23 §6, the monitor's `config`).
+///
+/// A value the page carries is decoded through the item's own type; an item the page does not carry is the
+/// firmware's default and says so. `category` and `item` narrow it, both by case-insensitive name.
+pub fn stored(stores: &Stores, flash: &SpiFlash, category: Option<&str>, item: Option<&str>) -> String {
+    let mut out = String::new();
+    for store in stores.found.iter().filter(|s| category.is_none_or(|c| s.spec.name.eq_ignore_ascii_case(c))) {
+        let records = flash.config_page(store.spec.page).unwrap_or_default();
+        out.push_str(&format!("[{}]\n", store.spec.name));
+        for def in store.table.defs.iter().filter(|d| d.is_setting()) {
+            if item.is_some_and(|i| !def.name.eq_ignore_ascii_case(i)) {
+                continue;
+            }
+            let stored = records.iter().rev().find(|(id, _, _)| *id == def.id);
+            let (value, source) = match stored {
+                Some((_, kind, payload)) => (decode(def, *kind, payload), "flash"),
+                None => (default_text(def), "default"),
+            };
+            out.push_str(&format!("{}={}   ({source})\n", def.name, value));
+        }
+    }
+    if out.is_empty() {
+        return match (category, item) {
+            (Some(c), Some(i)) => format!("no item '{i}' in '{c}'\n"),
+            (Some(c), None) => format!("no store '{c}' in this firmware\n"),
+            _ => "this firmware has no settings tables\n".into(),
+        };
+    }
+    out
+}
+
+/// One stored record as text, through the item's type (config.cc `ConfigItem::unpack`).
+fn decode(def: &Def, kind: u8, payload: &[u8]) -> String {
+    match kind {
+        CFG_TYPE_ENUM => {
+            let v = usize::from(payload.first().copied().unwrap_or(0));
+            def.choices.get(v).cloned().unwrap_or_else(|| v.to_string())
+        }
+        CFG_TYPE_VALUE => {
+            let mut b = [0u8; 4];
+            b[..payload.len().min(4)].copy_from_slice(&payload[..payload.len().min(4)]);
+            i32::from_be_bytes(b).to_string()
+        }
+        _ => String::from_utf8_lossy(payload.split(|&b| b == 0).next().unwrap_or(payload)).into_owned(),
+    }
+}
+
+/// The firmware's own default for an item it has never stored.
+fn default_text(def: &Def) -> String {
+    match &def.default {
+        DefaultValue::Text(t) => t.clone(),
+        DefaultValue::Int(v) if def.kind == CFG_TYPE_ENUM => {
+            def.choices.get(*v as usize).cloned().unwrap_or_else(|| v.to_string())
+        }
+        DefaultValue::Int(v) => v.to_string(),
+    }
+}
+
 pub fn template(stores: &Stores, firmware: &str) -> String {
     let mut out = format!(
         "; Settings of {firmware}, each at its default (docs/specs/S21-settings.md).\n\

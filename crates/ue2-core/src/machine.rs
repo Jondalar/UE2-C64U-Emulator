@@ -210,6 +210,9 @@ pub struct Machine {
     pub cpu: rv32::Cpu,
     pub bus: SystemBus,
     pub symbols: Symbols,
+    /// The firmware image's loaded segments (address, length), for a later scan of its own tables — the settings
+    /// definitions (S21) that the monitor's `config` verb reads (S23 §6). Empty for a machine built from parts.
+    pub segments: Vec<(u32, u32)>,
     pub cfg: MachineConfig,
     pub breakpoints: Vec<u32>,
     pub trace: TraceRing,
@@ -275,7 +278,9 @@ impl Machine {
                 Symbols::empty()
             }
         };
-        Ok(Self::from_parts(cfg, bus, fw.entry, symbols))
+        let mut machine = Self::from_parts(cfg, bus, fw.entry, symbols);
+        machine.segments = fw.segments;
+        Ok(machine)
     }
 
     /// Machine around an already populated bus: registers 0, `pc = entry`, log flags applied to the bus, fault
@@ -289,6 +294,7 @@ impl Machine {
             cpu: rv32::Cpu::new(entry),
             bus,
             symbols,
+            segments: Vec::new(),
             cfg,
             breakpoints: Vec::new(),
             trace: TraceRing::default(),

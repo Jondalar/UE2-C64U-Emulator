@@ -13,7 +13,9 @@ use c64_bridge::Trx64Backend;
 use trx64_monitor::host::{CpuView, Device, MonitorHost, Reg};
 use trx64_monitor::{addr_spans, verbs, MonitorSession};
 use ue2_core::devices::c64::C64Port;
+use ue2_core::devices::flash::SpiFlash;
 use ue2_core::machine::Machine;
+use ue2_core::settings;
 
 use crate::gdb::{peek8, ram_index, task_list};
 
@@ -69,6 +71,7 @@ impl Host<'_> {
         match verb {
             "fw" => Some(self.verb_fw(args)),
             "clock" => Some(Ok(self.verb_clock())),
+            "config" => Some(self.verb_config(args)),
             _ => None,
         }
     }
@@ -91,6 +94,29 @@ impl Host<'_> {
         }
     }
 
+    /// `config` — the Ultimate's settings, as the menu shows them (S23 §6). Reading only in this cut: `set`,
+    /// `write` and `read` need the firmware's own .cfg path and come next.
+    fn verb_config(&mut self, args: &[&str]) -> Result<String, String> {
+        let flash = self.m.bus.io.get::<SpiFlash>().ok_or("this machine has no flash")?;
+        if args == ["flash"] {
+            let pages = flash.config_pages();
+            let mut out = format!("  {} config pages in use\n", pages.len());
+            for page in pages {
+                let n = flash.config_page(page).map_or(0, |r| r.len());
+                // The id is four ASCII characters, most significant first ("GEN.", "C64 ", `register_store`).
+                let name = String::from_utf8_lossy(&page.to_be_bytes().map(|b| if b.is_ascii_graphic() { b } else { b'.' })).into_owned();
+                out.push_str(&format!("  {page:08x}  {name}  {n} records\n"));
+            }
+            return Ok(out);
+        }
+        if matches!(args.first(), Some(&"set" | &"write" | &"read")) {
+            return Err(format!("config {}: not in this build yet (S23 §6)", args[0]));
+        }
+        let tables = settings::tables(&self.m.bus.ram, &self.m.segments);
+        let stores = settings::stores(&tables);
+        Ok(settings::stored(&stores, flash, args.first().copied(), args.get(1).copied()))
+    }
+
     /// `clock` — the two clocks of this machine: the emulator's, which the firmware runs on, and the C64's.
     fn verb_clock(&mut self) -> String {
         let (now_ms, clocks) = (self.m.now_ms(), self.m.bus.now);
@@ -104,7 +130,7 @@ impl Host<'_> {
 
     /// The verbs of §5 for `help`, after the library's own list.
     fn help(&self) -> &'static str {
-        "\nthe Ultimate side (S23):\n  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n  clock             the emulator's clock, the firmware's instructions, the C64's cycle\n"
+        "\nthe Ultimate side (S23):\n  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n  clock             the emulator's clock, the firmware's instructions, the C64's cycle\n  config [cat [item]]  the settings, as stored in flash; `config flash` the raw pages\n"
     }
 }
 
@@ -174,11 +200,35 @@ pub fn exec(m: &mut Machine, session: &mut MonitorSession, line: &str) -> Result
         Some(Ok(text)) if verb == "help" => Ok(text + host.help()),
         Some(answer) => answer,
         None => {
-            let args: Vec<&str> = line.split_whitespace().skip(1).collect();
+            let args = words(line.trim_start().strip_prefix(&verb).unwrap_or(""));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
             host.ours(&verb, &args).unwrap_or(Err(format!("unknown monitor command '{verb}'")))
         }
     }?;
     Ok(addr_spans::plain(&answer))
+}
+
+/// Split a verb's arguments, honouring double quotes: store and item names have spaces ("C64 and Cartridge
+/// Settings", "REU Size").
+fn words(rest: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    for c in rest.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !word.is_empty() {
+                    out.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        out.push(word);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -197,6 +247,8 @@ mod tests {
         let cfg = MachineConfig::new(PathBuf::new(), PathBuf::new());
         let mut bus = SystemBus::new();
         c64::install(&mut bus.io, &cfg);
+        // `config` reads the flash, as it does on a real machine (volatile here).
+        ue2_core::devices::flash::install(&mut bus.io, &cfg);
         let mut m = Machine::from_parts(cfg, bus, 0x30000, Symbols::empty());
         m.attach_c64(Box::new(Trx64Backend::new(Path::new("/nonexistent"))));
         m
@@ -266,6 +318,23 @@ mod tests {
 
         let help = exec(&mut m, &mut s, "help").expect("help");
         assert!(help.contains("the Ultimate side (S23)") && help.contains("clock"), "both lists: {help}");
+    }
+
+    /// S23 §6: the settings as stored, narrowed by name, and quoted names survive the split.
+    #[test]
+    fn config_reads_the_stored_settings() {
+        assert_eq!(words(r#" "C64 and Cartridge Settings" "REU Size" "#), ["C64 and Cartridge Settings", "REU Size"]);
+
+        let mut m = machine();
+        let mut s = MonitorSession::new();
+        // A machine built from parts has no firmware image, so no settings tables: the answer says so.
+        let out = exec(&mut m, &mut s, "config").expect("config");
+        assert_eq!(out, "this firmware has no settings tables\n");
+        assert!(exec(&mut m, &mut s, "config flash").expect("config flash").contains("config pages in use"));
+        assert_eq!(
+            exec(&mut m, &mut s, "config set a b c").unwrap_err(),
+            "config set: not in this build yet (S23 §6)"
+        );
     }
 
     /// Run control is M3: until then the library's own sentence is the answer, not a panic.
