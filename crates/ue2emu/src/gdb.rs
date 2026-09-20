@@ -419,13 +419,13 @@ impl MonitorCmd for Debuggee {
 }
 
 /// DDR index of a data address: bit 28 clear and outside the boot BRAM page (`ue2_core::bus` decode).
-fn ram_index(addr: u32) -> Option<usize> {
+pub(crate) fn ram_index(addr: u32) -> Option<usize> {
     (addr & IO_BIT == 0 && addr >> 16 != BOOT_BRAM_PAGE).then_some((addr & RAM_MASK) as usize)
 }
 
 /// Debugger view of one data-bus byte, without side effects: DDR (and its mirrors) from RAM, IO bytes from
 /// `IoDevice::peek8`, 0 for the boot BRAM page and unmapped addresses.
-fn peek8(bus: &SystemBus, addr: u32) -> u8 {
+pub(crate) fn peek8(bus: &SystemBus, addr: u32) -> u8 {
     match ram_index(addr) {
         Some(i) => bus.ram[i],
         None => bus.io.resolve(addr).map_or(0, |(dev, off)| bus.io.devices[dev].peek8(off)),

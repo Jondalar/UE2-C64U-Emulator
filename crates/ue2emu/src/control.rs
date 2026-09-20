@@ -19,6 +19,7 @@
 //! | `expect-c64 <text> [ms]` | Wait until the C64 text screen (`c64screen`) contains `text`. |
 //! | `usb-sync [--force] [port]` | Write a `--usb-dir` stick's guest changes back to the host now (all sticks without a port); `--force` overrides the mass-deletion guard (docs/status/usb-dir.md). |
 //! | `usb-replug [--discard] [port]` | Unplug a USB device and plug it back in; a `--usb-dir` stick is synced and rebuilt from the host in between (`--discard`: its old image is kept aside, not synced). |
+//! | `monitor <cmd>` | Run one line of TRX64's monitor against the C64 and print what it prints (S23; needs `--c64 trx64`). |
 //! | `cart-info` | Print the physical expansion port's cartridge (`--cart-slot`) as `key: value` lines: type, banks, lines, bus sharing, flash decode, dirty flag (docs/status/cart-slot.md). |
 //! | `cart-save <path>` | Write that cartridge as it is now, every bank with flash and EEPROM contents, to a CRT file. |
 //! | `quit` | Stop the emulator. |
@@ -105,6 +106,8 @@ pub enum ControlCmd {
     UsbSync { port: Option<u8>, force: bool },
     /// `usb-replug [--discard] [port]`.
     UsbReplug { port: Option<u8>, discard: bool },
+    /// One line for the monitor (S23).
+    Monitor(String),
     /// `cart-info`.
     CartInfo,
     /// `cart-save <path>`.
@@ -141,6 +144,8 @@ pub trait Target {
     fn usb(&mut self, req: UsbRequest) -> Result<(Vec<String>, Option<String>)>;
     /// Run a `cart-info` / `cart-save` request: its result lines, or the reason it failed.
     fn cart(&mut self, req: CartRequest) -> Result<Vec<String>>;
+    /// Run one monitor line (S23) and return its text.
+    fn monitor(&mut self, line: &str) -> Result<String>;
     /// Ask the emulator to stop.
     fn quit(&mut self);
 }
@@ -247,6 +252,12 @@ pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
             } else {
                 ControlCmd::UsbReplug { port, discard: flagged }
             }
+        }
+        "monitor" => {
+            if rest.trim().is_empty() {
+                return Err("'monitor' needs a command".into());
+            }
+            ControlCmd::Monitor(rest.trim().to_owned())
         }
         "cart-info" => {
             arity(0, 0)?;
@@ -365,6 +376,10 @@ pub fn execute(t: &mut dyn Target, cmd: &ControlCmd, out: &mut dyn Write) -> Res
         }
         ControlCmd::UsbReplug { port, discard } => {
             usb_request(t, out, UsbRequest { action: UsbAction::Replug { discard: *discard }, port: *port })?
+        }
+        ControlCmd::Monitor(line) => {
+            let text = t.monitor(line)?;
+            print_lines(out, &text.lines().map(str::to_owned).collect::<Vec<_>>())?;
         }
         ControlCmd::CartInfo => print_lines(out, &t.cart(CartRequest::Info)?)?,
         ControlCmd::CartSave(path) => print_lines(out, &t.cart(CartRequest::Save(path.clone()))?)?,
@@ -659,6 +674,13 @@ impl Target for HandleTarget {
         result.recv().map_err(|_| anyhow!("emulator stopped"))?.map_err(|e| anyhow!(e))
     }
 
+    fn monitor(&mut self, line: &str) -> Result<String> {
+        let (done, result) = mpsc::channel();
+        let line = line.to_owned();
+        self.ctl.commands.send(Command::Monitor { line, done }).map_err(|_| anyhow!("emulator stopped"))?;
+        result.recv().map_err(|_| anyhow!("emulator stopped"))?.map_err(|e| anyhow!(e))
+    }
+
     fn quit(&mut self) {
         // The emulation thread may already be gone; then there is nothing left to stop.
         let _ = self.ctl.commands.send(Command::Quit);
@@ -777,6 +799,7 @@ mod tests {
         usb: Vec<UsbRequest>,
         /// Cartridge requests received; a save to `fail.crt` fails.
         cart: Vec<CartRequest>,
+        monitor: Vec<String>,
     }
 
     impl Fake {
@@ -845,6 +868,14 @@ mod tests {
             Ok((vec![format!("port {:?}: done", req.port)], error))
         }
 
+        fn monitor(&mut self, line: &str) -> Result<String> {
+            self.monitor.push(line.to_owned());
+            match line {
+                "r" => Ok("  ADDR A  X  Y\n  3000 00 00 00".into()),
+                _ => bail!("unknown monitor command '{line}'"),
+            }
+        }
+
         fn cart(&mut self, req: CartRequest) -> Result<Vec<String>> {
             self.cart.push(req.clone());
             match req {
@@ -888,6 +919,7 @@ mod tests {
         assert_eq!(ok(r#"expect-not "a \"q\" \\ b""#), Some(ExpectNot(r#"a "q" \ b"#.into(), 5000)));
         assert_eq!(ok(r#"expect-console "Page: 0 done." 800"#), Some(ExpectConsole("Page: 0 done.".into(), 800)));
         assert_eq!(ok(r#"expect-c64 "UCI OK" 2000"#), Some(ExpectC64("UCI OK".into(), 2000)));
+        assert_eq!(ok("monitor m c000 c00f"), Some(Monitor("m c000 c00f".into())));
         assert_eq!(ok(r##"expect "#1""##), Some(Expect("#1".into(), 5000)));
         assert_eq!(ok("quit\r"), Some(Quit));
         assert_eq!(ok("  \twait 1  "), Some(Wait(1)));
@@ -916,6 +948,7 @@ mod tests {
             ("screen now", "'screen' takes 0 argument(s)"),
             ("c64screen 1", "'c64screen' takes 0 argument(s)"),
             ("png", "'png' needs a path"),
+            ("monitor", "'monitor' needs a command"),
             ("expect", "'expect' needs text"),
             (r#"expect-not """#, "'expect-not' needs text"),
             (r#"expect "open"#, "unterminated quoted text"),
@@ -964,6 +997,19 @@ mod tests {
         let replug = |port| UsbRequest { action: UsbAction::Replug { discard: false }, port };
         assert_eq!(fake.usb, [UsbRequest { action: UsbAction::Sync { force: true }, port: Some(1) }, replug(None), replug(Some(3))]);
         assert_eq!(fake.now, 0, "the failed line stops the script");
+    }
+
+    /// S23: the line carries the rest verbatim, the answer is printed as the monitor prints it, and an error
+    /// names the line.
+    #[test]
+    fn monitor_lines_reach_the_target() {
+        let mut fake = Fake::default();
+        let (r, out) = run(&mut fake, "monitor r\n");
+        r.unwrap();
+        assert_eq!(out, "  ADDR A  X  Y\n  3000 00 00 00\n");
+        let (r, _) = run(&mut fake, "monitor nope\n");
+        assert_eq!(format!("{:#}", r.unwrap_err()), "line 1: unknown monitor command 'nope'");
+        assert_eq!(fake.monitor, ["r", "nope"]);
     }
 
     #[test]
@@ -1256,6 +1302,9 @@ mod tests {
                         }
                         Ok(Command::Cart { done, .. }) => {
                             let _ = done.send(Err("no cartridge in the fake".into()));
+                        }
+                        Ok(Command::Monitor { done, .. }) => {
+                            let _ = done.send(Err("no monitor in the fake".into()));
                         }
                         Ok(Command::Quit) => {
                             log.push((now, None));

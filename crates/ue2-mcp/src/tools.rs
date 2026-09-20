@@ -229,6 +229,16 @@ pub struct RestParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MonitorParams {
+    /// Instance id from emu_start.
+    pub id: String,
+    /// One monitor command, e.g. "r", "m c000 c00f", "d e000", "device fw".
+    pub command: String,
+    /// Wall-clock ms. Default 60000.
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ControlParams {
     /// Instance id from emu_start.
     pub id: String,
@@ -513,6 +523,15 @@ headers and body (text; binary bodies as base64 or written to save_body_to). 4xx
 normally.")]
     async fn emu_rest(&self, Parameters(p): Parameters<RestParams>) -> ToolResult {
         finish(self.rest(p).await)
+    }
+
+    #[tool(description = "Run one command of the C64 monitor and return its text: registers (`r`), memory \
+(`m c000 c00f`), disassembly (`d e000`), the debug surfaces (`bk`, `flow`, `bt`), `help` for the full verb list. \
+The verbs are TRX64's, the same monitor its own tools speak (docs/specs/S23-monitor.md). `device` selects the CPU: \
+the C64 (default), the 1541 (`drive8`), or the firmware's RISC-V (`fw`, registers and memory only). It needs an \
+instance started with a C64 (the default). Run control (`g`, `step`) is not in this build yet.")]
+    async fn emu_monitor(&self, Parameters(p): Parameters<MonitorParams>) -> ToolResult {
+        finish(self.monitor(p).await)
     }
 
     #[tool(description = "Send one raw line of ue2emu's TCP control protocol and return its result lines: the \
@@ -1249,6 +1268,14 @@ impl Emu {
         let line = format!("cart-save {}", path.display());
         let lines = inst.control(&line, Duration::from_millis(p.timeout_ms.unwrap_or(60_000))).await?;
         ok(vec![text(format!("PASS: {line}\n{}", lines.join("\n")))])
+    }
+
+    /// S23 §7: the monitor over the same control line, so a human and an agent read the same text.
+    async fn monitor(&self, p: MonitorParams) -> Result<CallToolResult> {
+        let inst = self.state.get(&p.id).await?;
+        let line = format!("monitor {}", p.command.trim());
+        let lines = inst.control(&line, Duration::from_millis(p.timeout_ms.unwrap_or(60_000))).await?;
+        ok(vec![text(if lines.is_empty() { "ok".to_string() } else { lines.join("\n") })])
     }
 
     async fn control(&self, p: ControlParams) -> Result<CallToolResult> {

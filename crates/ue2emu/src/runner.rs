@@ -82,6 +82,8 @@ pub enum Command {
     Usb { req: UsbRequest, done: UsbDone },
     /// `cart-info` / `cart-save` (`cartslot::CartSlot::request`).
     Cart { req: CartRequest, done: CartDone },
+    /// S23: one monitor line, answered with its text. The session lives on the emulation thread, with the machine.
+    Monitor { line: String, done: Sender<Result<String, String>> },
     Quit,
 }
 
@@ -348,6 +350,7 @@ impl EmuThread {
         let mut mips_mark = (Instant::now(), machine.cpu.insns, machine.now_ms());
         let mut stdout = std::io::stdout();
         let mut inputs = InputTimeline::default();
+        let mut monitor = MonitorState::default();
         // Emulated ms of the quit request: the machine keeps running while a --usb-dir guest write is recent.
         let mut quit_at: Option<u64> = None;
         loop {
@@ -379,7 +382,8 @@ impl EmuThread {
                 self.console.lock().unwrap_or_else(PoisonError::into_inner).push(&console);
             }
 
-            let quit = apply_commands(&mut machine, commands, &mut inputs, &mut usb_dirs, &mut cart) || quit_at.is_some();
+            let quit = apply_commands(&mut machine, commands, &mut inputs, &mut usb_dirs, &mut cart, &mut monitor)
+                || quit_at.is_some();
             usb_dirs.poll(&mut machine);
 
             let now_ms = machine.now_ms();
@@ -430,6 +434,27 @@ impl EmuThread {
     }
 }
 
+/// The monitor's own state between lines: the cursors, the selected device and the assemble mode (S23; without
+/// the `trx64` feature there is no C64 and no monitor).
+#[derive(Default)]
+pub struct MonitorState {
+    #[cfg(feature = "trx64")]
+    session: trx64_monitor::MonitorSession,
+}
+
+impl MonitorState {
+    /// One line, answered as the monitor prints it.
+    #[cfg(feature = "trx64")]
+    fn exec(&mut self, machine: &mut Machine, line: &str) -> Result<String, String> {
+        crate::monitor::exec(machine, &mut self.session, line)
+    }
+
+    #[cfg(not(feature = "trx64"))]
+    fn exec(&mut self, _machine: &mut Machine, _line: &str) -> Result<String, String> {
+        Err("this build has no C64, so no monitor (build with the trx64 feature)".into())
+    }
+}
+
 /// Apply queued commands, then the timed inputs now due; true when the thread should stop (`Quit`, or every
 /// sender dropped).
 fn apply_commands(
@@ -438,6 +463,7 @@ fn apply_commands(
     inputs: &mut InputTimeline,
     usb_dirs: &mut UsbDirs,
     cart: &mut CartSlot,
+    monitor: &mut MonitorState,
 ) -> bool {
     let quit = loop {
         match commands.try_recv() {
@@ -445,6 +471,9 @@ fn apply_commands(
             Ok(Command::Inputs { seq, done }) => inputs.push(seq, done, machine.now_ms()),
             Ok(Command::Usb { req, done }) => usb_dirs.request(machine, req, done),
             Ok(Command::Cart { req, done }) => cart.request(machine, req, done),
+            Ok(Command::Monitor { line, done }) => {
+                let _ = done.send(monitor.exec(machine, &line));
+            }
             Ok(Command::Quit) | Err(TryRecvError::Disconnected) => break true,
             Err(TryRecvError::Empty) => break false,
         }

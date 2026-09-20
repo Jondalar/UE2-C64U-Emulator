@@ -170,6 +170,12 @@ pub trait C64Backend {
 
     /// Whether this backend serves the UCI block. TRX64 has it on the `u64` profile, where it is part of the machine
     /// (Spec 852). Without it `devices::c64::C64Port` keeps the T0 register table at 0x10044000.
+    /// Downcast hook for a frontend that needs more of a backend than this trait offers — the monitor host of S23
+    /// reaches the TRX64 machine through it. A backend returns itself; `ue2-core` stays ignorant of what that is.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+
     fn has_uci(&self) -> bool {
         false
     }

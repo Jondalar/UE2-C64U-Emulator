@@ -351,6 +351,12 @@ impl C64Port {
         self.refresh_cart_detect();
     }
 
+    /// The attached backend, for a frontend that needs more of it than [`C64Backend`] offers (S23's monitor host
+    /// downcasts through `C64Backend::as_any_mut`).
+    pub fn backend_mut(&mut self) -> Option<&mut (dyn C64Backend + 'static)> {
+        self.backend.as_deref_mut()
+    }
+
     /// Where this firmware keeps the cartridge ROM (docs/status/carts.md, "Cartridge ROM in DDR"); passed on to the
     /// backend now and on every attach.
     pub fn set_cart_rom(&mut self, rom: CartRom) {

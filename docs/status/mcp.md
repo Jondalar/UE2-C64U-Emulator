@@ -121,6 +121,7 @@ Conventions:
 | `emu_wait` | `id`, `ms` | emulated vs wall time |
 | `emu_expect` | `id`, `text`, `source?` (`screen`/`console`), `timeout_ms?` (10000), `since_offset?`, `ignore_case?`, `absent?`, `require_visible?` | `PASS:`/`FAIL:`, evidence (screen, or console around the match or its tail), JSON with `elapsed_ms`, `match_offset`, `next_offset` |
 | `emu_rest` | `id`, `path`, `method?` (GET), `body?`/`body_file?`, `content_type?`, `headers?`, `timeout_ms?` (20000), `save_body_to?` | `HTTP <status> <reason> (…)`, headers, body. Retries while the web server does not answer yet |
+| `emu_monitor` | `id`, `command` (one monitor command), `timeout_ms?` (60000) | the monitor's text: `r`, `m`, `d`, `bk`, `flow`, `help`, `device c64\|drive8\|fw` (S23). Needs a C64 in the instance; run control is not in this build yet |
 | `emu_control` | `id`, `command` (one protocol line), `timeout_ms?` (60000) | raw result lines + `ok` |
 
 **Key names** (`emu_key`, control `key`):

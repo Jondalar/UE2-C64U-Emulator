@@ -2534,6 +2534,21 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.9.12+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
+dependencies = [
+ "indexmap",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 0.7.15",
+]
+
+[[package]]
+name = "toml"
 version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
@@ -2541,10 +2556,19 @@ dependencies = [
  "indexmap",
  "serde_core",
  "serde_spanned",
- "toml_datetime",
+ "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
  "toml_writer",
- "winnow",
+ "winnow 1.0.4",
+]
+
+[[package]]
+name = "toml_datetime"
+version = "0.7.5+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
+dependencies = [
+ "serde_core",
 ]
 
 [[package]]
@@ -2563,9 +2587,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1340ea94a5856333492c9064b02c778b191dd2c853778d9609debdcdfea3a614"
 dependencies = [
  "indexmap",
- "toml_datetime",
+ "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
- "winnow",
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -2574,7 +2598,7 @@ version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
 dependencies = [
- "winnow",
+ "winnow 1.0.4",
 ]
 
 [[package]]
@@ -2616,8 +2640,8 @@ dependencies = [
 
 [[package]]
 name = "trx64-core"
-version = "0.7.3"
-source = "git+https://github.com/Jondalar/TRX64?rev=4ab20e5#4ab20e5a55043d0167b4bbab10bea87993d801fe"
+version = "0.8.1"
+source = "git+https://github.com/Jondalar/TRX64?rev=6dd08ac#6dd08aca70a9c146bddd3f65423549d671daad2c"
 dependencies = [
  "base64",
  "cc",
@@ -2625,6 +2649,26 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
+name = "trx64-monitor"
+version = "0.8.1"
+source = "git+https://github.com/Jondalar/TRX64?rev=6dd08ac#6dd08aca70a9c146bddd3f65423549d671daad2c"
+dependencies = [
+ "serde",
+ "serde_json",
+ "trx64-core",
+ "trx64-static",
+]
+
+[[package]]
+name = "trx64-static"
+version = "0.8.1"
+source = "git+https://github.com/Jondalar/TRX64?rev=6dd08ac#6dd08aca70a9c146bddd3f65423549d671daad2c"
+dependencies = [
+ "trx64-core",
 ]
 
 [[package]]
@@ -2718,7 +2762,9 @@ dependencies = [
  "rv32",
  "softbuffer",
  "tempfile",
- "toml",
+ "toml 1.1.6+spec-1.1.0",
+ "trx64-core",
+ "trx64-monitor",
  "ue2-core",
  "ue2-net",
  "ue2-vfat",
@@ -3348,6 +3394,12 @@ dependencies = [
  "x11rb",
  "xkbcommon-dl",
 ]
+
+[[package]]
+name = "winnow"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 
 [[package]]
 name = "winnow"

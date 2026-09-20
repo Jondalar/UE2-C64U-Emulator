@@ -8,6 +8,8 @@ mod control;
 mod gdb;
 mod install;
 mod keymap;
+#[cfg(feature = "trx64")]
+mod monitor;
 mod net;
 mod runner;
 mod usb;

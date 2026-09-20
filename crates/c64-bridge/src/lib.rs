@@ -195,6 +195,12 @@ pub struct Trx64Backend {
 }
 
 impl Trx64Backend {
+    /// TRX64's machine, for the monitor host of S23 (`ue2emu::monitor`). The C64 and drive A are reached through
+    /// it, exactly as the daemon reaches its own.
+    pub fn trx64(&mut self) -> &mut Machine {
+        &mut self.m
+    }
+
     /// A powered-on C64 (S14 §7) with BASIC, KERNAL and CHAR ROM seeded from `rom_dir` where present.
     ///
     /// Unless `TRX64_CPUHISTORY` is set, TRX64's reverse-debug rings are switched off (a per-instruction cost) and
@@ -920,6 +926,11 @@ impl C64Backend for Trx64Backend {
     }
 
     // ---- UCI: TRX64's own block, part of the `u64` profile (Spec 852; docs/specs/S15-uci.md) ----
+
+    /// S23: the monitor host reaches this backend, and through it TRX64's machine.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
 
     fn has_uci(&self) -> bool {
         self.m.uci().is_some()
