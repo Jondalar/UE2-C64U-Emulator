@@ -43,6 +43,9 @@ const PACE_SLACK_MS: u64 = 2;
 const PACE_MAX_LAG_MS: u64 = 100;
 /// Wall-clock interval over which `EmuHandle::mips` is measured.
 const MIPS_INTERVAL: Duration = Duration::from_millis(500);
+/// How often a held machine looks for a command (S23 M3). Short enough that `fw go` feels immediate, long enough
+/// that a held emulator costs no CPU.
+const HELD_POLL: Duration = Duration::from_millis(5);
 /// Poll interval of the headless wall-clock wait.
 const HEADLESS_POLL: Duration = Duration::from_millis(10);
 
@@ -355,6 +358,18 @@ impl EmuThread {
         let mut quit_at: Option<u64> = None;
         loop {
             // A slice ends at the next timed input, so holds last exactly their emulated length.
+            // S23 M3: `fw halt` holds the firmware, and with it the whole machine — the C64 only advances while
+            // the firmware drives it. Commands are still served, or there would be no way back.
+            if monitor.firmware_held() {
+                if apply_commands(&mut machine, commands, &mut inputs, &mut usb_dirs, &mut cart, &mut monitor) {
+                    usb_dirs.finish(&mut machine, true);
+                    cart.finish(&mut machine);
+                    report(&machine);
+                    return Ok(());
+                }
+                thread::sleep(HELD_POLL);
+                continue;
+            }
             let slice = inputs.slice_insns(machine.bus.now, machine.cfg.clocks_per_insn, SLICE_INSNS);
             let exit = match gdb.as_mut() {
                 None => machine.run(slice),
@@ -394,6 +409,9 @@ impl EmuThread {
             }
             self.now_ms.store(now_ms, Ordering::Relaxed);
 
+            if let RunExit::Breakpoint(pc) = exit {
+                monitor.note_stop(format!("breakpoint at {:08x} {}", pc, machine.symbols.format(pc)));
+            }
             if let RunExit::Halted(msg) = exit {
                 eprintln!("halted: {msg}");
                 eprint!("{}", machine.trace_report());
@@ -446,6 +464,26 @@ pub struct MonitorState {
 }
 
 impl MonitorState {
+    /// S23 M3: the firmware is held, so the run loop must not advance the machine.
+    #[cfg(feature = "trx64")]
+    fn firmware_held(&self) -> bool {
+        crate::monitor::run::firmware_held(&self.ours)
+    }
+
+    #[cfg(not(feature = "trx64"))]
+    fn firmware_held(&self) -> bool {
+        false
+    }
+
+    /// A stop the run loop took by itself, so the next `status` says why.
+    #[cfg(feature = "trx64")]
+    fn note_stop(&mut self, reason: String) {
+        crate::monitor::run::note_stop(&mut self.ours, reason);
+    }
+
+    #[cfg(not(feature = "trx64"))]
+    fn note_stop(&mut self, _reason: String) {}
+
     /// One line, answered as the monitor prints it.
     #[cfg(feature = "trx64")]
     fn exec(&mut self, machine: &mut Machine, line: &str) -> Result<String, String> {

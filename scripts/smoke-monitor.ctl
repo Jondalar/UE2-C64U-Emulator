@@ -24,6 +24,17 @@ monitor cart
 monitor flash
 monitor net
 monitor audio
+# Run control (S23 M3). The C64's halt is the machine's own stop, so it reads back out of C64_STOP; holding the
+# firmware holds the C64 with it, and `fw go` has to bring both back or the rest of this script would not run.
+monitor status
+monitor c64 halt
+monitor c64 step 4
+monitor c64 go
+monitor fw halt
+monitor fw step 3
+monitor fw go
+monitor status
+
 monitor config flash
 monitor config "C64 and Cartridge Settings" "REU Size"
 

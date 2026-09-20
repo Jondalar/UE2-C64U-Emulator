@@ -176,6 +176,17 @@ impl SystemBus {
         }
     }
 
+    /// One write into a device register from outside the CPU, with every side effect the firmware's own write
+    /// would have (S23 §3: the monitor stops the C64 through `C64_STOP`, the register the firmware uses itself).
+    /// DDR addresses are not this door's business and are refused.
+    pub fn poke_io8(&mut self, addr: u32, val: u8) -> bool {
+        if !matches!(region(addr), Region::Io) || self.io.resolve(addr).is_none() {
+            return false;
+        }
+        self.io_write8(addr, val);
+        true
+    }
+
     fn io_write8(&mut self, addr: u32, val: u8) {
         self.io_touched = true;
         self.idle_dirty = true;

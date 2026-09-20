@@ -41,24 +41,44 @@ nothing of the monitor goes there.
 | `monitor <cmd>` | `ue2emu/src/control.rs` | One more line of the protocol S08 already carries. |
 | `emu_monitor` | `ue2-mcp` | A thin wrapper over that line, as `emu_cart_info` is over `cart-info`. |
 
-## 3. What "halted" means here
+## 3. Run control
 
-The daemon and VICE both stop the world: entering the monitor suspends the emulation, the sound and the frame
-clock. We cannot. The firmware's clock drives the C64 (S14 §4), and the firmware is a second CPU that keeps
-serving the UCI, the drives and its own tasks.
+A debug monitor for an Ultimate has to stop two things: the runtime the Ultimate's own application runs on — the
+firmware's RISC-V — and the C64 behind it. They are not symmetric, and the asymmetry is the machine's, not a
+choice made here.
 
-- **A halt stops the C64 only.** It goes through the path the firmware itself uses — the bridge's hold, the same
-  one `C64_STOP` drives — so the firmware's own view of the machine stays consistent.
-- **`resume` returns `Resumption::Resumed { until }`**, not a stop: the breakpoint fires in a later advance. The
-  monitor prints "running until …", which is why 864 requires `RunUntil` to be re-statable as a line.
-- **The stop arrives asynchronously.** The bridge calls `after_advance`, the library keeps it and hands it to
-  `on_stop`; we put it on the control connection and answer the next `status` with it.
-- **`step`, `z`, `n` stay synchronous**: one instruction out of band moves no firmware clock, the C64 merely
-  consumes a little of the lag it carries.
-- **`reset` and `power` are ours to intercept.** The default in the library resets the machine directly; we route
-  through the firmware, so the cartridge restore and the register file follow (c64.cc `restoreCart`).
-- **A long halt is visible to the firmware.** It polls the C64, serves the UCI and drives the drives, so it will
-  time things out and log. We say so once when a halt starts and leave it at that; see §10.
+**Stopping the firmware stops everything.** The C64 only advances because `run_cpu` in the bridge drives it, so a
+held RISC-V holds the C64 with it. On hardware the C64 has its own crystal and would run on; here it does not.
+That makes a firmware breakpoint a consistent snapshot of both — and it makes the bugs that live at the seam
+between the two clocks (issue #2 was one: the C64 polls the UCI while the firmware is late) invisible while
+stopped. Those are only visible running. The monitor says so when it holds, rather than leaving someone to wonder.
+
+The machinery is the GDB stub's, which already does breakpoints, stepping and resume on the RISC-V; the monitor is
+a second door onto it. The held state lives in the monitor and the run loop asks for it before every slice, so a
+held machine still serves commands — there would be no way back otherwise.
+
+**Stopping the C64 leaves the firmware running**, which is what a monitor wants when the question is about the C64.
+And it **is** the stop the machine already has: `Hold::Cpu` in TRX64 is documented as "DMA / freeze / C64_STOP" —
+one mechanism, which the firmware reaches by writing `C64_STOP`. So does the monitor, through the same register
+and the same side effects. Two consequences follow, and both are deliberate:
+
+- **The last writer wins.** The firmware releasing its DMA stop releases the monitor's halt too, and a monitor
+  release ends a stop the firmware wanted. On hardware, poking that register does exactly this.
+- **Every answer reports the state it read**, never the state it wrote. That is the only way the first point is
+  survivable, and it makes the halt visible where the firmware looks: `cart` shows it.
+
+Under `Hold::Cpu` the VIC, the CIAs, the SID and drive 8 keep running — only the 6510 stands. A halted C64's cycle
+therefore keeps advancing, and that is correct, not a leak.
+
+`resume(Forever)` is the one case this host cannot finish: the C64 runs because the firmware drives it, so the
+monitor lets go of the stop and answers `Resumed`. The stop, when it comes, arrives asynchronously — that is what
+the library's `on_stop` is for, and it is the piece that waits for TRX64 to move the run-control verbs into
+`trx64-monitor`. The bounded forms (`Pc`, `Cycles`) and `step` are finished here and now, out of band, because a
+bound is a question about the C64 alone. Reset stays the firmware's: the monitor does not reach around it.
+
+Verbs: `fw halt | go | step [n]` for the firmware, `c64 [halt | go | step [n]]` for the C64, `status` for both.
+The library's own `g`/`until`/`step`/`bk` will mean the C64 when they land — their types say so, `RunUntil::Pc` is
+16 bits — and they route to the same host methods.
 
 ## 4. Devices
 
@@ -195,9 +215,9 @@ API and it must not shape the rest of the monitor.
   which the firmware's own `DOS_CMD_OPEN_DIR` could answer over the same UCI transport `config` uses); the
   `--usb-dir` sync state and the network backend's forwards, which belong to the run loop, not to a device; and the
   audio mixer's gains, which are write-only registers the model does not store.
-- **A bound on a halt.** The firmware notices a wedged C64 within milliseconds. We start without a limit and see
-  what the log looks like; if it is unusable, the halt gets a release after N seconds of firmware time, with a
-  line saying so.
+- ~~**A bound on a halt.**~~ Answered by §3: because the monitor's halt is the machine's own stop, the bridge's
+  UCI event wait already gates on it, so the firmware does not wait forever for a C64 that stands. No release
+  timer; if a firmware path is found that still hangs, it comes back as a real question.
 - **`DISPLAY_GET`/`PALETTE_GET`.** Our canvas is the firmware's output composition (S07, after issue #3), not a
   bare VIC-II frame, so `DW/DH/XO/YO/IW/IH` would need a definition of their own. Deferred; not in the useful
   minimum.

@@ -13,6 +13,7 @@
 
 mod config;
 mod devices;
+pub mod run;
 mod uci;
 
 use c64_bridge::Trx64Backend;
@@ -54,6 +55,8 @@ impl<'a> Host<'a> {
 #[derive(Default)]
 pub struct State {
     staged: Vec<settings::Record>,
+    /// Run control (S23 M3): whether the firmware is held, and why.
+    pub run: run::State,
 }
 
 impl State {
@@ -84,6 +87,19 @@ impl MonitorHost for Host<'_> {
     fn devices(&self) -> Vec<Device> {
         vec![Device::C64, Device::Drive8, Device::Host(FW)]
     }
+
+    /// S23 §3: the C64's stop is the machine's own, through `C64_STOP`.
+    fn set_halted(&mut self, halted: bool) -> Result<(), String> {
+        run::set_halted(self, halted)
+    }
+
+    fn resume(&mut self, until: trx64_monitor::RunUntil) -> Result<trx64_monitor::Resumption, String> {
+        run::resume(self, until)
+    }
+
+    fn step(&mut self, n: u64, over: bool) -> Result<trx64_monitor::StopInfo, String> {
+        run::step(self, n, over)
+    }
 }
 
 /// Our own verbs (S23 §5): the Ultimate side, which the library has never seen.
@@ -92,6 +108,8 @@ impl Host<'_> {
     fn ours(&mut self, verb: &str, args: &[&str]) -> Option<Result<String, String>> {
         match verb {
             "fw" => Some(self.verb_fw(args)),
+            "c64" => Some(run::c64(self, args)),
+            "status" => Some(Ok(run::status(self))),
             "clock" => Some(Ok(self.verb_clock())),
             "config" => Some(config::verb(self, args)),
             _ => devices::verb(self, verb, args),
@@ -112,7 +130,7 @@ impl Host<'_> {
                 Ok(out)
             }
             ["tasks"] => Ok(task_list(self.m)),
-            _ => Err("fw: usage: fw [tasks]".into()),
+            _ => run::firmware(self, args),
         }
     }
 
@@ -132,6 +150,9 @@ impl Host<'_> {
         concat!(
             "\nthe Ultimate side (S23):\n",
             "  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n",
+            "  fw halt | go | step [n]     run control for the firmware (the C64 stands with it)\n",
+            "  c64 [halt | go | step [n]]  run control for the C64, firmware running\n",
+            "  status            where both CPUs stand\n",
             "  clock             the emulator's clock, the firmware's instructions, the C64's cycle\n",
             "  config [cat [item]]         the settings, as stored in flash\n",
             "  config flash                the raw config pages\n",
@@ -331,7 +352,10 @@ mod tests {
         let fw = exec(&mut m, &mut s, &mut st, "fw").expect("fw");
         assert!(fw.contains("sp   80001000"), "the firmware's registers: {fw}");
         assert!(exec(&mut m, &mut s, &mut st, "fw tasks").is_ok(), "the task list walks an unbooted kernel too");
-        assert_eq!(exec(&mut m, &mut s, &mut st, "fw nonsense").unwrap_err(), "fw: usage: fw [tasks]");
+        assert_eq!(
+            exec(&mut m, &mut s, &mut st, "fw nonsense").unwrap_err(),
+            "fw: usage: fw [tasks | halt | go | step [n]]"
+        );
 
         let clock = exec(&mut m, &mut s, &mut st, "clock").expect("clock");
         assert!(clock.contains("emulator") && clock.contains("firmware") && clock.contains("c64"), "{clock}");
@@ -450,14 +474,56 @@ mod tests {
         }
     }
 
-    /// Run control is M3: until then the library's own sentence is the answer, not a panic.
+    /// S23 M3: both CPUs have run control, and they are not symmetric.
     #[test]
-    fn run_control_is_refused_in_one_sentence() {
+    fn run_control_holds_the_firmware_and_the_c64() {
+        let mut m = machine();
+        let mut s = MonitorSession::new();
+        let mut st = State::default();
+        let run = |m: &mut Machine, st: &mut State, l: &str| {
+            exec(m, &mut MonitorSession::new(), st, l).unwrap_or_else(|e| panic!("{l}: {e}"))
+        };
+
+        // The C64's halt is the machine's own stop, so it reads back out of the register the firmware uses.
+        assert!(run(&mut m, &mut st, "c64").contains("running"));
+        let halted = run(&mut m, &mut st, "c64 halt");
+        assert!(halted.contains("c64  stopped"), "read back from C64_STOP, not from what we wrote: {halted}");
+        assert_eq!(super::super::gdb::peek8(&m.bus, 0x1004_0001) & 1, 1, "the register itself carries the request");
+        assert!(run(&mut m, &mut st, "c64 go").contains("c64  running"));
+
+        // Holding the firmware holds everything, and the answer says so.
+        assert!(run(&mut m, &mut st, "fw").contains("pc  "), "`fw` alone is still the register panel");
+        let held = run(&mut m, &mut st, "fw halt");
+        assert!(held.contains("fw   held") && held.contains("the C64 stands with it"), "{held}");
+        assert!(run::firmware_held(&st), "and the run loop is told");
+        assert!(run(&mut m, &mut st, "status").contains("fw   held"), "status carries both");
+        assert!(run(&mut m, &mut st, "fw go").contains("fw   running"));
+        assert!(!run::firmware_held(&st));
+
+        assert!(exec(&mut m, &mut s, &mut st, "c64 step 0").unwrap_err().contains("not a step"));
+        assert!(exec(&mut m, &mut s, &mut st, "c64 nonsense").unwrap_err().contains("usage"));
+        assert!(exec(&mut m, &mut s, &mut st, "fw nonsense").unwrap_err().contains("usage"));
+    }
+
+    /// The host trait's own run control, which the library's verbs call once TRX64 has moved them.
+    #[test]
+    fn the_host_trait_can_halt_and_step_the_c64() {
         let mut m = machine();
         let mut st = State::default();
         let mut host = Host::new(&mut m, &mut st).expect("a host");
-        let err = host.resume(trx64_monitor::RunUntil::Forever).unwrap_err();
-        assert!(err.contains("not available in this host"), "{err}");
-        assert!(host.step(1, false).is_err());
+
+        host.set_halted(true).expect("halt");
+        assert!(run::halted(&mut host), "through the same register as the firmware's own stop");
+        host.set_halted(false).expect("go");
+        assert!(!run::halted(&mut host));
+
+        // A C64 that is driven by the firmware cannot finish an open-ended resume itself.
+        match host.resume(trx64_monitor::RunUntil::Forever).expect("resume") {
+            trx64_monitor::Resumption::Resumed { .. } => {}
+            other => panic!("the firmware drives this C64: {other:?}"),
+        }
+        let stop = host.step(2, false).expect("step");
+        assert_eq!(stop.reason, "step");
+        assert_eq!(stop.steps.len(), 2, "one entry per retired instruction, for the library's flow tracker");
     }
 }

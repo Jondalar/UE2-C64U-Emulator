@@ -69,14 +69,34 @@ named together with the setting that turns it on, and the firmware's own status 
 so a build without `CTRL_CMD_LOAD_CONFIG` (it was added to the firmware fork in `Add UCI control command to load
 config file`) says `UNKNOWN COMMAND` instead of pretending.
 
-**Not yet:** run control — `g`, `step`, breakpoints (M3). Until then the library's own sentence answers: "run
-control is not available in this host".
+**M3 works, both CPUs.** A debug monitor for an Ultimate has to stop two things, and they are not symmetric.
+
+`fw halt | go | step [n]` holds the firmware's RISC-V — and with it the whole machine, because the C64 only
+advances while the firmware drives it. The answer says so, because a firmware breakpoint is a consistent snapshot
+of both and therefore hides exactly the bugs that live between the two clocks (issue #2 was one). The machinery is
+the GDB stub's; the monitor is a second door onto it, and the run loop asks before every slice whether the
+firmware is held, still serving commands while it is.
+
+`c64 [halt | go | step [n]]` stops the C64 and leaves the firmware running. It **is** the stop the machine already
+has: `Hold::Cpu` in TRX64 is "DMA / freeze / C64_STOP", one mechanism, which the firmware reaches by writing
+`C64_STOP` — so the monitor writes the same register with the same side effects. The last writer therefore wins
+(the firmware releasing its DMA stop releases ours), which is why every answer reports the state it *read*, never
+the state it wrote. Under that hold the VIC, CIAs, SID and drive 8 keep running, so a halted C64's cycle keeps
+advancing; only the 6510 stands.
+
+`status` gives both. On the host trait, `set_halted`, `resume` and `step` are implemented: the bounded resumes and
+`step` finish out of band, and `resume(Forever)` answers `Resumed` because this C64 is driven by the firmware —
+the stop arrives later through `on_stop`.
+
+**Still upstream:** the library's `g`/`until`/`step`/`bk` are not in `trx64-monitor` yet, and there is no entry
+point for delivering an asynchronous stop back into it. When TRX64 moves them they land on the host methods that
+are already here; until then our own verbs are the way in.
 
 ### Verified
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | green (10 in `ue2emu::monitor`, 87 in ue2emu) |
+| `cargo test --workspace` | green (12 in `ue2emu::monitor`, 89 in ue2emu) |
 | `cargo clippy` on the changed crates | no new warnings |
 | Booted 3.15, `monitor r` over the control port | the register panel with the flow line, `.;e5cd 00 00 0a f3 nv-bdiZc  MAIN`, the port and vector lines |
 | `monitor m 0400 0407` | `>C:0400  20 20 …`, screen RAM |
@@ -98,6 +118,9 @@ control is not available in this host".
 | `monitor itu` on a booted 3.15 | `capabilities 0x34800222` (with `--usb-dir`, so `USB_HOST2` is in it), `low enabled 0x95 timer usb cmdif reset`, `high enabled 0x6a 1581 wifi hdmi unlock` |
 | `monitor cart` | `cartridge type 0x00 variant 0 none, not active`, `cart rom 0x03c00000, 4 MiB`, `reu on, 16 MB` from the `--settings` flash, `command intf on at 0xdf18, bus id 11` |
 | `monitor flash` / `sd` / `usb` | the image path and 11 config pages; a 64 MiB card; `port 1 storage in use` for the `--usb-dir` stick, the other ports empty |
+| `monitor c64 halt` on a booted 3.15 | `c64  stopped at $f04a` — read back out of `C64_STOP`, and the cycle keeps advancing because only the 6510 is held |
+| `monitor c64 step 4` | `4 instruction(s), 16 cycles`, PC $f04a → $f079, the firmware's clock untouched |
+| `monitor fw halt` / `status` | `fw   held at 00035db8  prvIdleTask+0x3c  (the monitor asked)` plus the line that the C64 stands with it; `fw step 3` retires three, `fw go` brings both back |
 | `monitor net` / `audio` | no MAC programmed and RX off on a machine without `--net`; socket 1 empty, engines 1 and 5 as 6581, one window line `$d400-$d7ff -> chip 0` (48 mirrors collapsed) |
 | TRX64 repin 0.7.3 → 0.8.2 | no code change needed; `smoke-all.sh` 7/7, `smoke-c64-carts.ctl` 27/27 with the freeze and both SID loads, UltimateDemo2026 detection all `[ OK ]` |
 
