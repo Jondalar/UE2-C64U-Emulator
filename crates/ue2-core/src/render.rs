@@ -1,8 +1,14 @@
 //! Overlay renderer and text dump. Spec: docs/specs/S07-overlay-u64io-render.md
 //!
 //! Pixel semantics follow the open chargen IP as summarised in docs/hw/05-ui-overlay-input.md §B
-//! (char_generator_regs.vhd, char_generator_slave12.vhd). The image is the text grid, over the C64 frame when one
-//! is attached (docs/specs/S14-c64-trx64.md §9): X_ON/Y_ON are ignored (05 OQ 4); the frontend places and scales it.
+//! (char_generator_regs.vhd, char_generator_slave12.vhd).
+//!
+//! The image is the output mode the firmware programmed into the HDMI timing registers: the C64 frame scaled into
+//! the active area, and the text grid on top where the chargen registers put it — X_ON/Y_ON for the corner,
+//! CHARS_PER_LINE and ACTIVE_LINES for the size (05 OQ 4, answered). Nothing here is centred and no size is
+//! assumed: `DetermineOverlaySettings` (u64_config.cc) writes a different box per screen and per video mode, so a
+//! full-height panel flush to the right edge and a small floating submenu window are the same code path with
+//! different registers.
 
 use anyhow::{bail, Result};
 
