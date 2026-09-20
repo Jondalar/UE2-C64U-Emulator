@@ -192,6 +192,14 @@ API and it must not shape the rest of the monitor.
   banks. This is the one place where the two designs fit without argument.
 - **No disassembler on the wire.** Clients read bytes with `MEM_GET` and disassemble themselves.
 
+**Checkpoints stop where they should.** A checkpoint is armed on the machine itself, not checked by the run loop
+between slices: the bridge's watch table gains the checkpoint's addresses and its observer ends the run at the
+access, which is the only hook that can. An exec checkpoint is the instruction fetch — the read whose address is
+the PC — and load/store are the other two `MEMORY_OP` bits. The gate is taken off again when the client leaves, so
+a machine nobody debugs runs exactly as it did. One hole, and it is in the spec rather than in a comment: a run
+**with a cartridge** is already split by the cartridge's own hints and carries that observer instead, so a
+checkpoint does not fire while a cartridge is active. Growing the same gate into that path is the follow-up.
+
 ## 9. Acceptance
 
 1. `cargo test --workspace` green, and TRX64's port audit (864 item 13) runs over our bridge host in our own
@@ -203,9 +211,10 @@ API and it must not shape the rest of the monitor.
 4. `config set` changes a setting in the running firmware (the menu shows the new value without a restart),
    `config write` survives a restart, `config flash` shows what is stored.
 5. A smoke script (`scripts/smoke-monitor.ctl`) drives the above headless and is part of `smoke-all.sh`.
-6. M4: a test client in `tests/` does the VICE first contact, reads registers, sets a checkpoint, steps over it,
-   resumes, and reads memory through two banks. One real client (VS64 or IceBro Lite) attaches by hand once and
-   the result is written into `docs/status/monitor.md`.
+6. M4: `scripts/vice-client.py` does the VICE first contact, the discovery commands, the registers, memory
+   through a named bank, a checkpoint set and listed, a step with its event order, and the two error cases; it is
+   part of `smoke-all.sh` (§9.6). One real client (VS64 or IceBro Lite) attaches by hand once and the result is
+   written into `docs/status/monitor.md` — not done yet.
 7. No regression: `smoke-all.sh`, `smoke-c64-carts.ctl` and the `uci-targets` e2e stay green.
 
 ## 10. Open

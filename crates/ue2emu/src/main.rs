@@ -14,6 +14,8 @@ mod net;
 mod runner;
 mod usb;
 mod usbdir;
+#[cfg(feature = "trx64")]
+mod vice;
 mod window;
 
 use std::path::PathBuf;
@@ -110,6 +112,9 @@ struct RunArgs {
     /// GDB remote stub address, e.g. 127.0.0.1:1234; the machine waits at reset until the debugger continues
     #[arg(long)]
     gdb: Option<String>,
+    /// VICE binary monitor for the C64, for third-party debuggers (default 127.0.0.1:6502; S23 §8)
+    #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:6502")]
+    vice_monitor: Option<String>,
     /// Logging: unmapped, io, irq (comma separated)
     #[arg(long, value_delimiter = ',')]
     log: Vec<String>,
@@ -234,6 +239,7 @@ fn run(a: RunArgs) -> Result<()> {
         control: a.control,
         max_seconds: a.max_seconds,
         gdb: a.gdb,
+        vice_monitor: a.vice_monitor,
         net,
         c64,
         audio,

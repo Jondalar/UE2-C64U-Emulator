@@ -267,6 +267,109 @@ fn words(rest: &str) -> Vec<String> {
     out
 }
 
+// ── the VICE port's door into this host (S23 §8) ─────────────────────────────────────────────────────────────
+//
+// `crates/ue2emu/src/vice.rs` speaks someone else's protocol and must not learn our internals, so everything it
+// needs is one function here, each taking the machine and our state and building a [`Host`] the same way `exec`
+// does. Every one of them is about the C64: the RISC-V is not reachable over that protocol at all.
+
+/// The C64's registers as the protocol numbers them (montypes.h:52-107): PC, A, X, Y, SP, FL, LIN, CYC.
+pub fn c64_registers(m: &mut Machine, state: &mut State) -> Vec<(u8, u16)> {
+    let Some(mut host) = Host::new(m, state) else { return Vec::new() };
+    let machine = host.machine();
+    let core = &machine.c64_core;
+    let (a, x, y) = (core.reg_a, core.reg_x, core.reg_y);
+    let (sp, status, pc) = (core.reg_sp, core.status(), core.reg_pc);
+    let (line, cycle) = (machine.vic.raster_line, machine.vic.raster_cycle);
+    vec![
+        (0x03, pc),
+        (0x00, u16::from(a)),
+        (0x01, u16::from(x)),
+        (0x02, u16::from(y)),
+        (0x04, u16::from(sp)),
+        (0x05, u16::from(status)),
+        (0x35, line),
+        (0x36, cycle),
+    ]
+}
+
+/// One register, by the protocol's id. An id this CPU does not have is ignored, as VICE ignores it.
+pub fn set_c64_register(m: &mut Machine, state: &mut State, reg: u8, value: u16) {
+    let Some(mut host) = Host::new(m, state) else { return };
+    let core = &mut host.machine().c64_core;
+    match reg {
+        0x03 => core.reg_pc = value,
+        0x00 => core.reg_a = value as u8,
+        0x01 => core.reg_x = value as u8,
+        0x02 => core.reg_y = value as u8,
+        0x04 => core.reg_sp = value as u8,
+        0x05 => core.set_status_composite(value as u8),
+        _ => {}
+    }
+}
+
+/// `length` bytes from `start` through one bank lens, without side effects.
+pub fn c64_read(m: &mut Machine, state: &mut State, start: u16, length: usize, lens: &str) -> Vec<u8> {
+    let Some(mut host) = Host::new(m, state) else { return vec![0; length] };
+    let machine = host.machine();
+    (0..length).map(|i| machine.peek_lens(start.wrapping_add(i as u16), lens)).collect()
+}
+
+/// Bytes into the machine through one bank lens, the library's own write so both hosts agree what a lens means.
+pub fn c64_write(m: &mut Machine, state: &mut State, start: u16, bytes: &[u8], lens: &str) {
+    let Some(mut host) = Host::new(m, state) else { return };
+    trx64_monitor::verbs::monitor_write(&mut host, start, bytes, lens);
+}
+
+/// Stop or release the C64 (S23 §3: the machine's own stop).
+pub fn halt_c64(m: &mut Machine, state: &mut State, halted: bool) {
+    if let Some(mut host) = Host::new(m, state) {
+        let _ = run::set_halted(&mut host, halted);
+    }
+}
+
+/// `n` instructions, `over` running a `JSR` to its return address.
+pub fn step_c64(m: &mut Machine, state: &mut State, n: u64, over: bool) -> Result<(), String> {
+    let mut host = Host::new(m, state).ok_or("this machine has no C64")?;
+    run::step(&mut host, n, over).map(|_| ())
+}
+
+/// Run until the current subroutine returns: the address under the stack pointer is where it goes.
+pub fn c64_until_return(m: &mut Machine, state: &mut State) -> Result<(), String> {
+    let mut host = Host::new(m, state).ok_or("this machine has no C64")?;
+    run::until_return(&mut host)
+}
+
+/// `KEYBOARD_FEED`, as VICE's own `kbdbuf_feed` does it: into the KERNAL's keyboard buffer at $0277, with the
+/// count at $00C6 (10 bytes, kernal.s). Nothing else would work while the C64 is stopped.
+pub fn feed_keyboard(m: &mut Machine, text: &str) {
+    let mut state = State::default();
+    let Some(mut host) = Host::new(m, &mut state) else { return };
+    let machine = host.machine();
+    for (i, byte) in text.bytes().take(10).enumerate() {
+        machine.write_full(0x0277 + i as u16, byte);
+    }
+    machine.write_full(0x00C6, text.len().min(10) as u8);
+}
+
+/// Reset the C64 through the register the firmware uses for it (S23 §3), not around the firmware.
+pub fn reset_c64(m: &mut Machine, state: &mut State, hard: bool) -> Result<(), String> {
+    let mut host = Host::new(m, state).ok_or("this machine has no C64")?;
+    run::reset(&mut host, hard)
+}
+
+/// The checkpoints the VICE port set, handed to the bridge so its runs stop on them (S23 §8).
+pub fn set_c64_checkpoints(m: &mut Machine, ranges: &[(u16, u16, u8)]) {
+    if let Some(backend) = trx64(m) {
+        backend.set_checkpoints(ranges);
+    }
+}
+
+/// The checkpoint the last run stopped at, once.
+pub fn take_c64_checkpoint_hit(m: &mut Machine) -> Option<u16> {
+    trx64(m).and_then(Trx64Backend::take_checkpoint_hit)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};

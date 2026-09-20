@@ -108,8 +108,32 @@ const UCI_EVENT_WAIT: u64 = 10 * ue2_core::time::CLOCKS_PER_MS;
 /// abort (TRX64 `uci.rs` `handshake_in`).
 const UCI_EVENTS: u8 = 0x07;
 
-/// The TRX64 observer for runs without cartridge hints: halts after a C64 write to the UCI control register.
-struct UciObserver;
+/// The TRX64 observer for runs without cartridge hints.
+///
+/// Two jobs in one, because a run has one observer: it halts after a C64 write to the UCI control register, and it
+/// halts on a debugger's checkpoint (S23 §8). Both arrive through `on_access`, which is the only hook that can end
+/// a run, and both are gated by the watch table so an untouched address costs nothing.
+#[derive(Default)]
+struct UciObserver {
+    /// Checkpoint ranges the frontend set, as (start, end, operations) with `MEMORY_OP` bits: 1 load, 2 store,
+    /// 4 exec. Empty while no debugger is attached.
+    checkpoints: Vec<(u16, u16, u8)>,
+    /// The address of the first checkpoint this run hit.
+    hit: Option<u16>,
+}
+
+impl UciObserver {
+    /// Whether this access is a checkpoint of the kind that was asked for. An exec checkpoint is the instruction
+    /// fetch, which is the read whose address is the PC (`AccessCtx::pc`).
+    fn checkpoint(&self, kind: BusKind, addr: u16, ctx: &AccessCtx) -> bool {
+        let op = match kind {
+            BusKind::Write => 0x02,
+            _ if addr == ctx.pc => 0x04,
+            _ => 0x01,
+        };
+        self.checkpoints.iter().any(|&(start, end, ops)| start <= addr && addr <= end && ops & op != 0)
+    }
+}
 
 impl Observer for UciObserver {
     #[inline(always)]
@@ -121,7 +145,11 @@ impl Observer for UciObserver {
     #[inline(always)]
     fn on_interrupt(&mut self, _: u16, _: u64) {}
 
-    fn on_access(&mut self, kind: BusKind, addr: u16, _: u8, _: AccessCtx) -> bool {
+    fn on_access(&mut self, kind: BusKind, addr: u16, _: u8, ctx: AccessCtx) -> bool {
+        if !self.checkpoints.is_empty() && self.hit.is_none() && self.checkpoint(kind, addr, &ctx) {
+            self.hit = Some(addr);
+            return true;
+        }
         kind == BusKind::Write && is_uci_control(addr)
     }
 }
@@ -190,6 +218,12 @@ pub struct Trx64Backend {
     uci_off_since: Option<u64>,
     /// The C64 waits for the firmware to handle a UCI event: since when, and which event bits ([`UCI_EVENT_WAIT`]).
     uci_wait: Option<(u64, u8)>,
+    /// A debugger's checkpoints (S23 §8) as (start, end, `MEMORY_OP` bits), and the watch table they are gated by:
+    /// [`UCI_WATCH`] with their addresses added, rebuilt whenever they change.
+    checkpoints: Vec<(u16, u16, u8)>,
+    checkpoint_watch: Option<Box<[u8; 0x1_0000]>>,
+    /// The address of the checkpoint the last run stopped at, waiting to be picked up.
+    checkpoint_hit: Option<u16>,
     /// Ultimate Audio: UE2's own block, shared with the port device TRX64 holds (sampler.rs, S16).
     sampler: sampler::SamplerHandle,
 }
@@ -267,6 +301,9 @@ impl Trx64Backend {
             reu_off_since: None,
             uci_off_since: None,
             uci_wait: None,
+            checkpoints: Vec::new(),
+            checkpoint_watch: None,
+            checkpoint_hit: None,
             sampler,
         }
     }
@@ -390,25 +427,31 @@ impl Trx64Backend {
         // UCI: with the block on the bus, a run halts after a C64 write to its control register, so the C64 can wait
         // for the firmware to handle the event ([`UCI_EVENT_WAIT`]).
         let uci = self.m.uci().is_some_and(|u| u.status().enabled);
-        let with_uci = |m: &mut Machine, budget| {
-            m.run_for_full_capped_dbg(budget, u64::MAX, None, None, Some(&UCI_WATCH), &mut UciObserver, |_, _, _, _, _, _, _| {});
-        };
-        if self.m.cartridge.is_none() && !uci {
+        // A debugger's checkpoints need the same door: the watch table gates which accesses reach the observer,
+        // and the observer is the only hook that can end a run (S23 §8).
+        let watching = !self.checkpoints.is_empty();
+        if self.m.cartridge.is_none() && !uci && !watching {
             let clk = self.m.c64_core.clk;
             plain(&mut self.m, target - clk);
             return;
         }
+        if self.m.cartridge.is_none() {
+            let clk = self.m.c64_core.clk;
+            let events = self.uci_events();
+            self.run_watched(target.saturating_sub(clk).max(1));
+            self.wait_for_uci(events);
+            return;
+        }
+        let with_uci = |m: &mut Machine, budget| {
+            let mut obs = UciObserver::default();
+            m.run_for_full_capped_dbg(budget, u64::MAX, None, None, Some(&UCI_WATCH), &mut obs, |_, _, _, _, _, _, _| {});
+        };
         loop {
             let clk = self.m.c64_core.clk;
             if clk >= target || self.uci_wait.is_some() {
                 break;
             }
             let events = self.uci_events();
-            if self.m.cartridge.is_none() {
-                with_uci(&mut self.m, target - clk);
-                self.wait_for_uci(events);
-                continue;
-            }
             // CARTSLOT: the hints of the internal and the physical cartridge (slot.rs).
             let cart = &self.cart;
             let hints = self.slot.with(|s| s.run_hints(cart, clk));
@@ -499,6 +542,43 @@ impl Trx64Backend {
         } else {
             self.drive.after_run(&mut self.m);
         }
+    }
+
+    /// One run through the watch table: the UCI's control register, plus a debugger's checkpoints when there are
+    /// any. The table is [`UCI_WATCH`] unless checkpoints widened it.
+    fn run_watched(&mut self, budget: u64) {
+        let mut obs = UciObserver { checkpoints: self.checkpoints.clone(), hit: None };
+        let table: &[u8; 0x1_0000] = match &self.checkpoint_watch {
+            Some(watch) => watch,
+            None => &UCI_WATCH,
+        };
+        self.m.run_for_full_capped_dbg(budget, u64::MAX, None, None, Some(table), &mut obs, |_, _, _, _, _, _, _| {});
+        if obs.hit.is_some() {
+            self.checkpoint_hit = obs.hit;
+        }
+    }
+
+    /// The checkpoints a debugger set (S23 §8), as (start, end, `MEMORY_OP` bits). An empty list takes the gate
+    /// away again, so a machine nobody is debugging runs exactly as it did.
+    ///
+    /// The gate lives on the runs without a cartridge. With a cartridge the run is already split by the cart's own
+    /// hints and carries that observer instead; checkpoints there wait for the same gate to be grown into it.
+    pub fn set_checkpoints(&mut self, ranges: &[(u16, u16, u8)]) {
+        self.checkpoints = ranges.to_vec();
+        self.checkpoint_watch = (!ranges.is_empty()).then(|| {
+            let mut watch = Box::new(UCI_WATCH);
+            for &(start, end, _) in ranges {
+                for addr in start..=end {
+                    watch[usize::from(addr)] = 1;
+                }
+            }
+            watch
+        });
+    }
+
+    /// The checkpoint the last run stopped at, once.
+    pub fn take_checkpoint_hit(&mut self) -> Option<u16> {
+        self.checkpoint_hit.take()
     }
 
     /// Spec 850 D7 — the hold TRX64 runs under. The reset line wins over C64_STOP: with CPU, CIAs and SID in reset

@@ -266,6 +266,41 @@ pub(super) fn step(host: &mut Host, n: u64, over: bool) -> Result<StopInfo, Stri
     Ok(StopInfo { pc, cycle, reason: "step".into(), steps })
 }
 
+/// Run until the subroutine the C64 is in returns: the address under the stack pointer is where it goes back to,
+/// and `RTS` leaves the PC one past it (`EXECUTE_UNTIL_RETURN`, S23 §8).
+pub(super) fn until_return(host: &mut Host) -> Result<(), String> {
+    let held = halted(host);
+    set_stop(host, false);
+    let machine = host.machine();
+    let sp = machine.c64_core.reg_sp;
+    let lo = machine.read_full(0x0100 + u16::from(sp.wrapping_add(1)));
+    let hi = machine.read_full(0x0100 + u16::from(sp.wrapping_add(2)));
+    let back = u16::from_le_bytes([lo, hi]).wrapping_add(1);
+    for _ in 0..UNTIL_INSNS {
+        run_c64(host, 64, 1);
+        if pc_cycle(host).0 == back {
+            break;
+        }
+    }
+    if held {
+        set_stop(host, true);
+    }
+    Ok(())
+}
+
+/// Reset the C64 through `C64_MODE`, the register the firmware resets it with (c64.h:70-73). Warm and cold are the
+/// same line here; the difference on hardware is what the firmware does around it, which is the firmware's.
+pub(super) fn reset(host: &mut Host, _hard: bool) -> Result<(), String> {
+    const C64_MODE: u32 = 0x1004_0000;
+    const MODE_RESET: u8 = 0x04;
+    const MODE_UNRESET: u8 = 0x08;
+    let mode = peek8(&host.m.bus, C64_MODE);
+    host.m.bus.poke_io8(C64_MODE, (mode & !MODE_UNRESET) | MODE_RESET);
+    run_c64(host, 64, 1);
+    host.m.bus.poke_io8(C64_MODE, (mode & !MODE_RESET) | MODE_UNRESET);
+    Ok(())
+}
+
 /// The C64's PC and cycle.
 fn pc_cycle(host: &mut Host) -> (u16, u64) {
     let c64 = host.machine();

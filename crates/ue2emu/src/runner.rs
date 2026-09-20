@@ -18,6 +18,8 @@ use crate::audio::{self, AudioOptions, Output};
 use crate::cartslot::{CartDone, CartRequest, CartSlot, CartSlotSpec};
 use crate::control::{self, ConsoleLog, InputTimeline, TimedInputs};
 use crate::gdb::{self, GdbServer};
+#[cfg(feature = "trx64")]
+use crate::vice::ViceServer;
 use crate::net::{self, NetOptions};
 use crate::usbdir::{UsbDirs, UsbDone, UsbRequest, EXPLICIT_WAIT_MS};
 
@@ -62,6 +64,8 @@ pub struct RunOptions {
     pub control: Option<String>,
     pub max_seconds: Option<f64>,
     pub gdb: Option<String>,
+    /// VICE binary monitor address (`--vice-monitor`), S23 §8.
+    pub vice_monitor: Option<String>,
     /// Wired Ethernet backend (`--net`).
     pub net: Option<NetOptions>,
     /// Attach the TRX64 C64 (`--c64 trx64`); main.rs allows it only with the `trx64` feature.
@@ -124,6 +128,7 @@ pub struct EmuHandle {
 /// halts, and prints the machine stats (plus the unmapped summary with `--log unmapped`) to stderr when it ends.
 pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
     let gdb = opts.gdb.as_deref().map(gdb::listen).transpose()?;
+    let vice = vice_server(opts.vice_monitor.as_deref())?;
     // The audio device is opened on the caller's thread, which keeps its stream in `EmuHandle`; the sink moves to the
     // emulation thread with the C64.
     let (audio, sink) = if opts.c64 {
@@ -166,7 +171,7 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
             match build(cfg, net_opts.as_ref(), c64, sink, armsid, sid_thread, &usb_dirs, &usb_dir_work, cart_slot) {
                 Ok((machine, net, dirs, cart)) => {
                     let _ = ready_tx.send(Ok(()));
-                    emu.run(machine, net, dirs, cart, &command_rx, gdb.map(GdbServer::new))
+                    emu.run(machine, net, dirs, cart, &command_rx, gdb.map(GdbServer::new), vice)
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
@@ -347,6 +352,7 @@ impl EmuThread {
         mut cart: CartSlot,
         commands: &Receiver<Command>,
         mut gdb: Option<GdbServer>,
+        #[allow(unused_mut, unused_variables)] mut vice: Option<ViceServer>,
     ) -> Result<()> {
         let mut pacer = Pacer::new(machine.now_ms());
         let mut next_display_ms = 0;
@@ -361,6 +367,10 @@ impl EmuThread {
             // S23 M3: `fw halt` holds the firmware, and with it the whole machine — the C64 only advances while
             // the firmware drives it. Commands are still served, or there would be no way back.
             if monitor.firmware_held() {
+                #[cfg(feature = "trx64")]
+                if let Some(server) = vice.as_mut() {
+                    server.poll(&mut machine, &mut monitor.ours);
+                }
                 if apply_commands(&mut machine, commands, &mut inputs, &mut usb_dirs, &mut cart, &mut monitor) {
                     usb_dirs.finish(&mut machine, true);
                     cart.finish(&mut machine);
@@ -409,6 +419,10 @@ impl EmuThread {
             }
             self.now_ms.store(now_ms, Ordering::Relaxed);
 
+            #[cfg(feature = "trx64")]
+            if let Some(server) = vice.as_mut() {
+                server.poll(&mut machine, &mut monitor.ours);
+            }
             if let RunExit::Breakpoint(pc) = exit {
                 monitor.note_stop(format!("breakpoint at {:08x} {}", pc, machine.symbols.format(pc)));
             }
@@ -523,6 +537,26 @@ fn apply_commands(
     inputs.advance(now_ms, |ev| machine.input(ev));
     quit
 }
+
+/// `--vice-monitor [ADDR]`: the VICE binary monitor server, or None (S23 §8).
+#[cfg(feature = "trx64")]
+fn vice_server(addr: Option<&str>) -> Result<Option<ViceServer>> {
+    let Some(addr) = addr else { return Ok(None) };
+    let parsed = addr.parse().with_context(|| format!("--vice-monitor {addr}: not an address"))?;
+    ViceServer::bind(parsed).map(Some)
+}
+
+#[cfg(not(feature = "trx64"))]
+fn vice_server(addr: Option<&str>) -> Result<Option<ViceServer>> {
+    if addr.is_some() {
+        anyhow::bail!("--vice-monitor needs a C64: this build has none (build with the trx64 feature)");
+    }
+    Ok(None)
+}
+
+/// Without the C64 there is no VICE monitor, and the option is refused rather than ignored.
+#[cfg(not(feature = "trx64"))]
+pub struct ViceServer;
 
 /// Final machine report on stderr; stdout carries the firmware console.
 fn report(machine: &Machine) {

@@ -17,6 +17,7 @@
 #   monitor     smoke-monitor.ctl   --flash run/flash-monitor.bin (fresh) --settings smoke-settings.cfg
 #   uci         smoke-uci.ctl       --flash run/flash-uci.bin (fresh) --c64-roms --settings smoke-uci.cfg
 #                                   --usb-dir run/uci (uci-probe.prg from make-uci-probe.py)
+#   vice        scripts/vice-client.py talks the VICE binary monitor to --vice-monitor (S23 §8)
 #   negative    an expect that cannot match; passes only when ue2emu exits non-zero and names its line
 
 set -euo pipefail
@@ -85,6 +86,16 @@ mkdir run/uci
 python3 "$repo/scripts/make-uci-probe.py" run/uci/uci-probe.prg
 smoke uci "$repo/scripts/smoke-uci.ctl" --flash run/flash-uci.bin --c64-roms --settings "$repo/scripts/smoke-uci.cfg" \
     --usb-dir run/uci --usb-dir-work run/uci-work
+
+# vice: the binary monitor answers a real client conversation (S23 §8, §9.6). The emulator holds the port open
+# while the client talks to it, then both are brought down.
+printf 'expect "F3=HELP" 10000\nwait 600000\nquit\n' >run/vice.ctl
+emu vice run/vice.ctl --flash run/flash-vice.bin --settings "$repo/scripts/smoke-settings.cfg" --vice-monitor &
+vicepid=$!
+python3 "$repo/scripts/vice-client.py" || fail vice "the client conversation failed"
+kill "$vicepid" 2>/dev/null || true
+wait "$vicepid" 2>/dev/null || true
+echo "PASS vice"
 
 printf '# must fail\nexpect "NO SUCH TEXT ON THE SCREEN" 500\nquit\n' >run/negative.ctl
 rc=0
