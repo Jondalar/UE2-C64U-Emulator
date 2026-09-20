@@ -282,7 +282,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "c64-bridge"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "trx64-core",
  "ue2-core",
@@ -2089,7 +2089,7 @@ dependencies = [
 
 [[package]]
 name = "rv32"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "object",
 ]
@@ -2695,7 +2695,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "ue2-core"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "cpp_demangle",
@@ -2706,7 +2706,7 @@ dependencies = [
 
 [[package]]
 name = "ue2-mcp"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -2721,7 +2721,7 @@ dependencies = [
 
 [[package]]
 name = "ue2-net"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "block2",
@@ -2733,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "ue2-vfat"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2749,7 +2749,7 @@ dependencies = [
 
 [[package]]
 name = "ue2emu"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "c64-bridge",
