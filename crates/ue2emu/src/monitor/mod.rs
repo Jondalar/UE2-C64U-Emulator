@@ -6,8 +6,12 @@
 //! and memory yes, no flag register, no disassembler (S23 §4), and no debug gates — the watch tables are a 6502
 //! shape.
 //!
-//! Not here yet: run control (S23 M3, the library's defaults refuse it in one sentence) and our own Ultimate
-//! verbs (S23 M2).
+//! Our own verbs are S23 M2 and live below, behind the library's dispatch. [`uci`] is what `config` knocks on when
+//! a verb has to reach the *running* firmware rather than the bytes it left behind.
+//!
+//! Not here yet: run control (S23 M3, the library's defaults refuse it in one sentence).
+
+mod uci;
 
 use c64_bridge::Trx64Backend;
 use trx64_monitor::host::{CpuView, Device, MonitorHost, Reg};
@@ -109,12 +113,39 @@ impl Host<'_> {
             }
             return Ok(out);
         }
-        if matches!(args.first(), Some(&"set" | &"write" | &"read")) {
+        if let ["read", rest @ ..] = args {
+            return match rest {
+                [path] => self.config_read(path),
+                _ => Err("config read: usage: config read <path in the emulated machine>".into()),
+            };
+        }
+        if matches!(args.first(), Some(&"set" | &"write")) {
             return Err(format!("config {}: not in this build yet (S23 §6)", args[0]));
         }
         let tables = settings::tables(&self.m.bus.ram, &self.m.segments);
         let stores = settings::stores(&tables);
         Ok(settings::stored(&stores, flash, args.first().copied(), args.get(1).copied()))
+    }
+
+    /// `config read <path>` — the menu's "Load Settings", from the monitor: the firmware opens that `.cfg`, applies
+    /// the items it knows and effectuates every store they touched (`ControlTarget::load_config`). The path is the
+    /// emulated machine's — `/flash/...`, `/Usb0/...`, `/Temp/...`, the SD card — never the host's.
+    fn config_read(&mut self, path: &str) -> Result<String, String> {
+        if !path.is_ascii() {
+            return Err("config read: the firmware's paths are ASCII".into());
+        }
+        let mut message = vec![uci::TARGET_CONTROL, uci::CTRL_CMD_LOAD_CONFIG];
+        message.extend(path.as_bytes());
+        // No length field: the command's remainder is a C string, so it needs its terminator
+        // (control_target.cc:565-568).
+        message.push(0);
+        let reply = uci::command(self.m, &message)?;
+        // The reply data is the parse log — empty on full success, else the lines the firmware could not apply.
+        let log: String = reply.text().lines().map(|l| format!("  {l}\n")).collect();
+        if !reply.ok() {
+            return Err(format!("config read {path}: {}\n{log}", reply.status).trim_end().to_string());
+        }
+        Ok(format!("  {path}  {}\n{log}", reply.status))
     }
 
     /// `clock` — the two clocks of this machine: the emulator's, which the firmware runs on, and the C64's.
@@ -130,7 +161,7 @@ impl Host<'_> {
 
     /// The verbs of §5 for `help`, after the library's own list.
     fn help(&self) -> &'static str {
-        "\nthe Ultimate side (S23):\n  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n  clock             the emulator's clock, the firmware's instructions, the C64's cycle\n  config [cat [item]]  the settings, as stored in flash; `config flash` the raw pages\n"
+        "\nthe Ultimate side (S23):\n  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n  clock             the emulator's clock, the firmware's instructions, the C64's cycle\n  config [cat [item]]  the settings, as stored in flash; `config flash` the raw pages\n  config read PATH  hand a .cfg in the emulated machine to the running firmware\n"
     }
 }
 
@@ -335,6 +366,41 @@ mod tests {
             exec(&mut m, &mut s, "config set a b c").unwrap_err(),
             "config set: not in this build yet (S23 §6)"
         );
+    }
+
+    /// The firmware registers the block sits behind (command_if_pkg.vhd:7-25), as `CommandInterface`'s constructor
+    /// writes them: the window at $DF18 and the block on.
+    fn enable_uci(m: &mut Machine) {
+        let block = trx64(m).expect("a backend").trx64().uci_mut().expect("the u64 profile carries the block");
+        block.fw_write(0x0, 0x47);
+        block.fw_write(0x1, 1);
+    }
+
+    /// S23 §6: `config read` hands the path to the running firmware through the command interface.
+    #[test]
+    fn config_read_goes_through_the_command_interface() {
+        let mut m = machine();
+        let mut s = MonitorSession::new();
+
+        // A firmware that never enabled the block: the answer says which setting turns it on.
+        let err = exec(&mut m, &mut s, "config read /flash/x.cfg").unwrap_err();
+        assert!(err.starts_with("the firmware's command interface is off"), "{err}");
+        assert!(exec(&mut m, &mut s, "config read").unwrap_err().contains("usage"));
+        assert!(exec(&mut m, &mut s, "config read a b").unwrap_err().contains("usage"));
+
+        // With the block on, the command is pushed and the firmware is run for the answer. This machine has no
+        // firmware image, so the run faults at once — which is the answer, not a hang.
+        enable_uci(&mut m);
+        let err = exec(&mut m, &mut s, "config read /flash/x.cfg").unwrap_err();
+        assert!(err.starts_with("the firmware stopped with a command in flight"), "{err}");
+
+        let wanted = b"\x04\x50/flash/x.cfg\0";
+        let block = trx64(&mut m).expect("a backend").trx64().uci().expect("the block");
+        let pushed: Vec<u8> = (0..wanted.len() as u16).map(|i| block.fw_read(0x800 + i)).collect();
+        assert_eq!(pushed, wanted, "target 4, CTRL_CMD_LOAD_CONFIG, the path as a C string");
+        let s = trx64(&mut m).unwrap().trx64().uci_status().unwrap();
+        assert_eq!(s.command_length, wanted.len() as u16);
+        assert!(s.new_command, "and the block is telling the firmware about it");
     }
 
     /// Run control is M3: until then the library's own sentence is the answer, not a panic.

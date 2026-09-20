@@ -3,7 +3,7 @@
 TRX64's monitor runs against UE2's C64. The verbs are TRX64's own, from `trx64-monitor` (their Spec 864); UE2 is
 its second host. Design and the division of labour: `docs/specs/S23-monitor.md`.
 
-**M1 works.** `crates/ue2emu/src/monitor.rs` implements `MonitorHost`:
+**M1 works.** `crates/ue2emu/src/monitor/mod.rs` implements `MonitorHost`:
 
 - `machine()` hands over the TRX64 machine. `ue2-core` still knows nothing about TRX64: `C64Backend` grew a
   `as_any_mut` hook, `C64Port` a `backend_mut`, and the bridge a `trx64()` accessor, so the frontend downcasts and
@@ -21,8 +21,19 @@ takes it from there and appends its own section to `help`. TRX64 gains no notion
 stays one-way. Done: `fw` (the RISC-V registers, `fw tasks` for the FreeRTOS list), `clock` (the
 emulator's clock, the firmware's instructions, the C64's cycle) and `config`'s reading half — the settings as the
 flash holds them, decoded through each item's own type and marked `flash` or `default`, plus `config flash` for the
-raw pages. `config set`, `config write` and `config read` refuse with their spec reference for now. Still to come:
-`itu`, `cart`, `flash`, `sd`, `usb`, `net`, `audio`.
+raw pages. `config set` and `config write` refuse with their spec reference for now. Still to come: `itu`, `cart`,
+`flash`, `sd`, `usb`, `net`, `audio`.
+
+**`config read <path>` reaches the running firmware.** A verb that has to change something cannot go at the flash
+behind the firmware's back — the firmware holds its own copy of every store and would write it back over ours. So
+`config read` knocks where the cartridge software knocks: `crates/ue2emu/src/monitor/uci.rs` pushes a command into
+the UCI block (S15) as a host access, runs the firmware until the block has the reply, and reads the reply data and
+the status string back out. `CTRL_CMD_LOAD_CONFIG` (0x50, `ControlTarget::load_config`) then opens that `.cfg` in
+the *emulated* machine, applies the items it knows and effectuates every store they touched. What the firmware
+answers is what the monitor prints: `00,OK`, or the firmware's own error code as a failed line. The block is
+refused while the C64 has a command in flight, and a firmware that never enabled the command interface is named
+together with the setting that turns it on. A firmware without the command — it was added to the fork in `Add UCI
+control command to load config file` — answers `UNKNOWN COMMAND`, which reaches the caller unchanged.
 
 **Not yet:** run control — `g`, `step`, breakpoints (M3). Until then the library's own sentence answers: "run
 control is not available in this host".
@@ -31,7 +42,7 @@ control is not available in this host".
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | green (5 new in `ue2emu::monitor`, 82 in ue2emu) |
+| `cargo test --workspace` | green (6 in `ue2emu::monitor`, 83 in ue2emu) |
 | `cargo clippy` on the changed crates | no new warnings |
 | Booted 3.15, `monitor r` over the control port | the register panel with the flow line, `.;e5cd 00 00 0a f3 nv-bdiZc  MAIN`, the port and vector lines |
 | `monitor m 0400 0407` | `>C:0400  20 20 …`, screen RAM |
@@ -43,6 +54,8 @@ control is not available in this host".
 | `monitor clock` | the emulator's ms and clocks, the firmware's instructions and idle skips, the C64's cycle |
 | `monitor config flash` on a `--settings` flash | 11 pages with their names (`GEN.`, `C64.`, `U64C`, …) and record counts |
 | `monitor config "C64 and Cartridge Settings" "REU Size"` | `REU Size=16 MB   (flash)`, the value `--settings` wrote; an item nobody stored reads its firmware default |
+| `monitor config read /Usb0/change.cfg` on a booted fork build | `  /Usb0/change.cfg  00,OK`, and the firmware console shows `Effectuating settings of store 'C64 and Cartridge Settings' after loading.` |
+| `monitor config read` on a file that is not there | the line fails with the firmware's own `88,CANNOT OPEN CONFIG FILE` |
 | TRX64 repin 0.7.3 → 0.8.2 | no code change needed; `smoke-all.sh` 7/7, `smoke-c64-carts.ctl` 27/27 with the freeze and both SID loads, UltimateDemo2026 detection all `[ OK ]` |
 
 ### Open
