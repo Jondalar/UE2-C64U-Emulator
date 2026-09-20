@@ -461,7 +461,7 @@ const MAX_LIST_ITEMS: usize = 256;
 ///
 /// States follow `eTaskGetState` (tasks.c:1378-1459): `pxCurrentTCB` is running, a task on the suspended list with
 /// an event list is blocked; a suspended task waiting on a notification is shown as suspended.
-fn task_list(machine: &Machine) -> String {
+pub(crate) fn task_list(machine: &Machine) -> String {
     let bus = &machine.bus;
     let symbol = |name| machine.symbols.addr_of(name);
     let (Some(current), Some(ready)) = (symbol("pxCurrentTCB"), symbol("pxReadyTasksLists")) else {

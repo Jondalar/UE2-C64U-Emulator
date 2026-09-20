@@ -73,8 +73,10 @@ name instead of watching the wrong 64 KB.
 
 ## 5. Our verbs
 
-All read-only in the first cut, all `MachineEffect::Observes`, all registered into the library's dispatch so the
-modal state (`a`, prompts) stays in one place and `help` stays one list.
+All read-only in the first cut except `config`, all `MachineEffect::Observes`. The library sees every line first
+(it owns the modal state: `a`, a pending prompt) and returns `None` for a line it does not own; our dispatch takes
+it from there, and appends its own section to `help`. No registration API upstream: TRX64 must not gain a notion of
+this emulator — the dependency stays one-way, and their port audit stays their verbs while we audit ours.
 
 | Verb | Shows |
 |---|---|
@@ -94,18 +96,20 @@ answer for them truthfully.
 
 ## 6. `config`
 
-What the menu does, from the monitor.
+What the menu does, from the monitor. Paths are the emulated machine's, not the host's: `/flash/…`, `/Usb0/…`,
+`/Temp/…`, the SD card.
 
 | Command | Effect |
 |---|---|
-| `config [category [item]]` | Show. Values come from the flash config pages, decoded with the S21 code (`ue2-core/src/settings.rs`), and are marked as stored rather than live. |
-| `config set <cat> <item> <value>` | Change it in the running firmware: write a delta `.cfg` onto a `--usb-dir` stick and have the firmware load it through UCI `CTRL_CMD_LOAD_CONFIG` (0x50), which parses it and calls `effectuate()` per store (`configio.cc`). No network needed. |
-| `config write [cat]` | Make it permanent — the confirm step the menu has. With `--net user` this is the firmware's own `configs:save_to_flash`; without it we write the page ourselves. |
-| `config reload [cat]` | Throw away what is not saved (`configs:load_from_flash`, or a reboot's worth of nothing). |
-| `config flash` | The raw page decode, for the question "what is actually stored" — the one Xander's two flash images raised. |
+| `config [category [item]]` | Show. Values are decoded from the flash config pages with the S21 code (`ue2-core/src/settings.rs`). |
+| `config set <cat> <item> <value>` | Change it in the running firmware: a delta `.cfg` is written into `/flash` (our own FAT writer, as `--c64-roms` writes the ROMs) and handed to the firmware with UCI `CTRL_CMD_LOAD_CONFIG` (0x50), which parses it and calls `effectuate()` per store. No USB stick and no network needed. |
+| `config write` | Permanent, where the menu puts it: the config pages in flash. |
+| `config write <path>` | The menu's "save to file": a `.cfg` at that guest path (`/Usb0/mine.cfg`, `/flash/mine.cfg`, the SD card). |
+| `config read <path>` | The menu's load: that `.cfg` through UCI 0x50, so the firmware applies and effectuates it. |
+| `config flash` | The raw page decode — "what is actually stored", the question Xander's two flash images raised. |
 
-Rule, enforced and documented: `set` before `write`. Writing a page the firmware does not know about is undone
-the next time the firmware saves that page from its own copy.
+Rule, enforced and documented: `set` before `write`. Writing a page the firmware does not know about is undone the
+next time the firmware saves that page from its own copy.
 
 ## 7. Surfaces
 

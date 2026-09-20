@@ -15,7 +15,7 @@ use trx64_monitor::{addr_spans, verbs, MonitorSession};
 use ue2_core::devices::c64::C64Port;
 use ue2_core::machine::Machine;
 
-use crate::gdb::{peek8, ram_index};
+use crate::gdb::{peek8, ram_index, task_list};
 
 /// The name `device` takes for the firmware's core.
 pub const FW: &str = "fw";
@@ -59,6 +59,52 @@ impl MonitorHost for Host<'_> {
 
     fn devices(&self) -> Vec<Device> {
         vec![Device::C64, Device::Drive8, Device::Host(FW)]
+    }
+}
+
+/// Our own verbs (S23 §5): the Ultimate side, which the library has never seen.
+impl Host<'_> {
+    /// A line the library declined. `None` means nobody owns it.
+    fn ours(&mut self, verb: &str, args: &[&str]) -> Option<Result<String, String>> {
+        match verb {
+            "fw" => Some(self.verb_fw(args)),
+            "clock" => Some(Ok(self.verb_clock())),
+            _ => None,
+        }
+    }
+
+    /// `fw` — the firmware's core: its registers, or `fw tasks` for the FreeRTOS task list.
+    fn verb_fw(&mut self, args: &[&str]) -> Result<String, String> {
+        match args {
+            [] => {
+                let mut out = format!("  pc  {:08x}  {}\n", self.m.cpu.pc, self.m.symbols.format(self.m.cpu.pc));
+                for (i, name) in FW_REGS.iter().enumerate() {
+                    out.push_str(&format!("  {name:<4} {:08x}", self.m.cpu.x[i]));
+                    if i % 4 == 3 {
+                        out.push('\n');
+                    }
+                }
+                Ok(out)
+            }
+            ["tasks"] => Ok(task_list(self.m)),
+            _ => Err("fw: usage: fw [tasks]".into()),
+        }
+    }
+
+    /// `clock` — the two clocks of this machine: the emulator's, which the firmware runs on, and the C64's.
+    fn verb_clock(&mut self) -> String {
+        let (now_ms, clocks) = (self.m.now_ms(), self.m.bus.now);
+        let (insns, idle) = (self.m.cpu.insns, self.m.idle_insns);
+        let c64 = self.machine().c64_core.clk;
+        format!(
+            "  emulator  {now_ms} ms  ({clocks} clocks at {} Hz)\n  firmware  {insns} instructions, {idle} skipped idle\n  c64       cycle {c64}\n",
+            ue2_core::time::CLOCK_HZ,
+        )
+    }
+
+    /// The verbs of §5 for `help`, after the library's own list.
+    fn help(&self) -> &'static str {
+        "\nthe Ultimate side (S23):\n  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n  clock             the emulator's clock, the firmware's instructions, the C64's cycle\n"
     }
 }
 
@@ -123,8 +169,15 @@ impl CpuView for Host<'_> {
 pub fn exec(m: &mut Machine, session: &mut MonitorSession, line: &str) -> Result<String, String> {
     let mut host = Host::new(m).ok_or("the monitor needs a C64: start with --c64 trx64")?;
     let verb = line.split_whitespace().next().unwrap_or("").to_owned();
-    let answer = verbs::try_exec(session, &mut host, line)
-        .unwrap_or(Err(format!("unknown monitor command '{verb}'")))?;
+    let answer = match verbs::try_exec(session, &mut host, line) {
+        // `help` is the port audit's list on both sides, so ours goes after theirs.
+        Some(Ok(text)) if verb == "help" => Ok(text + host.help()),
+        Some(answer) => answer,
+        None => {
+            let args: Vec<&str> = line.split_whitespace().skip(1).collect();
+            host.ours(&verb, &args).unwrap_or(Err(format!("unknown monitor command '{verb}'")))
+        }
+    }?;
     Ok(addr_spans::plain(&answer))
 }
 
@@ -194,6 +247,25 @@ mod tests {
         assert_eq!(view.registers().iter().find(|r| r.name == "a0").map(|r| r.value), Some(7));
         assert!(view.set_register("zero", 1).is_err(), "x0 is hardwired");
         assert!(view.set_register("nope", 1).is_err());
+    }
+
+    /// S23 §5: the verbs the library declines are ours, and `help` carries both lists.
+    #[test]
+    fn our_own_verbs_take_what_the_library_declines() {
+        let mut m = machine();
+        m.cpu.x[2] = 0x8000_1000;
+        let mut s = MonitorSession::new();
+
+        let fw = exec(&mut m, &mut s, "fw").expect("fw");
+        assert!(fw.contains("sp   80001000"), "the firmware's registers: {fw}");
+        assert!(exec(&mut m, &mut s, "fw tasks").is_ok(), "the task list walks an unbooted kernel too");
+        assert_eq!(exec(&mut m, &mut s, "fw nonsense").unwrap_err(), "fw: usage: fw [tasks]");
+
+        let clock = exec(&mut m, &mut s, "clock").expect("clock");
+        assert!(clock.contains("emulator") && clock.contains("firmware") && clock.contains("c64"), "{clock}");
+
+        let help = exec(&mut m, &mut s, "help").expect("help");
+        assert!(help.contains("the Ultimate side (S23)") && help.contains("clock"), "both lists: {help}");
     }
 
     /// Run control is M3: until then the library's own sentence is the answer, not a panic.

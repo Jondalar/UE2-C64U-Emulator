@@ -16,8 +16,14 @@ its second host. Design and the division of labour: `docs/specs/S23-monitor.md`.
 
 **Surfaces.** `monitor <cmd>` on the control port (S08), and `emu_monitor` over MCP on top of it.
 
-**Not yet:** our own Ultimate verbs including `config` (M2), and run control — `g`, `step`, breakpoints (M3).
-Until then the library's own sentence answers: "run control is not available in this host".
+**M2 has started.** The library sees every line first and returns `None` for what it does not own; our dispatch
+takes it from there and appends its own section to `help`. TRX64 gains no notion of this emulator — the dependency
+stays one-way. Done: `fw` (the RISC-V registers, `fw tasks` for the FreeRTOS list) and `clock` (the emulator's
+clock, the firmware's instructions, the C64's cycle). Still to come: `itu`, `cart`, `flash`, `sd`, `usb`, `net`,
+`audio` and `config`.
+
+**Not yet:** run control — `g`, `step`, breakpoints (M3). Until then the library's own sentence answers: "run
+control is not available in this host".
 
 ### Verified
 
@@ -30,11 +36,15 @@ Until then the library's own sentence answers: "run control is not available in 
 | `monitor d e000 e001` | `$e000  85 56     STA $56` |
 | `monitor wr` then `m` | the bytes read back |
 | `monitor nonsense` | `unknown monitor command 'nonsense'` — our dispatch takes what the library declines |
-| TRX64 repin 0.7.3 → 0.8.1 | no code change needed; `smoke-all.sh` 7/7, `smoke-c64-carts.ctl` 27/27 with the freeze and both SID loads, UltimateDemo2026 detection all `[ OK ]` |
+| `monitor device` on a booted 3.15 | `device: c64   (c64 \| drive8 \| fw — anything but c64 is read-inspect r/m/d)`; `device fw` selects it |
+| `monitor fw` | the 32 registers with `pc  00035da8  prvIdleTask+0x2c` |
+| `monitor clock` | the emulator's ms and clocks, the firmware's instructions and idle skips, the C64's cycle |
+| TRX64 repin 0.7.3 → 0.8.2 | no code change needed; `smoke-all.sh` 7/7, `smoke-c64-carts.ctl` 27/27 with the freeze and both SID loads, UltimateDemo2026 detection all `[ OK ]` |
 
 ### Open
 
-- `device fw` is unreachable for now: the library's `device` verb validates against a fixed `c64|drive8` instead of
-  `host.devices()` (reported to TRX64, their `verbs.rs:845`). The view is tested directly in the meantime.
+- `r`/`m`/`d` still read the C64 after `device fw`: the library selects the device but does not route those verbs
+  through `CpuView` yet (TRX64 is wiring that next; the `device` validation itself was fixed in v0.8.2 after we
+  reported it).
 - The verbs of the second half of the extraction (`g`, `until`, `step`, `bk` hits) answer through our fall-through
   until they land upstream.
