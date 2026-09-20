@@ -35,6 +35,9 @@ pub struct DisplaySnapshot {
     /// HDMI timing registers 0x10144000 (`t_video_timing_regs`, u64.h:172-203): the output mode the firmware
     /// programmed, which is what the overlay's X_ON/Y_ON count in.
     pub hdmi: [u8; 0x1E],
+    /// VIC cropper 0x10148000 (`t_vic_crop_regs`, hdmi_scan.cc:45-60): which part of the VIC picture goes to the
+    /// scaler, `offset_x`, `offset_y`, `size_x >> 1`, `size_y >> 1`.
+    pub cropper: [u8; 4],
     /// Emulated time of the snapshot.
     pub now_ms: u64,
     /// C64 frame under the overlay; None without an attached C64 (docs/specs/S14-c64-trx64.md §9).

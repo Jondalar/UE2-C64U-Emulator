@@ -70,3 +70,24 @@ menu in graphics symbols.
 ## Acceptance
 
 `cargo test -p ue2-core overlay u64io render` passes.
+
+## The C64 picture is cropped, scaled and placed — not stretched
+
+The device does not put the VIC picture across the whole screen. `SetVicCrop` takes a window out of the frame, two
+fixed-ratio scalers blow it up, and `x_offset` places the result (hdmi_scan.cc:45-163):
+
+| 1080p | value |
+|---|---|
+| `SetVicCrop(8, 9, 384, 270)` | crop at (8, 9), 384x270 — the registers hold the size halved |
+| `hscaler = 0x0C` | 15/4, so 384 becomes 1440 |
+| `vscaler = 0x08` | 4/1, so 270 becomes 1080 |
+| `x_offset = 240` | 240 + 1440 + 240 = 1920: pillarboxed in the active area |
+
+The scaler codes are ratios, not sizes: the firmware's own table gives each code's output for a 384-pixel and a
+400-pixel crop, and for 240 and 270 lines, and every pair is the same factor. Four vertical entries are rounded in
+the 240 column (533, 686, 1067, 1371) and exact in the 270 one, which is where 20/9, 20/7, 40/9 and 40/7 come
+from.
+
+Until this was read out of the firmware the renderer stretched the frame over the whole canvas, which at 1080p made
+the picture 1920 wide instead of 1440 — a third too wide, and the reason a capture put beside a photo of real
+hardware did not line up.

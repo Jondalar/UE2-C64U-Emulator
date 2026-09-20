@@ -3,8 +3,9 @@
 //! Pixel semantics follow the open chargen IP as summarised in docs/hw/05-ui-overlay-input.md §B
 //! (char_generator_regs.vhd, char_generator_slave12.vhd).
 //!
-//! The image is the output mode the firmware programmed into the HDMI timing registers: the C64 frame scaled into
-//! the active area, and the text grid on top where the chargen registers put it — X_ON/Y_ON for the corner,
+//! The image is the output mode the firmware programmed into the HDMI timing registers: the C64 picture cropped,
+//! scaled and placed where the cropper and the two scalers put it, and the text grid on top where the chargen
+//! registers put it — X_ON/Y_ON for the corner,
 //! CHARS_PER_LINE and ACTIVE_LINES for the size (05 OQ 4, answered). Nothing here is centred and no size is
 //! assumed: `DetermineOverlaySettings` (u64_config.cc) writes a different box per screen and per video mode, so a
 //! full-height panel flush to the right edge and a small floating submenu window are the same code path with
@@ -40,6 +41,84 @@ struct Output {
     /// Counter value where the active area starts.
     x0: usize,
     y0: usize,
+}
+
+/// The horizontal scaler's ratio per `hscaler` code, and the vertical one per `vscaler` code, as numerator and
+/// denominator (hdmi_scan.cc:118-155, the tables in the comment above `SetVideoMode1080p`).
+///
+/// The firmware's table lists output widths for a 384-pixel and a 400-pixel crop, and heights for 240 and 270 —
+/// every pair is one ratio, so a crop of any other size scales by the same factor. The four entries whose 384/240
+/// column is rounded (533, 686, 1067, 1371) are taken from the 400/270 column, where the fraction comes out
+/// exact: 20/9, 20/7, 40/9, 40/7.
+const HSCALE: [(u8, u32, u32); 10] = [
+    (0x00, 1, 1),
+    (0x01, 5, 4),
+    (0x02, 4, 3),
+    (0x03, 5, 3),
+    (0x04, 15, 8),
+    (0x08, 2, 1),
+    (0x09, 5, 2),
+    (0x0A, 8, 3),
+    (0x0B, 10, 3),
+    (0x0C, 15, 4),
+];
+const VSCALE: [(u8, u32, u32); 18] = [
+    (0x00, 2, 1),
+    (0x10, 20, 9),
+    (0x11, 9, 4),
+    (0x12, 5, 2),
+    (0x13, 8, 3),
+    (0x14, 20, 7),
+    (0x15, 3, 1),
+    (0x16, 16, 5),
+    (0x17, 18, 5),
+    (0x08, 4, 1),
+    (0x18, 40, 9),
+    (0x19, 9, 2),
+    (0x1A, 5, 1),
+    (0x1B, 16, 3),
+    (0x1C, 40, 7),
+    (0x1D, 6, 1),
+    (0x1E, 32, 5),
+    (0x1F, 36, 5),
+];
+
+/// Where the C64 picture lands in the output, and which part of the VIC frame goes there.
+///
+/// The device does not stretch the picture over the whole screen: `SetVicCrop` takes a window out of the VIC
+/// frame, the two scalers blow it up by a fixed ratio each, and `x_offset` places the result
+/// (hdmi_scan.cc:111-163). At 1080p PAL that is a 384x270 crop at (8, 9), scaled 15/4 by 4/1 to 1440x1080 and put
+/// at x 240 — pillarboxed in the 1920-wide active area, not stretched across it.
+#[derive(Debug, PartialEq, Eq)]
+struct Picture {
+    /// Source rectangle in the VIC frame.
+    crop: (usize, usize, usize, usize),
+    /// Destination in the active area: left edge, then the size after both scalers.
+    x: usize,
+    width: usize,
+    height: usize,
+}
+
+impl Picture {
+    /// `None` when the scaler codes are ones this firmware never writes, which is also the unprogrammed state.
+    fn new(hdmi: &[u8; 0x1E], cropper: &[u8; 4]) -> Option<Picture> {
+        let ratio = |table: &[(u8, u32, u32)], code: u8| {
+            table.iter().find(|(c, _, _)| *c == code).map(|&(_, n, d)| (n, d))
+        };
+        let (hn, hd) = ratio(&HSCALE, hdmi[19])?;
+        let (vn, vd) = ratio(&VSCALE, hdmi[20])?;
+        // `SetVicCrop` stores the size halved (hdmi_scan.cc:58-59).
+        let (cw, ch) = (usize::from(cropper[2]) * 2, usize::from(cropper[3]) * 2);
+        if cw == 0 || ch == 0 {
+            return None;
+        }
+        Some(Picture {
+            crop: (usize::from(cropper[0]), usize::from(cropper[1]), cw, ch),
+            x: usize::from(hdmi[16]),
+            width: cw * hn as usize / hd as usize,
+            height: ch * vn as usize / vd as usize,
+        })
+    }
 }
 
 impl Output {
@@ -139,6 +218,7 @@ impl Renderer {
         let (w, h) = (geo.cols * geo.char_width, geo.rows * lines.len());
         let (gw, gh) = if w == 0 || h == 0 { DEFAULT_SIZE } else { (w, h) };
         let output = Output::new(&snap.hdmi);
+        let picture = Picture::new(&snap.hdmi, &snap.cropper);
         let (cw, ch) = match &output {
             Some(o) => (o.width, o.height),
             None => snap.c64.as_ref().map_or((gw, gh), |f| (f.width.max(gw), f.height.max(gh))),
@@ -147,7 +227,7 @@ impl Renderer {
         out.resize(cw * ch, BACKDROP);
         if let Some(frame) = &snap.c64 {
             match &output {
-                Some(_) => draw_c64_scaled(frame, out, cw, ch),
+                Some(_) => draw_c64_scaled(frame, picture.as_ref(), out, (cw, ch)),
                 None => draw_c64(frame, out, cw, ch),
             }
         }
@@ -225,18 +305,37 @@ impl Renderer {
     }
 }
 
-/// Palettize `frame` stretched over the whole canvas, as the device's scaler puts the VIC picture on the output
-/// (nearest neighbour; the hardware filters).
-fn draw_c64_scaled(frame: &C64Frame, out: &mut [u32], canvas_w: usize, canvas_h: usize) {
+/// Palettize the cropped VIC picture into the rectangle the cropper and the two scalers put it in (nearest
+/// neighbour; the hardware filters). Everything outside it keeps the backdrop, which is what the device sends
+/// where the picture is not.
+///
+/// Without a `Picture` — the scaler registers unprogrammed, which is every machine before the firmware sets a
+/// video mode — the frame goes over the whole canvas, as it did before there was anything to read.
+fn draw_c64_scaled(frame: &C64Frame, picture: Option<&Picture>, out: &mut [u32], canvas: (usize, usize)) {
+    let (canvas_w, canvas_h) = canvas;
     if frame.width == 0 || frame.height == 0 {
         return;
     }
-    for y in 0..canvas_h {
-        let src = (y * frame.height / canvas_h) * frame.width;
-        let dst = &mut out[y * canvas_w..][..canvas_w];
-        for (x, px) in dst.iter_mut().enumerate() {
-            let idx = frame.indices[src + x * frame.width / canvas_w];
-            *px = frame.palette[usize::from(idx & 0x0F)];
+    let (src_x, src_y, src_w, src_h, dst_x, dst_w, dst_h) = match picture {
+        Some(p) => (p.crop.0, p.crop.1, p.crop.2, p.crop.3, p.x, p.width, p.height),
+        None => (0, 0, frame.width, frame.height, 0, canvas_w, canvas_h),
+    };
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return;
+    }
+    for y in 0..dst_h.min(canvas_h) {
+        let row = src_y + y * src_h / dst_h;
+        if row >= frame.height {
+            break;
+        }
+        let src = row * frame.width;
+        for x in 0..dst_w {
+            let (px_x, col) = (dst_x + x, src_x + x * src_w / dst_w);
+            if px_x >= canvas_w || col >= frame.width {
+                continue;
+            }
+            let idx = frame.indices[src + col];
+            out[y * canvas_w + px_x] = frame.palette[usize::from(idx & 0x0F)];
         }
     }
 }
@@ -366,7 +465,7 @@ mod tests {
         for (i, rgb) in PAL.iter().enumerate() {
             palette[i * 4..i * 4 + 3].copy_from_slice(&rgb.to_be_bytes()[1..]);
         }
-        DisplaySnapshot { regs, screen: vec![0x20; 4096], color: vec![0; 4096], palette, hdmi: [0; 0x1E], now_ms: 0, c64: None }
+        DisplaySnapshot { regs, screen: vec![0x20; 4096], color: vec![0; 4096], palette, hdmi: [0; 0x1E], cropper: [0; 4], now_ms: 0, c64: None }
     }
 
     /// A `w` × `h` C64 frame of colour index 3 = `C64_BLUE`.
@@ -461,6 +560,36 @@ mod tests {
         frame.screen[..11].copy_from_slice(b"SD Card\x02\x06\x7F~");
         frame.charset = C64Charset::Ram;
         assert_eq!(c64_text_dump(&s).lines().next(), Some("SD Card-+#~"), "Freeze UI font");
+    }
+
+    /// S07/issue #3: the C64 picture is cropped, scaled by the two scaler ratios and placed by `x_offset` — the
+    /// device does not stretch it across the screen. 1080p PAL is the case the firmware's own numbers cover.
+    #[test]
+    fn the_picture_is_cropped_scaled_and_placed_like_the_device() {
+        let mut hdmi = [0u8; 0x1E];
+        // hdmi_scan.cc:145-151, e_1920x1080 PAL: SetVicCrop(8, 9, 384, 270), hscaler 0x0C, vscaler 0x08,
+        // x_offset 240.
+        hdmi[16] = 240;
+        hdmi[19] = 0x0C;
+        hdmi[20] = 0x08;
+        // The firmware writes the size halved, so these are the bytes the register holds.
+        let cropper: [u8; 4] = [8, 9, 192, 135];
+        let picture = Picture::new(&hdmi, &cropper).expect("the firmware programmed both scalers");
+        assert_eq!(picture.crop, (8, 9, 384, 270), "the size registers hold half the size");
+        assert_eq!((picture.x, picture.width, picture.height), (240, 1440, 1080));
+        assert_eq!(picture.x + picture.width + 240, 1920, "pillarboxed, not stretched across the active area");
+
+        // 720p60: SetVicCrop(8, 0, 384, 240), hscaler 0x09, vscaler 0x15 (SetVideoModeTester, hdmi_scan.cc:106).
+        hdmi[19] = 0x09;
+        hdmi[20] = 0x15;
+        let picture = Picture::new(&hdmi, &[8, 0, 192, 120]).expect("a picture");
+        assert_eq!((picture.width, picture.height), (960, 720), "5/2 by 3/1");
+
+        // A code this firmware never writes leaves the picture unplaced, and so does an empty crop.
+        hdmi[19] = 0x7F;
+        assert_eq!(Picture::new(&hdmi, &cropper), None);
+        hdmi[19] = 0x0C;
+        assert_eq!(Picture::new(&hdmi, &[8, 9, 0, 0]), None);
     }
 
     /// Font with glyph 0x41 = rows 80 01 FF 00 00 00 00 18, all other glyphs blank.

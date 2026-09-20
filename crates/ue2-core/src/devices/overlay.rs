@@ -92,6 +92,7 @@ impl Overlay {
             color: self.color.clone(),
             palette: self.palette.clone(),
             hdmi: self.hdmi,
+            cropper: self.cropper,
             now_ms,
             c64: None,
         }

@@ -663,6 +663,7 @@ impl Machine {
                 color: vec![0; 4096],
                 palette: vec![0; 64],
                 hdmi: [0; 0x1E],
+                cropper: [0; 4],
                 now_ms,
                 c64: None,
             },
