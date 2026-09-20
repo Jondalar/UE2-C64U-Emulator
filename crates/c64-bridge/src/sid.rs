@@ -734,6 +734,40 @@ impl Sid {
 
     /// The observer for a CPU run. Writes come from TRX64's trace now (S17 §2.3); it stays so the run calls do not
     /// change.
+    /// What the firmware has built and where it routes, for the monitor's `audio` verb (S23 §5): socket 1, the
+    /// engines that exist with their model, and the address windows TRX64 routes by.
+    pub fn summary(&self) -> String {
+        let model = |m: i32| if m == MODEL_8580 { "8580" } else { "6581" };
+        let mut out = format!(
+            "  socket 1      {}\n  output        {}\n",
+            if self.socket1 { "ARMSID fitted" } else { "empty" },
+            if self.listening { "a sink is listening, the engines run to the C64's clock" } else { "no sink" },
+        );
+        for (n, built) in self.built.iter().enumerate() {
+            if let Some(m) = built {
+                out.push_str(&format!("  engine {n}      {}\n", model(*m)));
+            }
+        }
+        // The firmware programs one 32-byte window per mirror, so 48 of them cover $D400-$D7FF; runs that reach
+        // the same chip are one line.
+        let mut runs: Vec<(u16, u16, u8)> = Vec::new();
+        for w in &self.map {
+            match runs.last_mut() {
+                Some(run) if run.2 == w.chip && run.1 + 1 == w.start => run.1 = w.end,
+                _ => runs.push((w.start, w.end, w.chip)),
+            }
+        }
+        match runs.is_empty() {
+            true => out.push_str("  windows       none: nothing is routed to a SID\n"),
+            false => {
+                for (start, end, chip) in runs {
+                    out.push_str(&format!("  window        ${start:04x}-${end:04x} -> chip {chip}\n"));
+                }
+            }
+        }
+        out
+    }
+
     pub fn tap(&self) -> SidTap {
         SidTap
     }

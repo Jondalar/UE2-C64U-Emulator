@@ -359,6 +359,11 @@ impl C64Port {
 
     /// Where this firmware keeps the cartridge ROM (docs/status/carts.md, "Cartridge ROM in DDR"); passed on to the
     /// backend now and on every attach.
+    /// Where this firmware keeps the cartridge ROM (S23, the monitor's `cart`).
+    pub fn cart_rom(&self) -> CartRom {
+        self.cart_rom
+    }
+
     pub fn set_cart_rom(&mut self, rom: CartRom) {
         self.cart_rom = rom;
         if let Some(b) = &mut self.backend {

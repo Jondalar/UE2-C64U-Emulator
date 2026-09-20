@@ -417,6 +417,19 @@ impl SpiFlash {
         })
     }
 
+    /// The image file behind this chip, or `None` for a volatile one (S23, the monitor's `flash`).
+    pub fn image(&self) -> Option<&Path> {
+        self.image.as_ref().map(|i| i.path.as_path())
+    }
+
+    /// Sectors changed since the last write-out, and whether a write-out is pending (S23, `flash`).
+    pub fn pending(&self) -> (usize, bool) {
+        match &self.image {
+            Some(image) => (image.dirty.iter().filter(|&&d| d).count(), image.dirty_since.is_some()),
+            None => (0, false),
+        }
+    }
+
     /// The ids of the config pages in use, in page order (S23 §6, `config flash`).
     pub fn config_pages(&self) -> Vec<u32> {
         (0..CONFIG_PAGES)

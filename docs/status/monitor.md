@@ -16,11 +16,27 @@ its second host. Design and the division of labour: `docs/specs/S23-monitor.md`.
 
 **Surfaces.** `monitor <cmd>` on the control port (S08), and `emu_monitor` over MCP on top of it.
 
-**M2 has started.** The library sees every line first and returns `None` for what it does not own; our dispatch
-takes it from there and appends its own section to `help`. TRX64 gains no notion of this emulator — the dependency
-stays one-way. Done: `fw` (the RISC-V registers, `fw tasks` for the FreeRTOS list), `clock` (the emulator's clock,
-the firmware's instructions, the C64's cycle) and all of `config`. Still to come: `itu`, `cart`, `flash`, `sd`,
-`usb`, `net`, `audio`.
+**M2 is done.** The library sees every line first and returns `None` for what it does not own; our dispatch takes
+it from there and appends its own section to `help`. TRX64 gains no notion of this emulator — the dependency stays
+one-way.
+
+| Verb | What it answers |
+|---|---|
+| `fw [tasks]` | The firmware's RISC-V: `pc` with its symbol and the 32 ABI registers, or the FreeRTOS task list. |
+| `clock` | The emulator's clock, the firmware's instructions and idle skips, the C64's cycle. |
+| `config …` | The settings, in all the ways the menu has them (below). |
+| `itu` | The capability word, the FPGA version, the ms/us timers, and the interrupt controller by source name. |
+| `cart` | What the firmware programmed for the C64: mode, stop, cartridge type and variant, the cart ROM window, KERNAL, REU and its size, the sampler, serve-while-stopped, the clock-detect lines, and the command interface. |
+| `flash` | The image behind the chip, sectors not written out yet, config pages in use. |
+| `sd` | The card: sectors, size, write protect. |
+| `usb` | The hub ports and what is on each. |
+| `net` | The MAC the firmware programmed, the RX filter, the buffer queues, the TX register. |
+| `audio` | Socket 1, the engines built with their model, and the address windows routed to each chip. |
+
+The device verbs read what the firmware reads — through the side-effect-free `peek8` the GDB stub uses, or out of
+the device's own state where the register is write-only — and decode it with the firmware's own names
+(`itu.h`, `c64.h`). Nothing is interpreted beyond that: when a line looks wrong, the machine is wrong. A machine
+without the device says which one is missing rather than inventing zeroes.
 
 **`config` is the whole cycle** (`crates/ue2emu/src/monitor/config.rs`), and it works the way the menu works:
 
@@ -60,7 +76,7 @@ control is not available in this host".
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | green (9 in `ue2emu::monitor`, 86 in ue2emu) |
+| `cargo test --workspace` | green (10 in `ue2emu::monitor`, 87 in ue2emu) |
 | `cargo clippy` on the changed crates | no new warnings |
 | Booted 3.15, `monitor r` over the control port | the register panel with the flow line, `.;e5cd 00 00 0a f3 nv-bdiZc  MAIN`, the port and vector lines |
 | `monitor m 0400 0407` | `>C:0400  20 20 …`, screen RAM |
@@ -79,6 +95,10 @@ control is not available in this host".
 | `monitor config write /temp/all.cfg` and `/Usb0/settings.cfg` | 179 items in ~4.9 KB, written by the firmware; the stick's copy reaches the host directory through the `--usb-dir` sync |
 | `monitor config read` on that dump | `00,OK` with an empty parse log: the firmware accepts its own spelling back |
 | `scripts/smoke-monitor.ctl` in `smoke-all.sh` | 8/8 (S23 §9.5); the script also greps the log for `REU Size=2 MB   (flash)` |
+| `monitor itu` on a booted 3.15 | `capabilities 0x34800222` (with `--usb-dir`, so `USB_HOST2` is in it), `low enabled 0x95 timer usb cmdif reset`, `high enabled 0x6a 1581 wifi hdmi unlock` |
+| `monitor cart` | `cartridge type 0x00 variant 0 none, not active`, `cart rom 0x03c00000, 4 MiB`, `reu on, 16 MB` from the `--settings` flash, `command intf on at 0xdf18, bus id 11` |
+| `monitor flash` / `sd` / `usb` | the image path and 11 config pages; a 64 MiB card; `port 1 storage in use` for the `--usb-dir` stick, the other ports empty |
+| `monitor net` / `audio` | no MAC programmed and RX off on a machine without `--net`; socket 1 empty, engines 1 and 5 as 6581, one window line `$d400-$d7ff -> chip 0` (48 mirrors collapsed) |
 | TRX64 repin 0.7.3 → 0.8.2 | no code change needed; `smoke-all.sh` 7/7, `smoke-c64-carts.ctl` 27/27 with the freeze and both SID loads, UltimateDemo2026 detection all `[ OK ]` |
 
 ### Open

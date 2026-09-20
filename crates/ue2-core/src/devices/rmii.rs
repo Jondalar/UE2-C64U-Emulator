@@ -85,6 +85,11 @@ impl<T: Copy + Default> Ring<T> {
         })
     }
 
+    /// How many entries stand between tail and head.
+    fn len(&self) -> usize {
+        usize::from(self.head.wrapping_sub(self.tail) & PTR_MASK)
+    }
+
     /// `soft_reset`: both pointers to 0 (free_queue.vhd:310-317).
     fn clear(&mut self) {
         (self.head, self.tail) = (0, 0);
@@ -147,6 +152,29 @@ impl Rmii {
             pop_size: 0,
             to_host: VecDeque::new(),
         }
+    }
+
+    /// The filter and the queues as the firmware left them, for the monitor's `net` verb (S23 §5): the MAC the
+    /// firmware programmed, whether RX is on, and how much is in flight.
+    pub fn summary(&self) -> String {
+        let mac = self.mac.map(|b| format!("{b:02x}")).join(":");
+        let unset = if self.mac == [0; 6] { "  (the firmware has not programmed one)" } else { "" };
+        let mut out = format!("  mac           {mac}{unset}\n");
+        out.push_str(&format!(
+            "  rx            {}{}\n",
+            if self.rx_enable { "on" } else { "off" },
+            if self.promiscuous { ", promiscuous" } else { "" },
+        ));
+        out.push_str(&format!("  free buffers  {}\n", self.free.len()));
+        out.push_str(&format!("  received      {} waiting for the firmware\n", self.used.len()));
+        out.push_str(&format!("  to the host   {} frame(s) not taken yet\n", self.to_host.len()));
+        out.push_str(&format!(
+            "  tx            {:#x} + {} bytes, irq {}\n",
+            self.tx_addr,
+            self.tx_len,
+            if self.tx_irq { "yes" } else { "no" },
+        ));
+        out
     }
 
     /// One host round trip: hand the frames transmitted since the last call to `net`, then deliver the frames it

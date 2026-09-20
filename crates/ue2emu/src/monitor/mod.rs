@@ -12,6 +12,7 @@
 //! Not here yet: run control (S23 M3, the library's defaults refuse it in one sentence).
 
 mod config;
+mod devices;
 mod uci;
 
 use c64_bridge::Trx64Backend;
@@ -93,7 +94,7 @@ impl Host<'_> {
             "fw" => Some(self.verb_fw(args)),
             "clock" => Some(Ok(self.verb_clock())),
             "config" => Some(config::verb(self, args)),
-            _ => None,
+            _ => devices::verb(self, verb, args),
         }
     }
 
@@ -127,8 +128,19 @@ impl Host<'_> {
     }
 
     /// The verbs of §5 for `help`, after the library's own list.
-    fn help(&self) -> &'static str {
-        "\nthe Ultimate side (S23):\n  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n  clock             the emulator's clock, the firmware's instructions, the C64's cycle\n  config [cat [item]]  the settings, as stored in flash; `config flash` the raw pages\n  config set CAT ITEM VALUE   change it in the running firmware\n  config write [PATH]  the config pages, or a .cfg inside the machine\n  config read PATH  hand a .cfg inside the machine to the running firmware\n"
+    fn help(&self) -> String {
+        concat!(
+            "\nthe Ultimate side (S23):\n",
+            "  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n",
+            "  clock             the emulator's clock, the firmware's instructions, the C64's cycle\n",
+            "  config [cat [item]]         the settings, as stored in flash\n",
+            "  config flash                the raw config pages\n",
+            "  config set CAT ITEM VALUE   change it in the running firmware\n",
+            "  config write [PATH]         the config pages, or a .cfg inside the machine\n",
+            "  config read PATH            hand a .cfg inside the machine to the firmware\n",
+        )
+        .to_string()
+            + devices::HELP
     }
 }
 
@@ -200,7 +212,7 @@ pub fn exec(
     let verb = line.split_whitespace().next().unwrap_or("").to_owned();
     let answer = match verbs::try_exec(session, &mut host, line) {
         // `help` is the port audit's list on both sides, so ours goes after theirs.
-        Some(Ok(text)) if verb == "help" => Ok(text + host.help()),
+        Some(Ok(text)) if verb == "help" => Ok(text + &host.help()),
         Some(answer) => answer,
         None => {
             let args = words(line.trim_start().strip_prefix(&verb).unwrap_or(""));
@@ -398,6 +410,44 @@ mod tests {
         let s = trx64(&mut m).unwrap().trx64().uci_status().unwrap();
         assert_eq!(s.command_length, wanted.len() as u16);
         assert!(s.new_command, "and the block is telling the firmware about it");
+    }
+
+    /// S23 §5: the Ultimate's own hardware, decoded from the registers the firmware reads.
+    #[test]
+    fn the_device_verbs_read_the_firmwares_registers() {
+        let mut m = machine();
+        let mut s = MonitorSession::new();
+        let mut st = State::default();
+        let run = |m: &mut Machine, st: &mut State, l: &str| {
+            exec(m, &mut MonitorSession::new(), st, l).unwrap_or_else(|e| panic!("{l}: {e}"))
+        };
+
+        let itu = run(&mut m, &mut st, "itu");
+        assert!(itu.contains("capabilities  0x34000222"), "the capability word this machine advertises: {itu}");
+        assert!(itu.contains("low  enabled"), "the interrupt controller as the ISR sees it: {itu}");
+
+        let cart = run(&mut m, &mut st, "cart");
+        assert!(cart.contains("cartridge     type 0x00 variant 0  none"), "{cart}");
+        assert!(cart.contains("reu           off, 16 MB"), "the reset value of C64_REU_SIZE is 7: {cart}");
+        assert!(cart.contains("cart rom      0x03c00000"), "where this firmware keeps it: {cart}");
+        assert!(cart.contains("command intf  off"), "the firmware never enabled the block: {cart}");
+
+        assert!(run(&mut m, &mut st, "flash").contains("volatile"), "the test machine's flash has no image");
+        // The test machine installs neither, and each says which one is missing.
+        assert_eq!(exec(&mut m, &mut s, &mut st, "sd").unwrap_err(), "this machine has no SD slot");
+        assert_eq!(exec(&mut m, &mut s, &mut st, "usb").unwrap_err(), "this machine has no USB host");
+        assert_eq!(exec(&mut m, &mut s, &mut st, "cart x").unwrap_err(), "cart: takes no arguments");
+
+        let audio = run(&mut m, &mut st, "audio");
+        assert!(audio.contains("socket 1      empty"), "no ARMSID in this machine: {audio}");
+        // The firmware programs one 32-byte window per mirror; a run that reaches one chip is one line.
+        assert!(audio.contains("window        $d400-$d7ff -> chip 0"), "the C64's own SID: {audio}");
+        assert_eq!(exec(&mut m, &mut s, &mut st, "net").unwrap_err(), "this machine has no Ethernet MAC");
+
+        let help = exec(&mut m, &mut s, &mut st, "help").expect("help");
+        for verb in ["itu", "cart", "flash", "sd", "usb", "net", "audio"] {
+            assert!(help.contains(&format!("\n  {verb} ")), "{verb} is in help: {help}");
+        }
     }
 
     /// Run control is M3: until then the library's own sentence is the answer, not a panic.

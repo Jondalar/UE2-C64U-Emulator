@@ -295,6 +295,11 @@ impl Trx64Backend {
     }
 
     /// Fit the ARMSID in SID socket 1 (`true`) or leave the socket empty, the default (S14 §W4-SID).
+    /// The SID routing as text, for the monitor's `audio` verb (S23 §5).
+    pub fn sid_summary(&self) -> String {
+        self.sid.summary()
+    }
+
     pub fn set_sid_socket1(&mut self, fitted: bool) {
         self.sid.set_socket1(fitted);
         self.update_sid_map();

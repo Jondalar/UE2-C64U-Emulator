@@ -359,6 +359,11 @@ impl SdCard {
     }
 
     /// Image capacity in 512-byte sectors (0 without a card).
+    /// The card, for the monitor's `sd` (S23): its sectors and whether the image is read-only. `None`: no card.
+    pub fn card(&self) -> Option<(u64, bool)> {
+        self.card.as_ref().map(|c| (c.sectors, c.write_protect))
+    }
+
     pub fn sectors(&self) -> u64 {
         self.card.as_ref().map_or(0, |card| card.sectors)
     }

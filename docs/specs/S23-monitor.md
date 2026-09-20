@@ -81,15 +81,20 @@ this emulator — the dependency stays one-way, and their port audit stays their
 | Verb | Shows |
 |---|---|
 | `fw` | RISC-V registers, the FreeRTOS task list (the GDB stub builds both today) |
-| `itu` | interrupt controller, timers, the capability word |
-| `cart` | the firmware's C64 register file at 0x10040000: cartridge type, mode, REU enable and size, UCI enable and base, sampler, bus sharing (today's `cart-info` is the physical cartridge only) |
-| `flash` | SPI flash: the config pages with their stores and items, the `/flash` FAT |
-| `sd` | the card and its FAT |
-| `usb` | hub ports, and the `--usb-dir` sticks with their sync state |
-| `net` | PHY link, slirp forwards |
-| `audio` | UltiSID, mixer and sampler as the firmware set them |
+| `itu` | interrupt controller by source name, the timers, the capability word |
+| `cart` | the firmware's C64 register file at 0x10040000: mode, stop, cartridge type and variant, the cart ROM window, KERNAL, REU enable and size, sampler, serve-while-stopped, the clock-detect lines, and the command interface (today's `cart-info` is the physical cartridge only) |
+| `flash` | SPI flash: the image behind it, what is not written out yet, how many config pages are in use (`config` reads their contents) |
+| `sd` | the card: sectors, size, write protect |
+| `usb` | the hub ports and what is on each |
+| `net` | the MAC the firmware programmed, the RX filter, the buffer queues, the TX register |
+| `audio` | socket 1, the engines built with their model, the address windows routed to each chip |
 | `clock` | the emulator clock, idle skip, and the lag between C64 and firmware time (invisible today, and the cause of issue #2) |
 | `config` | §6 |
+
+Every device verb reads what the firmware reads — the side-effect-free `peek8` of the GDB stub, or the device's own
+state where the register is write-only — and decodes it with the firmware's own names (`itu.h`, `c64.h`,
+`c64.cc`). Nothing is interpreted beyond that, so when a line looks wrong the machine is wrong. A machine without
+the device names the missing one instead of printing zeroes.
 
 Deliberately not ours: `reu`, `uci` and `turbo`. Those devices are the real ones here, and TRX64's own verbs
 answer for them truthfully.
@@ -185,6 +190,11 @@ API and it must not shape the rest of the monitor.
 
 ## 10. Open
 
+- **What the device verbs still do not reach.** Three things live outside the machine or outside what the hardware
+  keeps, and each would be its own piece of work: the filesystem inside `/flash` and on the SD card (a FAT listing,
+  which the firmware's own `DOS_CMD_OPEN_DIR` could answer over the same UCI transport `config` uses); the
+  `--usb-dir` sync state and the network backend's forwards, which belong to the run loop, not to a device; and the
+  audio mixer's gains, which are write-only registers the model does not store.
 - **A bound on a halt.** The firmware notices a wedged C64 within milliseconds. We start without a limit and see
   what the log looks like; if it is unusable, the halt gets a release after N seconds of firmware time, with a
   line saying so.

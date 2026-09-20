@@ -16,6 +16,14 @@ monitor device
 monitor fw
 monitor fw tasks
 monitor clock
+
+# The Ultimate's own hardware, as the firmware's registers stand. This run has only --flash, so `sd` and `usb`
+# would refuse by name and are left out; `itu`, `cart`, `flash`, `net` and `audio` always answer.
+monitor itu
+monitor cart
+monitor flash
+monitor net
+monitor audio
 monitor config flash
 monitor config "C64 and Cartridge Settings" "REU Size"
 
