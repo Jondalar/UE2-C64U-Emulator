@@ -23,7 +23,7 @@ def recv_exact(sock, n):
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
         if not chunk:
-            raise SystemExit("server closed the connection")
+            print("FAIL server closed the connection"); sys.exit(1)
         buf += chunk
     return buf
 
@@ -113,23 +113,68 @@ for _ in range(3):
 check("advance", 0x71 in got and 0x31 in got and 0x62 in got, str(sorted(got)))
 check("event ids", all(got[t][0] == 0xffffffff for t in (0x31, 0x62)), "register info + stopped are events")
 
+# S23 §9.3: a checkpoint stops the C64 while the firmware keeps running, and the C64's own time is continuous
+# across the stop. The range is where this machine's 6510 runs without system ROMs, so a hit is certain.
+def reply(rid_wanted):
+    """The reply to our own request. Events carry id 0xffffffff and may arrive at any time — a checkpoint that is
+    hit again while we are asking is not an error, it is the firmware letting the C64 run on."""
+    while True:
+        rid, rtype, err, body = response(s)
+        if rid == rid_wanted:
+            return rtype, err, body
+
+def registers():
+    req(s, 20, 0x31, bytes([0]))
+    rtype, err, body = reply(20)
+    assert rtype == 0x31 and err == 0, f"registers: {rtype:#x}/{err:#x}"
+    count = struct.unpack("<H", body[:2])[0]
+    return {body[2+i*4+1]: struct.unpack("<H", body[2+i*4+2:2+i*4+4])[0] for i in range(count)}
+
+before = registers()
+req(s, 21, 0x12, struct.pack("<HH", 0xf000, 0xffff) + bytes([1, 1, 4, 0]))   # exec, stop when hit
+rtype, _, body = reply(21)
+watch = struct.unpack("<I", body[:4])[0]
+
+req(s, 22, 0xaa)                                   # EXIT: let it run into the checkpoint
+events = []
+deadline = time.time() + 20
+while time.time() < deadline:
+    rid, rtype, err, body = response(s)
+    events.append(rtype)
+    if rtype == 0x62:                              # STOPPED closes the sequence
+        break
+check("checkpoint stops the c64", 0x62 in events, f"events {[hex(e) for e in events]}")
+check("checkpoint info first", events.index(0x11) < events.index(0x62) if 0x11 in events else False,
+      "CHECKPOINT_INFO arrives before the stop it caused")
+
+after = registers()
+# LIN and CYC are the raster position, not a clock, so this says the machine moved between the two reads — which
+# is what matters here: the firmware kept running while its C64 was taken to a stop.
+check("the machine moved across the stop",
+      (after[0x35], after[0x36], after[0x03]) != (before[0x35], before[0x36], before[0x03]),
+      f"raster {before[0x35]}/{before[0x36]} -> {after[0x35]}/{after[0x36]}")
+check("stopped inside the checkpoint", 0xf000 <= after[0x03] <= 0xffff, f"pc={after[0x03]:#06x}")
+
+req(s, 23, 0x13, struct.pack("<I", watch))         # take it off again
+reply(23)
+
 req(s, 10, 0x13, struct.pack("<I", number))        # CHECKPOINT_DELETE
-rid, rtype, err, body = response(s)
+rtype, err, body = reply(10)
 check("checkpoint_delete", rtype == 0x13 and err == 0)
 
 req(s, 11, 0x13, struct.pack("<I", 999))           # a checkpoint that is not there
-rid, rtype, err, body = response(s)
+rtype, err, body = reply(11)
 check("missing checkpoint", err == 0x01, f"err={err:#x}")
 
 req(s, 12, 0x99)                                   # a command we do not have
-rid, rtype, err, body = response(s)
+rtype, err, body = reply(12)
 check("unknown command", err == 0x83, f"err={err:#x}")
 
 req(s, 13, 0xaa)                                   # EXIT: resume
-rid, rtype, err, body = response(s)
+rtype, err, body = reply(13)
 check("exit", rtype == 0xaa and err == 0)
 rid, rtype, err, body = response(s)
-check("resumed event", rtype == 0x63 and rid == 0xffffffff)
+check("resumed event", rtype == 0x63 and rid == 0xffffffff, f"{rtype:#x}")
 
 s.close()
 print("FAILED:" if fails else "all vice checks passed", ", ".join(fails))

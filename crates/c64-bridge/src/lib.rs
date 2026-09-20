@@ -27,6 +27,7 @@ use std::path::Path;
 use trx64_core::c64_6510core::{IK_NMI, INTERRUPT_DELAY, INT_SRC_RESTORE};
 use trx64_core::cart::CartMapper;
 use trx64_core::expansion::Hold;
+use trx64_core::RunStop;
 use trx64_core::keyboard::JoystickState;
 use trx64_core::reu::Reu;
 use trx64_core::vic::SpeedProfile;
@@ -122,15 +123,11 @@ struct UciObserver {
     hit: Option<u16>,
 }
 
-/// Whether this access is a checkpoint of the kind that was asked for. An exec checkpoint is the instruction
-/// fetch, which is the read whose address is the PC (`AccessCtx::pc`); the other two `MEMORY_OP` bits are the
-/// plain load and store. Both observers ask this, because a checkpoint has to fire whatever the run is doing.
-fn is_checkpoint(checkpoints: &[(u16, u16, u8)], kind: BusKind, addr: u16, ctx: &AccessCtx) -> bool {
-    let op = match kind {
-        BusKind::Write => 0x02,
-        _ if addr == ctx.pc => 0x04,
-        _ => 0x01,
-    };
+/// Whether this access is a load/store checkpoint. Both observers ask this, because a checkpoint has to fire
+/// whatever the run is doing.
+fn is_checkpoint(checkpoints: &[(u16, u16, u8)], kind: BusKind, addr: u16, _ctx: &AccessCtx) -> bool {
+    // Load and store only: an instruction fetch never arrives here, so the exec bit is `exec_watch`'s job.
+    let op = if kind == BusKind::Write { 0x02 } else { 0x01 };
     checkpoints.iter().any(|&(start, end, ops)| start <= addr && addr <= end && ops & op != 0)
 }
 
@@ -220,7 +217,13 @@ pub struct Trx64Backend {
     /// A debugger's checkpoints (S23 §8) as (start, end, `MEMORY_OP` bits), and the watch table they are gated by:
     /// [`UCI_WATCH`] with their addresses added, rebuilt whenever they change.
     checkpoints: Vec<(u16, u16, u8)>,
+    /// Load/store checkpoints, gating `on_access`.
     checkpoint_watch: Option<Box<[u8; 0x1_0000]>>,
+    /// Exec checkpoints. These are a different door: an instruction FETCH never reaches `on_access` — that hook
+    /// is the load/store path (`full_sc.rs` `loadRead`/`store`) — so an exec breakpoint goes through TRX64's own
+    /// `exec_watch`, which is checked at the instruction boundary and ends the run with `RunStop::Breakpoint(pc)`
+    /// before the instruction runs.
+    checkpoint_exec: Option<Box<[u8; 0x1_0000]>>,
     /// The address of the checkpoint the last run stopped at, waiting to be picked up.
     checkpoint_hit: Option<u16>,
     /// Ultimate Audio: UE2's own block, shared with the port device TRX64 holds (sampler.rs, S16).
@@ -302,6 +305,7 @@ impl Trx64Backend {
             uci_wait: None,
             checkpoints: Vec::new(),
             checkpoint_watch: None,
+            checkpoint_exec: None,
             checkpoint_hit: None,
             sampler,
         }
@@ -485,10 +489,10 @@ impl Trx64Backend {
                     (None, false) => uci.then_some(&UCI_WATCH),
                 };
                 let budget = end.saturating_sub(clk).max(1);
-                self.m.run_for_full_capped_dbg(budget, max, None, None, watch, &mut obs, |_, _, _, _, _, _, _| {});
-                if obs.hit.is_some() {
-                    self.checkpoint_hit = obs.hit;
-                }
+                let exec = self.checkpoint_exec.as_deref();
+                let stop =
+                    self.m.run_for_full_capped_dbg(budget, max, None, exec, watch, &mut obs, |_, _, _, _, _, _, _| {});
+                self.note_checkpoint(stop, obs.hit);
                 if let Some(vector) = obs.vector.filter(|_| self.cart.with(|c| c.run_hints().freeze_pending)) {
                     self.freeze_after_vector(vector);
                 }
@@ -558,9 +562,27 @@ impl Trx64Backend {
             Some(watch) => watch,
             None => &UCI_WATCH,
         };
-        self.m.run_for_full_capped_dbg(budget, u64::MAX, None, None, Some(table), &mut obs, |_, _, _, _, _, _, _| {});
-        if obs.hit.is_some() {
-            self.checkpoint_hit = obs.hit;
+        let exec = self.checkpoint_exec.as_deref();
+        let stop =
+            self.m.run_for_full_capped_dbg(budget, u64::MAX, None, exec, Some(table), &mut obs, |_, _, _, _, _, _, _| {});
+        self.note_checkpoint(stop, obs.hit);
+    }
+
+    /// What a stopped run means for a checkpoint.
+    ///
+    /// `exec_watch` ends the run with `RunStop::Observer` and not `Breakpoint` — only the `HashSet` form gives
+    /// that — and `Observer` is also what an access watch returns, the UCI's own control-register halt included.
+    /// So an exec hit is a stop whose boundary PC is in the exec table, and nothing else.
+    fn note_checkpoint(&mut self, stop: RunStop, access_hit: Option<u16>) {
+        if access_hit.is_some() {
+            self.checkpoint_hit = access_hit;
+            return;
+        }
+        let pc = self.m.c64_core.reg_pc;
+        let exec_hit = matches!(stop, RunStop::Observer | RunStop::Breakpoint(_))
+            && self.checkpoint_exec.as_ref().is_some_and(|w| w[pc as usize] != 0);
+        if exec_hit {
+            self.checkpoint_hit = Some(pc);
         }
     }
 
@@ -571,6 +593,16 @@ impl Trx64Backend {
     /// bus as well as without one.
     pub fn set_checkpoints(&mut self, ranges: &[(u16, u16, u8)]) {
         self.checkpoints = ranges.to_vec();
+        self.checkpoint_exec = ranges.iter().any(|&(_, _, ops)| ops & 0x04 != 0).then(|| {
+            let mut watch = Box::new([0u8; 0x1_0000]);
+            for &(start, end, ops) in ranges.iter().filter(|(_, _, ops)| ops & 0x04 != 0) {
+                let _ = ops;
+                for addr in start..=end {
+                    watch[usize::from(addr)] = 1;
+                }
+            }
+            watch
+        });
         self.checkpoint_watch = (!ranges.is_empty()).then(|| {
             // Every base a run of this machine could otherwise have used, so one table serves all of them: the
             // UCI's control register, the cartridge's I/O window, and the checkpoints themselves. Watching more

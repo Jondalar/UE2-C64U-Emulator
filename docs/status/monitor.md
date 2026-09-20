@@ -102,10 +102,10 @@ a debugger does not get to do that. The banks keep the C64's own names (`default
 `cart`), because a client looks them up by name. The event order clients wait for is reproduced: `REGISTER_INFO`
 then `STOPPED` on a stop, `RESUMED` on the way out, `CHECKPOINT_INFO` before the stop it caused.
 
-A checkpoint is armed on the machine, not polled by the run loop: the bridge's watch table gains its addresses and
-its observer ends the run at the access. An exec checkpoint is the instruction fetch. Both of the bridge's
-observers carry the gate, the one for plain runs and the one for cartridge runs, so a checkpoint fires with a
-cartridge on the bus as well as without one.
+A checkpoint is armed on the machine, not polled by the run loop. Load and store go through the bridge's access
+watch and its observer; exec goes through TRX64's own `exec_watch`, because an instruction fetch never reaches
+`on_access` — that hook is the load/store path. Both of the bridge's observers carry the gate, the one for plain
+runs and the one for cartridge runs, so a checkpoint fires with a cartridge on the bus as well as without one.
 
 Where our framing is better than VICE's, deliberately: VICE drops one byte on a bad magic and desyncs on a short
 body; we bound-check every field and resynchronise on the magic.
@@ -144,7 +144,9 @@ library (`on_stop` has no caller yet).
 | `monitor g` / `z` / `step 3` / `n` / `ret` / `until` on a booted 3.15 | each answers on the C64 with its state and the instruction count; `g c000` sets the PC first; `until f000` runs out its budget and says so |
 | `monitor bk` | `no breakpoints (set: bk <addr>)` — the library's own verb, against our host |
 | `scripts/smoke-c64-carts.ctl` after the observer change | 27/27, unchanged |
-| `scripts/vice-client.py` against a booted 3.15 | 14/14: ping, the version, the six banks by name, the eight registers with VICE's own ids, `PC=$f116`, memory through the `rom` bank, a checkpoint set and listed, `ADVANCE_INSTRUCTIONS` answering with `REGISTER_INFO` + `STOPPED` as events, `OBJECT_MISSING` for a checkpoint that is not there, `CMD_INVALID_TYPE` for a command we do not have, and `RESUMED` after `EXIT` |
+| The port audit (S23 §9.1) | every verb in `help` answers, except the 45 the library lists from the daemon's own help text and does not dispatch; those are pinned so drift fails the test either way |
+| A checkpoint on a booted 3.15 | set exec `$f000-$ffff`, resume, and the events arrive as `CHECKPOINT_INFO`, `REGISTER_INFO`, `STOPPED` with the C64 stopped at `$f116` |
+| `scripts/vice-client.py` against a booted 3.15 | 16/16: ping, the version, the six banks by name, the eight registers with VICE's own ids, `PC=$f116`, memory through the `rom` bank, a checkpoint set and listed, `ADVANCE_INSTRUCTIONS` answering with `REGISTER_INFO` + `STOPPED` as events, `OBJECT_MISSING` for a checkpoint that is not there, `CMD_INVALID_TYPE` for a command we do not have, and `RESUMED` after `EXIT` |
 | `scripts/smoke-monitor.ctl` and the `vice` case in `smoke-all.sh` | 9/9 (S23 §9.5, §9.6); the script also greps the log for `REU Size=2 MB   (flash)` |
 | `monitor itu` on a booted 3.15 | `capabilities 0x34800222` (with `--usb-dir`, so `USB_HOST2` is in it), `low enabled 0x95 timer usb cmdif reset`, `high enabled 0x6a 1581 wifi hdmi unlock` |
 | `monitor cart` | `cartridge type 0x00 variant 0 none, not active`, `cart rom 0x03c00000, 4 MiB`, `reu on, 16 MB` from the `--settings` flash, `command intf on at 0xdf18, bus id 11` |

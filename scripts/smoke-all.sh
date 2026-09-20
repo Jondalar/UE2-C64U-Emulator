@@ -89,7 +89,8 @@ smoke uci "$repo/scripts/smoke-uci.ctl" --flash run/flash-uci.bin --c64-roms --s
 
 # vice: the binary monitor answers a real client conversation (S23 §8, §9.6). The emulator holds the port open
 # while the client talks to it, then both are brought down.
-printf 'expect "F3=HELP" 10000\nwait 600000\nquit\n' >run/vice.ctl
+# The wait only has to outlast the client; the emulator is killed as soon as it is done.
+printf 'expect "F3=HELP" 10000\nwait 20000000\nquit\n' >run/vice.ctl
 emu vice run/vice.ctl --flash run/flash-vice.bin --settings "$repo/scripts/smoke-settings.cfg" --vice-monitor &
 vicepid=$!
 python3 "$repo/scripts/vice-client.py" || fail vice "the client conversation failed"

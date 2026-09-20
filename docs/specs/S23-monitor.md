@@ -199,8 +199,12 @@ API and it must not shape the rest of the monitor.
 
 **Checkpoints stop where they should.** A checkpoint is armed on the machine itself, not checked by the run loop
 between slices: the bridge's watch table gains the checkpoint's addresses and its observer ends the run at the
-access, which is the only hook that can. An exec checkpoint is the instruction fetch — the read whose address is
-the PC — and load/store are the other two `MEMORY_OP` bits. The gate is taken off again when the client leaves, so
+access, which is the only hook that can. The two kinds go through different doors, because an instruction FETCH never
+reaches `on_access` — that hook is the load/store path. Load and store are the access watch and the observer; exec
+is TRX64's own `exec_watch`, checked at the instruction boundary before the instruction runs. `exec_watch` ends
+the run with `RunStop::Observer` and not `Breakpoint` (only the `HashSet` form gives that), and `Observer` is also
+what an access watch returns — the UCI's own control-register halt included — so an exec hit is a stop whose
+boundary PC is in the exec table, and nothing else. The gate is taken off again when the client leaves, so
 a machine nobody debugs runs exactly as it did. Both of the bridge's observers carry the gate — the one for plain
 runs and the one for cartridge runs — so a checkpoint fires with a cartridge on the bus as well as without one; the
 merged watch table covers every base a run of this machine could otherwise have used, and watching more than a run
@@ -209,11 +213,18 @@ needs costs observer calls that answer false, never correctness.
 ## 9. Acceptance
 
 1. `cargo test --workspace` green, and TRX64's port audit (864 item 13) runs over our bridge host in our own
-   tests: every verb in `help` answers, so drift from the daemon shows up here.
+   tests: every verb in `help` answers, so drift from the daemon shows up here. **Done**, and it found the drift
+   at once — 45 verbs `monitor_help_text()` lists that `verbs::try_exec` does not dispatch, because the library
+   carries the daemon's help text while the extraction is under way. They are pinned in `STILL_THE_DAEMONS`, so
+   the list failing in either direction is the signal: a verb that starts answering, or a new one that does not.
 2. `monitor r`, `monitor m c000 c00f`, `monitor d e000`, `monitor device fw` + `monitor r` all answer on a booted
    firmware; `monitor d` on `fw` refuses by name.
-3. A breakpoint on the C64 stops it, the firmware keeps running, `status` reports the stop, `g` resumes, and the
-   emulated C64 time afterwards is continuous (no lost cycles).
+3. A breakpoint on the C64 stops it while the firmware keeps running. **Done** over the VICE port, which is the
+   only place a breakpoint can be set until TRX64 moves `g` and the stepping verbs: `scripts/vice-client.py` sets
+   an exec checkpoint, resumes, and gets `CHECKPOINT_INFO` before `REGISTER_INFO` + `STOPPED`, with the C64
+   stopped inside the checkpoint's range and the machine moved across the stop. A checkpoint that is hit again
+   afterwards is not a fault: the firmware may clear `C64_STOP` itself, which is the last-writer-wins rule of §3
+   doing what it says.
 4. `config set` changes a setting in the running firmware (the menu shows the new value without a restart),
    `config write` survives a restart, `config flash` shows what is stored.
 5. A smoke script (`scripts/smoke-monitor.ctl`) drives the above headless and is part of `smoke-all.sh`.

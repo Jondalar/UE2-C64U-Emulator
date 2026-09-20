@@ -417,6 +417,76 @@ mod tests {
         assert_eq!(err, "unknown monitor command 'nonsense'", "our dispatch takes what the library declines");
     }
 
+    /// S23 §9.1, TRX64 Spec 864 item 13: the port audit. Every verb `help` lists answers on our host — drift from
+    /// the daemon shows up here, on our side, rather than in someone's session.
+    #[test]
+    fn every_verb_in_help_answers_on_this_host() {
+        let mut m = machine();
+        let mut s = MonitorSession::new();
+        let mut st = State::default();
+        let help = exec(&mut m, &mut s, &mut st, "help").expect("help");
+
+        // Both help sections lay a verb out in its own column: an indented line, the verb, then two or more
+        // spaces before the description. That is what tells a verb from the prose around it.
+        let verbs: Vec<String> = help
+            .lines()
+            .filter(|line| line.starts_with(' '))
+            .map(str::trim_start)
+            .filter_map(|line| line.split_once("  "))
+            .map(|(head, _)| head.split_whitespace().next().unwrap_or(""))
+            .filter(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()))
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        assert!(verbs.len() > 30, "the audit must actually walk the list, not a handful: {verbs:?}");
+
+        // Run control and the verbs that hand work to the firmware would drive the machine, and this machine has
+        // no firmware to drive; they are covered by their own tests above.
+        let drives_the_machine = ["g", "x", "z", "n", "next", "step", "ret", "return", "until", "dir", "reset"];
+        let mut missing = Vec::new();
+        let mut answered_now = Vec::new();
+        for verb in &verbs {
+            if drives_the_machine.contains(&verb.as_str()) {
+                continue;
+            }
+            let answer = exec(&mut m, &mut s, &mut State::default(), verb);
+            let text = match &answer {
+                Ok(text) => text.clone(),
+                Err(e) => e.clone(),
+            };
+            match text.starts_with("unknown monitor command") {
+                true => missing.push(verb.as_str()),
+                false if STILL_THE_DAEMONS.contains(&verb.as_str()) => answered_now.push(verb.as_str()),
+                false => {}
+            }
+        }
+        let unexpected: Vec<&str> = missing.iter().copied().filter(|v| !STILL_THE_DAEMONS.contains(v)).collect();
+        assert!(unexpected.is_empty(), "in help but nothing answers, and not a known gap: {unexpected:?}");
+        assert!(
+            answered_now.is_empty(),
+            "these answer now — take them out of STILL_THE_DAEMONS: {answered_now:?}"
+        );
+    }
+
+    /// The verbs `monitor_help_text()` lists that `verbs::try_exec` does not dispatch at rev 638175d.
+    ///
+    /// The library carries the DAEMON's help text while Spec 864's extraction is under way, so a second host is
+    /// offered a list it cannot honour. That is upstream's to close — either the verbs move into the library or
+    /// the help text narrows to what it dispatches — and this array is how we watch it happen: a verb that starts
+    /// answering fails the test until it is taken out, and a new one that does not answer fails it too.
+    ///
+    /// Most of these are a host's own business (`mount`, `eject`, `savecrt`, `drivepower`, `turbo`, `warp`,
+    /// `window`, `frame`, `play`, `pause`), which is exactly why they cannot live in help as if they were the
+    /// library's. We do not invent our own meanings for them: S23 §5 keeps `reu`, `uci` and `turbo` out on purpose.
+    const STILL_THE_DAEMONS: [&str; 45] = [
+        "bitmap", "bload", "bsave", "cadence", "chis", "diff", "drive", "drivepower", "eject", "frame", "goto",
+        "identify", "load", "log", "map", "mark", "marks", "mkdir", "model", "mount", "pause", "play", "pwd",
+        "rawframe", "recent", "rewind", "ringdump", "ringload", "rstep", "run", "save", "savecrt", "sf",
+        "swapcrt", "swimlane", "taint", "trace", "tracedb", "traceindex", "tracering", "traprules", "turbo",
+        "unmark", "warp", "window",
+    ];
+
     /// S23 §4: `device fw` is the firmware's core — 32-bit, registers and DDR, no flags, no disassembler.
     #[test]
     fn the_firmware_core_is_a_device_of_its_own() {
