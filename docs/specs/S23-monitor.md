@@ -77,8 +77,12 @@ the library's `on_stop` is for, and it is the piece that waits for TRX64 to move
 bound is a question about the C64 alone. Reset stays the firmware's: the monitor does not reach around it.
 
 Verbs: `fw halt | go | step [n]` for the firmware, `c64 [halt | go | step [n]]` for the C64, `status` for both.
-The library's own `g`/`until`/`step`/`bk` will mean the C64 when they land — their types say so, `RunUntil::Pc` is
-16 bits — and they route to the same host methods.
+
+TRX64's own spelling answers too, on the C64 — `g [addr]`, `x`, `until <addr>`, `z`/`step [n]`, `n`/`next [n]`,
+`ret` — because the library does not carry them yet: it owns `bk`, but nothing in `trx64-monitor` calls
+`MonitorHost::resume` or `::step`, so the run verbs are still in TRX64's daemon. Our dispatch only ever sees a line
+the library declined, so when they land upstream the library answers first and ours fall away on their own. That
+they mean the C64 is not a choice: `RunUntil::Pc` and `StopInfo::pc` are 16 bits.
 
 ## 4. Devices
 
@@ -196,9 +200,10 @@ API and it must not shape the rest of the monitor.
 between slices: the bridge's watch table gains the checkpoint's addresses and its observer ends the run at the
 access, which is the only hook that can. An exec checkpoint is the instruction fetch — the read whose address is
 the PC — and load/store are the other two `MEMORY_OP` bits. The gate is taken off again when the client leaves, so
-a machine nobody debugs runs exactly as it did. One hole, and it is in the spec rather than in a comment: a run
-**with a cartridge** is already split by the cartridge's own hints and carries that observer instead, so a
-checkpoint does not fire while a cartridge is active. Growing the same gate into that path is the follow-up.
+a machine nobody debugs runs exactly as it did. Both of the bridge's observers carry the gate — the one for plain
+runs and the one for cartridge runs — so a checkpoint fires with a cartridge on the bus as well as without one; the
+merged watch table covers every base a run of this machine could otherwise have used, and watching more than a run
+needs costs observer calls that answer false, never correctness.
 
 ## 9. Acceptance
 

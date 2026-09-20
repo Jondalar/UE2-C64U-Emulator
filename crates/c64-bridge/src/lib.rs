@@ -122,17 +122,16 @@ struct UciObserver {
     hit: Option<u16>,
 }
 
-impl UciObserver {
-    /// Whether this access is a checkpoint of the kind that was asked for. An exec checkpoint is the instruction
-    /// fetch, which is the read whose address is the PC (`AccessCtx::pc`).
-    fn checkpoint(&self, kind: BusKind, addr: u16, ctx: &AccessCtx) -> bool {
-        let op = match kind {
-            BusKind::Write => 0x02,
-            _ if addr == ctx.pc => 0x04,
-            _ => 0x01,
-        };
-        self.checkpoints.iter().any(|&(start, end, ops)| start <= addr && addr <= end && ops & op != 0)
-    }
+/// Whether this access is a checkpoint of the kind that was asked for. An exec checkpoint is the instruction
+/// fetch, which is the read whose address is the PC (`AccessCtx::pc`); the other two `MEMORY_OP` bits are the
+/// plain load and store. Both observers ask this, because a checkpoint has to fire whatever the run is doing.
+fn is_checkpoint(checkpoints: &[(u16, u16, u8)], kind: BusKind, addr: u16, ctx: &AccessCtx) -> bool {
+    let op = match kind {
+        BusKind::Write => 0x02,
+        _ if addr == ctx.pc => 0x04,
+        _ => 0x01,
+    };
+    checkpoints.iter().any(|&(start, end, ops)| start <= addr && addr <= end && ops & op != 0)
 }
 
 impl Observer for UciObserver {
@@ -146,7 +145,7 @@ impl Observer for UciObserver {
     fn on_interrupt(&mut self, _: u16, _: u64) {}
 
     fn on_access(&mut self, kind: BusKind, addr: u16, _: u8, ctx: AccessCtx) -> bool {
-        if !self.checkpoints.is_empty() && self.hit.is_none() && self.checkpoint(kind, addr, &ctx) {
+        if self.hit.is_none() && is_checkpoint(&self.checkpoints, kind, addr, &ctx) {
             self.hit = Some(addr);
             return true;
         }
@@ -475,14 +474,21 @@ impl Trx64Backend {
                     forced_ultimax: self.ultimax,
                     vector: None,
                     sid: self.sid.tap(),
+                    checkpoints: self.checkpoints.clone(),
+                    hit: None,
                 };
-                let watch = if hints.watch_io {
-                    Some(&IO_WATCH)
-                } else {
-                    uci.then_some(&UCI_WATCH)
+                // With checkpoints the merged table covers this run's own needs too, so the gate never costs the
+                // cart path its watch.
+                let watch = match (&self.checkpoint_watch, hints.watch_io) {
+                    (Some(watch), _) => Some(&**watch),
+                    (None, true) => Some(&IO_WATCH),
+                    (None, false) => uci.then_some(&UCI_WATCH),
                 };
                 let budget = end.saturating_sub(clk).max(1);
                 self.m.run_for_full_capped_dbg(budget, max, None, None, watch, &mut obs, |_, _, _, _, _, _, _| {});
+                if obs.hit.is_some() {
+                    self.checkpoint_hit = obs.hit;
+                }
                 if let Some(vector) = obs.vector.filter(|_| self.cart.with(|c| c.run_hints().freeze_pending)) {
                     self.freeze_after_vector(vector);
                 }
@@ -561,12 +567,18 @@ impl Trx64Backend {
     /// The checkpoints a debugger set (S23 §8), as (start, end, `MEMORY_OP` bits). An empty list takes the gate
     /// away again, so a machine nobody is debugging runs exactly as it did.
     ///
-    /// The gate lives on the runs without a cartridge. With a cartridge the run is already split by the cart's own
-    /// hints and carries that observer instead; checkpoints there wait for the same gate to be grown into it.
+    /// Both observers carry the gate, so a checkpoint fires whatever the run is doing — with a cartridge on the
+    /// bus as well as without one.
     pub fn set_checkpoints(&mut self, ranges: &[(u16, u16, u8)]) {
         self.checkpoints = ranges.to_vec();
         self.checkpoint_watch = (!ranges.is_empty()).then(|| {
+            // Every base a run of this machine could otherwise have used, so one table serves all of them: the
+            // UCI's control register, the cartridge's I/O window, and the checkpoints themselves. Watching more
+            // than a run needs costs observer calls that answer false, never correctness.
             let mut watch = Box::new(UCI_WATCH);
+            for (addr, byte) in IO_WATCH.iter().enumerate() {
+                watch[addr] |= byte;
+            }
             for &(start, end, _) in ranges {
                 for addr in start..=end {
                     watch[usize::from(addr)] = 1;
@@ -614,6 +626,11 @@ struct CartObserver {
     forced_ultimax: bool,
     vector: Option<u16>,
     sid: sid::SidTap,
+    /// A debugger's checkpoints (S23 §8). A cartridge run is split by the cart's own hints and carries this
+    /// observer instead of [`UciObserver`], so the gate has to be here too or a checkpoint would not fire while a
+    /// cartridge is active.
+    checkpoints: Vec<(u16, u16, u8)>,
+    hit: Option<u16>,
 }
 
 impl Observer for CartObserver {
@@ -627,7 +644,11 @@ impl Observer for CartObserver {
         self.vector = Some(vector);
     }
 
-    fn on_access(&mut self, kind: BusKind, addr: u16, _: u8, _: AccessCtx) -> bool {
+    fn on_access(&mut self, kind: BusKind, addr: u16, _: u8, ctx: AccessCtx) -> bool {
+        if self.hit.is_none() && is_checkpoint(&self.checkpoints, kind, addr, &ctx) {
+            self.hit = Some(addr);
+            return true;
+        }
         let (cart, forced) = (&self.cart, self.forced_ultimax);
         let lines = self.slot.with(|s| s.lines_changed(cart, forced));
         lines || (kind == BusKind::Write && is_uci_control(addr))

@@ -112,7 +112,7 @@ impl Host<'_> {
             "status" => Some(Ok(run::status(self))),
             "clock" => Some(Ok(self.verb_clock())),
             "config" => Some(config::verb(self, args)),
-            _ => devices::verb(self, verb, args),
+            _ => run::alias(self, verb, args).or_else(|| devices::verb(self, verb, args)),
         }
     }
 
@@ -152,6 +152,8 @@ impl Host<'_> {
             "  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n",
             "  fw halt | go | step [n]     run control for the firmware (the C64 stands with it)\n",
             "  c64 [halt | go | step [n]]  run control for the C64, firmware running\n",
+            "  g [addr] | x | until ADDR | z | step [n] | n | next [n] | ret\n",
+            "                    the same, in TRX64's spelling: they mean the C64\n",
             "  status            where both CPUs stand\n",
             "  clock             the emulator's clock, the firmware's instructions, the C64's cycle\n",
             "  config [cat [item]]         the settings, as stored in flash\n",
@@ -606,6 +608,38 @@ mod tests {
         assert!(exec(&mut m, &mut s, &mut st, "c64 step 0").unwrap_err().contains("not a step"));
         assert!(exec(&mut m, &mut s, &mut st, "c64 nonsense").unwrap_err().contains("usage"));
         assert!(exec(&mut m, &mut s, &mut st, "fw nonsense").unwrap_err().contains("usage"));
+    }
+
+    /// S23 M3: the run-control verbs in TRX64's spelling answer on the C64 while the library does not carry them.
+    #[test]
+    fn the_trx64_spelled_run_verbs_answer_on_the_c64() {
+        let mut m = machine();
+        let mut s = MonitorSession::new();
+        let mut st = State::default();
+        let run = |m: &mut Machine, st: &mut State, l: &str| {
+            exec(m, &mut MonitorSession::new(), st, l).unwrap_or_else(|e| panic!("{l}: {e}"))
+        };
+
+        // `bk` is the library's own and still answers; the run verbs are ours until they land upstream.
+        assert!(exec(&mut m, &mut s, &mut st, "bk").is_ok(), "the library owns the breakpoint verb");
+
+        assert!(run(&mut m, &mut st, "g").contains("c64  running"));
+        assert!(run(&mut m, &mut st, "g c000").contains("c64  running"));
+        assert_eq!(
+            trx64(&mut m).unwrap().trx64().c64_core.reg_pc,
+            0xc000,
+            "`g addr` sets the PC before it lets go"
+        );
+        assert!(run(&mut m, &mut st, "z").contains("instruction(s)"));
+        assert!(run(&mut m, &mut st, "step 3").contains("3 instruction(s)"));
+        assert!(run(&mut m, &mut st, "n").contains("instruction(s)"));
+        assert!(run(&mut m, &mut st, "ret").contains("c64  "));
+
+        assert!(exec(&mut m, &mut s, &mut st, "g zz").unwrap_err().contains("not an address"));
+        assert!(exec(&mut m, &mut s, &mut st, "until").unwrap_err().contains("usage"));
+
+        let help = exec(&mut m, &mut s, &mut st, "help").expect("help");
+        assert!(help.contains("in TRX64's spelling"), "and they are in help: {help}");
     }
 
     /// The host trait's own run control, which the library's verbs call once TRX64 has moved them.

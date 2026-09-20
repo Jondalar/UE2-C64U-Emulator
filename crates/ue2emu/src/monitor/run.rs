@@ -45,6 +45,67 @@ pub struct State {
     pub firmware_reason: Option<String>,
 }
 
+/// The run-control verbs in TRX64's own spelling, on the C64 — which is what they mean there: `RunUntil::Pc` is
+/// 16 bits, `StopInfo::pc` is 16 bits.
+///
+/// They live here because `trx64-monitor` does not carry them yet: the library owns `bk`, but nothing in it calls
+/// `MonitorHost::resume` or `::step`, so `g` and the stepping verbs are still in TRX64's daemon. Our dispatch only
+/// ever sees a line the library declined, so when they land upstream the library answers first and these fall away
+/// on their own — no collision, and nobody has to wait for them in the meantime.
+pub(super) fn alias(host: &mut Host, verb: &str, args: &[&str]) -> Option<Result<String, String>> {
+    let count = |args: &[&str]| -> Result<u64, String> {
+        match args {
+            [] => Ok(1),
+            [n] => n.parse().map_err(|_| format!("{verb}: {n} is not a number")),
+            _ => Err(format!("{verb}: usage: {verb} [count]")),
+        }
+    };
+    match verb {
+        "g" | "x" => Some(match args {
+            [] => c64(host, &["go"]),
+            [addr] => match parse_addr(addr) {
+                Some(pc) => {
+                    host.machine().c64_core.reg_pc = pc;
+                    c64(host, &["go"])
+                }
+                None => Err(format!("{verb}: {addr} is not an address")),
+            },
+            _ => Err(format!("{verb}: usage: {verb} [addr]")),
+        }),
+        "z" | "step" => Some(count(args).and_then(|n| c64_step(host, n))),
+        "n" | "next" => Some(count(args).and_then(|n| step_over(host, n))),
+        "ret" | "return" => Some(until_return(host).map(|()| c64_state(host))),
+        "until" => Some(match args {
+            [addr] => match parse_addr(addr) {
+                Some(pc) => run_until_pc(host, pc),
+                None => Err(format!("until: {addr} is not an address")),
+            },
+            _ => Err("until: usage: until <addr>".into()),
+        }),
+        _ => None,
+    }
+}
+
+/// A hex address, with or without the `$` the monitor's own verbs take.
+fn parse_addr(text: &str) -> Option<u16> {
+    u32::from_str_radix(text.trim_start_matches(['$', '+']), 16).ok().map(|v| v as u16)
+}
+
+/// `n`/`next`: like a step, but a `JSR` runs to its return address.
+fn step_over(host: &mut Host, n: u64) -> Result<String, String> {
+    let stop = step(host, n, true)?;
+    Ok(format!("{}  {} instruction(s)\n", c64_state(host), stop.steps.len()))
+}
+
+/// `until <addr>`: run the C64 until its PC is there.
+fn run_until_pc(host: &mut Host, pc: u16) -> Result<String, String> {
+    let stop = match resume(host, RunUntil::Pc(pc))? {
+        Resumption::Stopped(stop) => stop,
+        Resumption::Resumed { .. } => return Err("until: the C64 did not stop".into()),
+    };
+    Ok(format!("{}  {}\n", c64_state(host), stop.reason))
+}
+
 /// `c64 [halt|go|step [n]]` — the C64's own run control.
 pub(super) fn c64(host: &mut Host, args: &[&str]) -> Result<String, String> {
     match args {

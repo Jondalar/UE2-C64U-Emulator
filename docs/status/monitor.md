@@ -102,22 +102,27 @@ a debugger does not get to do that. The banks keep the C64's own names (`default
 then `STOPPED` on a stop, `RESUMED` on the way out, `CHECKPOINT_INFO` before the stop it caused.
 
 A checkpoint is armed on the machine, not polled by the run loop: the bridge's watch table gains its addresses and
-its observer ends the run at the access. An exec checkpoint is the instruction fetch. **One hole:** a run with a
-cartridge is split by the cartridge's own hints and carries that observer instead, so checkpoints do not fire while
-a cartridge is active.
+its observer ends the run at the access. An exec checkpoint is the instruction fetch. Both of the bridge's
+observers carry the gate, the one for plain runs and the one for cartridge runs, so a checkpoint fires with a
+cartridge on the bus as well as without one.
 
 Where our framing is better than VICE's, deliberately: VICE drops one byte on a bad magic and desyncs on a short
 body; we bound-check every field and resynchronise on the magic.
 
-**Still upstream:** the library's `g`/`until`/`step`/`bk` are not in `trx64-monitor` yet, and there is no entry
-point for delivering an asynchronous stop back into it. When TRX64 moves them they land on the host methods that
-are already here; until then our own verbs are the way in.
+TRX64's own spelling answers as well, on the C64: `g [addr]`, `x`, `until <addr>`, `z`/`step [n]`, `n`/`next [n]`,
+`ret`. `bk` is the library's own and already works against our host; what `trx64-monitor` does not carry is the
+*run* verbs — nothing in it calls `MonitorHost::resume` or `::step`, so those are still in TRX64's daemon. Our
+dispatch only sees what the library declined, so when they land upstream the library answers first and ours fall
+away without a collision.
+
+**Still upstream:** the run verbs above, and an entry point for delivering an asynchronous stop back into the
+library (`on_stop` has no caller yet).
 
 ### Verified
 
 | Check | Result |
 |---|---|
-| `cargo test --workspace` | green (12 in `ue2emu::monitor`, 3 in `ue2emu::vice`, 92 in ue2emu) |
+| `cargo test --workspace` | green (13 in `ue2emu::monitor`, 3 in `ue2emu::vice`, 93 in ue2emu) |
 | `cargo clippy` on the changed crates | no new warnings |
 | Booted 3.15, `monitor r` over the control port | the register panel with the flow line, `.;e5cd 00 00 0a f3 nv-bdiZc  MAIN`, the port and vector lines |
 | `monitor m 0400 0407` | `>C:0400  20 20 …`, screen RAM |
@@ -135,6 +140,9 @@ are already here; until then our own verbs are the way in.
 | `monitor config write` after it | the item in the config pages; `monitor config … "REU Size"` then reads `2 MB   (flash)` |
 | `monitor config write /temp/all.cfg` and `/Usb0/settings.cfg` | 179 items in ~4.9 KB, written by the firmware; the stick's copy reaches the host directory through the `--usb-dir` sync |
 | `monitor config read` on that dump | `00,OK` with an empty parse log: the firmware accepts its own spelling back |
+| `monitor g` / `z` / `step 3` / `n` / `ret` / `until` on a booted 3.15 | each answers on the C64 with its state and the instruction count; `g c000` sets the PC first; `until f000` runs out its budget and says so |
+| `monitor bk` | `no breakpoints (set: bk <addr>)` — the library's own verb, against our host |
+| `scripts/smoke-c64-carts.ctl` after the observer change | 27/27, unchanged |
 | `scripts/vice-client.py` against a booted 3.15 | 14/14: ping, the version, the six banks by name, the eight registers with VICE's own ids, `PC=$f116`, memory through the `rom` bank, a checkpoint set and listed, `ADVANCE_INSTRUCTIONS` answering with `REGISTER_INFO` + `STOPPED` as events, `OBJECT_MISSING` for a checkpoint that is not there, `CMD_INVALID_TYPE` for a command we do not have, and `RESUMED` after `EXIT` |
 | `scripts/smoke-monitor.ctl` and the `vice` case in `smoke-all.sh` | 9/9 (S23 §9.5, §9.6); the script also greps the log for `REU Size=2 MB   (flash)` |
 | `monitor itu` on a booted 3.15 | `capabilities 0x34800222` (with `--usb-dir`, so `USB_HOST2` is in it), `low enabled 0x95 timer usb cmdif reset`, `high enabled 0x6a 1581 wifi hdmi unlock` |
