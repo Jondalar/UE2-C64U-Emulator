@@ -212,8 +212,13 @@ fn bridged(_iface: Option<&str>) -> Result<Backend> {
     bail!("--net vmnet-bridged needs macOS (vmnet.framework)")
 }
 
-/// Exchange frames between the MAC and the backend.
+/// Exchange frames between the MAC and the backend, and put the UDP stream generators' datagrams on the same
+/// wire (S24 §4): the address, the ports and the source MAC are the guest's, so they go out as the MAC's frames
+/// do rather than through a socket of the emulator's own.
 pub fn pump(machine: &mut Machine, net: &mut Backend) {
+    for datagram in machine.stream_pump() {
+        net.send(&datagram);
+    }
     let bus = &mut machine.bus;
     if let Some(mac) = bus.io.get_mut::<Rmii>() {
         mac.exchange(net.as_mut(), &mut bus.ram, &mut bus.irq);

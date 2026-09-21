@@ -11,6 +11,7 @@ pub mod misc;
 pub mod overlay;
 pub mod rmii;
 pub mod sdcard;
+pub mod streams;
 pub mod u64io;
 pub mod usb;
 pub mod wifi;
@@ -31,6 +32,7 @@ pub fn install_all(map: &mut IoMap, cfg: &MachineConfig) {
     flash::install(map, cfg);
     wifi::install(map, cfg);
     sdcard::install(map, cfg);
+    streams::install(map, cfg);
     u64io::install(map, cfg);
     overlay::install(map, cfg);
 }

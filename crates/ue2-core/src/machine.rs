@@ -227,6 +227,10 @@ pub struct Machine {
     idle: IdleSlot,
     /// Instructions the idle skip did not execute; `cpu.insns` counts the executed ones (S19 §5).
     pub idle_insns: u64,
+    /// The VIC frame counter the UDP stream generator last sent (S24 §4).
+    streamed_frame: u64,
+    /// Whether the audio stream's tap is installed in the C64 backend.
+    streaming_audio: bool,
 }
 
 /// One loop head the idle skip watches: the machine state at the last arrival there (S19 §3).
@@ -304,6 +308,8 @@ impl Machine {
             resume_pc: None,
             idle: IdleSlot { head: u32::MAX, ..IdleSlot::default() },
             idle_insns: 0,
+            streamed_frame: 0,
+            streaming_audio: false,
         }
     }
 
@@ -670,6 +676,43 @@ impl Machine {
         };
         snap.c64 = self.bus.io.get::<C64Port>().and_then(C64Port::frame);
         snap
+    }
+
+    /// The UDP stream generators, once per call: a new VIC frame becomes datagrams, and everything waiting goes
+    /// back to the caller to put on the wire (S24 §4). Nothing happens while `ETHSTREAM_ENA` has no enabled
+    /// stream, so a machine nobody streams from does not build a frame it will not send.
+    pub fn stream_pump(&mut self) -> Vec<Vec<u8>> {
+        let ena = self.bus.io.get::<devices::u64io::U64Io>().map_or(0, devices::u64io::U64Io::ethstream_ena);
+        if ena & 0x01 != 0 {
+            let counter = self.bus.io.get::<C64Port>().map_or(0, C64Port::frame_counter);
+            if counter != self.streamed_frame {
+                self.streamed_frame = counter;
+                if let Some(frame) = self.bus.io.get::<C64Port>().and_then(C64Port::frame) {
+                    if let Some(streams) = self.bus.io.get_mut::<devices::streams::Streams>() {
+                        streams.send_frame(&frame);
+                    }
+                }
+            }
+        }
+        if (ena & 0x02 != 0) != self.streaming_audio {
+            self.streaming_audio = ena & 0x02 != 0;
+            let on = self.streaming_audio;
+            if let Some(port) = self.bus.io.get_mut::<C64Port>() {
+                port.set_stream_audio(on);
+            }
+        }
+        if self.streaming_audio {
+            let pcm = self.bus.io.get_mut::<C64Port>().map_or_else(Vec::new, C64Port::take_stream_audio);
+            if !pcm.is_empty() {
+                if let Some(streams) = self.bus.io.get_mut::<devices::streams::Streams>() {
+                    streams.send_audio(&pcm);
+                }
+            }
+        }
+        match self.bus.io.get_mut::<devices::streams::Streams>() {
+            Some(streams) => streams.take(),
+            None => Vec::new(),
+        }
     }
 
     pub fn now_ms(&self) -> u64 {

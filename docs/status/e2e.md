@@ -212,11 +212,33 @@ The T0 C64 is a 64 K byte array. Nothing executes 6510 code, so there is no KERN
   the suite polls with readmem (printer/printer_test.py:365-404). Checks [01]-[04] pass: REST, reset, load PRG,
   capture settings.
 
-### E2: no audio/video stream (doc 10 §Streams, OPEN QUESTION 5)
+### E2: the audio and video streams — **built** (S24, 2026-09-21)
 
-freezer-audio [01] fails with `no audio packets captured` (io/c64/freezer_audio_test.py:81-84). The FPGA generates
-the U64 streams as UDP (ETHSTREAM_ENA, `U64_UDP_BASE`, data_streamer.cc:386-404). The emulator models none of this,
-and it has no SID output to measure either.
+The FPGA's stream generators are emulated: `U64_UDP_BASE`'s four header templates and `ETHSTREAM_ENA` are a device
+(`devices/streams.rs`), a finished VIC frame becomes 68 datagrams of 780 bytes, the SID's samples become 770-byte
+datagrams, and both go out through the same backend the MAC's frames use — so the source address, the ports and
+the source MAC are the guest's, as a receiver requires. `docs/specs/S24-udp-streams.md` has the contract and what
+is deliberately not built (the bus and IEC streams, which carry cycle-level traces the emulator has no equivalent
+for, and which no suite asks for).
+
+Measured with `--net user`, the firmware armed over its own REST (`PUT /v1/streams/video:start?ip=10.0.2.2:11000`
+and the same for `audio`), both streams at once, captured on the host for 10 s:
+
+| | result |
+|---|---|
+| video | 34068 datagrams, none malformed, 501 frames = **50.1 fps** |
+| audio | 2502 datagrams, none malformed, **48038 stereo frames/s**, no sequence gap |
+
+The frame the receiver assembles is the picture: 272 lines, 4-bit indices, the BASIC screen with its border
+(`run/shots/stream-frame.png` is one, decoded by the harness's own packing rules).
+
+Two things to know about what arrives. The samples are **mono duplicated to both channels**, because the emulator
+mixes the SIDs down to one channel (S20); the stream is stereo on the wire, as the receiver expects. And the
+generator sends a frame's datagrams as one burst rather than spread across the frame, which the receiver's
+assembler does not depend on (S24 §5).
+
+Left for the suites themselves: `ultimax-cartridge`, which compares a whole frame against
+`tests/e2e/io/c64/jupiter_lander.png` index for index, and `av/stream_test`.
 
 ### E3: Flash Disk not provisioned
 

@@ -85,6 +85,12 @@ impl U64Io {
     ///
     /// The U64 register names are the other way round: the COL register selects a `row`, and the ROW
     /// register returns `col` bits.
+    /// `ETHSTREAM_ENA`: one enable bit per UDP stream generator in the low nibble, the bus stream's mode in the
+    /// high one (u64.h:80, data_streamer.cc:410-414).
+    pub fn ethstream_ena(&self) -> u8 {
+        self.latch[ETHSTREAM_ENA as usize]
+    }
+
     pub fn set_key(&mut self, row: u8, col: u8, down: bool) {
         if row >= 8 || col >= 8 {
             return;

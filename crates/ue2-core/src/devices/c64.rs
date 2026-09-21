@@ -421,6 +421,23 @@ impl C64Port {
         self.backend.as_ref().map(|b| b.frame())
     }
 
+    /// The attached C64's frame counter, or 0 with no C64 (S24 §4).
+    pub fn frame_counter(&self) -> u64 {
+        self.backend.as_ref().map_or(0, |b| b.frame_counter())
+    }
+
+    /// Turn the attached C64's audio-stream tap on or off (S24 §1 M3).
+    pub fn set_stream_audio(&mut self, on: bool) {
+        if let Some(b) = &mut self.backend {
+            b.set_stream_audio(on);
+        }
+    }
+
+    /// Samples the attached C64 collected for the audio stream.
+    pub fn take_stream_audio(&mut self) -> Vec<i16> {
+        self.backend.as_mut().map_or_else(Vec::new, |b| b.take_stream_audio())
+    }
+
     fn sync(&mut self, now: u64) {
         if let Some(b) = &mut self.backend {
             if now > self.synced {
@@ -862,8 +879,6 @@ pub fn install(map: &mut IoMap, _cfg: &MachineConfig) {
     add_table(map, 0x1018_2000, 0x200, "c64-glyph", &[]);
     // C64_SID_BASE: UltiSID filter curves at +0x1000/+0x1800, write-only (u64_config.cc:1259-1298).
     add_table(map, 0x1018_4000, 0x2000, "ultisid", &[]);
-    // U64_UDP_BASE stream header templates: write-only (data_streamer.cc:311-404).
-    add_table(map, 0x1019_0000, 0x100, "udp-headers", &[]);
 }
 
 #[cfg(test)]

@@ -108,6 +108,18 @@ pub trait C64Backend {
     /// Joystick port 1 or 2, lines active low (bit 0 up, 1 down, 2 left, 3 right, 4 fire).
     fn set_joystick(&mut self, port: u8, lines: u8);
     fn frame(&self) -> C64Frame;
+    /// The VIC's own frame counter, so a caller can see a new picture without building one. 0 means the backend
+    /// does not count frames, and nothing that watches for a change will ever fire (S24 §4).
+    fn frame_counter(&self) -> u64 {
+        0
+    }
+    /// The UDP audio stream was enabled or disabled (S24 §1 M3). A backend that can produce samples starts or
+    /// stops doing so here; the default does nothing, so a machine without one simply streams no audio.
+    fn set_stream_audio(&mut self, _on: bool) {}
+    /// Interleaved stereo samples collected since the last call, for the audio stream.
+    fn take_stream_audio(&mut self) -> Vec<i16> {
+        Vec::new()
+    }
 
     // --- W4-SID (docs/specs/S14-c64-trx64.md §W4-SID) ---
     /// C64 core config latch 0x10180000 + `off` was written (u64.h:104-154). The SID decode and UltiSID settings reach

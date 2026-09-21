@@ -169,6 +169,8 @@ const UCI_FW_RAM: u16 = 0x800;
 
 pub struct Trx64Backend {
     m: Box<Machine>,
+    /// S24 M3: the UDP audio stream's tap while that stream is enabled.
+    stream_tap: Option<std::sync::Arc<std::sync::Mutex<Vec<i16>>>>,
     /// Emulator clock → C64 cycles; anchored by the first `advance_to` and after every reset.
     clock: Option<Clock>,
     /// Emulator clock of the last `advance_to`.
@@ -279,6 +281,7 @@ impl Trx64Backend {
         let sampler = sampler::SamplerHandle::default();
         m.attach_expansion_also(Box::new(sampler.clone()));
         Trx64Backend {
+            stream_tap: None,
             m,
             clock: None,
             now: 0,
@@ -325,6 +328,26 @@ impl Trx64Backend {
     pub fn set_audio_threaded(&mut self, sample_rate: u32, sink: Box<dyn AudioSink + Send>) {
         let mixed = self.mix_with_sampler(sample_rate, sink);
         self.sid.set_audio_threaded(sample_rate, mixed, self.m.c64_core.clk);
+    }
+
+    /// S24 M3: the UDP audio stream's tap, while the firmware has the audio stream enabled.
+    pub fn set_stream_audio(&mut self, on: bool) {
+        if on == self.stream_tap.is_some() {
+            return;
+        }
+        let tap = on.then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        self.stream_tap = tap.clone();
+        // The rate the receiver derives from the PAL video clock (`tests/e2e/lib/streams.py:661`).
+        self.sid.set_stream_tap(tap, 47_983, self.m.c64_core.clk);
+    }
+
+    /// Samples the tap has collected, interleaved stereo, and the tap is empty afterwards.
+    pub fn take_stream_audio(&mut self) -> Vec<i16> {
+        let Some(tap) = &self.stream_tap else { return Vec::new() };
+        match tap.lock() {
+            Ok(mut buf) => std::mem::take(&mut *buf),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// The sampler's voices in front of `sink` (S16 §3.4).
@@ -946,6 +969,20 @@ impl C64Backend for Trx64Backend {
 
     fn frame(&self) -> C64Frame {
         video::frame(&self.m, &self.palette)
+    }
+
+    /// TRX64's own frame counter (`vic.frame`), which advances once per PAL frame whether anyone looks or not, so
+    /// the UDP stream generator sends one burst per picture (S24 §4).
+    fn frame_counter(&self) -> u64 {
+        self.m.vic.frame
+    }
+
+    fn set_stream_audio(&mut self, on: bool) {
+        Trx64Backend::set_stream_audio(self, on);
+    }
+
+    fn take_stream_audio(&mut self) -> Vec<i16> {
+        Trx64Backend::take_stream_audio(self)
     }
 
     fn lend_ddr(&mut self, mut ddr: Option<&mut [u8]>) {

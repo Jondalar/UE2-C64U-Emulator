@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use trx64_core::resid_ffi::{MODEL_6581, MODEL_8580, PAL_CLOCK_FREQ};
@@ -106,6 +106,10 @@ const CH_SOCKET1: usize = 2;
 const SILENT_CATCH_UP: u64 = 985_248;
 /// Largest cycle count handed to reSID at once (its `clock` takes an `int`).
 const CHUNK: u64 = 1 << 20;
+/// S24 M3: samples the UDP audio stream's tap may hold before the oldest are dropped — a second of stereo at the
+/// PAL rate, which is far more than the emission interval, so nothing is lost while the host drains.
+const STREAM_TAP_CAP: usize = 2 * 48_000;
+
 /// reSID's clock (TRX64 `ResidConfig` default), for the samples owed while no engine runs.
 const CLOCK_HZ: u64 = PAL_CLOCK_FREQ as u64;
 
@@ -376,6 +380,10 @@ struct Engines {
     /// Mono gain per receiver in 1/[`UNITY`] steps.
     gains: [i32; RECEIVERS],
     audio: Option<Box<dyn AudioSink>>,
+    /// S24 M3: the UDP audio stream's tap. Samples land here as well as in a sink, and its presence alone makes
+    /// the engines run, so the stream works without `--audio`. Capped: a host that stops draining loses the
+    /// oldest samples rather than growing this without bound.
+    stream: Option<Arc<Mutex<Vec<i16>>>>,
     /// $1B/$1C per receiver as of the last clocking, bit 16 set where an engine answers. Cached rather than read on
     /// demand: a reSID read of $1B/$1C sets the bus value the write-only registers read back (sid.cc `read`), so it
     /// may only happen where it did before S20 — right after clocking, never after a write.
@@ -392,12 +400,13 @@ impl Engines {
             pace: 0,
             gains: [UNITY; RECEIVERS],
             audio: None,
+            stream: None,
             cache: [0; RECEIVERS],
         }
     }
 
     fn listening(&self) -> bool {
-        self.audio.is_some()
+        self.audio.is_some() || self.stream.is_some()
     }
 
     /// Build receiver `rx`'s engine, or rebuild it with its registers when its model changed.
@@ -468,6 +477,15 @@ impl Engines {
             if let Some(sink) = &mut self.audio {
                 sink.samples(&pcm);
             }
+            if let Some(tap) = &self.stream {
+                if let Ok(mut buf) = tap.lock() {
+                    buf.extend_from_slice(&pcm);
+                    let over = buf.len().saturating_sub(STREAM_TAP_CAP);
+                    if over > 0 {
+                        buf.drain(..over);
+                    }
+                }
+            }
         }
         self.cache_readback();
     }
@@ -531,6 +549,8 @@ enum Cmd {
     Write { at: Option<u64>, mask: u16, reg: u8, val: u8 },
     ClockTo(u64),
     Gains([i32; RECEIVERS]),
+    /// S24 M3: install or remove the UDP audio stream's tap.
+    StreamTap(Option<Arc<Mutex<Vec<i16>>>>),
     Reset,
     Reanchor(u64),
     /// A firmware DMA read: the answer goes back before the emulation thread continues (S20 §3).
@@ -588,6 +608,7 @@ impl Worker {
                             }
                             Cmd::ClockTo(clk) => engines.clock_to(clk),
                             Cmd::Gains(gains) => engines.gains = gains,
+                            Cmd::StreamTap(tap) => engines.stream = tap,
                             Cmd::Reset => engines.reset(),
                             Cmd::Reanchor(clk) => engines.clk = clk,
                             Cmd::Read { mask, reg, clk, reply } => {
@@ -694,6 +715,32 @@ impl Sid {
             self.command(Cmd::Drop(SOCKET1_RX));
         }
         self.route();
+    }
+
+    /// S24 M3: install or remove the UDP audio stream's tap. With no sink the engines are idle, so the tap both
+    /// turns them on and fixes the rate the stream carries; with a sink already running the device's rate stands
+    /// and the tap rides along, worker or not.
+    pub fn set_stream_tap(&mut self, tap: Option<Arc<Mutex<Vec<i16>>>>, sample_rate: u32, clk: u64) {
+        let has_sink = match &self.host {
+            Host::Inline(engines) => engines.audio.is_some(),
+            // A worker only exists with a device sink (S20 §1).
+            Host::Worker(_) => true,
+        };
+        let on = tap.is_some();
+        if on && !has_sink {
+            let engines = self.engines_for_audio(clk);
+            engines.set_rate(sample_rate);
+        }
+        self.command(Cmd::StreamTap(tap));
+        // `listening` is what makes the writes traced and the engines clocked with the C64 rather than lazily, so
+        // the tap needs it as a sink does — and giving it up again is only safe while no sink wants it.
+        if on || has_sink {
+            self.listening = true;
+        } else {
+            self.listening = false;
+        }
+        self.gains();
+        self.refresh_readback();
     }
 
     /// Send samples at `sample_rate` Hz to `sink` from cycle `clk` on, from this thread. Without a sink the engines
@@ -1023,6 +1070,7 @@ impl Sid {
                 }
                 Cmd::ClockTo(clk) => engines.clock_to(clk),
                 Cmd::Gains(gains) => engines.gains = gains,
+                Cmd::StreamTap(tap) => engines.stream = tap,
                 Cmd::Reset => engines.reset(),
                 Cmd::Reanchor(clk) => engines.clk = clk,
                 Cmd::Read { mask, reg, clk, reply } => {
