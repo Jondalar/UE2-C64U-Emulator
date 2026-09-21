@@ -24,9 +24,11 @@ use crate::host::DisplaySnapshot;
 /// through.
 pub const BACKDROP: u32 = 0x0010_1010;
 
-/// Half the overlay colour over half of what is under it, per channel: the overlay window is drawn at 50 %, so the
-/// C64 picture stays readable through the menu the way it is on the device's HDMI output. Pixels of the
-/// transparent index are not drawn at all and are unaffected.
+/// Half the overlay colour over half of what is under it, per channel: the whole window is drawn at 50 %, its
+/// background included. The cells' background is colour 0, which is black, so the panel is black at half strength
+/// over the C64 picture and the picture stays visible through it. The open chargen IP would leave a pixel of the
+/// transparent index fully see-through (`pixel_opaque = '0'`, char_generator_slave12.vhd:161-172), which is a text
+/// layer with no panel behind it; the mixer that makes it a panel is in the closed U64 part of the FPGA.
 fn blend_half(over: u32, under: u32) -> u32 {
     let mix = |shift: u32| (((over >> shift) & 0xFF) + ((under >> shift) & 0xFF)) / 2;
     (mix(16) << 16) | (mix(8) << 8) | mix(0)
@@ -283,9 +285,7 @@ impl Renderer {
                         // slave12.vhd:159-173: foreground where the glyph bit differs from reverse.
                         let fg = ((bits >> (geo.char_width - 1 - x)) & 1 != 0) != reverse;
                         let idx = if fg { attr & 0x0F } else { attr >> 4 };
-                        if idx != geo.transparent {
-                            *px = blend_half(palette[idx as usize], *px);
-                        }
+                        *px = blend_half(palette[idx as usize], *px);
                     }
                 }
             }
@@ -509,7 +509,7 @@ mod tests {
         let px = |out: &[u32], x: usize, y: usize| out[y * 20 + x];
         assert_eq!((px(&out, 0, 0), px(&out, 19, 10)), (C64_BLUE, C64_BLUE), "frame around the grid");
         assert_eq!((px(&out, 2, 1), px(&out, 3, 1)), (over(1, C64_BLUE), over(2, C64_BLUE)), "grid centred at (2, 1), row 80");
-        assert!((10..18).all(|x| px(&out, x, 1) == C64_BLUE), "transparent cell shows the C64");
+        assert!((10..18).all(|x| px(&out, x, 1) == over(0, C64_BLUE)), "a bg-0 cell is the panel: black at half over the C64");
 
         s.regs[REG_TRANSPARENCY] = 0x00;
         r.render(&s, &mut out);
@@ -550,7 +550,7 @@ mod tests {
         assert_eq!((px(0, 0), px(719, 575)), (C64_BLUE, C64_BLUE), "the C64 fills the output");
         assert_eq!((px(254, 263), px(255, 263)), (over(1, C64_BLUE), over(2, C64_BLUE)), "the window starts at (254, 263)");
         assert_eq!(px(253, 263), C64_BLUE, "and not a pixel earlier");
-        assert!((262..270).all(|x| px(x, 264) == C64_BLUE), "a transparent cell shows the C64 through");
+        assert!((262..270).all(|x| px(x, 264) == over(0, C64_BLUE)), "a bg-0 cell is the panel over the C64");
 
         // A window that reaches past the right edge is clipped, not a panic (1080p: X_ON 1438 + 480 of 1920).
         (s.regs[REG_X_ON_HI], s.regs[REG_X_ON_LO]) = ((700u16 >> 8) as u8, 700u16 as u8);
@@ -631,7 +631,7 @@ mod tests {
         assert_eq!((px(8, 10), px(15, 10)), (over(2, BACKDROP), over(1, BACKDROP)), "row 01");
         assert!((8..16).all(|x| px(x, 11) == over(1, BACKDROP)), "row FF");
         assert_eq!((px(10, 17), px(11, 17), px(12, 17), px(13, 17)), (over(2, BACKDROP), over(1, BACKDROP), over(1, BACKDROP), over(2, BACKDROP)), "line 8 = 0x18");
-        assert!((0..8).all(|x| (0..18).all(|y| px(x, y) == BACKDROP)), "bg 0 = transparent index 0");
+        assert!((0..8).all(|x| (0..18).all(|y| px(x, y) == over(0, BACKDROP))), "bg 0 is drawn as the panel, not skipped");
     }
 
     #[test]
@@ -654,7 +654,7 @@ mod tests {
         s.color[0] = 0x21; // fg 1, bg 2
         let mut out = Vec::new();
         Renderer::new(&font()).render(&s, &mut out);
-        assert_eq!((out[0], out[1]), (BACKDROP, over(1, BACKDROP)), "set bit → bg (transparent), clear bit → fg");
+        assert_eq!((out[0], out[1]), (over(2, BACKDROP), over(1, BACKDROP)), "set bit → bg 2, clear bit → fg 1, both at half; nothing is skipped any more");
     }
 
     #[test]
