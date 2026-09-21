@@ -24,6 +24,14 @@ use crate::host::DisplaySnapshot;
 /// through.
 pub const BACKDROP: u32 = 0x0010_1010;
 
+/// Half the overlay colour over half of what is under it, per channel: the overlay window is drawn at 50 %, so the
+/// C64 picture stays readable through the menu the way it is on the device's HDMI output. Pixels of the
+/// transparent index are not drawn at all and are unaffected.
+fn blend_half(over: u32, under: u32) -> u32 {
+    let mix = |shift: u32| (((over >> shift) & 0xFF) + ((under >> shift) & 0xFF)) / 2;
+    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
 /// Image size while the chargen registers are unprogrammed: 40×25 cells of 8×9, the default SD geometry
 /// (u64_config.cc:2984-2986).
 const DEFAULT_SIZE: (usize, usize) = (320, 225);
@@ -276,7 +284,7 @@ impl Renderer {
                         let fg = ((bits >> (geo.char_width - 1 - x)) & 1 != 0) != reverse;
                         let idx = if fg { attr & 0x0F } else { attr >> 4 };
                         if idx != geo.transparent {
-                            *px = palette[idx as usize];
+                            *px = blend_half(palette[idx as usize], *px);
                         }
                     }
                 }
@@ -477,6 +485,18 @@ mod tests {
 
     const C64_BLUE: u32 = 0x0000_00FF;
 
+    /// An overlay pixel of palette index `i` over `under`: the window is drawn at 50 % ([`blend_half`]).
+    fn over(i: usize, under: u32) -> u32 {
+        blend_half(PAL[i], under)
+    }
+
+    #[test]
+    fn overlay_pixels_are_drawn_at_half() {
+        assert_eq!(blend_half(0x00FF_FFFF, BACKDROP), 0x0087_8787, "white over the backdrop");
+        assert_eq!(blend_half(0x0000_0000, 0x00FF_FFFF), 0x007F_7F7F, "black over white");
+        assert_eq!(blend_half(0x0000_00FF, 0x0000_00FF), 0x0000_00FF, "a colour over itself is itself");
+    }
+
     #[test]
     fn render_overlay_over_c64_frame() {
         let mut s = snap(2, 1, 0x09, 0x80); // 16×9 grid, transparent index 0
@@ -488,7 +508,7 @@ mod tests {
         assert_eq!(r.render(&s, &mut out), (20, 11), "canvas covers the frame");
         let px = |out: &[u32], x: usize, y: usize| out[y * 20 + x];
         assert_eq!((px(&out, 0, 0), px(&out, 19, 10)), (C64_BLUE, C64_BLUE), "frame around the grid");
-        assert_eq!((px(&out, 2, 1), px(&out, 3, 1)), (PAL[1], PAL[2]), "grid centred at (2, 1), row 80");
+        assert_eq!((px(&out, 2, 1), px(&out, 3, 1)), (over(1, C64_BLUE), over(2, C64_BLUE)), "grid centred at (2, 1), row 80");
         assert!((10..18).all(|x| px(&out, x, 1) == C64_BLUE), "transparent cell shows the C64");
 
         s.regs[REG_TRANSPARENCY] = 0x00;
@@ -528,7 +548,7 @@ mod tests {
         assert_eq!(r.render(&s, &mut out), (720, 576), "the canvas is the output mode");
         let px = |x: usize, y: usize| out[y * 720 + x];
         assert_eq!((px(0, 0), px(719, 575)), (C64_BLUE, C64_BLUE), "the C64 fills the output");
-        assert_eq!((px(254, 263), px(255, 263)), (PAL[1], PAL[2]), "the window starts at (254, 263)");
+        assert_eq!((px(254, 263), px(255, 263)), (over(1, C64_BLUE), over(2, C64_BLUE)), "the window starts at (254, 263)");
         assert_eq!(px(253, 263), C64_BLUE, "and not a pixel earlier");
         assert!((262..270).all(|x| px(x, 264) == C64_BLUE), "a transparent cell shows the C64 through");
 
@@ -607,10 +627,10 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(Renderer::new(&font()).render(&s, &mut out), (16, 18));
         let px = |x: usize, y: usize| out[y * 16 + x];
-        assert_eq!((px(8, 9), px(9, 9), px(15, 9)), (PAL[1], PAL[2], PAL[2]), "row 80");
-        assert_eq!((px(8, 10), px(15, 10)), (PAL[2], PAL[1]), "row 01");
-        assert!((8..16).all(|x| px(x, 11) == PAL[1]), "row FF");
-        assert_eq!((px(10, 17), px(11, 17), px(12, 17), px(13, 17)), (PAL[2], PAL[1], PAL[1], PAL[2]), "line 8 = 0x18");
+        assert_eq!((px(8, 9), px(9, 9), px(15, 9)), (over(1, BACKDROP), over(2, BACKDROP), over(2, BACKDROP)), "row 80");
+        assert_eq!((px(8, 10), px(15, 10)), (over(2, BACKDROP), over(1, BACKDROP)), "row 01");
+        assert!((8..16).all(|x| px(x, 11) == over(1, BACKDROP)), "row FF");
+        assert_eq!((px(10, 17), px(11, 17), px(12, 17), px(13, 17)), (over(2, BACKDROP), over(1, BACKDROP), over(1, BACKDROP), over(2, BACKDROP)), "line 8 = 0x18");
         assert!((0..8).all(|x| (0..18).all(|y| px(x, y) == BACKDROP)), "bg 0 = transparent index 0");
     }
 
@@ -623,8 +643,8 @@ mod tests {
         font[0x42 * 8 + 7] = 0xFF;
         let mut out = Vec::new();
         Renderer::new(&font).render(&s, &mut out);
-        assert!(out[56..64].iter().all(|&p| p == PAL[1]), "row 7 = FF drawn");
-        assert!(out[64..72].iter().all(|&p| p == PAL[2]), "line 8 blank for row 7 = FF");
+        assert!(out[56..64].iter().all(|&p| p == over(1, BACKDROP)), "row 7 = FF drawn");
+        assert!(out[64..72].iter().all(|&p| p == over(2, BACKDROP)), "line 8 blank for row 7 = FF");
     }
 
     #[test]
@@ -634,7 +654,7 @@ mod tests {
         s.color[0] = 0x21; // fg 1, bg 2
         let mut out = Vec::new();
         Renderer::new(&font()).render(&s, &mut out);
-        assert_eq!((out[0], out[1]), (BACKDROP, PAL[1]), "set bit → bg (transparent), clear bit → fg");
+        assert_eq!((out[0], out[1]), (BACKDROP, over(1, BACKDROP)), "set bit → bg (transparent), clear bit → fg");
     }
 
     #[test]
@@ -660,7 +680,7 @@ mod tests {
         s.screen[0] = 0x41;
         s.color[0] = 0x21;
         assert_eq!(r.render(&s, &mut out), (320, 400));
-        assert_eq!((out[0], out[320], out[640]), (PAL[1], PAL[1], PAL[2]), "stretch doubles rows");
+        assert_eq!((out[0], out[320], out[640]), (over(1, BACKDROP), over(1, BACKDROP), over(2, BACKDROP)), "stretch doubles rows");
 
         s.regs[REG_CHAR_HEIGHT] = 0x5E;
         s.regs[REG_CHAR_WIDTH] = 12;
@@ -668,10 +688,10 @@ mod tests {
         r.big_font[0x41 * 8 + 1] = 0x000_000_800;
         assert_eq!(r.render(&s, &mut out), (480, 575));
         let px = |x: usize, y: usize| out[y * 480 + x];
-        assert_eq!((px(0, 0), px(11, 0)), (PAL[1], PAL[1]), "sub-row 0 = 0x801");
-        assert_eq!((px(0, 1), px(11, 1)), (PAL[1], PAL[1]), "sub-row 1 = 0xDEF");
-        assert_eq!((px(0, 2), px(11, 2)), (PAL[1], PAL[2]), "sub-row 2 = 0xABC");
-        assert_eq!((px(0, 3), px(1, 3)), (PAL[1], PAL[2]), "y = 3 skipped, y = 4 is word 1");
+        assert_eq!((px(0, 0), px(11, 0)), (over(1, BACKDROP), over(1, BACKDROP)), "sub-row 0 = 0x801");
+        assert_eq!((px(0, 1), px(11, 1)), (over(1, BACKDROP), over(1, BACKDROP)), "sub-row 1 = 0xDEF");
+        assert_eq!((px(0, 2), px(11, 2)), (over(1, BACKDROP), over(2, BACKDROP)), "sub-row 2 = 0xABC");
+        assert_eq!((px(0, 3), px(1, 3)), (over(1, BACKDROP), over(2, BACKDROP)), "y = 3 skipped, y = 4 is word 1");
     }
 
     #[test]
@@ -689,7 +709,7 @@ mod tests {
         s.color[0] = 0x01;
         let mut out = Vec::new();
         Renderer::new(&std::fs::read(path).unwrap()).render(&s, &mut out);
-        let row1: Vec<bool> = out[8..16].iter().map(|&p| p == PAL[1]).collect();
+        let row1: Vec<bool> = out[8..16].iter().map(|&p| p == over(1, BACKDROP)).collect();
         assert_eq!(row1, [false, false, true, true, true, true, false, false], "chars.bin 'A' row 1 = 0x3C");
     }
 

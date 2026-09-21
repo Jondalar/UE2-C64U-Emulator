@@ -253,7 +253,15 @@ Timing (keyboard_c64.cc:105-111, 286-309): the first scan that sees a key queues
    `sync + back porch` in (`char_generator_timing.vhd:108-113` with the mode tables of hdmi_scan.cc). The renderer
    composes at the output size and places the window there. Open only: how exactly the scaler maps the VIC picture
    into the active area (we stretch it; the hardware has `hscaler`/`vscaler` and the VIC cropper).
-5. CHAR_HEIGHT 0x5E → h=30 with big_font → 23 visible scanlines per cell in open VHDL (sub-row 7.2 never shown), while the macro is named `_24` and y_on=240 fits 600 lines. Is the U64-II RTL different?
+5. **Answered for the open IP (2026-09-21), and the cell is portrait.** `char_generator_slave12.vhd:104-119`: a row
+   ends when `char_y = char_height-1`, and with `big_font` the counter goes `+2` where `char_y(1:0) = "10"`, so it
+   counts 0,1,2,4,5,6,8,… With h=30 that is 23 scanlines per cell and sub-row 7.2 is never shown, exactly as this
+   line suspected — the `_24` in the macro name is the font's row count, not the cell's. Horizontally the `draw`
+   state emits `char_width` pixels at one per chargen clock, so 12 means 12 output pixels. A 40×25 window at 1080p
+   is therefore **480×575, taller than it is wide**, and that is what the firmware asks for: Gideon's own U64-II
+   tester uses the same 12/0x5E cell with 100×39 cells (`u64ii_programmer.cc:61-64`) to fill the screen, 1200×897.
+   Open only for the closed U64-II RTL, and only between 23 and 24 scanlines (575 vs 600) — nothing in either
+   reading makes the window landscape.
 6. Semantics of 0x1010040A/0B/06 come from firmware usage only. Open points: does ROW also reflect keys injected via MATRIX_KEYB or the Blingboard? Does `own_keyboard` detach the C64 CIA from the matrix? Is read 0x10100406 (port-2 lines) really a separate function from write (swap bit)?
 7. Can the FPGA raise ITU_BUTTON1 from USB F11 (MATRIX_KEYB[10] "freeze"), a C64-keyboard combo or the case switch? No firmware path exists. Help text mentions only reset by holding the switch up (userinterface.cc:106-110).
 8. Blingboard (C64U keyboard, 0x10100800): RX_DATA/RX_GET are never read in this build. How does that keyboard reach the menu, if at all (via KEYB_ROW?).
