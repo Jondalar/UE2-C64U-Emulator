@@ -849,6 +849,14 @@ impl PhysicalCart {
         matches!(&self.device, Device::Mapper(m) if m.fake_ultimax())
     }
 
+    /// The ULTIMAX ROMH window this cartridge drives, for the VIC's fetches (TRX64 cart.rs `vic_romh`).
+    fn vic_romh(&self) -> Option<&[u8]> {
+        match &self.device {
+            Device::Mapper(m) => m.vic_romh(),
+            Device::Logic(c) => c.logic.vic_romh(),
+        }
+    }
+
     fn interrupts(&self) -> (bool, bool) {
         match &self.device {
             Device::Mapper(_) => (false, false),
@@ -1197,6 +1205,20 @@ impl Slot {
         self.physical.as_ref().is_some_and(|p| self.bus_external & BUS_ROM != 0 && p.fake_ultimax())
     }
 
+    /// The ULTIMAX ROMH window the VIC fetches from, resolved the way `read` resolves a byte: the internal cartridge
+    /// first, the expansion port's when the internal side does not serve `$E000` (S14; `CartMapper::vic_romh`).
+    pub fn vic_romh<'a>(&'a self, cart: &'a CartHandle) -> Option<&'a [u8]> {
+        if serves(self.bus_internal, 0xE000) {
+            if let Some(window) = cart.view().vic_romh() {
+                return Some(window);
+            }
+        }
+        match self.physical.as_ref() {
+            Some(p) if serves(self.bus_external, 0xE000) => p.vic_romh(),
+            _ => None,
+        }
+    }
+
     /// The physical cartridge as a CRT at TRX64 cycle `clk`.
     pub fn crt_image(&mut self, clk: u64) -> Option<Vec<u8>> {
         self.physical.as_mut().map(|p| p.crt_image(clk))
@@ -1239,6 +1261,12 @@ unsafe impl Sync for SlotCell {}
 
 impl SlotHandle {
     /// Run `f` on the slot. Calls do not nest (as `CartHandle::with`); `f` may use the internal `CartHandle`.
+    /// The slot behind the handle, for a borrow that has to outlive the call (as `CartHandle::view`).
+    pub fn view(&self) -> &Slot {
+        // SAFETY: as `with`, and read-only.
+        unsafe { &*self.0 .0.get() }
+    }
+
     pub fn with<R>(&self, f: impl FnOnce(&mut Slot) -> R) -> R {
         // SAFETY: single thread, no two borrows of the slot live at once.
         f(unsafe { &mut *self.0 .0.get() })

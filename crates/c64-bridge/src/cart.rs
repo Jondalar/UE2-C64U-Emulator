@@ -619,6 +619,30 @@ impl CartLogic {
         self.ddr_read(self.offset(addr, map, o.rom_mode))
     }
 
+    /// The 8 KiB this cartridge drives through the ULTIMAX ROMH window `$E000-$FFFF`, as a slice of the lent DDR —
+    /// what the VIC-II fetches, not what the 6510 reads (TRX64 `CartMapper::vic_romh`, VICE vicii.c:842-875). Under
+    /// ultimax the VIC's fetches at `$3000-$3FFF` of every bank come out of this window instead of RAM, which is the
+    /// only place a MAX-machine cartridge can keep its charset: RAM exists at `$0000-$0FFF` alone.
+    ///
+    /// A slice and not a per-byte read because TRX64 builds one `VicMemView` per cycle and indexes it directly. The
+    /// window is a single DDR run: `offset` mixes in address bits 13 and 14 only, and both are the same for every
+    /// address in `$E000-$FFFF`, so the bytes are contiguous and their order is the bus's.
+    pub(crate) fn vic_romh(&self) -> Option<&[u8]> {
+        let o = self.out(0xE000, false);
+        if !(self.cart_en && o.rom) {
+            return None;
+        }
+        let (map, _) = self.map(0xE000);
+        if map != Map::Rom {
+            return None;
+        }
+        let ddr = self.ddr?;
+        let off = self.offset(0xE000, map, o.rom_mode);
+        // SAFETY: as in `ddr_read`, `ddr` is the DDR lent for the access in progress. The slice is handed to TRX64's
+        // `VicMemView`, which is built and dropped inside one `Machine` cycle, so it never outlives the lend.
+        (off + 0x2000 <= ddr.len).then(|| unsafe { std::slice::from_raw_parts(ddr.ptr.add(off), 0x2000) })
+    }
+
     /// IO1/IO2 read data: a register (`slot_resp.reg_output`), served memory, or open bus (slot_slave.vhd:292-301).
     fn io_data(&self, addr: u16) -> Option<u8> {
         let io1 = addr & 0x100 == 0;
@@ -838,6 +862,13 @@ impl CartHandle {
         // SAFETY: single thread, and no two borrows are live at once (see above).
         f(unsafe { &mut *self.0 .0.get() })
     }
+
+    /// The logic behind the handle, for a borrow that has to outlive the call: `CartMapper::vic_romh` hands TRX64 a
+    /// slice of the ROMH window, which `with` cannot express (its closure's argument has its own lifetime).
+    pub fn view(&self) -> &CartLogic {
+        // SAFETY: as `with`, and read-only: the caller holds no other borrow while the reference is live.
+        unsafe { &*self.0 .0.get() }
+    }
 }
 
 /// The cartridge in TRX64's slot: the shared internal logic and the physical cartridge of the expansion port
@@ -897,6 +928,12 @@ impl CartMapper for CartProxy {
     /// GMod4 in the expansion port holds ULTIMAX and resolves the windows itself (TRX64 cart.rs `fake_ultimax`).
     fn fake_ultimax(&self) -> bool {
         self.slot.with(|s| s.fake_ultimax())
+    }
+
+    /// The ULTIMAX ROMH window the VIC-II fetches `$3000-$3FFF` from, from whichever side of the bus serves it.
+    /// TRX64 asks only under a real ultimax board, so the mode is not re-checked here.
+    fn vic_romh(&self) -> Option<&[u8]> {
+        self.slot.view().vic_romh(&self.cart)
     }
 
     fn active_bank(&self, _addr: u16) -> u16 {
