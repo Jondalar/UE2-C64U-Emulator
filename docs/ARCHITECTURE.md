@@ -904,7 +904,8 @@ It has no TRX64 types.
 - CPU trace ring (`--trace`, implied by `--gdb`): the PCs of the last 256 steps, printed with symbols when a
   fault hook halts the machine (`monitor trace` in GDB). It costs about 3 % of host MIPS when on and nothing
   measurable when off.
-- GDB remote stub (`--gdb 127.0.0.1:1234`, `riscv32-unknown-elf-gdb`, S11, `ue2emu/src/gdb.rs`):
+- GDB remote stub (`--gdb 127.0.0.1:1234`, `riscv32-unknown-elf-gdb`, S11, `ue2emu/src/gdb.rs`,
+  [gdb.md](status/gdb.md)):
   - The machine waits at reset until the debugger continues; a debugger attaching later stops it where it is.
   - x0-x31 and pc; memory reads without side effects (IO through `peek8`, ITU registers included), memory writes to
     DDR only.

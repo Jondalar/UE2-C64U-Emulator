@@ -197,7 +197,7 @@ option.
 | `--max-seconds S` | Stop after S wall-clock seconds |
 | `--script FILE` | Execute a control script (`docs/specs/S08-frontend-control.md`, `docs/status/tooling.md`) |
 | `--control ADDR` | Serve the TCP control protocol on ADDR, e.g. `127.0.0.1:6400` (`docs/status/mcp.md`, "Direct API") |
-| `--gdb ADDR` | GDB remote stub, e.g. `127.0.0.1:1234`; the machine waits at reset until the debugger continues |
+| `--gdb ADDR` | GDB remote stub, e.g. `127.0.0.1:1234`; the machine waits at reset until the debugger continues (`docs/status/gdb.md`) |
 | `--log LIST` | Logging: `unmapped`, `io`, `irq`, comma separated |
 | `--no-halt` | Keep running when a firmware fault hook fires |
 | `--trace` | Record the last 256 PCs, printed when a fault hook halts the machine (implied by `--gdb`; about 3 % MIPS) |

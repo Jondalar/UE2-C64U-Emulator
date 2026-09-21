@@ -28,4 +28,8 @@ What works, by milestone. Details are in the linked files.
   with drive A on and the ARMSID playing into a WAV (13.5 s), and 208 with `--c64 none` (7.2 s). Realtime needs
   25 MIPS; with drive, SID and the audio device on it keeps up at 26 % of one core.
 
+- **Debugging** (`docs/status/gdb.md`): GDB on the firmware's RISC-V (`--gdb`) with symbols, software
+  breakpoints and the FreeRTOS task list; the C64 side is served by the VICE binary monitor port
+  (`docs/status/monitor.md`).
+
 Architecture: `docs/ARCHITECTURE.md`. Specs: `docs/specs/`.
