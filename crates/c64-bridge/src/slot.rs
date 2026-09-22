@@ -746,6 +746,8 @@ pub struct PhysicalCart {
     banks: usize,
     /// Cycles before the last C64 reset release, added to TRX64's cycle counter for the mapper (module doc).
     epoch: u64,
+    /// `--log cart` (S14): trace every access this cartridge sees.
+    trace_on: bool,
 }
 
 impl PhysicalCart {
@@ -802,6 +804,7 @@ impl PhysicalCart {
             chips: parsed.chips,
             banks,
             epoch: 0,
+            trace_on: false,
         })
     }
 
@@ -817,10 +820,12 @@ impl PhysicalCart {
     }
 
     fn read(&mut self, addr: u16, info: &BankInfo, clk: u64) -> Option<u8> {
-        match &mut self.device {
+        let val = match &mut self.device {
             Device::Mapper(m) => m.read(addr, info, clk + self.epoch),
             Device::Logic(c) => c.logic.bus_read(addr, clk),
-        }
+        };
+        self.trace('R', addr, val, clk);
+        val
     }
 
     fn peek(&self, addr: u16, info: &BankInfo) -> Option<u8> {
@@ -831,10 +836,27 @@ impl PhysicalCart {
     }
 
     fn write(&mut self, addr: u16, val: u8, info: &BankInfo, clk: u64) -> bool {
-        match &mut self.device {
+        let taken = match &mut self.device {
             Device::Mapper(m) => m.write(addr, val, info, clk + self.epoch),
             Device::Logic(c) => c.logic.bus_write(addr, val, clk, false),
+        };
+        self.trace('W', addr, Some(val), clk);
+        taken
+    }
+
+    /// `--log cart`: one line per access to the cartridge in the expansion port.
+    ///
+    /// The clock is the point: the flash families schedule an erase off the cycle they are handed and finish it
+    /// only when a later access carries a cycle at or after the due one (`Flash040::catch_up_erase`, VICE's lazy
+    /// alarm). Nothing else in the emulator shows that clock, so a cartridge that seems stuck mid-erase can only
+    /// be told apart here -- a chip that is genuinely busy from a chip whose time is not moving. `--` as the byte
+    /// is a read the cartridge declined, which is not the same as a read that returned $FF.
+    fn trace(&self, dir: char, addr: u16, val: Option<u8>, clk: u64) {
+        if !self.trace_on {
+            return;
         }
+        let byte = val.map_or_else(|| "--".to_string(), |v| format!("{v:02x}"));
+        eprintln!("cart {dir} ${addr:04x} {byte}  clk {clk} + epoch {} = {}", self.epoch, clk + self.epoch);
     }
 
     /// The expansion port's RESET line.
@@ -1042,6 +1064,13 @@ impl Default for Slot {
 impl Slot {
     pub fn insert(&mut self, cart: PhysicalCart) {
         self.physical = Some(cart);
+    }
+
+    /// `--log cart`: trace the expansion port's cartridge.
+    pub fn set_trace(&mut self, on: bool) {
+        if let Some(p) = &mut self.physical {
+            p.trace_on = on;
+        }
     }
 
     pub fn eject(&mut self) -> Option<PhysicalCart> {

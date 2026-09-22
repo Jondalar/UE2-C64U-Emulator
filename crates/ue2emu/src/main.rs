@@ -115,7 +115,7 @@ struct RunArgs {
     /// VICE binary monitor for the C64, for third-party debuggers (default 127.0.0.1:6502; S23 §8)
     #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:6502")]
     vice_monitor: Option<String>,
-    /// Logging: unmapped, io, irq (comma separated)
+    /// Logging: unmapped, io, irq, cart (comma separated)
     #[arg(long, value_delimiter = ',')]
     log: Vec<String>,
     /// Which label the board wears: u64ii (default) or c64u, the same hardware with the Bling Board present
@@ -222,7 +222,8 @@ fn run(a: RunArgs) -> Result<()> {
             "unmapped" => log.unmapped = true,
             "io" => log.io = true,
             "irq" => log.irq = true,
-            other => bail!("unknown --log flag '{other}' (expected unmapped, io, irq)"),
+            "cart" => log.cart = true,
+            other => bail!("unknown --log flag '{other}' (expected unmapped, io, irq, cart)"),
         }
     }
     cfg.log = log;

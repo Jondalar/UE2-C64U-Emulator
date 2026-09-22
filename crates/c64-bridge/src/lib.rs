@@ -405,6 +405,11 @@ impl Trx64Backend {
         Ok(self.slot.with(|s| s.info()).expect("inserted above"))
     }
 
+    /// `--log cart` (S14): trace every access the C64 makes to the cartridge in the expansion port.
+    pub fn set_log_cart(&mut self, on: bool) {
+        self.slot.with(|s| s.set_trace(on));
+    }
+
     /// CARTSLOT: take the physical cartridge out of the expansion port.
     pub fn eject_cart(&mut self) {
         if self.slot.with(|s| s.eject()).is_some() {
