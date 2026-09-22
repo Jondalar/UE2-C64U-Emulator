@@ -263,6 +263,7 @@ fn attach_trx64_audio(
                 info.model,
                 spec.mode()
             );
+            c64.set_log_cart(machine.cfg.log.cart);
         }
         // S15: TRX64 carries the UCI block on its `u64` profile, so the firmware may start its UCI task.
         let has_uci = ue2_core::c64host::C64Backend::has_uci(&c64);

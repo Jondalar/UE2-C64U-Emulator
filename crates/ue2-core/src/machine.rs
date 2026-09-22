@@ -23,6 +23,9 @@ pub struct LogFlags {
     pub unmapped: bool,
     pub io: bool,
     pub irq: bool,
+    /// Every access the C64 makes to a cartridge in the expansion port, with the clock the cartridge is given.
+    /// The flash families time their erase off that clock, so a stalled one is only visible here.
+    pub cart: bool,
 }
 
 #[derive(Clone, Debug)]

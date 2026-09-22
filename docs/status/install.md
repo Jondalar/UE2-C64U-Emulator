@@ -199,7 +199,7 @@ option.
 | `--script FILE` | Execute a control script (`docs/specs/S08-frontend-control.md`, `docs/status/tooling.md`) |
 | `--control ADDR` | Serve the TCP control protocol on ADDR, e.g. `127.0.0.1:6400` (`docs/status/mcp.md`, "Direct API") |
 | `--gdb ADDR` | GDB remote stub, e.g. `127.0.0.1:1234`; the machine waits at reset until the debugger continues (`docs/status/gdb.md`) |
-| `--log LIST` | Logging: `unmapped`, `io`, `irq`, comma separated |
+| `--log LIST` | Logging: `unmapped`, `io`, `irq`, `cart`, comma separated. `cart` traces every access the C64 makes to a cartridge in `--cart-slot`, with the cycle the cartridge is handed -- the flash families time an erase off that cycle, and nothing else shows it |
 | `--no-halt` | Keep running when a firmware fault hook fires |
 | `--trace` | Record the last 256 PCs, printed when a fault hook halts the machine (implied by `--gdb`; about 3 % MIPS) |
 | `--no-sid-thread` | Run the reSID engines on the emulation thread instead of their own, also with an audio device (S20) |
