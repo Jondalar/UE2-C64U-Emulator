@@ -161,6 +161,19 @@ pub fn host_key(code: KeyCode) -> Option<MatrixKey> {
         Digit9 => "9",
         Period => ".",
         Comma => ",",
+        // The C64 row after "0" is 0,+,-,£,HOME,DEL; a PC's is 0,-,=,Backspace — so PC Minus lines up
+        // with C64 "+", not "-". Same logic on the home row (L,:,;,= vs PC's L,;,') and the QWERTY row
+        // (P,@,*,↑ vs PC's P,[,],\). The C64 has more dedicated symbol keys in these two rows than a PC
+        // keyboard has spare punctuation positions, so "=" and "£" (pound) have no honest positional slot
+        // left; F9/F10 are unused otherwise and stand in for them.
+        Semicolon => ":",
+        Quote => ";",
+        Slash => "/",
+        Minus => "+",
+        Equal => "-",
+        BracketLeft => "@",
+        BracketRight => "*",
+        Backslash => "uparrow",
         Space => "space",
         Enter | NumpadEnter => "return",
         Backspace | Delete => "del",
@@ -176,12 +189,15 @@ pub fn host_key(code: KeyCode) -> Option<MatrixKey> {
         F6 => "f6",
         F7 => "f7",
         F8 => "f8",
-        Home => "home",
+        F9 => "=",
+        F10 => "pound",
+        F11 | Home => "home",
         ShiftLeft => "lshift",
         ShiftRight => "rshift",
         ControlLeft | ControlRight => "ctrl",
         AltLeft | AltRight => "cbm",
         Escape => "runstop",
+        Backquote => "larrow",
         _ => return None,
     };
     key_by_name(name)
@@ -258,6 +274,17 @@ mod tests {
         assert_eq!(host_key(KeyCode::Escape), key_by_name("runstop"));
         assert_eq!(host_key(KeyCode::F12), None, "menu button belongs to the window");
         assert_eq!(host_key(RESTORE_KEY), None, "RESTORE is not a matrix key");
+        assert_eq!(host_key(KeyCode::Semicolon), key_by_name(":"));
+        assert_eq!(host_key(KeyCode::Quote), key_by_name(";"));
+        assert_eq!(host_key(KeyCode::Slash), key_by_name("/"));
+        assert_eq!(host_key(KeyCode::Minus), key_by_name("+"));
+        assert_eq!(host_key(KeyCode::Equal), key_by_name("-"));
+        assert_eq!(host_key(KeyCode::BracketLeft), key_by_name("@"));
+        assert_eq!(host_key(KeyCode::BracketRight), key_by_name("*"));
+        assert_eq!(host_key(KeyCode::Backslash), key_by_name("uparrow"));
+        assert_eq!(host_key(KeyCode::Backquote), key_by_name("larrow"));
+        assert_eq!(host_key(KeyCode::F9), key_by_name("="));
+        assert_eq!(host_key(KeyCode::F10), key_by_name("pound"));
     }
 
     /// Token of a C initializer list: a char literal, or the bare identifier / number.
