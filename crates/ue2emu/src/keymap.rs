@@ -191,6 +191,10 @@ pub fn host_key(code: KeyCode) -> Option<MatrixKey> {
         F8 => "f8",
         F9 => "=",
         F10 => "pound",
+        // F11 aliases HOME for keyboards that have no Home key. On macOS, Mission Control owns F11
+        // ("Show Desktop") by default, so the key never reaches the application and the alias is inert
+        // until that shortcut is turned off in System Settings > Keyboard > Keyboard Shortcuts. Home
+        // itself is unaffected either way.
         F11 | Home => "home",
         ShiftLeft => "lshift",
         ShiftRight => "rshift",
