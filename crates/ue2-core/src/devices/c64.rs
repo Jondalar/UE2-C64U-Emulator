@@ -13,6 +13,7 @@ use crate::devices::board::{add_table, at, span, Reg, RegTable, Span, RAM, RAM_P
 use crate::devices::drives::DriveRegs;
 use crate::io::{IoCtx, IoDevice, IoMap, IO_BASE};
 use crate::machine::MachineConfig;
+use crate::time;
 
 /// C64_CORE_VERSION (0x10180010). Display only ("1.%02x", product.cc:139, system_info.cc:176); the value on
 /// real cores is OPEN (10 Q6), so any fixed non-zero value serves.
@@ -671,6 +672,7 @@ impl IoDevice for C64Port {
                     None => self.dma.read(addr),
                 };
                 self.return_ddr();
+                ctx.stall += time::DMA_BYTE_CLOCKS;
                 self.update_uci(ctx);
                 val
             }
@@ -731,6 +733,7 @@ impl IoDevice for C64Port {
                 if addr == UNLOCK_ACK_ADDR && val == 0 && self.has_uci() {
                     ctx.irq.set_high(UNLOCK_IRQ_HIGH_BIT, false);
                 }
+                ctx.stall += time::DMA_BYTE_CLOCKS;
                 self.update_uci(ctx);
             }
             // UCI, when the backend has the block.
@@ -1213,7 +1216,7 @@ mod tests {
         fn with_ctx<R>(&mut self, addr: u32, f: impl FnOnce(&mut dyn IoDevice, u32, &mut IoCtx) -> R) -> R {
             let (dev, off) = self.map.resolve(addr).expect("mapped");
             let mut ctx =
-                IoCtx { now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
+                IoCtx { stall: 0, now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
             f(self.map.devices[dev].as_mut(), off, &mut ctx)
         }
 
@@ -1228,6 +1231,30 @@ mod tests {
         fn port(&mut self) -> &mut C64Port {
             self.map.get_mut::<C64Port>().unwrap()
         }
+
+        /// The wait state one access charged.
+        fn stall_of(&mut self, addr: u32, write: bool) -> u64 {
+            self.with_ctx(addr, |dev, off, ctx| {
+                if write {
+                    dev.write8(off, 0, ctx);
+                } else {
+                    dev.read8(off, ctx);
+                }
+                ctx.stall
+            })
+        }
+    }
+
+    /// A byte through the C64 memory window is a DMA cycle on the C64's bus and costs the firmware what it costs
+    /// the device (`time::DMA_BYTE_CLOCKS`, measured at 3.26 us per byte on a C64 Ultimate). The registers beside
+    /// it answer in their own cycle and charge nothing.
+    #[test]
+    fn the_dma_window_charges_what_a_bus_cycle_costs() {
+        let mut b = Bench::new();
+        assert_eq!(b.stall_of(DMA_ADDR + 0x0400, false), time::DMA_BYTE_CLOCKS, "a DMA read waits");
+        assert_eq!(b.stall_of(DMA_ADDR + 0x0400, true), time::DMA_BYTE_CLOCKS, "and so does a DMA write");
+        assert_eq!(b.stall_of(STOP_ADDR, false), 0, "a register of the port itself does not");
+        assert_eq!(b.stall_of(CORE_ADDR + 0x03, true), 0);
     }
 
     #[test]

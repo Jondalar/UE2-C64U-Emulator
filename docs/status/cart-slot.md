@@ -264,7 +264,14 @@ unchanged.
   U64-II's own expansion-port logic is not public. Routing is live, not latched at cartridge init (the Auto/External
   DMA difference above).
 - **Bridge:** only bit 0 ("Writes") of C64_BUS_BRIDGE is modelled; reads are never mirrored.
-- **No port timing:** no bus contention, no PHI2 or address-setup timing; two data drivers are simply ANDed.
+- **No port timing:** no bus contention, no PHI2 or address-setup timing; two data drivers are simply ANDed. What
+  is modelled is the price of a DMA byte through the C64 memory window, because a flash erase is timed in C64
+  cycles and a firmware that polls over DMA has to reach the due cycle. Measured on a real C64 Ultimate (3.15)
+  over `machine:readmem`, a byte costs **3.26 us**, about three cycles; the emulator charged 1.61 us of firmware
+  instructions and nothing for the bus, so the upstream cart tool's chip erase -- 6 000 000 polls, 20 s on the
+  device -- ran out in under 3 s here and never saw the chip finish. `time::DMA_BYTE_CLOCKS` adds the remainder;
+  the same measurement now reads 3.25 us. `--log cart` shows the cycle a cartridge is handed, which is the only
+  place that clock is visible.
 - **Freeze button** of a physical freezer (Action Replay, Retro Replay in the slot) is not wired; the U64 freeze
   button reaches the internal cartridge as before.
 - **GMod4** (type 87) and **EasyFlash XL** (232) are served but not exercised by the acceptance; GMod4's SPI flash is

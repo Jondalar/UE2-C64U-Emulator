@@ -528,13 +528,13 @@ mod tests {
 
         fn r(&mut self, addr: u32) -> u8 {
             let (dev, off) = self.map.resolve(addr).expect("SD window mapped");
-            let mut ctx = IoCtx { now: 0, pc: 0, ram: &mut [], irq: &mut self.irq, console: &mut self.console };
+            let mut ctx = IoCtx { stall: 0, now: 0, pc: 0, ram: &mut [], irq: &mut self.irq, console: &mut self.console };
             self.map.devices[dev].read8(off, &mut ctx)
         }
 
         fn w(&mut self, addr: u32, val: u8) {
             let (dev, off) = self.map.resolve(addr).expect("SD window mapped");
-            let mut ctx = IoCtx { now: 0, pc: 0, ram: &mut [], irq: &mut self.irq, console: &mut self.console };
+            let mut ctx = IoCtx { stall: 0, now: 0, pc: 0, ram: &mut [], irq: &mut self.irq, console: &mut self.console };
             self.map.devices[dev].write8(off, val, &mut ctx);
         }
 

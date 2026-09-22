@@ -414,7 +414,7 @@ mod tests {
         }
 
         fn ctx(&mut self) -> (&mut DriveRegs, &mut MockDrive, IoCtx<'_>) {
-            let ctx = IoCtx { now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
+            let ctx = IoCtx { stall: 0, now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
             (&mut self.regs, &mut self.drive, ctx)
         }
 

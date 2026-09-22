@@ -373,7 +373,7 @@ mod tests {
         let mut ram = vec![0u8; 0x100];
         let mut irq = crate::irq::IrqState::default();
         let mut console = Vec::new();
-        let mut ctx = IoCtx { now: 0, pc: 0, ram: &mut ram, irq: &mut irq, console: &mut console };
+        let mut ctx = IoCtx { stall: 0, now: 0, pc: 0, ram: &mut ram, irq: &mut irq, console: &mut console };
         for id in 0..STREAMS {
             s.write8((id * STRIDE) as u32, 0x40 + id as u8, &mut ctx);
         }

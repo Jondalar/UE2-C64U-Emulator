@@ -20,6 +20,10 @@ pub struct IoCtx<'a> {
     pub irq: &'a mut IrqState,
     /// UART TX bytes, drained by the machine.
     pub console: &'a mut Vec<u8>,
+    /// What this access costs the firmware beyond the instruction itself, in [`crate::time::CLOCK_HZ`] ticks.
+    /// A device that models a wait state adds to it; the bus collects it and emulated time carries it. Zero for
+    /// every register that answers in the cycle it is asked.
+    pub stall: u64,
 }
 
 pub trait IoDevice: Any {
