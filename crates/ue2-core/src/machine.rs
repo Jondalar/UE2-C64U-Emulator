@@ -44,6 +44,8 @@ pub struct MachineConfig {
     pub sd_image: Option<PathBuf>,
     /// Devices on the USB hub ports (`devices::usb`). Advertising them needs `devices::usb::CAPAB_USB_HOST2`.
     pub usb: devices::usb::UsbConfig,
+    /// Which label this board wears: the Bling Board's presence bit, and nothing else (`devices::board::Board`).
+    pub board: devices::board::Board,
     /// Seed CFG_USERIF_ITYPE=1 (overlay UI) into blank flash config.
     pub overlay_ui: bool,
     /// Halt on vAssertCalled / exception handler entry / get_mem PANIC loop / illegal instruction.
@@ -69,6 +71,7 @@ impl MachineConfig {
             flash_image: None,
             sd_image: None,
             usb: devices::usb::UsbConfig::default(),
+            board: devices::board::Board::default(),
             overlay_ui: true,
             halt_on_fault: true,
             trace: false,
