@@ -251,12 +251,12 @@ mod tests {
         }
 
         fn rd(&mut self, off: u32) -> u8 {
-            let mut ctx = IoCtx { now: self.now, pc: 0, ram: &mut [], irq: &mut self.irq, console: &mut self.console };
+            let mut ctx = IoCtx { stall: 0, now: self.now, pc: 0, ram: &mut [], irq: &mut self.irq, console: &mut self.console };
             self.itu.read8(off, &mut ctx)
         }
 
         fn wr(&mut self, off: u32, val: u8) {
-            let mut ctx = IoCtx { now: self.now, pc: 0, ram: &mut [], irq: &mut self.irq, console: &mut self.console };
+            let mut ctx = IoCtx { stall: 0, now: self.now, pc: 0, ram: &mut [], irq: &mut self.irq, console: &mut self.console };
             self.itu.write8(off, val, &mut ctx);
         }
 
@@ -264,7 +264,7 @@ mod tests {
             while let Some(e) = self.itu.next_event().filter(|&e| e <= t) {
                 self.now = e;
                 let mut ctx =
-                    IoCtx { now: self.now, pc: 0, ram: &mut [], irq: &mut self.irq, console: &mut self.console };
+                    IoCtx { stall: 0, now: self.now, pc: 0, ram: &mut [], irq: &mut self.irq, console: &mut self.console };
                 self.itu.tick(&mut ctx);
             }
             self.now = t;

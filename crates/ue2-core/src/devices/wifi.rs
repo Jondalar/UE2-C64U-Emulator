@@ -614,13 +614,13 @@ mod tests {
 
         fn wr(&mut self, off: u32, val: u8) {
             let mut ctx =
-                IoCtx { now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
+                IoCtx { stall: 0, now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
             self.dev.write8(off, val, &mut ctx);
         }
 
         fn rd(&mut self, off: u32) -> u8 {
             let mut ctx =
-                IoCtx { now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
+                IoCtx { stall: 0, now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
             self.dev.read8(off, &mut ctx)
         }
 
@@ -767,7 +767,7 @@ mod tests {
                 match self.dev.next_event() {
                     Some(at) if at <= end => {
                         self.now = self.now.max(at);
-                        let mut ctx = IoCtx {
+                        let mut ctx = IoCtx { stall: 0,
                             now: self.now,
                             pc: 0,
                             ram: &mut self.ram,

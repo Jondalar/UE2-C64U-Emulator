@@ -154,7 +154,7 @@ mod tests {
         let mut ram = [0u8; 0];
         let mut irq = IrqState::new();
         let mut console = Vec::new();
-        let mut ctx = IoCtx { now: 0, pc: 0, ram: &mut ram, irq: &mut irq, console: &mut console };
+        let mut ctx = IoCtx { stall: 0, now: 0, pc: 0, ram: &mut ram, irq: &mut irq, console: &mut console };
         f(&mut ctx)
     }
 

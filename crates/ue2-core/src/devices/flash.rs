@@ -729,14 +729,14 @@ mod tests {
         fn read8(&mut self, addr: u32) -> u8 {
             let (dev, off) = self.map.resolve(addr).expect("flash window mapped");
             let mut ctx =
-                IoCtx { now: self.now, pc: 0, ram: &mut self.ram[..], irq: &mut self.irq, console: &mut self.console };
+                IoCtx { stall: 0, now: self.now, pc: 0, ram: &mut self.ram[..], irq: &mut self.irq, console: &mut self.console };
             self.map.devices[dev].read8(off, &mut ctx)
         }
 
         fn write8(&mut self, addr: u32, val: u8) {
             let (dev, off) = self.map.resolve(addr).expect("flash window mapped");
             let mut ctx =
-                IoCtx { now: self.now, pc: 0, ram: &mut self.ram[..], irq: &mut self.irq, console: &mut self.console };
+                IoCtx { stall: 0, now: self.now, pc: 0, ram: &mut self.ram[..], irq: &mut self.irq, console: &mut self.console };
             self.map.devices[dev].write8(off, val, &mut ctx);
         }
 

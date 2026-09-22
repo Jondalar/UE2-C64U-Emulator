@@ -701,7 +701,7 @@ mod tests {
         }
 
         fn w8(&mut self, off: usize, val: u8) {
-            let mut ctx = IoCtx { now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
+            let mut ctx = IoCtx { stall: 0, now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
             self.usb.write8(off as u32, val, &mut ctx);
         }
 
@@ -737,7 +737,7 @@ mod tests {
             while let Some(at) = self.usb.next_event().filter(|&at| at <= end) {
                 self.now = self.now.max(at);
                 let mut ctx =
-                    IoCtx { now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
+                    IoCtx { stall: 0, now: self.now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
                 self.usb.tick(&mut ctx);
                 if stop(self) {
                     return true;

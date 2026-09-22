@@ -63,6 +63,10 @@ pub struct SystemBus {
     pub pc: u32,
     /// Set on any IO access; the machine recomputes device deadlines and clears it.
     pub io_touched: bool,
+    /// Wait states the devices of this instruction charged, in 100 MHz ticks. The machine adds them to emulated
+    /// time after the instruction and clears it, so a device that models a real delay slows the firmware down the
+    /// way the hardware does ([`crate::time::DMA_BYTE_CLOCKS`]).
+    pub stall: u64,
     /// Record every IO byte access for the IO trace (`--log io`).
     pub trace_io: bool,
     /// Count unmapped accesses and record the first hits per address (`--log unmapped`).
@@ -122,6 +126,7 @@ impl SystemBus {
             now: 0,
             pc: 0,
             io_touched: false,
+            stall: 0,
             trace_io: false,
             log_unmapped: false,
             accesses: Vec::new(),
@@ -143,7 +148,7 @@ impl SystemBus {
         for dev in &mut self.io.devices {
             if dev.next_event().is_some_and(|t| t <= now) {
                 let mut ctx =
-                    IoCtx { now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
+                    IoCtx { stall: 0, now, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
                 dev.tick(&mut ctx);
             }
         }
@@ -154,7 +159,7 @@ impl SystemBus {
         self.idle_dirty = true;
         match self.io.resolve(addr) {
             Some((dev, off)) => {
-                let mut ctx = IoCtx {
+                let mut ctx = IoCtx { stall: 0,
                     now: self.now,
                     pc: self.pc,
                     ram: &mut self.ram,
@@ -162,6 +167,7 @@ impl SystemBus {
                     console: &mut self.console,
                 };
                 let val = self.io.devices[dev].read8(off, &mut ctx);
+                self.stall += ctx.stall;
                 if self.trace_io {
                     self.record(false, addr, val, true, true);
                 }
@@ -192,7 +198,7 @@ impl SystemBus {
         self.idle_dirty = true;
         match self.io.resolve(addr) {
             Some((dev, off)) => {
-                let mut ctx = IoCtx {
+                let mut ctx = IoCtx { stall: 0,
                     now: self.now,
                     pc: self.pc,
                     ram: &mut self.ram,
@@ -200,6 +206,7 @@ impl SystemBus {
                     console: &mut self.console,
                 };
                 self.io.devices[dev].write8(off, val, &mut ctx);
+                self.stall += ctx.stall;
                 if self.trace_io {
                     self.record(true, addr, val, true, true);
                 }

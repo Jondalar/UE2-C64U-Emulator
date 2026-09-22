@@ -427,7 +427,7 @@ impl Machine {
     /// After a step: advance time, recompute the deadline after IO, print logged accesses (§Machine loop 1, 3).
     #[inline(always)]
     fn post_step(&mut self) {
-        self.bus.now += self.cfg.clocks_per_insn;
+        self.bus.now += self.cfg.clocks_per_insn + std::mem::take(&mut self.bus.stall);
         if self.bus.io_touched {
             self.bus.io_touched = false;
             self.next_deadline = self.bus.next_deadline();

@@ -281,13 +281,13 @@ pub(crate) mod rig {
 
         pub(crate) fn r8(&mut self, addr: u32) -> u8 {
             let Some((dev, off)) = self.map.resolve(addr) else { return 0 };
-            let mut ctx = IoCtx { now: 0, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
+            let mut ctx = IoCtx { stall: 0, now: 0, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
             self.map.devices[dev].read8(off, &mut ctx)
         }
 
         pub(crate) fn w8(&mut self, addr: u32, val: u8) {
             let Some((dev, off)) = self.map.resolve(addr) else { return };
-            let mut ctx = IoCtx { now: 0, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
+            let mut ctx = IoCtx { stall: 0, now: 0, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
             self.map.devices[dev].write8(off, val, &mut ctx);
         }
 

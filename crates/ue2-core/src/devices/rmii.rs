@@ -528,7 +528,7 @@ mod tests {
         }
 
         fn ctx(&mut self) -> (&mut Rmii, IoCtx<'_>) {
-            let ctx = IoCtx { now: 0, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
+            let ctx = IoCtx { stall: 0, now: 0, pc: 0, ram: &mut self.ram, irq: &mut self.irq, console: &mut self.console };
             (&mut self.dev, ctx)
         }
 
