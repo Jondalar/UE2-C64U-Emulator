@@ -144,6 +144,24 @@ pub(crate) fn add_table(map: &mut IoMap, base: u32, size: u32, name: &'static st
 /// U2PIO_BOARDREV: board revision 0x17 "U64E V2.2 (Mass Prod)" in bits 7:3 (product.cc:44,57-62).
 const BOARDREV: u8 = 0x17 << 3;
 
+/// Which label the same board wears. `BOARDREV` does not tell the two apart -- 0x16 and 0x17 are one piece of
+/// hardware that Commodore's branch calls a C64U and Gideon's calls an Ultimate 64-II Elite, and a C64U running
+/// 3.15 writes "ULTIMATE 64-II" in its own title bar. What differs is the Bling Board, the LED and keyboard
+/// controller the C64U carries: `BLINGBOARD_INSTALLED` is `BLING_RX_FLAGS & 0x04` (u64.h:35-43), and a firmware
+/// that wants to know asks that, not the revision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Board {
+    /// No Bling Board. 3.15 reads the flag in one place, `LedStrip::setup_config_menu` (led_strip.cc:497).
+    #[default]
+    U64II,
+    /// The Bling Board answers present. Its data, get and irqen registers stay unmodelled: 3.15 never reads them,
+    /// and the branches that do (`bling_board.cc`, `u64_config.cc`) are not in this firmware.
+    C64U,
+}
+
+/// `BLING_RX_FLAGS` with the presence bit set.
+const BLING_PRESENT: &[Span] = &[at(0x02, Reg::Const(0x04))];
+
 /// U2PIO_GET_MDIO / U2PIO_SET_MDC / U2PIO_SET_MDIO (u2p.h:66-68).
 const GET_MDIO: u32 = 0x06;
 const SET_MDC: u32 = 0x0A;
@@ -203,7 +221,7 @@ impl IoDevice for U2pio {
     crate::impl_as_any!();
 }
 
-pub fn install(map: &mut IoMap, _cfg: &MachineConfig) {
+pub fn install(map: &mut IoMap, cfg: &MachineConfig) {
     map.add(0x1010_0000, 0x100, Box::new(U2pio { table: RegTable::new("u2pio", U2PIO), phy: Phy::new() }));
     // DDR2 PHY: boot ROM only (00 §1b).
     add_table(map, 0x1010_0100, 0x100, "ddr2-phy", &[]);
@@ -214,8 +232,13 @@ pub fn install(map: &mut IoMap, _cfg: &MachineConfig) {
     // (docs/specs/S17-ultisid.md §2.5).
     // LED strip data/map/intensity/start (led_strip.cc:150-154): write-only.
     add_table(map, 0x1010_0600, 0x100, "led-strip", &[]);
-    // Blingboard RX: BLING_RX_FLAGS 0x10100802 reads 0 = not installed (led_strip.cc:497-501).
-    add_table(map, 0x1010_0800, 0x100, "blingboard", &[]);
+    // Blingboard RX: BLING_RX_FLAGS 0x10100802 reads 0 = not installed (led_strip.cc:497-501), or 0x04 for a
+    // C64U, which is the one thing that tells the two labels of this board apart ([`Board`]).
+    let bling = match cfg.board {
+        Board::U64II => &[][..],
+        Board::C64U => BLING_PRESENT,
+    };
+    add_table(map, 0x1010_0800, 0x100, "blingboard", bling);
     // U64II_BLINGBOARD_LEDS: defined (u64.h:36), never accessed.
     add_table(map, 0x1010_0900, 0x100, "blingboard-leds", &[]);
     // MMCM DRP words at 2·idx and MMCM_RESET 0x102000FF (u64ii_init.cc:213-228,266-267): write-only, no lock poll.
@@ -246,8 +269,13 @@ pub(crate) mod rig {
 
     impl Rig {
         pub(crate) fn new(install: fn(&mut IoMap, &MachineConfig)) -> Self {
+            Self::with_cfg(install, &cfg())
+        }
+
+        /// The same rig for a machine configured differently, e.g. another board label.
+        pub(crate) fn with_cfg(install: fn(&mut IoMap, &MachineConfig), cfg: &MachineConfig) -> Self {
             let mut map = IoMap::new();
-            install(&mut map, &cfg());
+            install(&mut map, cfg);
             Rig { map, irq: IrqState::new(), ram: vec![0; 16], console: Vec::new() }
         }
 
@@ -284,6 +312,7 @@ pub(crate) mod rig {
 #[cfg(test)]
 mod tests {
     use super::rig::{cfg, Rig};
+    use crate::machine::MachineConfig;
     use super::*;
     use crate::devices::{c64, drives, i2c, iec, install_all, misc, rmii, usb};
 
@@ -296,6 +325,20 @@ mod tests {
         assert_eq!(rig.r8(0x1010_000C), 0xB8);
         assert_eq!(rig.r8(0x1010_000C) >> 3, 0x17);
         assert_eq!(rig.r8(0x1010_0006), 1, "GET_MDIO: line released, no PHY frame in progress");
+    }
+
+    /// The Bling Board's presence bit is the only thing that separates a C64U from an Elite: the revision is 0x17
+    /// either way (product.cc:44,57-62; u64.h:35-43). `--board c64u` sets it, and nothing else moves.
+    #[test]
+    fn the_bling_board_answers_only_for_a_c64u() {
+        let mut elite = Rig::new(install);
+        assert_eq!(elite.r8(0x1010_0802), 0, "BLING_RX_FLAGS: no Bling Board");
+
+        let mut c64u = Rig::with_cfg(install, &MachineConfig { board: Board::C64U, ..cfg() });
+        assert_eq!(c64u.r8(0x1010_0802) & 0x04, 0x04, "BLINGBOARD_INSTALLED");
+        assert_eq!(c64u.r8(0x1010_000C) >> 3, 0x17, "the revision is the same board");
+        c64u.w8(0x1010_0802, 0);
+        assert_eq!(c64u.r8(0x1010_0802) & 0x04, 0x04, "a constant, not a latch");
     }
 
     #[test]

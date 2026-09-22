@@ -118,6 +118,9 @@ struct RunArgs {
     /// Logging: unmapped, io, irq (comma separated)
     #[arg(long, value_delimiter = ',')]
     log: Vec<String>,
+    /// Which label the board wears: u64ii (default) or c64u, the same hardware with the Bling Board present
+    #[arg(long, value_name = "MODEL", value_parser = ["u64ii", "c64u"])]
+    board: Option<String>,
     /// Do not seed the overlay user interface into blank flash config
     #[arg(long)]
     no_overlay_ui: bool,
@@ -206,6 +209,9 @@ fn run(a: RunArgs) -> Result<()> {
     cfg.flash_image = a.flash;
     cfg.sd_image = a.sd;
     cfg.overlay_ui = !a.no_overlay_ui;
+    if a.board.as_deref() == Some("c64u") {
+        cfg.board = ue2_core::devices::board::Board::C64U;
+    }
     cfg.halt_on_fault = !a.no_halt;
     cfg.trace = a.trace || a.gdb.is_some();
     cfg.idle_skip = !a.no_idle_skip;

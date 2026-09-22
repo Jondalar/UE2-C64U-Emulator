@@ -141,6 +141,7 @@ is RESTORE.
 | `--roms DIR` | Firmware roms directory: overlay font `chars.bin`, TRX64 ROM seeds, `--c64-roms` source; default `firmware/1541ultimate/roms` |
 | `--flash FILE` | Persistent SPI flash image, created erased if missing |
 | `--caps HEX` | ITU capability word; default `34000222`. Given explicitly it is used as it stands, so the frontend adds none of its own bits (EEPROM, UCI, sampler) — that is how a machine without one of them is modelled |
+| `--board MODEL` | Which label the board wears: `u64ii` (default) or `c64u`. The revision register says `0x17` either way -- it is one piece of hardware -- so the difference is the Bling Board, the LED and keyboard controller the C64U carries. `c64u` makes `BLINGBOARD_INSTALLED` answer present; 3.15 reads it once, for a heading in the LED settings, and a firmware built from Commodore's branch reads it for `isCommodoreBoard()` |
 | `--no-overlay-ui` | Do not seed the overlay user interface into blank flash config |
 | `--settings FILE.cfg` | Firmware settings from a `.cfg` in the firmware's own format, written into the flash before boot at every start; only the settings to change are needed; repeatable, later files win; a bad value stops the start. `ue2emu settings [--firmware F]` prints every setting of an image with its default (`docs/specs/S21-settings.md`) |
 
@@ -276,7 +277,7 @@ Only `run` takes `--config`. `crates/ue2emu/src/config.rs` turns the file's entr
 
 - **Keys** are the long flag names without `--`, spelled like the flag: `firmware`, `roms`, `flash`, `sd`, `c64`,
   `caps`, `clocks-per-insn`, `speed`, `headless`, `script`, `control`, `max-seconds`, `gdb`, `log`, `no-overlay-ui`,
-  `no-halt`, `trace`, `net`, `hostfwd`, `web-port`, `usb`, `usb-dir`, `usb-dir-work`, `usb-keyboard`, `audio`,
+  `no-halt`, `trace`, `board`, `net`, `hostfwd`, `web-port`, `usb`, `usb-dir`, `usb-dir-work`, `usb-keyboard`, `audio`,
   `audio-wav`, `sid-socket1`, `c64-roms`, `c64-roms-force`, `cart-slot`, `settings`.
   - The alias `elf` works for `firmware`; setting both is an error.
   - An unknown key is an error, and so is `config`. `help` is not a key.
