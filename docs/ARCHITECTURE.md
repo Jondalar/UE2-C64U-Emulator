@@ -487,7 +487,7 @@ Level 2 of `ue2emu`: how the host reaches the machine and what it gets back.
   palette, text screen and character set of an attached C64). Published by the emulation thread about every 20 ms
   emulated. `render::Renderer` composites the overlay over the 384×272 C64 frame (overlay only without a C64);
   `render::text_dump` and `render::c64_text_dump` turn the overlay and the C64 screen into text.
-- **Window:** realtime, 4:3 letterboxed, opens at 768×576. F12 = menu button, Page Up = RESTORE; other keys go to
+- **Window:** realtime, held to the rendered image's ratio on resize, opens at 768×576. F12 = menu button, Page Up = RESTORE; other keys go to
   the matrix, or with `--usb-keyboard` to the USB keyboard.
 - **Control:** `--script file` or `--control 127.0.0.1:PORT`, one command per line (S08):
   `wait <ms>`, `button [ms]`, `key <name> [ms]`, `type <text>`, `usbkey <name> [ms]`, `screen`, `c64screen`,
