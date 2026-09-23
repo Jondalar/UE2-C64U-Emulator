@@ -1,7 +1,8 @@
 # Gaps against the device
 
 What the emulator does not do that a U64-II / C64 Ultimate does, and who has to build it. Details are in the linked
-status files.
+status files. Each item was reviewed on 2026-09-23 and is marked **Planned**, **parked**/**Deferred** (until a program
+or a need shows up), accepted as a limit, or **dropped**.
 
 ## TRX64 (the C64 core)
 
