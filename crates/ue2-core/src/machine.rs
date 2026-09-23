@@ -536,19 +536,21 @@ impl Machine {
         self.bus.accesses = accesses;
     }
 
-    /// `io R/W addr val device+off @pc sym+off`.
+    /// `io R/W addr val device+off @pc sym+off t=seconds`, the time in emulated seconds to the 10 ns tick.
     fn format_io(&self, a: &Access) -> String {
         let target = match self.bus.io.resolve(a.addr) {
             Some((dev, off)) => format!("{}+{off:#x}", self.bus.io.devices[dev].name()),
             None => "unmapped".to_owned(),
         };
         format!(
-            "io {} {:#010x} {:#04x} {target} @{:#010x} {}",
+            "io {} {:#010x} {:#04x} {target} @{:#010x} {} t={}.{:08}",
             rw(a.write),
             a.addr,
             a.val,
             a.pc,
-            self.symbols.format(a.pc)
+            self.symbols.format(a.pc),
+            a.now / time::CLOCK_HZ,
+            a.now % time::CLOCK_HZ,
         )
     }
 
@@ -1080,8 +1082,13 @@ mod tests {
         config.log.io = true;
         let mut m = machine(config, vec![timer(1, 1, None)], Symbols::empty());
         m.bus.pc = 0x40;
+        m.bus.now = 123_456_789;
         m.bus.write8(IO_BASE + 7, 3);
-        assert_eq!(m.format_io(&m.bus.accesses[0]), "io W 0x10000007 0x03 timer+0x7 @0x00000040 0x00000040");
+        assert_eq!(
+            m.format_io(&m.bus.accesses[0]),
+            "io W 0x10000007 0x03 timer+0x7 @0x00000040 0x00000040 t=1.23456789",
+            "the time is the emulated clock of the access, in seconds to the 10 ns tick"
+        );
     }
 
     #[test]
