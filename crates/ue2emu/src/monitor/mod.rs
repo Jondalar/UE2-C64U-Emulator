@@ -84,8 +84,8 @@ impl MonitorHost for Host<'_> {
         (dev == Device::Host(FW)).then_some(self as &mut dyn CpuView)
     }
 
-    fn devices(&self) -> Vec<Device> {
-        vec![Device::C64, Device::Drive8, Device::Host(FW)]
+    fn devices(&mut self) -> Vec<Device> {
+        vec![Device::C64, Device::Drive(8), Device::Host(FW)]
     }
 
     /// S23 §3: the C64's stop is the machine's own, through `C64_STOP`.
