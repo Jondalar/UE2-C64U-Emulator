@@ -22,7 +22,7 @@ use ue2_core::host::HostInput;
 use ue2_core::machine::MachineConfig;
 use ue2_core::render::Renderer;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -33,8 +33,8 @@ use crate::keymap::{self, MatrixKey, LSHIFT};
 use crate::runner::{self, Command, ControlHandle, EmuHandle, RunOptions};
 use crate::usb::UsbKeys;
 
-/// 4:3 display area at 1×; the window opens at twice this (logical pixels), which fits the 384×272 C64
-/// frame at 2× (docs/specs/S14-c64-trx64.md §9).
+/// The window opens at twice this (logical pixels) and is never lower than `BASE_H`; its shape then follows
+/// the rendered image (see `aspect_snap`).
 const BASE_W: u32 = 384;
 const BASE_H: u32 = 288;
 /// 50 Hz redraw.
@@ -80,6 +80,8 @@ pub fn run_window(cfg: MachineConfig, opts: RunOptions) -> Result<()> {
         speed_pct,
         renderer: Renderer::new(&font),
         pixels: Vec::new(),
+        image: (0, 0),
+        last_size: (0, 0),
         held: HeldKeys::default(),
         usb_keys,
         menu_down: false,
@@ -117,6 +119,10 @@ struct App {
     speed_pct: Arc<AtomicU64>,
     renderer: Renderer,
     pixels: Vec<u32>,
+    /// Size of the last rendered image: the ratio the window is held to.
+    image: (u32, u32),
+    /// Window size before the latest resize, so `aspect_snap` can tell which edge was dragged.
+    last_size: (u32, u32),
     held: HeldKeys,
     /// With `--usb-keyboard`, host keys go to the USB keyboard instead of the matrix.
     usb_keys: Option<UsbKeys>,
@@ -159,6 +165,16 @@ impl App {
         };
         let snap = self.ctl.display.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         let (sw, sh) = self.renderer.render(&snap, &mut self.pixels);
+        let image = (sw as u32, sh as u32);
+        if image != self.image && sw != 0 && sh != 0 {
+            // A new output mode brings a new shape: the minimum and the window follow it.
+            self.image = image;
+            window.set_min_inner_size(Some(LogicalSize::new(BASE_H * image.0 / image.1, BASE_H)));
+            if let Some(want) = aspect_snap(size.width, size.height, self.last_size, image, min_size(window, image))
+            {
+                let _ = window.request_inner_size(PhysicalSize::new(want.0, want.1));
+            }
+        }
         if surface.resize(w, h).is_err() {
             return;
         }
@@ -261,8 +277,14 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Focused(false) => self.release_all(),
-            WindowEvent::Resized(_) => {
+            WindowEvent::Resized(size) => {
                 if let Some(window) = &self.window {
+                    // winit has no aspect constraint, so the size is corrected after the drag (TRX64 trx64-cli).
+                    let min = min_size(window, self.image);
+                    if let Some(want) = aspect_snap(size.width, size.height, self.last_size, self.image, min) {
+                        let _ = window.request_inner_size(PhysicalSize::new(want.0, want.1));
+                    }
+                    self.last_size = (size.width, size.height);
                     window.request_redraw();
                 }
             }
@@ -346,21 +368,48 @@ impl HeldKeys {
     }
 }
 
-/// Where an `img_w`×`img_h` frame goes in a `win_w`×`win_h` surface, as (x, y, w, h): the largest
-/// integer scale that fits the centred 4:3 display area, centred. A frame larger than that area is
-/// shrunk to fit with its aspect ratio kept.
+/// Where an `img_w`×`img_h` frame goes in a `win_w`×`win_h` surface, as (x, y, w, h): as large as fits with
+/// its aspect ratio kept, centred. `aspect_snap` keeps the window on that ratio, so it normally fills it.
 fn place(win_w: u32, win_h: u32, img_w: u32, img_h: u32) -> (u32, u32, u32, u32) {
     let (ww, wh, iw, ih) = (win_w as u64, win_h as u64, img_w.max(1) as u64, img_h.max(1) as u64);
-    let (aw, ah) = if ww * 3 >= wh * 4 { (wh * 4 / 3, wh) } else { (ww, ww * 3 / 4) };
-    let scale = (aw / iw).min(ah / ih);
-    let (w, h) = if scale >= 1 {
-        (iw * scale, ih * scale)
-    } else if iw * ah >= ih * aw {
-        (aw, ih * aw / iw)
-    } else {
-        (iw * ah / ih, ah)
-    };
+    let (w, h) = if iw * wh >= ih * ww { (ww, ih * ww / iw) } else { (iw * wh / ih, wh) };
     (((ww - w) / 2) as u32, ((wh - h) / 2) as u32, w as u32, h as u32)
+}
+
+/// The smallest window for `image`, in physical pixels: `BASE_H` logical pixels high, as wide as the ratio says.
+fn min_size(window: &Window, image: (u32, u32)) -> (u32, u32) {
+    if image.0 == 0 || image.1 == 0 {
+        return (0, 0);
+    }
+    let h = (f64::from(BASE_H) * window.scale_factor()).round() as u32;
+    (h * image.0 / image.1, h)
+}
+
+/// The size a `w`×`h` window should snap to so it keeps the ratio of `image`, or `None` when it already does
+/// (after TRX64 trx64-cli `aspect_snap`).
+///
+/// `prev` is the size before this resize: the axis that changed more is the one being dragged, so it stays and the
+/// other follows; correcting the dragged axis would move the corner under the mouse. One pixel of slack, because
+/// integer division cannot always land exactly and a snap never satisfied would resize on every frame. Below `min`
+/// the window snaps to `min` whole, since clamping one axis would break the ratio.
+fn aspect_snap(w: u32, h: u32, prev: (u32, u32), image: (u32, u32), min: (u32, u32)) -> Option<(u32, u32)> {
+    let (iw, ih) = image;
+    if w == 0 || h == 0 || iw == 0 || ih == 0 {
+        return None;
+    }
+    let want_h = (u64::from(w) * u64::from(ih) / u64::from(iw)) as u32;
+    if want_h.abs_diff(h) <= 1 {
+        return None;
+    }
+    let (nw, nh) = if w.abs_diff(prev.0) >= h.abs_diff(prev.1) {
+        (w, want_h)
+    } else {
+        ((u64::from(h) * u64::from(iw) / u64::from(ih)) as u32, h)
+    };
+    if nw < min.0 || nh < min.1 {
+        return Some(min);
+    }
+    Some((nw, nh))
 }
 
 /// Nearest-neighbour copy of `src` (`sw`×`sh`) into `dst` (`dw`×`dh`) at [`place`], black elsewhere.
@@ -437,18 +486,26 @@ mod tests {
     }
 
     #[test]
-    fn placement_is_integer_scaled_in_a_4_3_area() {
-        // Default 40×25 grid of 8×9 cells in the 2× window.
-        assert_eq!(place(640, 480, 320, 225), (0, 15, 640, 450));
-        // Retina backing store of the same window.
-        assert_eq!(place(1280, 960, 320, 225), (0, 30, 1280, 900));
-        // Wide window: the 4:3 area (960×720) limits the scale to 3.
-        assert_eq!(place(1280, 720, 320, 225), (160, 22, 960, 675));
-        assert_eq!(place(1600, 900, 320, 225), (320, 112, 960, 675));
-        // 720p stretch mode (320×400) only fits at 1×.
-        assert_eq!(place(640, 480, 320, 400), (160, 40, 320, 400));
-        // 1080p big-font grid (480×575) is larger than the area: shrunk, aspect kept.
-        assert_eq!(place(640, 480, 480, 575), (120, 0, 400, 480));
+    fn placement_fills_the_window_with_the_aspect_kept() {
+        // A window on the image's ratio is filled, at any scale.
+        assert_eq!(place(1280, 960, 640, 480), (0, 0, 1280, 960));
+        assert_eq!(place(1000, 750, 640, 480), (0, 0, 1000, 750));
+        // Off the ratio (before the snap lands): bars on the long side.
+        assert_eq!(place(1280, 720, 640, 480), (160, 0, 960, 720));
+        assert_eq!(place(640, 480, 1920, 1080), (0, 60, 640, 360));
+    }
+
+    #[test]
+    fn resizing_holds_the_aspect_ratio() {
+        let (vga, hd) = ((640, 480), (1920, 1080));
+        let min = (384, 288);
+        assert_eq!(aspect_snap(768, 576, (768, 576), vga, min), None, "already 4:3");
+        assert_eq!(aspect_snap(1000, 576, (768, 576), vga, min), Some((1000, 750)), "dragged wider: height follows");
+        assert_eq!(aspect_snap(768, 700, (768, 576), vga, min), Some((933, 700)), "dragged taller: width follows");
+        assert_eq!(aspect_snap(384, 40, min, vga, min), Some(min), "never below the minimum, snapped whole");
+        assert_eq!(aspect_snap(768, 576, (768, 576), hd, (512, 288)), Some((768, 432)), "1080p: 16:9");
+        assert_eq!(aspect_snap(0, 0, (768, 576), vga, min), None, "minimised");
+        assert_eq!(aspect_snap(768, 576, (768, 576), (0, 0), min), None, "no image yet");
     }
 
     #[test]
@@ -458,10 +515,10 @@ mod tests {
         blit(&src, 2, 1, &mut dst, 6, 4);
         #[rustfmt::skip]
         let want = [
-            0, 0,    0,    0,    0,    0,
-            0, 0x11, 0x11, 0x22, 0x22, 0,
-            0, 0x11, 0x11, 0x22, 0x22, 0,
-            0, 0,    0,    0,    0,    0,
+            0x11, 0x11, 0x11, 0x22, 0x22, 0x22,
+            0x11, 0x11, 0x11, 0x22, 0x22, 0x22,
+            0x11, 0x11, 0x11, 0x22, 0x22, 0x22,
+            0,    0,    0,    0,    0,    0,
         ];
         assert_eq!(dst, want);
 

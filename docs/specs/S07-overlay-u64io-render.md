@@ -91,3 +91,8 @@ from.
 Until this was read out of the firmware the renderer stretched the frame over the whole canvas, which at 1080p made
 the picture 1920 wide instead of 1440 — a third too wide, and the reason a capture put beside a photo of real
 hardware did not line up.
+
+Only the crop's size is taken over. Its origin counts in the FPGA's video stream, which starts elsewhere than the
+TRX64 canvas (384x272 from raster line 16, 32-pixel borders). Laid on the canvas as is, the 480p crop (8, 0) left 35
+border lines above the text and 5 below it (issue #3). The crop is centred on the canvas instead: 19 lines above and
+21 below at 240 lines, 34 and 36 at 270, 32 pixels left and right.

@@ -101,7 +101,7 @@ const VSCALE: [(u8, u32, u32); 18] = [
 /// at x 240 — pillarboxed in the 1920-wide active area, not stretched across it.
 #[derive(Debug, PartialEq, Eq)]
 struct Picture {
-    /// Source rectangle in the VIC frame.
+    /// Source rectangle in the FPGA's video stream. Only its size is used; see `draw_c64_scaled`.
     crop: (usize, usize, usize, usize),
     /// Destination in the active area: left edge, then the size after both scalers.
     x: usize,
@@ -317,6 +317,10 @@ impl Renderer {
 /// neighbour; the hardware filters). Everything outside it keeps the backdrop, which is what the device sends
 /// where the picture is not.
 ///
+/// Only the crop's size is taken over. Its origin counts in the FPGA's video stream, which starts elsewhere than
+/// the TRX64 canvas; laid on the canvas as is, 480p put 35 border lines above the text and 5 below it (issue #3).
+/// The device shows a centred C64, so the crop is centred on the canvas, which has symmetric borders.
+///
 /// Without a `Picture` — the scaler registers unprogrammed, which is every machine before the firmware sets a
 /// video mode — the frame goes over the whole canvas, as it did before there was anything to read.
 fn draw_c64_scaled(frame: &C64Frame, picture: Option<&Picture>, out: &mut [u32], canvas: (usize, usize)) {
@@ -324,24 +328,28 @@ fn draw_c64_scaled(frame: &C64Frame, picture: Option<&Picture>, out: &mut [u32],
     if frame.width == 0 || frame.height == 0 {
         return;
     }
-    let (src_x, src_y, src_w, src_h, dst_x, dst_w, dst_h) = match picture {
-        Some(p) => (p.crop.0, p.crop.1, p.crop.2, p.crop.3, p.x, p.width, p.height),
-        None => (0, 0, frame.width, frame.height, 0, canvas_w, canvas_h),
+    let (src_w, src_h, dst_x, dst_w, dst_h) = match picture {
+        Some(p) => (p.crop.2, p.crop.3, p.x, p.width, p.height),
+        None => (frame.width, frame.height, 0, canvas_w, canvas_h),
     };
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return;
     }
+    // Negative when the crop is larger than the canvas: the rows and columns outside it stay backdrop.
+    let centre = |have: usize, want: usize| (have as isize - want as isize) / 2;
+    let (src_x, src_y) = (centre(frame.width, src_w), centre(frame.height, src_h));
     for y in 0..dst_h.min(canvas_h) {
-        let row = src_y + y * src_h / dst_h;
-        if row >= frame.height {
-            break;
+        let row = src_y + (y * src_h / dst_h) as isize;
+        if row < 0 || row as usize >= frame.height {
+            continue;
         }
-        let src = row * frame.width;
+        let src = row as usize * frame.width;
         for x in 0..dst_w {
-            let (px_x, col) = (dst_x + x, src_x + x * src_w / dst_w);
-            if px_x >= canvas_w || col >= frame.width {
+            let (px_x, col) = (dst_x + x, src_x + (x * src_w / dst_w) as isize);
+            if px_x >= canvas_w || col < 0 || col as usize >= frame.width {
                 continue;
             }
+            let col = col as usize;
             let idx = frame.indices[src + col];
             out[y * canvas_w + px_x] = frame.palette[usize::from(idx & 0x0F)];
         }
@@ -610,6 +618,27 @@ mod tests {
         assert_eq!(Picture::new(&hdmi, &cropper), None);
         hdmi[19] = 0x0C;
         assert_eq!(Picture::new(&hdmi, &[8, 9, 0, 0]), None);
+    }
+
+    /// Issue #3: the crop's origin counts in the FPGA's stream, not in the TRX64 canvas. Taken as is, 480p left 35
+    /// border lines above the text and 5 below it; centred, the borders come out as a C64 has them.
+    #[test]
+    fn the_crop_is_centred_on_the_canvas() {
+        // The PAL canvas: 384x272 from raster line 16, text at lines 51-250 and pixels 32-351.
+        let mut frame = c64_frame(384, 272);
+        frame.palette[6] = 0x0000_0066;
+        for y in 35..235 {
+            frame.indices[y * 384 + 32..y * 384 + 352].fill(6);
+        }
+        // SetVideoModeTester's SetVicCrop(8, 0, 384, 240), shown 1:1.
+        let picture = Picture { crop: (8, 0, 384, 240), x: 0, width: 384, height: 240 };
+        let mut out = vec![BACKDROP; 384 * 240];
+        draw_c64_scaled(&frame, Some(&picture), &mut out, (384, 240));
+        let text_rows: Vec<usize> = (0..240).filter(|&y| out[y * 384 + 192] == 0x66).collect();
+        assert_eq!((text_rows[0], 239 - text_rows[199]), (19, 21), "border lines above and below the text");
+        let text_cols: Vec<usize> = (0..384).filter(|&x| out[120 * 384 + x] == 0x66).collect();
+        assert_eq!((text_cols[0], 383 - text_cols[319]), (32, 32), "border pixels left and right");
+        assert!(!out.contains(&BACKDROP), "the crop fits the canvas, so no backdrop shows");
     }
 
     /// Font with glyph 0x41 = rows 80 01 FF 00 00 00 00 18, all other glyphs blank.

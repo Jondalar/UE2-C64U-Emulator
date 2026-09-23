@@ -11,8 +11,8 @@
 
 **`window.rs` — `run_window(cfg, opts)`**
 - winit 0.30 `ApplicationHandler` + softbuffer 0.4; this pairing is proven in TRX64's `crates/trx64-cli` (https://github.com/Jondalar/TRX64).
-- Spawns the emulator via `runner::spawn`. Renders the latest `DisplaySnapshot` at 50 Hz, scaled 2× with
-  integer scaling, 4:3 letterbox.
+- Spawns the emulator via `runner::spawn`. Renders the latest `DisplaySnapshot` at 50 Hz, filling the window
+  with the aspect kept; a resize snaps the window back to the image's ratio (`aspect_snap`, after trx64-cli).
 - Title shows emulated time and MIPS.
 - Keyboard events go through `keymap` → `Command::Input(HostInput::Key{..})`.
 - **F12** = menu button (press/release → `MenuButton`). ESC may map to RUN/STOP.
