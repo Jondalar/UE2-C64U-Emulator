@@ -486,7 +486,7 @@ mod tests {
     use super::*;
 
     /// `MachineConfig::new` capabilities: FPGA type 3, the 100T layout.
-    const CAPS_100T: u32 = 0x3400_0222;
+    const CAPS_100T: u32 = 0x3400_0226;
     /// FPGA type 2, the 50T layout.
     const CAPS_50T: u32 = 0x2400_0222;
 

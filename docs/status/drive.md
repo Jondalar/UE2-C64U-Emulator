@@ -156,9 +156,10 @@ and ports. Open, and not TRX64's (2026-09-23):
 
 - **1571/1581:** DRIVETYPE 1/2 keeps drive A off with a one-time notice; MFM tracks, the WD177x path and side 1 are
   not modelled. Extra RAM (RAMMAP bit 7), DISKCHANGE/force ready and the drive sounds are latched only.
-- **Drive B** runs as TRX64's position B (S27), but the firmware only builds it when the capability word has
-  `CAPAB_DRIVE_1541_2` (bit 2, c1541.cc:1263); the default word lacks it, so it takes `--caps 35640226` today.
-  Checked with it: Drive B Settings enabled, `drive.d64` mounted over REST, `LOAD"$",9` and `LIST` show the directory.
+- **Drive B** runs as TRX64's position B (S27). The firmware builds it only when the capability word has
+  `CAPAB_DRIVE_1541_2` (bit 2, c1541.cc:1263); the default word has it since S27, as a C64 Ultimate does (its REST
+  API lists drive B, disabled, bus ID 9). Checked: Drive B Settings enabled, `drive.d64` mounted over REST,
+  `LOAD"$",9` and `LIST` show the directory.
   The IEC processor (SoftIEC, printer, UltiCopy) is still T0.
 - **Held drive:** a drive in reset releases the bus lines (TRX64 leaves Conf0, 870 §10), where the FPGA drive pulls
   CLK and DATA while its VIA is reset.

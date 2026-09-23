@@ -258,11 +258,12 @@ Left for the suites themselves: `ultimax-cartridge`, which compares a whole fram
 
 Closing this needs a Flash Disk laid out the way the updater leaves it.
 
-### E4: second drive not advertised
+### E4: second drive not advertised — closed by S27
 
-rest-api-coverage [51] fails with `drive b missing from the listing: ['IEC Drive', 'Printer Emulation', 'a']`. The T0
-capability word 0x34000222 leaves out `CAPAB_DRIVE_1541_2` (itu.h:51). Drive B is only created when that bit is set
-(c1541.cc:1260-1265; docs/hw/00 §3 C4, Q-B1).
+rest-api-coverage [51] failed with `drive b missing from the listing: ['IEC Drive', 'Printer Emulation', 'a']`. The T0
+capability word 0x34000222 left out `CAPAB_DRIVE_1541_2` (itu.h:51), and drive B is only created when that bit is set
+(c1541.cc:1260-1265; docs/hw/00 §3 C4, Q-B1). Since S27 the default word is 0x34000226 and drive B is TRX64's second
+drive: `/v1/drives` lists `b` (bus ID 9, disabled), as on a C64 Ultimate. The suite was not re-run.
 
 ### E5: REST connections reset when they overlap (network path, S12)
 

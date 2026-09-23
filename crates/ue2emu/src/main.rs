@@ -89,7 +89,7 @@ struct RunArgs {
     /// C64 behind the cart/DMA registers [default: trx64 when built with the trx64 feature, else none]
     #[arg(long, value_enum)]
     c64: Option<C64Arg>,
-    /// ITU capability word, hex [default: 34000222]
+    /// ITU capability word, hex [default: 34000226]
     #[arg(long, value_parser = parse_hex)]
     caps: Option<u32>,
     /// Emulated 100 MHz clocks per instruction, at least 1 [default: 4]

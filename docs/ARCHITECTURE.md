@@ -114,7 +114,8 @@ Status:
   Shown only when HPD = 1 and `CFG_USERIF_ITYPE = 1`.
 - **Input:** 8×8 keyboard matrix (COL `0x1010040A` write, ROW `0x1010040B` read). Menu button = ITU
   `0x1000000A` bit 6.
-- **Capabilities** (T0): `0x34000222`. `--net` adds CAPAB_ETH_RMII (bit 24), a USB device CAPAB_USB_HOST2 (bit 23).
+- **Capabilities:** `0x34000226`, the T0 word `0x34000222` plus CAPAB_DRIVE_1541_2 (bit 2, drive B, which a C64
+  Ultimate lists; S27). The banners below are quoted from before that bit. `--net` adds CAPAB_ETH_RMII (bit 24), a USB device CAPAB_USB_HOST2 (bit 23).
   The TRX64 C64 adds CAPAB_EEPROM (bit 22, GMOD2 carts), which makes the default boot banner `34400222`;
   CAPAB_COMMAND_INTF (bit 18, [S15](specs/S15-uci.md), banner `34440222`); and CAPAB_SAMPLER (bit 21,
   [S16](specs/S16-ultimate-audio.md)). With a USB device as well the word is `34E40222`. An explicit `--caps` is used as

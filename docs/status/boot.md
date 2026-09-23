@@ -151,7 +151,8 @@ the boot path and in the idle system hits a modelled window.
 
 Open questions from `docs/hw` that still affect what the boot shows:
 
-- **Capability word** `0x34000222` is the T0 choice, not a measured value (00 Q-B1). USB (bit 23) is set only with
+- **Capability word** `0x34000226`: the T0 choice `0x34000222`, not a measured value (00 Q-B1), plus
+  CAPAB_DRIVE_1541_2, since a C64 Ultimate's REST API lists drive B (S27). USB (bit 23) is set only with
   `--usb`/`--usb-keyboard` and RMII (bit 24) only with `--net`; without them the log says "No USB2 hardware found"
   and there is no Ethernet (`docs/status/usb.md`, `docs/status/network.md`).
 - **Closed U64-II top level.** The CPU instance, IP identity and address aliasing come from the open U2+ RTL (00

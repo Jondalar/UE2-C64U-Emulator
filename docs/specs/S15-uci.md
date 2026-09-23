@@ -222,7 +222,7 @@ the source.
 
 `runner::attach_trx64_audio` ORs `CAPAB_COMMAND_INTF` into the ITU capabilities when the attached backend reports
 `has_uci()`. Without it the firmware starts no "UCI Server" task (intf:44) and skips every enable write
-(c64.cc:311, 328, 1306). `--c64 none` changes nothing: the capability word stays 0x34000222.
+(c64.cc:311, 328, 1306). `--c64 none` changes nothing: the capability word stays the default (0x34000222 then, 0x34000226 since S27).
 
 ## 4. What is deliberately not built
 
