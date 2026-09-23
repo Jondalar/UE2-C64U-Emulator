@@ -188,12 +188,9 @@ const CORE_CONFIG: &[Span] = &[
 ];
 
 /// Core config offsets (u64.h:104-154).
-const VIDEOFORMAT: u32 = 0x01;
 const DMA_MEMONLY: u32 = 0x03;
 const JOY1_SWOUT: u32 = 0x30;
 const JOY2_SWOUT: u32 = 0x31;
-/// C64_VIDEOFORMAT bit1: 60 Hz (u64.h:163-170).
-const VIDEOFORMAT_60HZ: u8 = 0x02;
 
 /// C64_PALETTE RGB: 16 × {R,G,B,pad} at +0x000; YUV at +0x400 has no effect (u64_config.cc:2720-2763).
 const PALETTE_RGB_SIZE: u32 = 0x40;
@@ -299,8 +296,6 @@ pub struct C64Port {
     joystick: u8,
     /// Host RESTORE key held.
     restore: bool,
-    /// The PAL-only notice for C64_VIDEOFORMAT 60 Hz was printed.
-    pal_noted: bool,
     /// W4-DRIVE: drive A registers; the drive behind them is the backend's (`C64Backend::drive`).
     drive_a: DriveRegs,
     /// CARTSLOT: U64_CART_DETECT, shared with `U64Io` (docs/status/cart-slot.md).
@@ -335,7 +330,6 @@ impl C64Port {
             ],
             joystick: 0xFF,
             restore: false,
-            pal_noted: false,
             drive_a: DriveRegs::new(0),
             cart_detect: None,
             uci: RegTable::new("uci", UCI_T0),
@@ -565,10 +559,6 @@ impl C64Port {
             b.core_config_write(reg as u8, val);
         }
         match reg {
-            VIDEOFORMAT if val & VIDEOFORMAT_60HZ != 0 && self.backend.is_some() && !self.pal_noted => {
-                eprintln!("c64: C64_VIDEOFORMAT {val:#04x} asks for 60 Hz; the C64 core is PAL-only (S14 §13 OQ3)");
-                self.pal_noted = true;
-            }
             JOY1_SWOUT | JOY2_SWOUT => self.apply_joysticks(),
             _ => {}
         }

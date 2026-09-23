@@ -29,6 +29,7 @@ use trx64_core::cart::CartMapper;
 use trx64_core::expansion::Hold;
 use trx64_core::RunStop;
 use trx64_core::keyboard::JoystickState;
+use trx64_core::model::{self, C64Model};
 use trx64_core::reu::Reu;
 use trx64_core::vic::SpeedProfile;
 use trx64_core::{AccessCtx, BusKind, CpuHistoryRing, DeltaRing, Machine, Observer};
@@ -51,6 +52,15 @@ pub use cart::{CAPAB_COMMAND_INTF, CAPAB_EEPROM, CAPAB_SAMPLER};
 const CORE_TURBOREGS_EN: u8 = 0x02;
 const CORE_SPEED_PREFER: u8 = 0x2D;
 const CORE_SPEED_UPDATE: u8 = 0x2E;
+/// C64_VIDEOFORMAT and its cycles-per-line field (u64.h:105,167-169): 63 is PAL timing, 65 NTSC; the colour encoding
+/// and the other bits change nothing the C64 core produces (S25 §1).
+const CORE_VIDEOFORMAT: u8 = 0x01;
+const VIDEOFORMAT_CYCLES: u8 = 0x30;
+const VIDEOFORMAT_CYCLES_63: u8 = 0x00;
+const VIDEOFORMAT_CYCLES_65: u8 = 0x20;
+/// Cycles past the computed frame end a switching run aims at: TRX64 reports line 0 from the cycle after the frame
+/// boundary, and the switch has to land early in line 0 (S25 §2).
+const BOUNDARY_SLACK: u64 = 2;
 /// C64_BUS_INTERNAL bits that gate the internal IO1 and IO2 ranges, and with them the UCI window (c64.cc:1536-1590;
 /// u64_config.cc:1015-1016; Spec 852 §5).
 const BUS_IO1: u8 = 0x01;
@@ -175,6 +185,10 @@ pub struct Trx64Backend {
     clock: Option<Clock>,
     /// Emulator clock of the last `advance_to`.
     now: u64,
+    /// The row C64_VIDEOFORMAT asks for, until the VIC reaches a frame boundary to switch at (S25 §2).
+    pending_model: Option<&'static C64Model>,
+    /// C64_VIDEOFORMAT asked for a cycle count no row has; noticed once.
+    videoformat_noted: bool,
     stopped: bool,
     reset_held: bool,
     ultimax: bool,
@@ -285,6 +299,8 @@ impl Trx64Backend {
             m,
             clock: None,
             now: 0,
+            pending_model: None,
+            videoformat_noted: false,
             stopped: false,
             reset_held: false,
             ultimax: false,
@@ -559,6 +575,70 @@ impl Trx64Backend {
         }
     }
 
+    /// Up to cycle `target`: the chips alone while the 6510 is held, else whole instructions, unless it waits for the
+    /// firmware (UCI).
+    fn run_to(&mut self, target: u64) {
+        if self.stopped || self.reset_held {
+            self.run_held(target);
+        } else if self.uci_wait.is_none() {
+            self.run_cpu(target);
+            // W4-DRIVE: note what drive A wrote.
+            self.drive.after_run(&mut self.m);
+        }
+    }
+
+    /// The C64's clock in Hz, as its row has it.
+    fn cpu_hz(&self) -> u64 {
+        u64::from(self.m.timing().cpu_hz)
+    }
+
+    /// Cycles until the VIC starts the next frame.
+    fn cycles_to_frame_end(&self) -> u64 {
+        let t = self.m.timing();
+        let (line, cycle) = (u64::from(self.m.vic.raster_line), u64::from(self.m.vic.raster_cycle));
+        (u64::from(t.lines_per_frame) * u64::from(t.cycles_per_line))
+            .saturating_sub(line * u64::from(t.cycles_per_line) + cycle)
+            .max(1)
+    }
+
+    /// C64_VIDEOFORMAT was written: the row its cycles field names becomes pending, or nothing is pending when the
+    /// machine is on it already (S25 §1).
+    fn request_model(&mut self, val: u8) {
+        let name = match val & VIDEOFORMAT_CYCLES {
+            VIDEOFORMAT_CYCLES_63 => "c64-pal",
+            VIDEOFORMAT_CYCLES_65 => "c64-ntsc",
+            _ => {
+                if !self.videoformat_noted {
+                    eprintln!("c64: C64_VIDEOFORMAT {val:#04x} asks for 64 cycles per line; no row has them");
+                    self.videoformat_noted = true;
+                }
+                return;
+            }
+        };
+        let model = model::find(name).expect("TRX64 has the PAL and NTSC rows");
+        self.pending_model = (!std::ptr::eq(self.m.model(), model)).then_some(model);
+    }
+
+    /// At a frame boundary: put the machine on `model`, and move the clock and reSID to its rate (S25 §2-§3). A VIC
+    /// that is not in line 0 (the run was held for the firmware, or overshot) leaves the switch pending. Whether it
+    /// happened is returned.
+    fn switch_model(&mut self, model: &'static C64Model) -> bool {
+        if self.m.vic.raster_line != 0 {
+            return false;
+        }
+        if let Err(why) = self.m.switch_model(model) {
+            eprintln!("c64: switching to {}: {why}", model.name);
+            return false;
+        }
+        self.pending_model = None;
+        let clk = self.m.c64_core.clk;
+        // The emulator time of this cycle on the old clock anchors the new one.
+        let at = self.clock.map_or(self.now, |c| c.time_of(clk));
+        self.clock = Some(Clock::new(at, clk, self.cpu_hz()));
+        self.sid.set_clock(self.cpu_hz(), clk);
+        true
+    }
+
     /// Run up to cycle `target` with the 6510 held: TRX64 clocks the chips itself (Spec 850 D7), `Hold::Cpu` with the
     /// VIC, CIAs, SID and drive 8, `Hold::Reset` with the VIC alone — the 6569 has no reset pin (S14 §4).
     /// [`Self::apply_hold`] has put the hold in; the run then spends the whole budget without executing.
@@ -743,18 +823,22 @@ impl C64Backend for Trx64Backend {
                 self.uci_wait = None;
             }
         }
-        let clk = self.m.c64_core.clk;
-        let target = self.clock.get_or_insert(Clock::new(now, clk)).cycles(now);
+        let (clk, hz) = (self.m.c64_core.clk, self.cpu_hz());
+        let mut target = self.clock.get_or_insert(Clock::new(now, clk, hz)).cycles(now);
         if target <= clk {
             return;
         }
-        if self.stopped || self.reset_held {
-            self.run_held(target);
-        } else if self.uci_wait.is_none() {
-            self.run_cpu(target);
-            // W4-DRIVE: note what drive A wrote.
-            self.drive.after_run(&mut self.m);
+        // S25 §2: a row switch waits for the frame boundary, so the slice stops there first.
+        if let Some(model) = self.pending_model {
+            let boundary = clk + self.cycles_to_frame_end() + BOUNDARY_SLACK;
+            if boundary <= target {
+                self.run_to(boundary);
+                if self.switch_model(model) {
+                    target = self.clock.map_or(target, |c| c.cycles(now));
+                }
+            }
         }
+        self.run_to(target);
         self.sid.advance(self.m.c64_core.clk);
         // S16: the voices are FPGA-clocked, so they follow the emulator's clock rather than the C64's — and they run
         // whether or not anyone is listening, because a finished voice sets the status bit `audio_detect()` polls.
@@ -798,7 +882,7 @@ impl C64Backend for Trx64Backend {
         self.m.clk = self.m.c64_core.clk;
         self.sid.reanchor(self.m.c64_core.clk);
         self.drive.after_c64_reset(&mut self.m, self.stopped);
-        self.clock = Some(Clock::new(self.now, self.m.c64_core.clk));
+        self.clock = Some(Clock::new(self.now, self.m.c64_core.clk, self.cpu_hz()));
         self.keys.cleared();
         self.keys.apply(&mut self.m.keyboard);
         self.apply_joysticks();
@@ -940,6 +1024,7 @@ impl C64Backend for Trx64Backend {
             CORE_TURBOREGS_EN => self.turbo_regs_en = val,
             CORE_SPEED_PREFER => self.speed_prefer = val,
             CORE_SPEED_UPDATE => self.m.set_u64_turbo(self.turbo_regs_en, self.speed_prefer),
+            CORE_VIDEOFORMAT => self.request_model(val),
             // Spec 852 §5: the U64 bus multiplexer decides whether the internal IO1/IO2 range — and with it the UCI
             // window — reaches the C64 bus. `unlock_irq` sets bit 1 for exactly that (u64_config.cc:1015-1016).
             slot::CORE_BUS_INTERNAL => {
@@ -1234,6 +1319,50 @@ mod tests {
         let frame = c64.frame();
         assert_eq!((frame.width, frame.height), (384, 272));
         assert_eq!((frame.indices[4 * 384 + 4], frame.indices[220 * 384 + 340]), (14, 6), "border and background");
+    }
+
+    /// S25: System Mode NTSC (C64_VIDEOFORMAT 0x2b, the firmware's default) boots an NTSC C64, and PAL (0x00) puts it
+    /// back: the KERNAL's own detection answers, and the canvas follows the row.
+    #[test]
+    fn videoformat_picks_the_standard_the_kernal_detects() {
+        let Some(roms) = roms() else { return };
+        for (format, pal, height) in [(0x2B, 0, 247), (0x00, 1, 272)] {
+            let mut c64 = Trx64Backend::new(&roms);
+            let mut now = 0;
+            c64.advance_to(now);
+            c64.set_reset(true);
+            c64.core_config_write(CORE_VIDEOFORMAT, format);
+            run_ms(&mut c64, &mut now, 20);
+            c64.set_reset(false);
+            run_ms(&mut c64, &mut now, 3000);
+            assert!(screen_has(&c64, "READY."), "{format:#04x}");
+            assert_eq!(c64.m.ram[0x02A6], pal, "{format:#04x}: $02A6, 1 = PAL");
+            assert_eq!(c64.frame().height, height, "{format:#04x}");
+        }
+    }
+
+    /// S25 §2-§3: a switch while the C64 runs lands at a frame boundary, and from there the clock counts at the new row's
+    /// rate. PAL-60 (65 cycles, PAL encoding) is NTSC timing; a 64-cycle format names no row and changes nothing.
+    #[test]
+    fn a_running_switch_lands_at_a_frame_boundary_on_the_new_clock() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        let mut now = 0;
+        c64.advance_to(now);
+        run_ms(&mut c64, &mut now, 7);
+        c64.core_config_write(CORE_VIDEOFORMAT, 0x2A);
+        assert!(c64.pending_model.is_some(), "not at a frame boundary yet");
+        run_ms(&mut c64, &mut now, 25);
+        assert_eq!(c64.m.model().name, "c64-ntsc");
+        assert!(c64.pending_model.is_none());
+        let clk = c64.m.c64_core.clk;
+        run_ms(&mut c64, &mut now, 1000);
+        let second = c64.m.c64_core.clk - clk;
+        assert!(second.abs_diff(1_022_730) < 100, "one second at the NTSC clock: {second}");
+
+        c64.core_config_write(CORE_VIDEOFORMAT, 0x10);
+        assert!(c64.pending_model.is_none(), "64 cycles: no row");
+        c64.core_config_write(CORE_VIDEOFORMAT, 0x2A);
+        assert!(c64.pending_model.is_none(), "already NTSC");
     }
 
     #[test]

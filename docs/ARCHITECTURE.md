@@ -1045,7 +1045,7 @@ realtime with 2004 host forwards keeps 25 MIPS at about 24 % of one core ([e2e.m
 | Closed U64-II FPGA top level | Bus sharing, UCI gating, the SID mixer, sampler generics, BOARDREV and the capability word are inferred | [boot.md](status/boot.md), [S15](specs/S15-uci.md) §6, [S16](specs/S16-ultimate-audio.md) §6, [S17](specs/S17-ultisid.md) §5 |
 | The bridge drives TRX64 internals | A TRX64 change can break the build or behaviour; the pin, tests and C64 smokes guard it | [install.md](status/install.md) "TRX64 dependency" |
 | TRX64's UCI read advances `stalled_on_bus + 1` | UBoot64 stalls reading an existing file; reported to TRX64, not worked around | [xander-tests.md](status/xander-tests.md) |
-| PAL only | The firmware defaults to NTSC; program timing and 50/60 Hz assumptions differ | [c64.md](status/c64.md) §Known gaps |
+| 50/60 Hz outside the C64 | The C64 runs NTSC or PAL (S25); overlay, redraw and the UDP stream assume 50 Hz | [c64.md](status/c64.md) §Known gaps |
 | Stops and DMA on instruction boundaries | STOP_MODE latched only, always "Frozen on Bad line"; raster-timed programs may glitch on freeze | [c64.md](status/c64.md), [carts.md](status/carts.md) |
 | SID gaps after S17 | No stereo, RES/DIGI/filter curves, socket 2 chip, VOICE_ADSR; `$DE00-$DFFF` precedence unverified | [S17](specs/S17-ultisid.md) §3, §5 |
 | Sampler gaps | Mono downmix, no read pipeline, no memory contention, REU mirror answers a closed window | [sampler.md](status/sampler.md) |

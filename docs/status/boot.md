@@ -163,7 +163,7 @@ Open questions from `docs/hw` that still affect what the boot shows:
   no APs; the link stays down.
 - **C64 core:** TRX64 by default since S14 phase A (`docs/status/c64.md`); `--c64 none` is the register stub of doc 10
   T0. With TRX64 the console differs from the stub in the RTC date, the cart register dump of `set_emulation_flags`
-  and one stack high-water mark, and stderr notes that the core is PAL-only. SID detection reads zeros in both
+  and one stack high-water mark. SID detection reads zeros in both
   modes.
 - **SD card:** no image by default ("No media"); `--sd <image>` attaches one (S09).
 - **Overlay rendering** follows the open chargen IP; palette path, `pixel_opaque`, X_ON/Y_ON origin and big-font
