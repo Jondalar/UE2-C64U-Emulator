@@ -34,6 +34,9 @@ fn blend_half(over: u32, under: u32) -> u32 {
     (mix(16) << 16) | (mix(8) << 8) | mix(0)
 }
 
+/// An overlay layer pixel the text grid does not cover. Pixels are 0x00RRGGBB, so this is never a colour.
+const CLEAR: u32 = u32::MAX;
+
 /// Image size while the chargen registers are unprogrammed: 40×25 cells of 8×9, the default SD geometry
 /// (u64_config.cc:2984-2986).
 const DEFAULT_SIZE: (usize, usize) = (320, 225);
@@ -101,7 +104,7 @@ const VSCALE: [(u8, u32, u32); 18] = [
 /// at x 240 — pillarboxed in the 1920-wide active area, not stretched across it.
 #[derive(Debug, PartialEq, Eq)]
 struct Picture {
-    /// Source rectangle in the FPGA's video stream. Only its size is used; see `draw_c64_scaled`.
+    /// Source rectangle in the FPGA's video stream. Only its size is used; see `draw_c64`.
     crop: (usize, usize, usize, usize),
     /// Destination in the active area: left edge, then the size after both scalers.
     x: usize,
@@ -195,6 +198,8 @@ pub struct Renderer {
     /// `new` fills it with the 8×8 font widened to 12 px and tripled per row; assign
     /// `parse_font_pkg` output for the real `c_font`.
     pub big_font: Vec<u64>,
+    /// The overlay drawn at canvas size, [`CLEAR`] where it shows nothing; kept between frames for its allocation.
+    layer: Vec<u32>,
 }
 
 impl Renderer {
@@ -207,7 +212,7 @@ impl Renderer {
                 wide | (wide << 12) | (wide << 24)
             })
             .collect();
-        Renderer { font: font.to_vec(), big_font }
+        Renderer { font: font.to_vec(), big_font, layer: Vec::new() }
     }
 
     /// Render the overlay into 0x00RRGGBB pixels; returns (width, height).
@@ -223,36 +228,68 @@ impl Renderer {
     ///
     /// Before that, and without a C64, the canvas covers frame and grid, both centred, as it always did.
     pub fn render(&mut self, snap: &DisplaySnapshot, out: &mut Vec<u32>) -> (usize, usize) {
+        let canvas = Self::canvas(snap);
+        self.render_scaled(snap, out, canvas);
+        canvas
+    }
+
+    /// The size of the image [`Renderer::render`] makes for `snap`: the output mode once the firmware has programmed
+    /// one, else frame and grid covered.
+    pub fn canvas(snap: &DisplaySnapshot) -> (usize, usize) {
+        let geo = Geometry::new(&snap.regs);
+        let (w, h) = (geo.cols * geo.char_width, geo.rows * geo.lines().len());
+        let (gw, gh) = if w == 0 || h == 0 { DEFAULT_SIZE } else { (w, h) };
+        match Output::new(&snap.hdmi) {
+            Some(o) => (o.width, o.height),
+            None => snap.c64.as_ref().map_or((gw, gh), |f| (f.width.max(gw), f.height.max(gh))),
+        }
+    }
+
+    /// [`Renderer::render`]'s image resampled to `size` in one step: each target pixel goes straight to the C64 pixel
+    /// and the overlay pixel under it, so every C64 pixel is rounded once, as trx64-cli does. Scaling `render`'s
+    /// image instead rounds twice, through the output mode's own non-integer ratios, and the C64 font comes out
+    /// uneven. At `size` = [`Renderer::canvas`] it is `render`.
+    pub fn render_scaled(&mut self, snap: &DisplaySnapshot, out: &mut Vec<u32>, size: (usize, usize)) {
         let geo = Geometry::new(&snap.regs);
         let lines = geo.lines();
         let (w, h) = (geo.cols * geo.char_width, geo.rows * lines.len());
-        let (gw, gh) = if w == 0 || h == 0 { DEFAULT_SIZE } else { (w, h) };
         let output = Output::new(&snap.hdmi);
         let picture = Picture::new(&snap.hdmi, &snap.cropper);
-        let (cw, ch) = match &output {
-            Some(o) => (o.width, o.height),
-            None => snap.c64.as_ref().map_or((gw, gh), |f| (f.width.max(gw), f.height.max(gh))),
-        };
+        let (cw, ch) = Self::canvas(snap);
+        let (tw, th) = size;
         out.clear();
-        out.resize(cw * ch, BACKDROP);
+        out.resize(tw * th, BACKDROP);
+        if tw == 0 || th == 0 {
+            return;
+        }
         if let Some(frame) = &snap.c64 {
-            match &output {
-                Some(_) => draw_c64_scaled(frame, picture.as_ref(), out, (cw, ch)),
-                None => draw_c64(frame, out, cw, ch),
-            }
+            draw_c64(frame, output.is_some().then_some(picture.as_ref()), out, (cw, ch), size);
         }
         if w != 0 && h != 0 && geo.visible {
             let origin = match &output {
                 Some(o) => (geo.x_on.saturating_sub(o.x0), geo.y_on.saturating_sub(o.y0)),
                 None => ((cw - w) / 2, (ch - h) / 2),
             };
-            self.draw_text(snap, &geo, &lines, out, (cw, ch), origin);
+            let mut layer = std::mem::take(&mut self.layer);
+            layer.clear();
+            layer.resize(cw * ch, CLEAR);
+            self.draw_text(snap, &geo, &lines, &mut layer, (cw, ch), origin);
+            let xs: Vec<usize> = (0..tw).map(|x| x * cw / tw).collect();
+            for y in 0..th {
+                let row = &layer[(y * ch / th) * cw..][..cw];
+                for (px, &ox) in out[y * tw..][..tw].iter_mut().zip(&xs) {
+                    if row[ox] != CLEAR {
+                        *px = blend_half(row[ox], *px);
+                    }
+                }
+            }
+            self.layer = layer;
         }
-        (cw, ch)
     }
 
-    /// Draw the opaque pixels of the text grid with its top-left corner at `origin`, clipped to the canvas: a
-    /// window placed near the right edge can reach past it (u64_config.cc:2993, 1080p X_ON 1438 + 480).
+    /// Draw the opaque pixels of the text grid into the overlay layer with its top-left corner at `origin`, clipped
+    /// to the canvas: a window placed near the right edge can reach past it (u64_config.cc:2993, 1080p X_ON 1438 +
+    /// 480). The layer is blended over the C64 afterwards, at whatever size the image is made.
     fn draw_text(
         &self,
         snap: &DisplaySnapshot,
@@ -285,7 +322,7 @@ impl Renderer {
                         // slave12.vhd:159-173: foreground where the glyph bit differs from reverse.
                         let fg = ((bits >> (geo.char_width - 1 - x)) & 1 != 0) != reverse;
                         let idx = if fg { attr & 0x0F } else { attr >> 4 };
-                        *px = blend_half(palette[idx as usize], *px);
+                        *px = palette[idx as usize];
                     }
                 }
             }
@@ -313,61 +350,68 @@ impl Renderer {
     }
 }
 
-/// Palettize the cropped VIC picture into the rectangle the cropper and the two scalers put it in (nearest
-/// neighbour; the hardware filters). Everything outside it keeps the backdrop, which is what the device sends
-/// where the picture is not.
+/// Palettize the C64 frame into a `size` image of the `canvas`, rounding each target pixel to a C64 pixel once.
 ///
-/// Only the crop's size is taken over. Its origin counts in the FPGA's video stream, which starts elsewhere than
-/// the TRX64 canvas; laid on the canvas as is, 480p put 35 border lines above the text and 5 below it (issue #3).
-/// The device shows a centred C64, so the crop is centred on the canvas, which has symmetric borders.
+/// With a `Picture`, the cropped VIC picture goes into the rectangle the cropper and the two scalers put it in
+/// (nearest neighbour; the hardware filters). Everything outside it keeps the backdrop, which is what the device
+/// sends where the picture is not. Only the crop's size is taken over: its origin counts in the FPGA's video stream,
+/// which starts elsewhere than the TRX64 canvas; laid on the canvas as is, 480p put 35 border lines above the text
+/// and 5 below it (issue #3). The device shows a centred C64, so the crop is centred on the canvas, which has
+/// symmetric borders.
 ///
-/// Without a `Picture` — the scaler registers unprogrammed, which is every machine before the firmware sets a
-/// video mode — the frame goes over the whole canvas, as it did before there was anything to read.
-fn draw_c64_scaled(frame: &C64Frame, picture: Option<&Picture>, out: &mut [u32], canvas: (usize, usize)) {
-    let (canvas_w, canvas_h) = canvas;
+/// With an output mode but no `Picture` — the scaler registers unprogrammed, which is every machine before the
+/// firmware sets a video mode — the frame goes over the whole canvas. Without an output mode (`picture` None) the
+/// frame sits 1:1 in the middle of the canvas.
+fn draw_c64(
+    frame: &C64Frame,
+    picture: Option<Option<&Picture>>,
+    out: &mut [u32],
+    canvas: (usize, usize),
+    size: (usize, usize),
+) {
+    let ((cw, ch), (tw, th)) = (canvas, size);
     if frame.width == 0 || frame.height == 0 {
         return;
     }
-    let (src_w, src_h, dst_x, dst_w, dst_h) = match picture {
-        Some(p) => (p.crop.2, p.crop.3, p.x, p.width, p.height),
-        None => (frame.width, frame.height, 0, canvas_w, canvas_h),
+    // Per axis: the part of the canvas the picture covers (offset, length) and the source span it shows.
+    let (x_axis, y_axis) = match picture {
+        Some(Some(p)) => ((p.x, p.width, p.crop.2), (0, p.height, p.crop.3)),
+        Some(None) => ((0, cw, frame.width), (0, ch, frame.height)),
+        None => (
+            ((cw - frame.width) / 2, frame.width, frame.width),
+            ((ch - frame.height) / 2, frame.height, frame.height),
+        ),
     };
-    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
-        return;
-    }
-    // Negative when the crop is larger than the canvas: the rows and columns outside it stay backdrop.
-    let centre = |have: usize, want: usize| (have as isize - want as isize) / 2;
-    let (src_x, src_y) = (centre(frame.width, src_w), centre(frame.height, src_h));
-    for y in 0..dst_h.min(canvas_h) {
-        let row = src_y + (y * src_h / dst_h) as isize;
-        if row < 0 || row as usize >= frame.height {
-            continue;
-        }
-        let src = row as usize * frame.width;
-        for x in 0..dst_w {
-            let (px_x, col) = (dst_x + x, src_x + (x * src_w / dst_w) as isize);
-            if px_x >= canvas_w || col < 0 || col as usize >= frame.width {
-                continue;
+    let xs = axis(tw, cw, x_axis, frame.width);
+    let ys = axis(th, ch, (y_axis.0, y_axis.1.min(ch), y_axis.2), frame.height);
+    for (y, row) in ys.iter().enumerate() {
+        let Some(row) = row else { continue };
+        let src = &frame.indices[row * frame.width..][..frame.width];
+        for (px, col) in out[y * tw..][..tw].iter_mut().zip(&xs) {
+            if let Some(col) = col {
+                *px = frame.palette[usize::from(src[*col] & 0x0F)];
             }
-            let col = col as usize;
-            let idx = frame.indices[src + col];
-            out[y * canvas_w + px_x] = frame.palette[usize::from(idx & 0x0F)];
         }
     }
 }
 
-/// Palettize `frame` centred into the `canvas_w` × `canvas_h` image (canvas at least the frame size).
-fn draw_c64(frame: &C64Frame, out: &mut [u32], canvas_w: usize, canvas_h: usize) {
-    if frame.width == 0 {
-        return;
-    }
-    let (x0, y0) = ((canvas_w - frame.width) / 2, (canvas_h - frame.height) / 2);
-    for (y, row) in frame.indices.chunks_exact(frame.width).take(frame.height).enumerate() {
-        let dst = &mut out[(y0 + y) * canvas_w + x0..][..frame.width];
-        for (px, &idx) in dst.iter_mut().zip(row) {
-            *px = frame.palette[usize::from(idx & 0x0F)];
-        }
-    }
+/// For each of `target` pixels along one axis of a `canvas`-long image, the frame pixel it shows, or None: the
+/// picture covers `len` canvas pixels from `off` and shows `span` frame pixels centred in the frame's `have`
+/// (negative when the span is larger, and those stay backdrop). One division per pixel, from the target straight
+/// to the frame.
+fn axis(target: usize, canvas: usize, (off, len, span): (usize, usize, usize), have: usize) -> Vec<Option<usize>> {
+    let start = (have as isize - span as isize) / 2;
+    (0..target)
+        .map(|t| {
+            // The target pixel's position on the canvas is t * canvas / target, kept as a fraction.
+            let at = t * canvas;
+            if len == 0 || span == 0 || at < off * target || at >= (off + len) * target {
+                return None;
+            }
+            let col = start + ((at - off * target) * span / (target * len)) as isize;
+            (0..have as isize).contains(&col).then_some(col as usize)
+        })
+        .collect()
 }
 
 /// Whether `font` is a C64 character ROM rather than the firmware's overlay font (issue #3). The overlay font
@@ -633,12 +677,40 @@ mod tests {
         // SetVideoModeTester's SetVicCrop(8, 0, 384, 240), shown 1:1.
         let picture = Picture { crop: (8, 0, 384, 240), x: 0, width: 384, height: 240 };
         let mut out = vec![BACKDROP; 384 * 240];
-        draw_c64_scaled(&frame, Some(&picture), &mut out, (384, 240));
+        draw_c64(&frame, Some(Some(&picture)), &mut out, (384, 240), (384, 240));
         let text_rows: Vec<usize> = (0..240).filter(|&y| out[y * 384 + 192] == 0x66).collect();
         assert_eq!((text_rows[0], 239 - text_rows[199]), (19, 21), "border lines above and below the text");
         let text_cols: Vec<usize> = (0..384).filter(|&x| out[120 * 384 + x] == 0x66).collect();
         assert_eq!((text_cols[0], 383 - text_cols[319]), (32, 32), "border pixels left and right");
         assert!(!out.contains(&BACKDROP), "the crop fits the canvas, so no backdrop shows");
+    }
+
+    /// Scaled in one step, every C64 column is as wide as its neighbours give or take one target pixel; through the
+    /// output mode's 15/8 first and then 2x it would be 2 or 4 wide.
+    #[test]
+    fn one_step_scaling_keeps_c64_pixels_even() {
+        let mut frame = c64_frame(384, 240);
+        (frame.palette[1], frame.palette[2]) = (0x11, 0x22);
+        for (i, px) in frame.indices.iter_mut().enumerate() {
+            *px = 1 + (i % 2) as u8;
+        }
+        let picture = Picture { crop: (0, 0, 384, 240), x: 0, width: 720, height: 480 };
+        let mut out = vec![BACKDROP; 1440 * 960];
+        draw_c64(&frame, Some(Some(&picture)), &mut out, (720, 480), (1440, 960));
+        let row = &out[500 * 1440..][..1440];
+        let mut runs = Vec::new();
+        let mut run = 1;
+        for w in row.windows(2) {
+            if w[0] == w[1] {
+                run += 1;
+            } else {
+                runs.push(run);
+                run = 1;
+            }
+        }
+        runs.push(run);
+        assert_eq!(runs.len(), 384, "every column shows");
+        assert!(runs.iter().all(|r| (3..=4).contains(r)), "3.75 target pixels per column: {runs:?}");
     }
 
     /// Font with glyph 0x41 = rows 80 01 FF 00 00 00 00 18, all other glyphs blank.
