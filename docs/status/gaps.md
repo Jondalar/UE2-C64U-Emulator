@@ -26,10 +26,9 @@ or a need shows up), accepted as a limit, or **dropped**.
 - **ACIA** (the SwiftLink/modem cartridge at `$DE00`/`$DF00`, which the firmware bridges to the network as a Hayes
   modem): not modelled. A cartridge device like the freezers, so UE2's (2026-09-23). **Deferred:** C64 programs reach
   the network through UCI, which is enough for now. `carts.md`
-- **Audio. Planned:** a stereo sink (UltiSID 1/2 and the sampler panned as on the device; touches the sink, the
-  ring, the WAV writer and `wav-tone.py`), and the mixer registers (`U64_AUDIO_MIXER`, `AUDIO_SEL_BASE`) for the
-  sampler, drive and tape channels. Dropped: C64_VOICE_ADSR (the LED strip, no LEDs here) and the UltiSID filter
-  curves (FPGA filters, no source; reSID's own apply). `sid-audio.md`, `sampler.md`
+- **Audio.** Stereo with the mixer's volume and pan for the SIDs and the sampler since S29. Drive sounds (an FPGA
+  sample player reading `snds1541.bin`) and tape sounds have no source here; C64_VOICE_ADSR (the LED strip) and the
+  UltiSID filter curves are dropped. `sid-audio.md`, `sampler.md`
 - **Disk surface.** An external surface with a write hook and the firmware's per-track bit time is not TRX64's
   (2026-09-23): UE2 keeps setting the image in and polling for written tracks; G64 tracks whose length differs from
   their zone's wrap at another rate than on hardware. Accepted as a known limit, not planned. `drive.md`

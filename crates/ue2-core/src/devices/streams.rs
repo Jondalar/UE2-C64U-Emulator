@@ -150,18 +150,13 @@ impl Streams {
     /// Samples for the audio stream, as many whole datagrams as they fill. What is left over waits for the next
     /// call, so a caller may hand over any number of samples.
     ///
-    /// The samples arrive **mono** — the emulator mixes the SIDs down to one channel (S20, `audio.rs`), and the
-    /// device's stream is stereo — so each one goes to both channels. A stereo mix would change this line and
-    /// nothing else in the generator.
+    /// The samples arrive as stereo frames, left then right (S29), which is the stream's own layout.
     pub fn send_audio(&mut self, pcm: &[i16]) {
         let Some(template) = self.template(AUDIO).map(<[u8]>::to_vec) else {
             self.pcm.clear();
             return;
         };
-        for &sample in pcm {
-            self.pcm.push(sample);
-            self.pcm.push(sample);
-        }
+        self.pcm.extend_from_slice(pcm);
         let per_packet = AUDIO_FRAMES_PER_PACKET * 2;
         while self.pcm.len() >= per_packet {
             let mut packet = Vec::with_capacity(2 + AUDIO_PAYLOAD);
@@ -355,10 +350,10 @@ mod tests {
     #[test]
     fn audio_is_770_bytes_of_192_stereo_frames() {
         let mut s = armed(AUDIO);
-        // Mono in, both channels out: 192 frames need 192 mono samples.
-        s.send_audio(&vec![0; 50]);
+        // Stereo frames in: 192 frames are 384 samples.
+        s.send_audio(&vec![0; 100]);
         assert!(s.take().is_empty(), "a partial datagram waits for the rest");
-        s.send_audio(&vec![0x1234; 192 - 50 + 4]);
+        s.send_audio(&vec![0x1234; 384 - 100 + 8]);
         let out = s.take();
         assert_eq!(out.len(), 1, "one whole datagram, the remainder held back");
         assert_eq!(out[0].len(), TEMPLATE + 2 + AUDIO_PAYLOAD, "812 bytes on the wire, 770 of them UDP payload");

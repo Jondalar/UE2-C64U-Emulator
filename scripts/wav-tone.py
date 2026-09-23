@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""W4-SID: level and dominant frequency at the end of a mono 16-bit WAV written by `ue2emu run --audio-wav`.
+"""W4-SID: level and dominant frequency at the end of a 16-bit WAV written by `ue2emu run --audio-wav`.
 
-    scripts/wav-tone.py FILE [--expect HZ | --silent]
+    scripts/wav-tone.py FILE [--channel mix|left|right] [--expect HZ | --silent]
+
+A stereo file (S29) is analysed as (L + R) / 2 unless --channel picks one side; a mono file as it is.
 
 Analyses the last 32768 samples (0.68 s at 48 kHz, 0.74 s at 44.1 kHz): peak-to-peak level and the dominant
 frequency (mean removed, Hann window, FFT, parabolic interpolation of the peak bin). Pure Python, no numpy.
@@ -50,17 +52,27 @@ def fft(x):
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("file")
+    p.add_argument("--channel", choices=["mix", "left", "right"], default="mix")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--expect", type=float, metavar="HZ")
     g.add_argument("--silent", action="store_true")
     args = p.parse_args()
 
     with wave.open(args.file, "rb") as w:
-        if w.getnchannels() != 1 or w.getsampwidth() != 2:
-            sys.exit(f"{args.file}: need mono 16-bit PCM")
+        channels = w.getnchannels()
+        if channels not in (1, 2) or w.getsampwidth() != 2:
+            sys.exit(f"{args.file}: need mono or stereo 16-bit PCM")
         rate = w.getframerate()
         frames = w.getnframes()
-        pcm = struct.unpack(f"<{frames}h", w.readframes(frames))
+        raw = struct.unpack(f"<{frames * channels}h", w.readframes(frames))
+    if channels == 1:
+        pcm = raw
+    elif args.channel == "left":
+        pcm = raw[0::2]
+    elif args.channel == "right":
+        pcm = raw[1::2]
+    else:
+        pcm = [(l + r) // 2 for l, r in zip(raw[0::2], raw[1::2])]
     if frames < N:
         sys.exit(f"{args.file}: {frames} samples, need at least {N}")
     tail = pcm[-N:]

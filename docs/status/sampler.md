@@ -95,10 +95,8 @@ the voice engine (one-shot end, repeat B→A, equality misses, the enable bit, t
 
 ## Known gaps
 
-- **Mono.** The hardware mixes stereo with a pan law; the sink is mono, so UE2 models the law and downmixes.
-  Stereo would touch `AudioSink`, the ring, the WAV writer and `wav-tone.py`.
-- **Mixer gains and routing.** `U64_AUDIO_MIXER` (0x10100500) and `AUDIO_SEL_BASE` (0x10060700) stay write-only
-  stubs; the voices are always audible at unity. The firmware writes 6/7 there for "Play MOD".
+- **Output routing.** The pair leaves through mixer channels 4 and 5 in stereo (S29). `AUDIO_SEL_BASE` (0x10060700)
+  stays a write-only stub; the firmware writes 6/7 there for "Play MOD", and only with `CAPAB_SAMPLER`.
 - **No read pipeline.** Hardware returns a previous value, preset `0xAA`, until the internal response lands; UE2
   answers immediately.
 - **No memory contention.** One byte per request with no FIFO, no dropped fetches and no repeated samples under

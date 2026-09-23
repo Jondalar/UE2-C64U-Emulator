@@ -1035,9 +1035,11 @@ impl C64Backend for Trx64Backend {
         self.palette.set_byte(off, val);
     }
 
-    /// S17 §2.5: the SID channels weight reSID; the sampler, drive and tape channels are not applied.
+    /// S17 §2.5, S29: the SID channels weight reSID, the sampler channels the sampler's pair; drive and tape have no
+    /// source here.
     fn mixer_write(&mut self, off: u8, val: u8) {
         self.sid.mixer_write(off, val);
+        self.sampler.with(|s| s.mixer_write(off, val));
     }
 
     /// The SID decode and UltiSID settings (S17), and CARTSLOT's C64_BUS_BRIDGE / C64_BUS_INTERNAL /
@@ -1420,9 +1422,10 @@ mod tests {
 
     struct Collect(Rc<RefCell<Vec<i16>>>);
 
+    /// Keeps the left side of each stereo frame (S29): the tests measure length, tone and level of a centred SID.
     impl AudioSink for Collect {
         fn samples(&mut self, pcm: &[i16]) {
-            self.0.borrow_mut().extend_from_slice(pcm);
+            self.0.borrow_mut().extend(pcm.iter().step_by(2));
         }
     }
 

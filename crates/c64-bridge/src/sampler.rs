@@ -202,10 +202,19 @@ pub struct Sampler {
     now: u64,
     /// Half-ticks elapsed but not yet turned into output samples.
     avail: u64,
-    /// Samples waiting for the sink, oldest first. Shared, because the sink may drain it on the SID worker thread
-    /// while the voices fill it on the emulation thread (S20 §4).
+    /// Stereo frames waiting for the sink, interleaved, oldest first. Shared, because the sink may drain it on the SID
+    /// worker thread while the voices fill it on the emulation thread (S20 §4).
     queue: SampleQueue,
+    /// U64_AUDIO_MIXER bytes 8-11: channel 4 (sampler left) and 5 (sampler right), each a left and a right gain (S29).
+    mixer: [u8; 4],
 }
+
+/// The mixer bytes of channels 4 and 5 the default settings give (u64_config.cc:452-473; S29 §1).
+const MIXER_DEFAULT: [u8; 4] = [0x79, 0x27, 0x27, 0x79];
+/// Mixer offset of channel 4's first byte.
+const MIXER_BASE: u8 = 8;
+/// Both bytes of a 0 dB centred channel: a gain of this over one side keeps the level the mono average had (S29 §2).
+const MIXER_UNITY: i64 = 180;
 
 /// The sampler's output samples between the voices and the sink: filled by [`Sampler::advance_to`], taken by
 /// [`SamplerMix`]. Both sides touch it once per block, so one mutex costs nothing (S20 §4).
@@ -217,11 +226,11 @@ impl SampleQueue {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Append `samples`; what nobody drained falls off the back at [`QUEUE_CAP`].
+    /// Append `samples`; what nobody drained falls off the back at [`QUEUE_CAP`], in whole frames.
     fn push(&self, samples: &[i16]) {
         let mut q = self.lock();
         q.extend(samples);
-        let over = q.len().saturating_sub(QUEUE_CAP);
+        let over = q.len().saturating_sub(QUEUE_CAP).next_multiple_of(2);
         q.drain(..over);
     }
 
@@ -256,6 +265,7 @@ impl Sampler {
             now: 0,
             avail: 0,
             queue: SampleQueue::default(),
+            mixer: MIXER_DEFAULT,
         };
         s.set_sample_rate(DEFAULT_RATE);
         s
@@ -283,6 +293,13 @@ impl Sampler {
         self.per_sample = if rate == 0 { 0 } else { (HALF_TICK_HZ << 16) / u64::from(rate) };
         self.frac = 0;
         self.queue.clear();
+    }
+
+    /// U64_AUDIO_MIXER byte `off`: channels 4 and 5 weight the voices' left and right outputs from the next sample on.
+    pub fn mixer_write(&mut self, off: u8, val: u8) {
+        if let Some(b) = off.checked_sub(MIXER_BASE).and_then(|i| self.mixer.get_mut(usize::from(i))) {
+            *b = val;
+        }
     }
 
     /// A C64 reset clears the IRQ latches and nothing else: the register file has no reset branch, which is why the
@@ -385,14 +402,15 @@ impl Sampler {
             }
             self.frac = next & 0xFFFF;
             self.avail -= want;
-            rendered.push(self.mix(&ram, want));
+            rendered.extend(self.mix(&ram, want));
         }
         self.queue.push(&rendered);
     }
 
-    /// One output sample: every voice advanced by `halves` half-ticks, time-averaged over the interval, then through
-    /// the hardware's volume, pan and saturating sum (`sampler_accu.vhd:54-84`).
-    fn mix(&mut self, ram: &SamplerRam, halves: u64) -> i16 {
+    /// One output frame: every voice advanced by `halves` half-ticks, time-averaged over the interval, then through
+    /// the hardware's volume, pan and saturating sum (`sampler_accu.vhd:54-84`), and the pair through mixer channels
+    /// 4 and 5 into the left and right side (S29 §2).
+    fn mix(&mut self, ram: &SamplerRam, halves: u64) -> [i16; 2] {
         let (mut left, mut right) = (0i64, 0i64);
         for v in 0..VOICES {
             let avg = Self::advance(&mut self.voices[v], &mut self.irq, ram, v, halves);
@@ -403,9 +421,11 @@ impl Sampler {
             left = sat21(left + scaled * i64::from(fl));
             right = sat21(right + scaled * i64::from(fr));
         }
-        // accu >> 3 gives the hardware's 18-bit pair; the sink is mono, so the pair is downmixed and scaled to i16.
-        let mono = ((left >> 3) + (right >> 3)) / 2;
-        (mono >> 2).clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16
+        // accu >> 3 gives the hardware's 18-bit pair, >> 2 more the i16 scale.
+        let (l, r) = (left >> 5, right >> 5);
+        let g = self.mixer.map(i64::from);
+        let side = |v: i64| (v / MIXER_UNITY).clamp(i64::from(i16::MIN), i64::from(i16::MAX)) as i16;
+        [side(l * g[0] + r * g[2]), side(l * g[1] + r * g[3])]
     }
 
     /// Advance one voice by `halves` half-ticks and return its time-averaged sample over that interval. The average is
@@ -710,6 +730,31 @@ mod tests {
         assert_eq!(pan_factors(0xF), (0, 7), "hard right");
         assert_eq!(sat21((1 << 20) + 5), (1 << 20) - 1, "the accumulator saturates, it does not wrap");
         assert_eq!(sat21(-(1 << 21)), -(1 << 20));
+    }
+
+    /// S29: the pair leaves through mixer channels 4 and 5, each weighting one output into both sides.
+    #[test]
+    fn the_mixer_pans_the_sampler_pair() {
+        let mut s = Sampler::new();
+        s.set_sample_rate(48_000);
+        // A stopped voice holds its sample as DC; pan 0 puts it on the block's left output only.
+        (s.voices[0].sample, s.voices[0].pan) = (0x4000, 0);
+        let (mut now, mut out) = (0, Vec::new());
+        let mut frame = |s: &mut Sampler| {
+            s.queue.clear();
+            run(s, &mut now, 4);
+            out.clear();
+            s.queue().drain(&mut out, 2);
+            [out[0], out[1]]
+        };
+        let [l, r] = frame(&mut s);
+        assert!(r > 0 && l > 3 * r, "Left 3 by default, 0x79 against 0x27: {l} / {r}");
+        s.mixer_write(8, 0);
+        s.mixer_write(9, 0x80);
+        let [l, r] = frame(&mut s);
+        assert!(l == 0 && r > 0, "channel 4 moved hard right: {l} / {r}");
+        s.mixer_write(11, 0x80);
+        assert_eq!(frame(&mut s), [0, r], "channel 5 carries the right output, silent here");
     }
 
     #[test]
