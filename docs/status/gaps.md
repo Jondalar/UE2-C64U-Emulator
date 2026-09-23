@@ -31,7 +31,8 @@ status files.
   in the same snapshot. **Planned:** `docs/specs/S26-frame-pacing.md`. The UDP video stream's NTSC framing stays
   open. `c64.md`
 - **ACIA** (the SwiftLink/modem cartridge at `$DE00`/`$DF00`, which the firmware bridges to the network as a Hayes
-  modem): not modelled. A cartridge device like the freezers, so UE2's (2026-09-23). `carts.md`
+  modem): not modelled. A cartridge device like the freezers, so UE2's (2026-09-23). **Deferred:** C64 programs reach
+  the network through UCI, which is enough for now. `carts.md`
 - **SID socket 2** and the second SID of a dual chip (ARM2SID): their probes find nothing. UltiSID 1 and 2 run on
   reSID in the bridge already; TRX64 only routes the addresses (Spec 855). Chip 0's OSC3/ENV3 reads come from
   TRX64's fastsid, not reSID — accepted, not planned. `sid-audio.md`
