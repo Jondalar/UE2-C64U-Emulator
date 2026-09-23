@@ -27,7 +27,8 @@ use trx64_core::resid_ffi::{MODEL_6581, MODEL_8580, PAL_CLOCK_FREQ};
 use trx64_core::sid::SidMapping;
 use trx64_core::{BusKind, Machine, Observer, Resid, ResidConfig};
 
-/// The mono sample stream of the emulated SIDs, in emulated-time order at the rate given to [`Sid::set_audio`].
+/// The stereo sample stream of the emulated SIDs, in emulated-time order at the rate given to [`Sid::set_audio`]: frames
+/// of a left and a right sample, interleaved (S29).
 pub trait AudioSink {
     fn samples(&mut self, pcm: &[i16]);
 }
@@ -96,6 +97,8 @@ const MIXER_DEFAULT: [u8; MIXER_BYTES] = [
 ];
 /// A channel's two bytes summing to this are unity mono gain: the firmware's 0 dB centre, 0x5A/0x5A (S17 §2.5).
 const UNITY: i32 = 180;
+/// One side's unity: byte `2i` is the channel's left gain, `2i + 1` its right, 0x5A each at the 0 dB centre (S29 §1).
+const SIDE_UNITY: i32 = UNITY / 2;
 /// Mixer channels of the receivers (u64_config.cc:436-446).
 const CH_ULTISID1: usize = 0;
 const CH_ULTISID2: usize = 1;
@@ -380,8 +383,8 @@ struct Engines {
     clk: u64,
     /// Cycles × sample rate not yet turned into silence while no engine runs.
     pace: u64,
-    /// Mono gain per receiver in 1/[`UNITY`] steps.
-    gains: [i32; RECEIVERS],
+    /// Left and right gain per receiver in 1/[`SIDE_UNITY`] steps.
+    gains: [(i32, i32); RECEIVERS],
     audio: Option<Box<dyn AudioSink>>,
     /// S24 M3: the UDP audio stream's tap. Samples land here as well as in a sink, and its presence alone makes
     /// the engines run, so the stream works without `--audio`. Capped: a host that stops draining loses the
@@ -402,7 +405,7 @@ impl Engines {
             clock_hz: CLOCK_HZ,
             clk: 0,
             pace: 0,
-            gains: [UNITY; RECEIVERS],
+            gains: [(SIDE_UNITY, SIDE_UNITY); RECEIVERS],
             audio: None,
             stream: None,
             cache: [0; RECEIVERS],
@@ -469,7 +472,7 @@ impl Engines {
                 let pcm = self.engines[rx].as_mut().expect("ordered engines exist").resid.emit(n as u32);
                 if listening {
                     if i == 0 {
-                        mixed = vec![0; pcm.len()];
+                        mixed = vec![0; 2 * pcm.len()];
                     }
                     mix_into(&mut mixed, &pcm, gain);
                 }
@@ -477,14 +480,14 @@ impl Engines {
             if !listening {
                 continue;
             }
-            let pcm = if self.order.is_empty() { vec![0; self.silence(n)] } else { mixed_down(&mixed) };
+            let pcm = if self.order.is_empty() { vec![0; 2 * self.silence(n)] } else { mixed_down(&mixed) };
             if let Some(sink) = &mut self.audio {
                 sink.samples(&pcm);
             }
             if let Some(tap) = &self.stream {
                 if let Ok(mut buf) = tap.lock() {
                     buf.extend_from_slice(&pcm);
-                    let over = buf.len().saturating_sub(STREAM_TAP_CAP);
+                    let over = buf.len().saturating_sub(STREAM_TAP_CAP).next_multiple_of(2);
                     if over > 0 {
                         buf.drain(..over);
                     }
@@ -564,7 +567,7 @@ enum Cmd {
     /// Clock to `at` first when it is given (the write's traced cycle), then write.
     Write { at: Option<u64>, mask: u16, reg: u8, val: u8 },
     ClockTo(u64),
-    Gains([i32; RECEIVERS]),
+    Gains([(i32, i32); RECEIVERS]),
     /// S24 M3: install or remove the UDP audio stream's tap.
     StreamTap(Option<Arc<Mutex<Vec<i16>>>>),
     Reset,
@@ -1041,14 +1044,14 @@ impl Sid {
         }
     }
 
-    /// Mono gain of receiver `rx` in 1/[`UNITY`] steps: the sum of its mixer channel's two bytes.
-    fn gain(&self, rx: usize) -> i32 {
+    /// Left and right gain of receiver `rx` in 1/[`SIDE_UNITY`] steps: its mixer channel's two bytes.
+    fn gain(&self, rx: usize) -> (i32, i32) {
         let ch = match rx {
             SOCKET1_RX => CH_SOCKET1,
             _ if rx < ultisid_rx(1, 0) => CH_ULTISID1,
             _ => CH_ULTISID2,
         };
-        i32::from(self.mixer[2 * ch]) + i32::from(self.mixer[2 * ch + 1])
+        (i32::from(self.mixer[2 * ch]), i32::from(self.mixer[2 * ch + 1]))
     }
 
     /// Hand the gains of the current mixer bytes to the engines.
@@ -1168,17 +1171,19 @@ impl Default for Sid {
     }
 }
 
-/// Add `pcm` at `gain` into `acc`, padded with its last sample or trimmed to `acc`'s length: an engine built after the
-/// first can be a sample apart per chunk (855 §2).
-fn mix_into(acc: &mut [i32], pcm: &[i16], gain: i32) {
+/// Add mono `pcm` at `(left, right)` gain into the stereo frames `acc`, padded with its last sample or trimmed to
+/// `acc`'s length: an engine built after the first can be a sample apart per chunk (855 §2).
+fn mix_into(acc: &mut [i32], pcm: &[i16], (left, right): (i32, i32)) {
     let last = pcm.last().copied().unwrap_or(0);
-    for (i, a) in acc.iter_mut().enumerate() {
-        *a += i32::from(pcm.get(i).copied().unwrap_or(last)) * gain;
+    for (i, frame) in acc.chunks_exact_mut(2).enumerate() {
+        let s = i32::from(pcm.get(i).copied().unwrap_or(last));
+        frame[0] += s * left;
+        frame[1] += s * right;
     }
 }
 
 fn mixed_down(acc: &[i32]) -> Vec<i16> {
-    acc.iter().map(|&s| (s / UNITY).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16).collect()
+    acc.iter().map(|&s| (s / SIDE_UNITY).clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16).collect()
 }
 
 /// TRX64 [`Observer`] for a CPU run. Empty: TRX64's write trace carries the chip and cycle now (855 D4).
@@ -1472,9 +1477,14 @@ mod tests {
     #[derive(Default)]
     struct Collect(Rc<RefCell<Vec<i16>>>);
 
+    /// The mean of each stereo frame: the tests below measure tone and level, which pan does not change.
+    fn mono(pcm: &[i16]) -> impl Iterator<Item = i16> + '_ {
+        pcm.chunks_exact(2).map(|f| ((i32::from(f[0]) + i32::from(f[1])) / 2) as i16)
+    }
+
     impl AudioSink for Collect {
         fn samples(&mut self, pcm: &[i16]) {
-            self.0.borrow_mut().extend_from_slice(pcm);
+            self.0.borrow_mut().extend(mono(pcm));
         }
     }
 
@@ -1498,7 +1508,7 @@ mod tests {
 
     impl AudioSink for SendCollect {
         fn samples(&mut self, pcm: &[i16]) {
-            self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend_from_slice(pcm);
+            self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(mono(pcm));
         }
     }
 
@@ -1586,13 +1596,43 @@ mod tests {
         assert!((990.0..1010.0).contains(&hz), "{hz} Hz");
     }
 
+    /// S29: byte `2i` is the left gain, `2i + 1` the right.
+    #[test]
+    fn a_channel_panned_hard_left_is_silent_on_the_right() {
+        #[derive(Default)]
+        struct Raw(Rc<RefCell<Vec<i16>>>);
+        impl AudioSink for Raw {
+            fn samples(&mut self, pcm: &[i16]) {
+                self.0.borrow_mut().extend_from_slice(pcm);
+            }
+        }
+        let mut sid = Sid::new();
+        player_map(&mut sid, [(0x40, 0xC0), UNMAPPED]);
+        let out = Raw::default();
+        let pcm = Rc::clone(&out.0);
+        sid.set_audio(48_000, Box::new(out), 0);
+        sid.mixer_write(0, 0x80);
+        sid.mixer_write(1, 0x00);
+        tone(&sid, 0xD400, 0);
+        sid.advance(300 * 985);
+        let pcm = pcm.borrow();
+        let tail = &pcm[pcm.len() / 4 * 2..];
+        assert!(tail.len() % 2 == 0 && tail.chunks(2).all(|f| f[1] == 0), "nothing on the right");
+        let left: Vec<i16> = tail.iter().step_by(2).copied().collect();
+        assert!(level(&left) > 1000.0, "the tone on the left: {}", level(&left));
+    }
+
     #[test]
     fn mixer_gains_scale_and_mute() {
-        let mut acc = vec![0; 4];
-        mix_into(&mut acc, &[100, -200, 300], UNITY);
-        mix_into(&mut acc, &[10, 20, 30, 40, 50], UNITY / 2);
-        assert_eq!(mixed_down(&acc), [105, -190, 315, 320], "padded with the last sample, trimmed to the first engine");
-        assert_eq!(mixed_down(&[i32::from(i16::MAX) * UNITY * 2]), [i16::MAX], "saturates");
+        let mut acc = vec![0; 8];
+        mix_into(&mut acc, &[100, -200, 300], (SIDE_UNITY, 0));
+        mix_into(&mut acc, &[10, 20, 30, 40, 50], (SIDE_UNITY / 2, SIDE_UNITY));
+        assert_eq!(
+            mixed_down(&acc),
+            [105, 10, -190, 20, 315, 30, 320, 40],
+            "left and right apart, padded with the last sample, trimmed to the first engine"
+        );
+        assert_eq!(mixed_down(&[i32::from(i16::MAX) * UNITY]), [i16::MAX], "saturates");
 
         let mut sid = Sid::new();
         player_map(&mut sid, [(0x40, 0xC0), UNMAPPED]);

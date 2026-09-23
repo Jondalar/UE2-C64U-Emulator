@@ -232,8 +232,8 @@ and the same for `audio`), both streams at once, captured on the host for 10 s:
 The frame the receiver assembles is the picture: 272 lines, 4-bit indices, the BASIC screen with its border
 (`run/shots/stream-frame.png` is one, decoded by the harness's own packing rules).
 
-Two things to know about what arrives. The samples are **mono duplicated to both channels**, because the emulator
-mixes the SIDs down to one channel (S20); the stream is stereo on the wire, as the receiver expects. And the
+Two things to know about what arrives. The samples are the SIDs' stereo mix (S29), panned by the mixer; the
+sampler is not in the stream, as it joins only on the way to the audio device. And the
 generator sends a frame's datagrams as one burst rather than spread across the frame, which the receiver's
 assembler does not depend on (S24 §5).
 

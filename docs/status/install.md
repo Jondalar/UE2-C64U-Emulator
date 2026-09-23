@@ -185,7 +185,7 @@ option.
 | Option | Meaning |
 |---|---|
 | `--audio on\|off` | SID audio through the default output device (needs `--c64 trx64`); default on with a window, off with `--headless` |
-| `--audio-wav PATH` | Write the SID sample stream to a WAV: mono, 16 bit, the device rate with audio on, else 44100 Hz |
+| `--audio-wav PATH` | Write the SID sample stream to a WAV: stereo, 16 bit, the device rate with audio on, else 44100 Hz |
 | `--sid-socket1 none\|armsid` | What SID socket 1 holds (needs `--c64 trx64`); on a flash that has not saved an ARMSID yet the firmware asks to review the settings; default `none` |
 
 **Speed, window, control, debugging**
@@ -245,7 +245,7 @@ under the repo root; elsewhere pass `--firmware` and `--roms` (`png` reads its f
 `UE2_FIRMWARE` for the tests.
 
 - **Audio:** `--audio on|off` plays the SID on the default output device (on with a window, off with `--headless`).
-  `--audio-wav PATH` writes the mono sample stream, also headless. `--sid-socket1 armsid` fits an ARMSID in socket 1;
+  `--audio-wav PATH` writes the stereo sample stream, also headless. `--sid-socket1 armsid` fits an ARMSID in socket 1;
   on a flash that has not saved it, the menu asks once to review the SID settings (OK, then save). Without it
   UltiSID 1 at `$D400` plays (`docs/status/sid-audio.md`).
 - **Cartridges:** RETURN on a `.crt` in the file browser, then "Run Cart". Freezer carts freeze with F11 on the USB

@@ -1,8 +1,8 @@
 //! SID audio out: `--audio on|off` through cpal and `--audio-wav <path>`. Spec: docs/specs/S14-c64-trx64.md §W4-SID;
 //! status: docs/status/sid-audio.md.
 //!
-//! The emulation thread hands every block of mono samples reSID produced to a [`Sink`] (c64-bridge `AudioSink`), in
-//! emulated-time order. The sink writes them to the WAV file unchanged and pushes them into a small [`Ring`] the cpal
+//! The emulation thread hands every block of stereo frames (left, right; S29) the SIDs and the sampler produced to a
+//! [`Sink`] (c64-bridge `AudioSink`), in emulated-time order. The sink writes them to the WAV file unchanged and pushes them into a small [`Ring`] the cpal
 //! callback plays. The ring follows emulated time and never blocks the emulator: past [`MAX_MS`] of backlog
 //! (`--speed max`, a stalled device) the oldest samples are dropped down to [`PREROLL_MS`]; when it runs dry the
 //! callback plays silence. The cpal stream lives on the thread that started it ([`Output`], held by `EmuHandle`).
@@ -40,7 +40,7 @@ pub struct AudioArgs {
     /// SID audio through the default output device (needs --c64 trx64) [default: on with a window, off with --headless]
     #[arg(long, value_enum)]
     audio: Option<OnOff>,
-    /// Write the SID sample stream to a WAV file: mono, 16 bit, the device rate with audio on, else 44100 Hz
+    /// Write the SID sample stream to a WAV file: stereo, 16 bit, the device rate with audio on, else 44100 Hz
     #[arg(long, value_name = "PATH")]
     audio_wav: Option<PathBuf>,
     /// What SID socket 1 holds (needs --c64 trx64). The firmware detects an ARMSID at boot; on a flash that has not
@@ -143,7 +143,7 @@ impl c64_bridge::AudioSink for Sink {
 
 /// The default output device at its own rate when that is 44.1 or 48 kHz, else at 48 or 44.1 kHz, else at its own rate
 /// whatever it is (WASAPI in shared mode takes only the device's mix rate, often 96 or 192 kHz; the engines render at
-/// any rate); mono is copied to every channel.
+/// any rate); left and right go to channels 0 and 1, their mean to a mono device and to any further channel.
 fn open_device() -> Result<(cpal::Stream, Arc<Ring>, u32)> {
     let device = cpal::default_host().default_output_device().ok_or_else(|| anyhow!("no default output device"))?;
     let default = device.default_output_config().context("no default output config")?;
@@ -194,7 +194,7 @@ fn build_stream(
     Ok(stream)
 }
 
-/// Mono samples between the emulation thread and the device callback.
+/// Stereo frames, interleaved, between the emulation thread and the device callback.
 struct Ring {
     state: Mutex<RingState>,
     preroll: usize,
@@ -210,7 +210,8 @@ struct RingState {
 
 impl Ring {
     fn new(rate: u32) -> Self {
-        let per_ms = rate as usize / 1000;
+        // Samples, two per frame.
+        let per_ms = rate as usize / 1000 * 2;
         Ring {
             state: Mutex::new(RingState { buf: VecDeque::with_capacity(per_ms * MAX_MS * 2), primed: false }),
             preroll: per_ms * PREROLL_MS,
@@ -218,12 +219,12 @@ impl Ring {
         }
     }
 
-    /// Append, dropping the oldest samples down to the pre-roll past the maximum: never waits.
+    /// Append, dropping the oldest frames down to the pre-roll past the maximum: never waits.
     fn push(&self, pcm: &[i16]) {
         let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         s.buf.extend(pcm);
         if s.buf.len() > self.max {
-            let excess = s.buf.len() - self.preroll;
+            let excess = (s.buf.len() - self.preroll) & !1;
             s.buf.drain(..excess);
         }
     }
@@ -240,12 +241,21 @@ impl Ring {
             s.primed = true;
         }
         for frame in out.chunks_mut(channels) {
-            frame.fill(s.buf.pop_front().map_or(silence, T::from_sample));
+            if s.buf.len() < 2 {
+                frame.fill(silence);
+                continue;
+            }
+            let (l, r) = (s.buf.pop_front().unwrap_or(0), s.buf.pop_front().unwrap_or(0));
+            let mid = T::from_sample(((i32::from(l) + i32::from(r)) / 2) as i16);
+            frame.fill(mid);
+            if let [left, right, ..] = frame {
+                (*left, *right) = (T::from_sample(l), T::from_sample(r));
+            }
         }
     }
 }
 
-/// A mono 16-bit PCM WAV file whose sizes are written when it is dropped.
+/// A stereo 16-bit PCM WAV file whose sizes are written when it is dropped.
 struct Wav {
     out: BufWriter<File>,
     path: PathBuf,
@@ -299,7 +309,7 @@ impl Drop for Wav {
     }
 }
 
-/// 44-byte RIFF header of a mono 16-bit PCM file with `samples` samples.
+/// 44-byte RIFF header of a stereo 16-bit PCM file with `samples` samples (two per frame).
 fn header(rate: u32, samples: u32) -> [u8; 44] {
     let data = samples.saturating_mul(2);
     let mut h = [0u8; 44];
@@ -310,10 +320,10 @@ fn header(rate: u32, samples: u32) -> [u8; 44] {
         (12, b"fmt "),
         (16, &16u32.to_le_bytes()),
         (20, &1u16.to_le_bytes()),
-        (22, &1u16.to_le_bytes()),
+        (22, &2u16.to_le_bytes()),
         (24, &rate.to_le_bytes()),
-        (28, &(rate * 2).to_le_bytes()),
-        (32, &2u16.to_le_bytes()),
+        (28, &(rate * 4).to_le_bytes()),
+        (32, &4u16.to_le_bytes()),
         (34, &16u16.to_le_bytes()),
         (36, b"data"),
         (40, &data.to_le_bytes()),
@@ -337,33 +347,42 @@ mod tests {
             let mut sink = start(&opts).unwrap().1.unwrap();
             assert_eq!(sink.rate(), WAV_RATE);
             sink.push(&[1, -2]);
-            sink.push(&[i16::MAX, i16::MIN, 0]);
+            sink.push(&[i16::MAX, i16::MIN, 0, 3]);
         }
         let bytes = std::fs::read(&path).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(&bytes[..44], &header(WAV_RATE, 5));
+        assert_eq!(&bytes[..44], &header(WAV_RATE, 6));
+        assert_eq!((bytes[22], bytes[32]), (2, 4), "two channels, four bytes a frame");
         let pcm: Vec<i16> = bytes[44..].chunks(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect();
-        assert_eq!(pcm, [1, -2, i16::MAX, i16::MIN, 0]);
+        assert_eq!(pcm, [1, -2, i16::MAX, i16::MIN, 0, 3]);
     }
 
     #[test]
     fn ring_prerolls_drops_backlog_and_plays_silence_on_underrun() {
         let ring = Ring::new(1000);
         let mut out = [7i16; 4];
-        ring.push(&[1; 59]);
+        ring.push(&[1; 118]);
         ring.fill(&mut out, 2);
-        assert_eq!(out, [0; 4], "below the 60-sample pre-roll");
-        ring.push(&[2]);
+        assert_eq!(out, [0; 4], "below the 60-frame pre-roll");
+        ring.push(&[2, 4]);
         ring.fill(&mut out, 2);
-        assert_eq!(out, [1, 1, 1, 1], "primed; mono to both channels");
-        ring.push(&[3; 200]);
-        assert_eq!(ring.state.lock().unwrap().buf.len(), 60, "backlog past 150 dropped to the pre-roll");
+        assert_eq!(out, [1, 1, 1, 1], "primed");
+        ring.push(&[3; 400]);
+        assert_eq!(ring.state.lock().unwrap().buf.len(), 120, "backlog past 150 frames dropped to the pre-roll");
         let mut long = [9i16; 130];
         ring.fill(&mut long, 1);
         assert_eq!((long[59], long[60]), (3, 0), "underrun: silence, no new pre-roll");
-        ring.push(&[4]);
+        ring.push(&[4, 8]);
         ring.fill(&mut out, 2);
-        assert_eq!(out, [4, 4, 0, 0]);
+        assert_eq!(out, [4, 8, 0, 0], "left and right apart");
+        ring.push(&[4, 8]);
+        let mut surround = [0i16; 4];
+        ring.fill(&mut surround, 4);
+        assert_eq!(surround, [4, 8, 6, 6], "the mean past channel 1");
+        ring.push(&[4, 8]);
+        let mut mono = [0i16; 1];
+        ring.fill(&mut mono, 1);
+        assert_eq!(mono, [6], "a mono device gets the mean");
     }
 
     #[test]

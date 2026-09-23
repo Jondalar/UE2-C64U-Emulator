@@ -380,7 +380,7 @@ device through `map_origin`.
   - With S17 (TRX64 Spec 855, landing now) UE2 decodes all four decoders — sockets 1 and 2, UltiSID 1 and 2 — with
     the split bits (up to four instances per UltiSID), gives each receiver that has been written its own reSID, hands
     TRX64 a SID map of receiver groups, and fans each traced write out to its group. `C64Port` takes the audio mixer
-    `0x10100500` and passes bytes `0x00-0x13` to `C64Backend::mixer_write`; the SID channel gains weight the mono mix
+    `0x10100500` and passes bytes `0x00-0x13` to `C64Backend::mixer_write`; the SID channel gains weight the stereo mix ([S29](specs/S29-stereo.md))
     ([S17](specs/S17-ultisid.md)).
 - Cartridges: every access that can run the C64 lends `IoCtx::ram` to the backend (`C64Backend::lend_ddr`), so the
   cartridge logic serves the firmware's CRT banks, cart RAM and GeoRAM from guest DDR live. The EEPROM window
@@ -690,9 +690,9 @@ sequenceDiagram
     FW->>B: DMA write, stamped with the live cycle
     FW->>B: mixer_write from 0x10100500
     B->>S: fan out to every receiver of the group, clocked to the cycle of the write
-    S->>X: mono samples, weighted by the SID mixer channels
+    S->>X: stereo frames, weighted and panned by the SID mixer channels
     B->>V: advance voices at 6.25 MHz of the emulator clock
-    V->>X: queued samples, resampled, stereo downmixed
+    V->>X: queued frames, through mixer channels 4 and 5
     X->>A: sum with the same sample count reSID produced
     A->>A: WAV gets every sample
     A->>A: ring for cpal, 150 ms max, silence on underrun
@@ -704,8 +704,8 @@ sequenceDiagram
   ([sampler.md](status/sampler.md)).
 - Without a sink, CPU writes only set registers and a DMA access clocks the gap (at most 1 s); reSID is never
   clocked with `clock_silent` ([sid-audio.md](status/sid-audio.md)).
-- Mono gain of a mixer channel is `(byte 2c + byte 2c+1) / 180`, so the boot default `5A/5A` is unity; the sampler,
-  drive and tape channels are not applied ([S17](specs/S17-ultisid.md) §2.5).
+- Byte 2c of a mixer channel is its left gain, 2c+1 its right, each / 90, so the boot default `5A/5A` is unity on
+  both sides; the drive and tape channels have no source ([S29](specs/S29-stereo.md)) ([S17](specs/S17-ultisid.md) §2.5).
 
 ### MCP-driven test run
 
@@ -1048,8 +1048,8 @@ realtime with 2004 host forwards keeps 25 MIPS at about 24 % of one core ([e2e.m
 | TRX64's UCI read advances `stalled_on_bus + 1` | UBoot64 stalls reading an existing file; reported to TRX64, not worked around | [xander-tests.md](status/xander-tests.md) |
 | 50/60 Hz outside the C64 | The C64 runs NTSC or PAL (S25); overlay, redraw and the UDP stream assume 50 Hz | [c64.md](status/c64.md) §Known gaps |
 | Stops and DMA on instruction boundaries | STOP_MODE latched only, always "Frozen on Bad line"; raster-timed programs may glitch on freeze | [c64.md](status/c64.md), [carts.md](status/carts.md) |
-| SID gaps after S17 | No stereo, RES/DIGI/filter curves, socket 2 chip, VOICE_ADSR; `$DE00-$DFFF` precedence unverified | [S17](specs/S17-ultisid.md) §3, §5 |
-| Sampler gaps | Mono downmix, no read pipeline, no memory contention, REU mirror answers a closed window | [sampler.md](status/sampler.md) |
+| SID gaps after S17 | RES/DIGI/filter curves, socket 2 chip, VOICE_ADSR; `$DE00-$DFFF` precedence unverified | [S17](specs/S17-ultisid.md) §3, §5 |
+| Sampler gaps | No read pipeline, no memory contention, REU mirror answers a closed window | [sampler.md](status/sampler.md) |
 | Drives | 1541 only; drive B registers only; IEC processor (SoftIEC, printer) still T0 | [drive.md](status/drive.md) |
 | No pointing device reaches the C64; "Run Cart" leaves the keyboard with the menu | Mouse-driven software (GEOS) cannot be used; cartridges need a button press | [xander-tests.md](status/xander-tests.md) |
 | TRX64 cartridge API gaps | No cart ROM in the VIC view; cart writes only in mapped windows; Business Basic's dynamic mode off | [carts.md](status/carts.md) |

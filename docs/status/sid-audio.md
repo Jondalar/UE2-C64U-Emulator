@@ -17,8 +17,8 @@ Firmware paths are relative to `firmware/1541ultimate/software/`; TRX64 paths to
 
 | Option | Default | Effect |
 |---|---|---|
-| `--audio on\|off` | on with a window, off `--headless` | the default output device at its own rate if 44.1 or 48 kHz, else 48 or 44.1 kHz; mono to every channel |
-| `--audio-wav PATH` | none | mono 16-bit PCM WAV of exactly the samples reSID produced: the device rate with `--audio on`, else 44100 Hz; sizes written when the emulator stops |
+| `--audio on\|off` | on with a window, off `--headless` | the default output device at its own rate if 44.1 or 48 kHz, else 48 or 44.1 kHz; left and right on channels 0 and 1, their mean on a mono device and past channel 1 (S29) |
+| `--audio-wav PATH` | none | stereo 16-bit PCM WAV of exactly the frames the SIDs and the sampler produced (S29): the device rate with `--audio on`, else 44100 Hz; sizes written when the emulator stops |
 | `--sid-socket1 none\|armsid` | none | what SID socket 1 holds |
 
 `--audio-wav` with `--c64 none` warns and writes nothing. No audio device (or a failed stream) is a warning; the
@@ -133,9 +133,10 @@ engine and replays registers $00-$18. reSID runs with its filter on, the externa
 
 - `C64Port` serves 0x10100500-0x101005FF. Bytes 0x00-0x13 reach the backend (`C64Backend::mixer_write`); the speaker
   mixer (+0x40) and the resampler (+0x80) stay write sinks; the page reads 0.
-- Mono gain of a channel = (byte 2c + byte 2c+1) / 180. The firmware's 0 dB centre (`5A/5A`) is unity. Until the
-  firmware writes the mixer the boot values `5A 5A 5A 5A 79 27 27 79 …` apply.
-- Channel 0 weights UltiSID 1 A-D, channel 1 UltiSID 2 A-D, channel 2 socket 1. Pans are summed. Muting (bytes 0-7
+- Byte 2c is a channel's left gain, byte 2c+1 its right, each / 90: the firmware's 0 dB centre (`5A/5A`) is unity on
+  both sides, hard left at 0 dB is 128/90 on the left (S29). Until the firmware writes the mixer the boot values
+  `5A 5A 5A 5A 79 27 27 79 …` apply.
+- Channel 0 weights UltiSID 1 A-D, channel 1 UltiSID 2 A-D, channel 2 socket 1, channels 4 and 5 the sampler's pair. Muting (bytes 0-7
   zero, `u64_mute_sids`) silences all SIDs.
 - The boot map mixes UltiSID 1 and 2 playing the same writes at unity: twice one UltiSID's level, as the hardware sums
   them. With the ARMSID fitted socket 1 adds 160/180 of it.
@@ -162,7 +163,7 @@ writes to a SID mapped at $DE00-$DFFF reach it. Left:
 
 - **With a sink:** traced writes are applied at their cycle (every engine is clocked to it first), and the engines
   follow every `advance_to` (1 ms emulated, S14 §4). Every engine gets the same cycle deltas in one loop; the mixed
-  mono samples go to the sink in emulated-time order. Before the first write no engine exists, and the sink gets
+  stereo frames go to the sink in emulated-time order. Before the first write no engine exists, and the sink gets
   silence at reSID's cadence.
 - **Without a sink:** CPU writes only set registers; a DMA write or read clocks the gap, at most 1 s of cycles.
   - C64 programs read chip 0 from TRX64's own SID, and the firmware's DMA reads come with the 6510 stopped, so
@@ -270,8 +271,8 @@ placeholder KERNAL, whose welcome jingle writes the SID. Baseline is main `9b2b7
 ## Known gaps
 
 - Socket 2 and the second SID of a dual chip in a socket (ARM2SID) are not built; their probes find nothing.
-- Stereo: pan pairs are summed to the mono sink. The speaker mixer and the sampler, drive and tape mixer channels are
-  not applied.
+- The drive and tape mixer channels have no source (no drive sound player, no tape model); the speaker mixer is not
+  applied (S29 §4).
 - UltiSID filter curves, resonance and digi level have no reSID equivalent and are ignored (855 D7). C64_VOICE_ADSR
   still reads 0, so the LED strip sees no envelopes.
 - Chip 0's OSC3/ENV3 for C64 programs come from TRX64's fastsid, not reSID. Chips 1 and up read reSID only as of its
