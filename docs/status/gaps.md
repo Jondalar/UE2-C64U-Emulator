@@ -51,8 +51,8 @@ status files.
 - **Never run end to end. Planned** as one test package with smoke scripts: REU preload and "Save REU"; KCS, SS5
   and FC1 freezing from the firmware menu; GeoRAM and TwoMegabyter started by the firmware. A failure becomes a fix.
   `reu.md`, `c64.md`
-- **Network.** No link loss when the vmnet daemon goes away; no mDNS (the RX filter drops multicast, as on the
-  hardware). `network.md`
+- **Network — dropped.** No link loss when the vmnet daemon goes away (vmnet mode only, unused); no mDNS, which the
+  hardware's RX filter drops as well. `network.md`
 
 ## Needs a measurement on the device
 
