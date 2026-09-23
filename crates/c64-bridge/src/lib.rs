@@ -14,6 +14,7 @@ mod cart;
 mod cart_eeprom;
 mod clock;
 mod drive;
+pub mod iec_proc;
 mod keys;
 mod reu;
 mod sampler;
