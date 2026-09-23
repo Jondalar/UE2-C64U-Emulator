@@ -16,7 +16,6 @@ status files.
     from memory (16 K and 32 K), device number, independence from the C64 warm reset, VIA2/RAM accessors. First.
   - (c) A second drive on the bus (unit 9+), for drive B. After (a).
   - 1571 and 1581: TRX64, as their own specs later. Not built in UE2. `drive.md`
-- **ACIA** as a device. `carts.md`
 
 ## UE2 (board, firmware side, host)
 
@@ -28,6 +27,8 @@ status files.
 
 - **50/60 Hz outside the C64.** The C64 runs NTSC since S25; the overlay, the window's redraw and the UDP video
   stream still assume 50 Hz. `c64.md`
+- **ACIA** (the SwiftLink/modem cartridge at `$DE00`/`$DF00`, which the firmware bridges to the network as a Hayes
+  modem): not modelled. A cartridge device like the freezers, so UE2's (2026-09-23). `carts.md`
 - **SID socket 2** and the second SID of a dual chip (ARM2SID): their probes find nothing. UltiSID 1 and 2 run on
   reSID in the bridge already; TRX64 only routes the addresses (Spec 855). Chip 0's OSC3/ENV3 reads come from
   TRX64's fastsid, not reSID — accepted, not planned. `sid-audio.md`
