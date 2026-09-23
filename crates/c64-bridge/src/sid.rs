@@ -101,7 +101,7 @@ const CH_ULTISID1: usize = 0;
 const CH_ULTISID2: usize = 1;
 const CH_SOCKET1: usize = 2;
 
-/// Without an audio sink, a gap longer than this is clocked as this many cycles (1 s): the chip has settled, and a
+/// Without an audio sink, a gap longer than this is clocked as this many cycles (1 s PAL): the chip has settled, and a
 /// DMA read after minutes of silence does not clock minutes of reSID.
 const SILENT_CATCH_UP: u64 = 985_248;
 /// Largest cycle count handed to reSID at once (its `clock` takes an `int`).
@@ -110,7 +110,7 @@ const CHUNK: u64 = 1 << 20;
 /// PAL rate, which is far more than the emission interval, so nothing is lost while the host drains.
 const STREAM_TAP_CAP: usize = 2 * 48_000;
 
-/// reSID's clock (TRX64 `ResidConfig` default), for the samples owed while no engine runs.
+/// reSID's clock until the machine's row says otherwise (TRX64 `ResidConfig` default, PAL).
 const CLOCK_HZ: u64 = PAL_CLOCK_FREQ as u64;
 
 /// ARMSID "VI" answer: firmware version, shown as "%d.%d" (readParams, sid_device_armsid.cc:105-175). Any value serves.
@@ -338,11 +338,12 @@ struct Engine {
 
 impl Engine {
     /// TRX64's `ResidConfig` is fixed at construction, so a model or rate change builds the engine again; oscillator and
-    /// envelope phase restart.
-    fn build(model: i32, rate: u32, regs: [u8; 0x19]) -> Self {
+    /// envelope phase restart. A clock change does not (`Engines::set_clock`).
+    fn build(model: i32, rate: u32, clock_hz: u64, regs: [u8; 0x19]) -> Self {
         let rate = f64::from(rate);
         let mut resid = Resid::new(ResidConfig {
             model,
+            clock_freq: clock_hz as f64,
             sample_rate: rate,
             passband: rate * 90.0 / 200.0,
             filter: true,
@@ -373,6 +374,8 @@ struct Engines {
     /// Receivers with an engine, in the order the engines were built. The first one's sample count is each chunk's.
     order: Vec<usize>,
     sample_rate: u32,
+    /// The C64's clock, Hz: the machine's row (S25 §3).
+    clock_hz: u64,
     /// C64 cycle the engines have been clocked to.
     clk: u64,
     /// Cycles × sample rate not yet turned into silence while no engine runs.
@@ -396,6 +399,7 @@ impl Engines {
             engines: Default::default(),
             order: Vec::new(),
             sample_rate,
+            clock_hz: CLOCK_HZ,
             clk: 0,
             pace: 0,
             gains: [UNITY; RECEIVERS],
@@ -413,9 +417,9 @@ impl Engines {
     fn ensure(&mut self, rx: usize, model: i32) {
         match self.engines[rx].as_ref().map(|e| (e.model, e.regs)) {
             Some((built, _)) if built == model => {}
-            Some((_, regs)) => self.engines[rx] = Some(Engine::build(model, self.sample_rate, regs)),
+            Some((_, regs)) => self.engines[rx] = Some(Engine::build(model, self.sample_rate, self.clock_hz, regs)),
             None => {
-                self.engines[rx] = Some(Engine::build(model, self.sample_rate, [0; 0x19]));
+                self.engines[rx] = Some(Engine::build(model, self.sample_rate, self.clock_hz, [0; 0x19]));
                 self.order.push(rx);
             }
         }
@@ -502,8 +506,8 @@ impl Engines {
     /// Samples in `n` cycles while no engine runs, at reSID's cadence.
     fn silence(&mut self, n: u64) -> usize {
         self.pace += n * u64::from(self.sample_rate);
-        let samples = self.pace / CLOCK_HZ;
-        self.pace %= CLOCK_HZ;
+        let samples = self.pace / self.clock_hz;
+        self.pace %= self.clock_hz;
         samples as usize
     }
 
@@ -513,7 +517,19 @@ impl Engines {
         }
         self.sample_rate = sample_rate;
         for e in self.engines.iter_mut().flatten() {
-            *e = Engine::build(e.model, sample_rate, e.regs);
+            *e = Engine::build(e.model, sample_rate, self.clock_hz, e.regs);
+        }
+    }
+
+    /// The C64 runs on another clock (a model switch, S25 §3): reSID re-samples at it, the oscillators run on.
+    fn set_clock(&mut self, clock_hz: u64) {
+        if clock_hz == self.clock_hz {
+            return;
+        }
+        self.clock_hz = clock_hz;
+        self.pace = 0;
+        for e in self.engines.iter_mut().flatten() {
+            e.resid.set_clock_freq(clock_hz as f64);
         }
     }
 
@@ -553,6 +569,8 @@ enum Cmd {
     StreamTap(Option<Arc<Mutex<Vec<i16>>>>),
     Reset,
     Reanchor(u64),
+    /// The C64's clock in Hz changed.
+    ClockFreq(u64),
     /// A firmware DMA read: the answer goes back before the emulation thread continues (S20 §3).
     Read { mask: u16, reg: u8, clk: u64, reply: SyncSender<u8> },
 }
@@ -611,6 +629,7 @@ impl Worker {
                             Cmd::StreamTap(tap) => engines.stream = tap,
                             Cmd::Reset => engines.reset(),
                             Cmd::Reanchor(clk) => engines.clk = clk,
+                            Cmd::ClockFreq(hz) => engines.set_clock(hz),
                             Cmd::Read { mask, reg, clk, reply } => {
                                 engines.clock_to(clk);
                                 let _ = reply.send(engines.read(mask, reg));
@@ -928,6 +947,17 @@ impl Sid {
         self.finish();
     }
 
+    /// The C64 moved to a row with another clock at cycle `clk` (S25 §3): what was owed up to there is clocked at the
+    /// old rate, the rest at `clock_hz`.
+    pub fn set_clock(&mut self, clock_hz: u64, clk: u64) {
+        self.drain(self.clocking());
+        if self.listening {
+            self.command(Cmd::ClockTo(clk));
+        }
+        self.command(Cmd::ClockFreq(clock_hz));
+        self.finish();
+    }
+
     /// TRX64 restarted its cycle counter at `clk` (warm reset, c64_6510core.rs:677).
     pub fn reanchor(&mut self, clk: u64) {
         self.command(Cmd::Reanchor(clk));
@@ -1073,6 +1103,7 @@ impl Sid {
                 Cmd::StreamTap(tap) => engines.stream = tap,
                 Cmd::Reset => engines.reset(),
                 Cmd::Reanchor(clk) => engines.clk = clk,
+                Cmd::ClockFreq(hz) => engines.set_clock(hz),
                 Cmd::Read { mask, reg, clk, reply } => {
                     engines.clock_to(clk);
                     let _ = reply.send(engines.read(mask, reg));

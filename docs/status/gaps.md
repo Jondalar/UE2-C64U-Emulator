@@ -19,10 +19,8 @@ status files.
 
 ## UE2 (board, firmware side, host)
 
-- **NTSC.** The firmware asks for it with C64_VIDEOFORMAT bit 1 (0x2b under System Mode NTSC, the firmware's
-  default); the bridge only prints a notice and the C64 stays PAL: `$02A6` reads 01 after a reset in either mode.
-  TRX64 has the models (`c64-ntsc`, 384x247) and `switch_model` / `put_on_model`; the bridge has to switch on that
-  bit. `c64.md`
+- **50/60 Hz outside the C64.** The C64 runs NTSC since S25; the overlay, the window's redraw and the UDP video
+  stream still assume 50 Hz. `c64.md`
 - **Audio.** Stereo sink, the mixer registers (`U64_AUDIO_MIXER`, `AUDIO_SEL_BASE`), C64_VOICE_ADSR for the LED
   strip, UltiSID filter curves. `sid-audio.md`, `sampler.md`
 - **IEC processor** (SoftIEC, printer, UltiCopy). FPGA logic, so ours, but it needs TRX64's IEC bus. `drive.md`
