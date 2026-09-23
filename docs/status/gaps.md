@@ -43,7 +43,8 @@ status files.
 - **IEC processor. Planned:** Software IEC only (the virtual drive, device 11 by default, loading straight from SD
   and USB directories). The processor and its microcode come from the open FPGA source; it drives TRX64's IEC lines.
   Spec not written yet. Dropped: the IEC printer and UltiCopy (needs a real drive). `drive.md`
-- **I2C devices.** Codec (NAU8822), hub (USB2513), expanders, PLLs: they ACK and read 0xFF. `fixes.md`
+- **I2C devices — dropped.** Codec (NAU8822), hub (USB2513), expanders, PLLs ACK and read 0xFF; they configure
+  hardware the emulator does not have, and the boot is clean. Revisit only if the firmware stalls on one. `fixes.md`
 - **Peripherals.** WiFi beyond the stub (a scan finds nothing), USB mouse, AX88772, detach on the root port, HDMI
   hot-plug. `boot.md`, `usb.md`, `fixes.md`
 - **Never run end to end.** REU preload and "Save REU"; KCS, SS5 and FC1 freezing, GeoRAM and TwoMegabyter from
