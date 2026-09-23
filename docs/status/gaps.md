@@ -48,8 +48,9 @@ status files.
 - **Peripherals. Planned:** a USB mouse (host mouse → HID mouse → the firmware's 1351 emulation on the joyport, for
   GEOS), and detach on the root port (the nano's disconnect path, `RAM_STATUS = 0x8000`). Dropped: WiFi beyond the
   stub (Ethernet covers the network), AX88772 (same), HDMI hot-plug (no second monitor). `usb.md`, `boot.md`
-- **Never run end to end.** REU preload and "Save REU"; KCS, SS5 and FC1 freezing, GeoRAM and TwoMegabyter from
-  the firmware. `reu.md`, `c64.md`
+- **Never run end to end. Planned** as one test package with smoke scripts: REU preload and "Save REU"; KCS, SS5
+  and FC1 freezing from the firmware menu; GeoRAM and TwoMegabyter started by the firmware. A failure becomes a fix.
+  `reu.md`, `c64.md`
 - **Network.** No link loss when the vmnet daemon goes away; no mDNS (the RX filter drops multicast, as on the
   hardware). `network.md`
 
