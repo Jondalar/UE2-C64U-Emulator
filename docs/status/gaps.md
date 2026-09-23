@@ -11,8 +11,8 @@ status files.
   phase at resume: code that re-syncs each frame shows at most one bad frame, code that syncs once stays shifted
   after menu, freeze or DMA load. TRX64: medium change in the cycle core (RDY hold on read cycles, R/W history,
   BA-low count), needs a device measurement. No program known to break; revisit when one does. `c64.md`, `carts.md`
-- **Drives.** Drive B, 1571 and 1581 (MFM, WD177x, side 1). API: a held or powered-off drive, drive power on the
-  IEC bus, ROM from memory instead of a file. `drive.md`
+- **Drives.** Drive B, 1571 and 1581 (MFM, WD177x, side 1). API: a held drive, drive A switched off (DRIVE_POWER:
+  it must leave the emulated IEC lines alone), ROM from memory instead of a file. `drive.md`
 - **SID.** C64 programs read OSC3/ENV3 from fastsid instead of reSID; several SID instances for socket 2 and
   UltiSID 2. `sid-audio.md`
 - **ACIA** as a device. `carts.md`
