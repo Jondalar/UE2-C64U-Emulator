@@ -1,6 +1,6 @@
 # S26 — Frame pacing: the window shows every picture the VIC makes
 
-**Status:** planned (2026-09-23), not built.
+**Status:** built (2026-09-23).
 
 **Owns:**
 - `crates/ue2emu/src/runner.rs`: when a display snapshot is published
@@ -28,20 +28,20 @@ part of the same snapshot, so it follows the same path and has no clock of its o
   the last publish, checked after every run slice. The slice is 4 ms emulated at most, so a picture is published at
   most 4 ms after the VIC finished it. The C64's row decides the rate; nothing here knows PAL or NTSC.
 - Without a C64 (`--c64 none`): the 20 ms period stays; there is no VIC to follow.
-- The snapshot carries the frame counter, so a reader can tell a new picture from the one it already has.
+- Every snapshot has its own `now_ms` (pictures are at least 16 ms apart, the fallback 20 ms), so a reader tells a new
+  picture from the one it already has by that; `DisplaySnapshot` keeps its fields.
 
 ## 3. Drawing
 
-- The window polls every 4 ms and redraws only when the snapshot's frame counter changed (or the window was resized
-  or exposed).
+- The window polls every 4 ms and redraws only when the snapshot's `now_ms` changed (or the window was resized or
+  exposed).
 - No vsync to the host display: softbuffer has none. A 50 Hz picture on a 60 Hz display still shows one picture
   twice every fifth refresh; that is the display, not the emulator.
 
 ## 4. Checks
 
 - A unit test on the publish rule: a counter step publishes, no step does not, `--c64 none` keeps 20 ms.
-- Headless, `--speed max` off: pictures published per emulated second, 50 under PAL and 60 under NTSC (a counter in
-  the runner, printed with `--log`?). To be decided when built.
+- The frame counter itself is TRX64's `vic.frame`: 50.12 steps per second under PAL, 59.83 under NTSC.
 - The user looks at a scrolling program in the window under PAL and NTSC.
 
 ## 5. Not in this spec

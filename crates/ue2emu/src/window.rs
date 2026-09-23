@@ -37,8 +37,8 @@ use crate::usb::UsbKeys;
 /// the rendered image (see `aspect_snap`).
 const BASE_W: u32 = 384;
 const BASE_H: u32 = 288;
-/// 50 Hz redraw.
-const FRAME: Duration = Duration::from_millis(20);
+/// How often the window looks for a new display snapshot; it redraws only when there is one (S26 §3).
+const POLL: Duration = Duration::from_millis(4);
 const TITLE_EVERY: Duration = Duration::from_millis(500);
 
 /// Open the emulator window on the main thread; returns when it is closed.
@@ -90,7 +90,8 @@ pub fn run_window(cfg: MachineConfig, opts: RunOptions) -> Result<()> {
         surface: None,
         error: None,
         deadline: deadline.map(|d| started + d),
-        next_frame: Instant::now(),
+        next_poll: Instant::now(),
+        drawn_ms: None,
         next_title: Instant::now(),
     };
     let looped = event_loop.run_app(&mut app);
@@ -134,7 +135,9 @@ struct App {
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     error: Option<anyhow::Error>,
     deadline: Option<Instant>,
-    next_frame: Instant,
+    next_poll: Instant,
+    /// `now_ms` of the snapshot last drawn: a snapshot with another one is a new picture.
+    drawn_ms: Option<u64>,
     next_title: Instant,
 }
 
@@ -164,6 +167,7 @@ impl App {
             return;
         };
         let snap = self.ctl.display.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        self.drawn_ms = Some(snap.now_ms);
         let (sw, sh) = self.renderer.render(&snap, &mut self.pixels);
         let image = (sw as u32, sh as u32);
         if image != self.image && sw != 0 && sh != 0 {
@@ -298,9 +302,10 @@ impl ApplicationHandler for App {
             el.exit();
             return;
         }
-        if now >= self.next_frame {
-            self.next_frame = now + FRAME;
-            if let Some(window) = &self.window {
+        if now >= self.next_poll {
+            self.next_poll = now + POLL;
+            let published = self.ctl.display.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).now_ms;
+            if let Some(window) = self.window.as_ref().filter(|_| self.drawn_ms != Some(published)) {
                 window.request_redraw();
             }
         }
@@ -308,7 +313,7 @@ impl ApplicationHandler for App {
             self.next_title = now + TITLE_EVERY;
             self.update_title();
         }
-        el.set_control_flow(ControlFlow::WaitUntil(self.next_frame.min(self.next_title)));
+        el.set_control_flow(ControlFlow::WaitUntil(self.next_poll.min(self.next_title)));
     }
 }
 

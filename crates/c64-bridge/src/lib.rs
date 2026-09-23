@@ -1075,8 +1075,8 @@ impl C64Backend for Trx64Backend {
         video::frame(&self.m, &self.palette)
     }
 
-    /// TRX64's own frame counter (`vic.frame`), which advances once per PAL frame whether anyone looks or not, so
-    /// the UDP stream generator sends one burst per picture (S24 §4).
+    /// TRX64's own frame counter (`vic.frame`), which advances once per frame whether anyone looks or not, so
+    /// the UDP stream generator sends one burst per picture (S24 §4) and the window shows each one (S26).
     fn frame_counter(&self) -> u64 {
         self.m.vic.frame
     }

@@ -37,8 +37,14 @@ pub fn warn_on_c64_char_rom(font: &[u8], path: &std::path::Path) {
 
 /// Instructions per `Machine::run` slice (4 ms emulated at the default 4 clocks per instruction).
 const SLICE_INSNS: u64 = 100_000;
-/// Emulated interval between published display snapshots.
+/// Emulated interval between published display snapshots when there is no VIC frame counter to follow (S26 §2).
 const DISPLAY_PERIOD_MS: u64 = 20;
+
+/// Whether a display snapshot is due: at every new VIC picture, or every `DISPLAY_PERIOD_MS` without a counting
+/// C64 (`frame == 0`), so the C64's row sets the rate under PAL and NTSC alike (S26 §2).
+fn display_due(frame: u64, shown_frame: u64, now_ms: u64, next_display_ms: u64) -> bool {
+    if frame == 0 { now_ms >= next_display_ms } else { frame != shown_frame }
+}
 /// Realtime pacing sleeps once emulated time leads wall time by more than this.
 const PACE_SLACK_MS: u64 = 2;
 /// Realtime pacing drops a larger backlog (host stall, sleep) instead of catching up at full speed.
@@ -98,7 +104,7 @@ pub enum Command {
 #[derive(Clone)]
 pub struct ControlHandle {
     pub commands: Sender<Command>,
-    /// Latest overlay snapshot (published about every 20 ms emulated).
+    /// Latest display snapshot, published at every VIC picture, or every 20 ms emulated without a C64 (S26).
     pub display: Arc<Mutex<DisplaySnapshot>>,
     /// Emulated milliseconds since power-on.
     pub now_ms: Arc<AtomicU64>,
@@ -357,6 +363,7 @@ impl EmuThread {
     ) -> Result<()> {
         let mut pacer = Pacer::new(machine.now_ms());
         let mut next_display_ms = 0;
+        let mut shown_frame = 0;
         let mut mips_mark = (Instant::now(), machine.cpu.insns, machine.now_ms());
         let mut stdout = std::io::stdout();
         let mut inputs = InputTimeline::default();
@@ -414,8 +421,10 @@ impl EmuThread {
 
             let now_ms = machine.now_ms();
             cart.poll(&mut machine, now_ms);
-            if now_ms >= next_display_ms {
+            let frame = machine.frame_counter();
+            if display_due(frame, shown_frame, now_ms, next_display_ms) {
                 *self.display.lock().unwrap_or_else(PoisonError::into_inner) = machine.display();
+                shown_frame = frame;
                 next_display_ms = now_ms + DISPLAY_PERIOD_MS;
             }
             self.now_ms.store(now_ms, Ordering::Relaxed);
@@ -601,6 +610,16 @@ impl Pacer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_follows_the_vic_frame_counter() {
+        // A counting C64: a new picture publishes, the same one does not, whatever the time.
+        assert!(display_due(7, 6, 0, 100));
+        assert!(!display_due(7, 7, 500, 100));
+        // No counter (`--c64 none`): every DISPLAY_PERIOD_MS.
+        assert!(!display_due(0, 0, 99, 100));
+        assert!(display_due(0, 0, 100, 100));
+    }
 
     #[test]
     fn pacer_sleeps_when_ahead_and_reanchors_when_far_behind() {

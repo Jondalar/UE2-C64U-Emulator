@@ -485,8 +485,8 @@ Level 2 of `ue2emu`: how the host reaches the machine and what it gets back.
   150 ms ring that drops the oldest samples when full and plays silence on underrun, so `--speed max` never waits;
   the cpal stream lives in `EmuHandle` on the thread that spawned the emulation. The WAV gets every sample.
 - **`DisplaySnapshot`:** overlay registers, screen RAM, colour RAM and palette, plus `c64: Option<C64Frame>` (frame,
-  palette, text screen and character set of an attached C64). Published by the emulation thread about every 20 ms
-  emulated. `render::Renderer` composites the overlay over the 384×272 C64 frame (overlay only without a C64);
+  palette, text screen and character set of an attached C64). Published by the emulation thread at every VIC picture, or
+  every 20 ms emulated without a C64 (S26). `render::Renderer` composites the overlay over the 384×272 C64 frame (overlay only without a C64);
   `render::text_dump` and `render::c64_text_dump` turn the overlay and the C64 screen into text.
 - **Window:** realtime, held to the rendered image's ratio on resize, opens at 768×576. F12 = menu button, Page Up = RESTORE; other keys go to
   the matrix, or with `--usb-keyboard` to the USB keyboard.
@@ -531,7 +531,7 @@ flowchart LR
 
 The emulation thread runs `Machine::run` in slices of 100 000 instructions (4 ms emulated at the default 4 clocks per
 instruction), cut short at the next timed input. After each slice it drains the console to stdout, processes queued
-`Command`s, publishes the `DisplaySnapshot` every 20 ms emulated, pumps the network backend and paces
+`Command`s, publishes the `DisplaySnapshot` at every VIC picture (S26), pumps the network backend and paces
 ([S02](specs/S02-core.md), [tooling.md](status/tooling.md)). Other threads: the cpal stream, the web UI proxy (one
 accept thread, one per connection direction), and the `--usb-dir` worker and host watcher. With an audio device the
 reSID engines, the mixing and the sink run on the SID worker ([S20](specs/S20-sid-thread.md)); the emulation thread
@@ -825,7 +825,7 @@ The workspace version is 0.2.0 ([Cargo.toml](../Cargo.toml)).
   re-anchors after every release ([S14](specs/S14-c64-trx64.md) §4, §7, [S15](specs/S15-uci.md) §3.4).
 - **Audio clocks.** reSID follows the C64 cycles; the sampler engine runs at 6.25 MHz = `CLOCK_HZ / 16` and is
   resampled to the sink rate.
-- **Host time.** Snapshots every 20 ms emulated; control inputs applied at exact emulated milliseconds; every wait in
+- **Host time.** Snapshots at every VIC picture (every 20 ms emulated without a C64); control inputs applied at exact emulated milliseconds; every wait in
   scripts, the control protocol and MCP is emulated time; the pacer and MCP's `timeout_ms` are wall clock.
 
 ### Device model: bus, IoMap and devices
