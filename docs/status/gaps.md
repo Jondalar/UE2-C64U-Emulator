@@ -16,8 +16,6 @@ status files.
     from memory (16 K and 32 K), device number, independence from the C64 warm reset, VIA2/RAM accessors. First.
   - (c) A second drive on the bus (unit 9+), for drive B. After (a).
   - 1571 and 1581: TRX64, as their own specs later. Not built in UE2. `drive.md`
-- **SID.** C64 programs read OSC3/ENV3 from fastsid instead of reSID; several SID instances for socket 2 and
-  UltiSID 2. `sid-audio.md`
 - **ACIA** as a device. `carts.md`
 
 ## UE2 (board, firmware side, host)
@@ -30,6 +28,9 @@ status files.
 
 - **50/60 Hz outside the C64.** The C64 runs NTSC since S25; the overlay, the window's redraw and the UDP video
   stream still assume 50 Hz. `c64.md`
+- **SID socket 2** and the second SID of a dual chip (ARM2SID): their probes find nothing. UltiSID 1 and 2 run on
+  reSID in the bridge already; TRX64 only routes the addresses (Spec 855). Chip 0's OSC3/ENV3 reads come from
+  TRX64's fastsid, not reSID — accepted, not planned. `sid-audio.md`
 - **Audio.** Stereo sink, the mixer registers (`U64_AUDIO_MIXER`, `AUDIO_SEL_BASE`), C64_VOICE_ADSR for the LED
   strip, UltiSID filter curves. `sid-audio.md`, `sampler.md`
 - **Disk surface.** An external surface with a write hook and the firmware's per-track bit time is not TRX64's
