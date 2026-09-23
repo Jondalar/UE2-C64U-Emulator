@@ -26,8 +26,10 @@ status files.
   are lost); Business BASIC's dynamic mode off. A hook the fix needs has to live in UE2. `carts.md`
   **Planned:** the lost RAM writes — an observer hands every `$8000-$BFFF`/`$E000-$FFFF` write to the cart logic
   while one of these carts is in.
-- **50/60 Hz outside the C64.** The C64 runs NTSC since S25; the overlay, the window's redraw and the UDP video
-  stream still assume 50 Hz. `c64.md`
+- **50/60 Hz outside the C64.** The C64 runs NTSC since S25, but snapshots are published every 20 ms emulated and the
+  window redraws every 20 ms wall: under NTSC one picture in six is lost, under PAL the clocks beat. The overlay rides
+  in the same snapshot. **Planned:** `docs/specs/S26-frame-pacing.md`. The UDP video stream's NTSC framing stays
+  open. `c64.md`
 - **ACIA** (the SwiftLink/modem cartridge at `$DE00`/`$DF00`, which the firmware bridges to the network as a Hayes
   modem): not modelled. A cartridge device like the freezers, so UE2's (2026-09-23). `carts.md`
 - **SID socket 2** and the second SID of a dual chip (ARM2SID): their probes find nothing. UltiSID 1 and 2 run on
