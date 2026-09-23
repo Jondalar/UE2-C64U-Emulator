@@ -11,8 +11,11 @@ status files.
   phase at resume: code that re-syncs each frame shows at most one bad frame, code that syncs once stays shifted
   after menu, freeze or DMA load. TRX64: medium change in the cycle core (RDY hold on read cycles, R/W history,
   BA-low count), needs a device measurement. No program known to break; revisit when one does. `c64.md`, `carts.md`
-- **Drives.** Drive B, 1571 and 1581 (MFM, WD177x, side 1). API: a held drive, drive A switched off (DRIVE_POWER:
-  it must leave the emulated IEC lines alone), ROM from memory instead of a file. `drive.md`
+- **Drives** (owner decision 2026-09-23, one spec each, spec numbers to follow):
+  - (a) Drive API: a held drive, drive A switched off (DRIVE_POWER: it must leave the emulated IEC lines alone), ROM
+    from memory (16 K and 32 K), device number, independence from the C64 warm reset, VIA2/RAM accessors. First.
+  - (c) A second drive on the bus (unit 9+), for drive B. After (a).
+  - 1571 and 1581: TRX64, as their own specs later. Not built in UE2. `drive.md`
 - **SID.** C64 programs read OSC3/ENV3 from fastsid instead of reSID; several SID instances for socket 2 and
   UltiSID 2. `sid-audio.md`
 - **ACIA** as a device. `carts.md`
@@ -29,6 +32,9 @@ status files.
   stream still assume 50 Hz. `c64.md`
 - **Audio.** Stereo sink, the mixer registers (`U64_AUDIO_MIXER`, `AUDIO_SEL_BASE`), C64_VOICE_ADSR for the LED
   strip, UltiSID filter curves. `sid-audio.md`, `sampler.md`
+- **Disk surface.** An external surface with a write hook and the firmware's per-track bit time is not TRX64's
+  (2026-09-23): UE2 keeps setting the image in and polling for written tracks; G64 tracks whose length differs from
+  their zone's wrap at another rate than on hardware. `drive.md`
 - **IEC processor** (SoftIEC, printer, UltiCopy). FPGA logic, so ours, but it needs TRX64's IEC bus. `drive.md`
 - **I2C devices.** Codec (NAU8822), hub (USB2513), expanders, PLLs: they ACK and read 0xFF. `fixes.md`
 - **Peripherals.** WiFi beyond the stub (a scan finds nothing), USB mouse, AX88772, detach on the root port, HDMI
