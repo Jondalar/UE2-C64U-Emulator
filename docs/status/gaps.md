@@ -40,7 +40,9 @@ status files.
 - **Disk surface.** An external surface with a write hook and the firmware's per-track bit time is not TRX64's
   (2026-09-23): UE2 keeps setting the image in and polling for written tracks; G64 tracks whose length differs from
   their zone's wrap at another rate than on hardware. Accepted as a known limit, not planned. `drive.md`
-- **IEC processor** (SoftIEC, printer, UltiCopy). FPGA logic, so ours, but it needs TRX64's IEC bus. `drive.md`
+- **IEC processor. Planned:** Software IEC only (the virtual drive, device 11 by default, loading straight from SD
+  and USB directories). The processor and its microcode come from the open FPGA source; it drives TRX64's IEC lines.
+  Spec not written yet. Dropped: the IEC printer and UltiCopy (needs a real drive). `drive.md`
 - **I2C devices.** Codec (NAU8822), hub (USB2513), expanders, PLLs: they ACK and read 0xFF. `fixes.md`
 - **Peripherals.** WiFi beyond the stub (a scan finds nothing), USB mouse, AX88772, detach on the root port, HDMI
   hot-plug. `boot.md`, `usb.md`, `fixes.md`
