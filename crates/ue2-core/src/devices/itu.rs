@@ -533,6 +533,6 @@ mod tests {
         assert_eq!(map.resolve(0x1000_000C), Some((0, 0x0C)));
         assert_eq!(map.resolve(0x1000_00FF), Some((0, 0xFF)));
         assert_eq!(map.resolve(0x1000_0100), None);
-        assert_eq!(map.get::<Itu>().map(|i| i.capabilities), Some(0x3400_0222));
+        assert_eq!(map.get::<Itu>().map(|i| i.capabilities), Some(0x3400_0226));
     }
 }

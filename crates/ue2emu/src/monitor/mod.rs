@@ -633,7 +633,7 @@ mod tests {
         };
 
         let itu = run(&mut m, &mut st, "itu");
-        assert!(itu.contains("capabilities  0x34000222"), "the capability word this machine advertises: {itu}");
+        assert!(itu.contains("capabilities  0x34000226"), "the capability word this machine advertises: {itu}");
         assert!(itu.contains("low  enabled"), "the interrupt controller as the ISR sees it: {itu}");
 
         let cart = run(&mut m, &mut st, "cart");

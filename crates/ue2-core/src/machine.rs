@@ -34,7 +34,8 @@ pub struct MachineConfig {
     pub elf: PathBuf,
     /// Firmware roms directory (chars.bin etc.), usually firmware/1541ultimate/roms.
     pub rom_dir: PathBuf,
-    /// ITU capability word (big-endian at 0x1000000C). T0 default 0x34000222.
+    /// ITU capability word (big-endian at 0x1000000C). Default 0x34000226: the T0 word plus CAPAB_DRIVE_1541_2, which a
+    /// C64 Ultimate has (its REST API lists drive B, 2026-09-23).
     pub capabilities: u32,
     /// Whether `capabilities` came from the command line. An explicit word is the user's, so the frontend does not
     /// OR its own feature bits into it (`--caps` is the only way to model a machine whose FPGA lacks one).
@@ -68,7 +69,7 @@ impl MachineConfig {
         MachineConfig {
             elf,
             rom_dir,
-            capabilities: 0x3400_0222,
+            capabilities: 0x3400_0226,
             capabilities_explicit: false,
             clocks_per_insn: time::DEFAULT_CLOCKS_PER_INSN,
             flash_image: None,

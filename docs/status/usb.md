@@ -33,7 +33,7 @@ grep -q '^HELLO                         PRG  254' run/smoke-usb.log && echo S13 
 - `usb-replug [port]` unplugs a device and plugs it back in (hot-plug through the hub, `docs/status/usb-dir.md`
   §Hot-plug); `usb-sync` is for `--usb-dir` sticks.
 - More than 3 devices is an error (the USB2513 has 3 ports). With any device the capability word gets
-  `CAPAB_USB_HOST2` (bit 23); without `--usb`/`--usb-dir`/`--usb-keyboard` it stays `0x34000222`.
+  `CAPAB_USB_HOST2` (bit 23); without `--usb`/`--usb-dir`/`--usb-keyboard` it stays `0x34000226` (`0x34000222` before S27 added drive B's bit).
 
 ## Results
 

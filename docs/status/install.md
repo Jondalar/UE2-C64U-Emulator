@@ -140,7 +140,7 @@ is RESTORE.
 | `--firmware ELF` (alias `--elf`) | Firmware image: `ultimate.elf` (with symbols), `ultimate.app` or a `.ue2`; default `firmware/1541ultimate/target/u64ii/riscv/ultimate/result/ultimate.elf` |
 | `--roms DIR` | Firmware roms directory: overlay font `chars.bin`, TRX64 ROM seeds, `--c64-roms` source; default `firmware/1541ultimate/roms` |
 | `--flash FILE` | Persistent SPI flash image, created erased if missing |
-| `--caps HEX` | ITU capability word; default `34000222`. Given explicitly it is used as it stands, so the frontend adds none of its own bits (EEPROM, UCI, sampler) — that is how a machine without one of them is modelled |
+| `--caps HEX` | ITU capability word; default `34000226` (drive B's bit included since S27). Given explicitly it is used as it stands, so the frontend adds none of its own bits (EEPROM, UCI, sampler) — that is how a machine without one of them is modelled |
 | `--board MODEL` | Which label the board wears: `u64ii` (default) or `c64u`. The revision register says `0x17` either way -- it is one piece of hardware -- so the difference is the Bling Board, the LED and keyboard controller the C64U carries. `c64u` makes `BLINGBOARD_INSTALLED` answer present; 3.15 reads it once, for a heading in the LED settings, and a firmware built from Commodore's branch reads it for `isCommodoreBoard()` |
 | `--no-overlay-ui` | Do not seed the overlay user interface into blank flash config |
 | `--settings FILE.cfg` | Firmware settings from a `.cfg` in the firmware's own format, written into the flash before boot at every start; only the settings to change are needed; repeatable, later files win; a bad value stops the start. `ue2emu settings [--firmware F]` prints every setting of an image with its default (`docs/specs/S21-settings.md`) |
@@ -461,7 +461,7 @@ All runs start from an erased flash; install runs flat out (`--speed` does not a
     snds1541.bin, snds1571.bin, snds1581.bin, index.html, api.html, openapi.yaml; `Flashing Runtime FPGA..`,
     `Flashing Ultimate Application..`; `WiFi module detected: ESP32 WiFi Bridge V1.14 (1.14)`,
     `No WiFi module update needed!`; `Turning OFF machine in 5 seconds....`
-  - Flash: FPGA bitstream at 0; application at 0x3C0000, the XC7A100T slot for the default capabilities 0x34000222
+  - Flash: FPGA bitstream at 0; application at 0x3C0000, the XC7A100T slot for the default capabilities (FPGA type 3 in the top byte, then 0x34000222)
     (update_u64ii.cc:179-180); FAT flash disk at 0x580000 (`MSDOS5.0`); all 24 config pages erased (0xFE8000 reads FF,
     the answer to "Reset Configuration").
   - On a populated flash "Reformat Flash Disk?" comes first (update_common.h:244-253), then the same two questions.
