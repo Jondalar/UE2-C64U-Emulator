@@ -11,10 +11,6 @@ status files.
   phase at resume: code that re-syncs each frame shows at most one bad frame, code that syncs once stays shifted
   after menu, freeze or DMA load. TRX64: medium change in the cycle core (RDY hold on read cycles, R/W history,
   BA-low count), needs a device measurement. No program known to break; revisit when one does. `c64.md`, `carts.md`
-- **Cartridge API.** `carts.md` §TRX64 API gaps:
-  - EXROM/GAME by address and R/W (`get_lines`); Business BASIC's dynamic mode is off without it.
-  - PLA re-evaluation after reads and by time.
-  - A hook between the interrupt pushes and the vector fetch.
 - **Drives.** Drive B, 1571 and 1581 (MFM, WD177x, side 1). API: a held or powered-off drive, drive power on the
   IEC bus, ROM from memory instead of a file. `drive.md`
 - **SID.** C64 programs read OSC3/ENV3 from fastsid instead of reSID; several SID instances for socket 2 and
@@ -22,6 +18,12 @@ status files.
 - **ACIA** as a device. `carts.md`
 
 ## UE2 (board, firmware side, host)
+
+- **Cartridges beyond TRX64's families** (freezers, Atomic Power, Business BASIC, Pagefox). TRX64 keeps `CartMapper`
+  as it is (2026-09-23), so these stay on the bridge's workarounds: PLA recompute after line-changing reads and on
+  timers; a replicated NMI check to switch a freezer in before the vector (an IRQ-first freeze runs one KERNAL
+  instruction); cart RAM written only while its window is mapped (AR/RR/SS5/Pagefox writes under a banked-out ROM
+  are lost); Business BASIC's dynamic mode off. A hook the fix needs has to live in UE2. `carts.md`
 
 - **50/60 Hz outside the C64.** The C64 runs NTSC since S25; the overlay, the window's redraw and the UDP video
   stream still assume 50 Hz. `c64.md`

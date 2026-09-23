@@ -196,7 +196,12 @@ C64_CARTRIDGE_TYPE (c64.h:125-163). "Done" means implemented after the VHDL and 
 | – | MUS Player Cartridge | 0x01 + UCI `$DFFC` | done (s02) |
 | – | GeoRAM (REU setting "GeoRAM") | 0x1F | implemented (DDR `0x01000000`, unit test); not run. The size mask is taken as 16 MB (REU_SIZE is not passed on) |
 
-## TRX64 API gaps met (and how the bridge works around them)
+## What TRX64's cartridge API does not cover (and how the bridge works around it)
+
+TRX64 supports its own families — Normal 8K/16K/Ultimax, MagicDesk, Ocean, EasyFlash (+XL), GMOD2, GMOD4, MegaByter,
+C64MegaCart, possibly GMOD3 later — and none of them needs items 1-3 and 6 below. Freezers, Atomic Power, Business
+BASIC and Pagefox are out of TRX64's scope (owner decision, 2026-09-23): `CartMapper` stays as it is, and any hook these
+families need lives in UE2. The items are UE2's to carry, not TRX64 gaps.
 
 1. **No PLA re-evaluation after reads or by time.** `pla_config_changed` runs only for `$00/$01` and consumed
    `$DE00-$DFFF` writes (full.rs:237-252, 612-619); I/O reads fall through to the mapper without it (full.rs:486-491).
