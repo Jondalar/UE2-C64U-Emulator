@@ -5,8 +5,12 @@ status files.
 
 ## TRX64 (the C64 core)
 
-- **Cycle-exact stops and DMA.** Needs an API that stops inside an instruction; today stops and DMA land on
-  instruction boundaries and STOP_MODE is latched only. `c64.md`, `carts.md`
+- **Cycle-exact stops and DMA — parked (2026-09-23).** Stops land on instruction boundaries and resume at once;
+  the device stops and releases on the STOP_MODE condition (14 cycles into a badline, a read after a write, or at
+  once; `slot_master_v4.vhd`). VIC and CIAs run through the stop on both, so the only difference is the sub-line
+  phase at resume: code that re-syncs each frame shows at most one bad frame, code that syncs once stays shifted
+  after menu, freeze or DMA load. TRX64: medium change in the cycle core (RDY hold on read cycles, R/W history,
+  BA-low count), needs a device measurement. No program known to break; revisit when one does. `c64.md`, `carts.md`
 - **Cartridge API.** `carts.md` §TRX64 API gaps:
   - EXROM/GAME by address and R/W (`get_lines`); Business BASIC's dynamic mode is off without it.
   - PLA re-evaluation after reads and by time.
