@@ -687,13 +687,18 @@ impl Machine {
         snap
     }
 
+    /// The attached C64's VIC frame counter, or 0 when there is no C64 or its backend does not count frames.
+    pub fn frame_counter(&self) -> u64 {
+        self.bus.io.get::<C64Port>().map_or(0, C64Port::frame_counter)
+    }
+
     /// The UDP stream generators, once per call: a new VIC frame becomes datagrams, and everything waiting goes
     /// back to the caller to put on the wire (S24 §4). Nothing happens while `ETHSTREAM_ENA` has no enabled
     /// stream, so a machine nobody streams from does not build a frame it will not send.
     pub fn stream_pump(&mut self) -> Vec<Vec<u8>> {
         let ena = self.bus.io.get::<devices::u64io::U64Io>().map_or(0, devices::u64io::U64Io::ethstream_ena);
         if ena & 0x01 != 0 {
-            let counter = self.bus.io.get::<C64Port>().map_or(0, C64Port::frame_counter);
+            let counter = self.frame_counter();
             if counter != self.streamed_frame {
                 self.streamed_frame = counter;
                 if let Some(frame) = self.bus.io.get::<C64Port>().and_then(C64Port::frame) {

@@ -60,7 +60,7 @@ Merged from other branches: `usbkey <name> [ms]` (a timed sequence like `key`, `
 
 - **Text:** `<text>` is one word, or a double-quoted string with `\"` and `\\` escapes, e.g.
   `expect "SD      SD Card                Ready" 3000`. Unquoted text with spaces is rejected at parse time.
-- **Timeout:** 5000 ms emulated by default. Checks poll the display snapshot (published every 20 ms emulated) or
+- **Timeout:** 5000 ms emulated by default. Checks poll the display snapshot (published at every VIC picture, or every 20 ms emulated without a C64) or
   the console log with a 1 ms wall-clock sleep between checks. A check that fails at or after the deadline is the
   last one.
 - **Failure:** the screen block (`--- screen ---`) goes to stdout, and the error names the script line. Headless,
