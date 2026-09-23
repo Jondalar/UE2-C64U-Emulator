@@ -56,8 +56,10 @@ status files.
 
 ## Needs a measurement on the device
 
-- **HDMI scan lines.** Accepted and ignored; the video path is in the closed FPGA. `c64.md`
-- **Expansion port timing.** No contention, no PHI2 or address-setup timing; only the DMA byte cost is measured.
-  `cart-slot.md`
-- **Top level.** Capability word, BOARDREV, flash part and the freeze button's matrix position are assumptions.
-  `boot.md`, `carts.md`
+- **HDMI scan lines. Planned once a photo exists:** accepted and ignored today; a cosmetic darkening of every other
+  line in the renderer, matched to a photo of a C64U with scan lines on. `c64.md`
+- **Expansion port timing — dropped.** No contention, no PHI2 or address-setup timing; only the DMA byte cost is
+  measured. It would take a logic analyser on the port, for exotic hardware carts only. `cart-slot.md`
+- **Top level.** Capability word, BOARDREV, flash part and the freeze button's matrix position are assumptions that
+  work. Read what can be read on the C64U (REST, monitor) when the occasion comes; no plan of its own. `boot.md`,
+  `carts.md`
