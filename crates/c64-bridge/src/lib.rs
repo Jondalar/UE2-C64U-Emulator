@@ -213,8 +213,10 @@ pub struct Trx64Backend {
     palette: Palette,
     /// The sockets and UltiSIDs on reSID, the mixer and the sample stream (S17).
     sid: sid::Sid,
-    /// W4-DRIVE: drive A on TRX64's drive 8 (drive.rs).
-    drive: drive::DriveA,
+    /// S27: drives A and B on TRX64's two drive positions (drive.rs).
+    drives: [drive::DriveSlot; 2],
+    /// The drive `C64Backend::drive` handed out last; `C64Drive` calls go to it.
+    drive_sel: usize,
     /// REU: guest DDR at `REU_MEMORY_BASE` as the store TRX64's `Reu` holds (reu.rs, Spec 854).
     reu: ReuRam,
     /// C64_REU_SIZE in KiB, which the next attach takes. The register resets to "111" = 16 MB (c64.rs `CART_REGS`),
@@ -288,7 +290,10 @@ impl Trx64Backend {
         // S17: TRX64's SID write trace, host door and decode table (Spec 855); the machine keeps them across resets.
         let mut sid = sid::Sid::new();
         sid.install(&mut m);
-        let drive = drive::DriveA::new(&mut m);
+        let drives = [
+            drive::DriveSlot::new(&mut m, trx64_core::drive::DrivePosition::A),
+            drive::DriveSlot::new(&mut m, trx64_core::drive::DrivePosition::B),
+        ];
         // S16: the sampler is on the port for the life of the machine, as it is in the FPGA; `C64_SAMPLER_ENABLE`
         // gates the window, not the block's existence. Attaching it before any REU also settles who answers
         // `$DF20-$DFFF`: TRX64's REU mirrors its registers there, the U64's does not.
@@ -315,7 +320,8 @@ impl Trx64Backend {
             speed_prefer: 0x80,
             palette: Palette::default(),
             sid,
-            drive,
+            drives,
+            drive_sel: 0,
             reu: ReuRam::default(),
             reu_size_kb: reu::DEFAULT_SIZE_KB,
             parked_reu: None,
@@ -583,7 +589,9 @@ impl Trx64Backend {
         } else if self.uci_wait.is_none() {
             self.run_cpu(target);
             // W4-DRIVE: note what drive A wrote.
-            self.drive.after_run(&mut self.m);
+            for d in &mut self.drives {
+                d.after_run(&mut self.m);
+            }
         }
     }
 
@@ -650,15 +658,16 @@ impl Trx64Backend {
         // DMA holds the Epyx capacitor while the 6510 is stopped (slot_slave.vhd:126); CARTSLOT: in both cartridges.
         let cart = &self.cart;
         self.slot.with(|s| s.hold_time(cart, clk - start));
-        // W4-DRIVE: `Hold::Cpu` clocked drive 8 already, so only the write-back check is left. `Hold::Reset` leaves
-        // the drive standing and moves its reference along, but on the U64 the drive's own RESET bit 1
-        // (`use_c64_reset`, drive_registers.vhd) decides whether the C64's reset reaches it, so it is clocked here
-        // from the reference the hold skipped, exactly as before.
+        // S27 §2: `Hold::Cpu` clocked both drives already, so only the write-back check is left. `Hold::Reset` leaves
+        // them standing and moves their reference along, but on the U64 each drive's own RESET bit 1
+        // (`use_c64_reset`, drive_registers.vhd) decides whether the C64's reset reaches it, so they are clocked
+        // here from the reference the hold skipped.
         if self.reset_held {
             self.m.drive_c64_ref = drive_ref;
-            self.drive.run_with_chips(&mut self.m);
-        } else {
-            self.drive.after_run(&mut self.m);
+            drive::run_with_chips(&mut self.m);
+        }
+        for d in &mut self.drives {
+            d.after_run(&mut self.m);
         }
     }
 
@@ -857,8 +866,10 @@ impl C64Backend for Trx64Backend {
             // S16: the C64 reset clears the sampler's IRQ latches and nothing else — its register file has no reset
             // branch, which is why the firmware clears the voices in software on every reset (`sampler2.vhd:229-232`).
             self.sampler.with(|s| s.c64_reset());
-            // W4-DRIVE: drive A may follow the C64's reset.
-            self.drive.update(&mut self.m, self.stopped, true);
+            // S27: a drive may follow the C64's reset.
+            for d in &mut self.drives {
+                d.update(&mut self.m, self.stopped, true);
+            }
             // CARTSLOT: the expansion port's RESET line holds the physical cartridge in its reset state, so
             // U64_CART_DETECT shows its boot lines while the firmware decides (c64.cc:1449-1464).
             self.slot.with(|s| s.reset_physical());
@@ -866,8 +877,6 @@ impl C64Backend for Trx64Backend {
             return;
         }
         self.install_cart();
-        // W4-DRIVE: TRX64's warm reset also resets drive 8; drive A's lines decide instead.
-        self.drive.before_c64_reset(&mut self.m);
         // CARTSLOT: TRX64's reset restarts its cycle counter; the physical cartridge's flash timers go on (slot.rs).
         let clk = self.m.c64_core.clk.max(self.m.clk);
         self.slot.with(|s| s.reset_release(clk));
@@ -881,7 +890,10 @@ impl C64Backend for Trx64Backend {
         }
         self.m.clk = self.m.c64_core.clk;
         self.sid.reanchor(self.m.c64_core.clk);
-        self.drive.after_c64_reset(&mut self.m, self.stopped);
+        // S27: the drives' RESET line is cut in TRX64, so `warm_reset` left them alone; their lines decide.
+        for d in &mut self.drives {
+            d.update(&mut self.m, self.stopped, false);
+        }
         self.clock = Some(Clock::new(self.now, self.m.c64_core.clk, self.cpu_hz()));
         self.keys.cleared();
         self.keys.apply(&mut self.m.keyboard);
@@ -896,7 +908,9 @@ impl C64Backend for Trx64Backend {
         self.stopped = stopped;
         self.apply_hold();
         // W4-DRIVE: drive A may stop with the C64.
-        self.drive.update(&mut self.m, stopped, self.reset_held);
+        for d in &mut self.drives {
+            d.update(&mut self.m, stopped, self.reset_held);
+        }
     }
 
     fn set_ultimax(&mut self, on: bool) {
@@ -1168,13 +1182,10 @@ impl C64Backend for Trx64Backend {
         self.sampler.with(|s| s.set_enabled(on));
     }
 
-    // W4-DRIVE: drive A is TRX64's drive 8 (drive.rs); there is no drive B.
+    // S27: drive A is TRX64's position A, drive B position B (drive.rs).
     fn drive(&mut self, unit: u8) -> Option<&mut dyn C64Drive> {
-        if unit == 0 {
-            Some(self)
-        } else {
-            None
-        }
+        self.drive_sel = usize::from(unit);
+        (self.drive_sel < self.drives.len()).then_some(self as &mut dyn C64Drive)
     }
 
     /// CARTSLOT: GAME (bit 0) and EXROM (bit 1) of the physical cartridge, 0x03 without one (slot.rs).

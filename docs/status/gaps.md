@@ -12,12 +12,7 @@ or a need shows up), accepted as a limit, or **dropped**.
   phase at resume: code that re-syncs each frame shows at most one bad frame, code that syncs once stays shifted
   after menu, freeze or DMA load. TRX64: medium change in the cycle core (RDY hold on read cycles, R/W history,
   BA-low count), needs a device measurement. No program known to break; revisit when one does. `c64.md`, `carts.md`
-- **Drives** (owner decision 2026-09-23, TRX64 building):
-  - Spec 870, the drive as a part: on/off (off releases the IEC lines), stopped (§3a: powered, clock frozen — UE2
-    ties it to the freeze via `stop_when_frozen`), own reset, ROM 16/32 K from memory, unit 8-11 (the FPGA's range
-    too; UE2's `$77/$78` patch goes), read access to RAM, motor, LED, track. First.
-  - Spec 871, a second drive on the bus: slots A and B, B off by default. After 870.
-  - 1571 and 1581: TRX64, as their own specs later. Not built in UE2. `drive.md`
+- **Drives:** Specs 870 and 871 are in TRX64 v0.8.8 and UE2 uses them (S27). 1571 and 1581 are TRX64's, later.
 
 ## UE2 (board, firmware side, host)
 

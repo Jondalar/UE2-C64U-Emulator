@@ -17,6 +17,7 @@ pub mod run;
 mod uci;
 
 use c64_bridge::Trx64Backend;
+use trx64_core::drive::DrivePosition;
 use trx64_monitor::host::{CpuView, Device, MonitorHost, Reg};
 use trx64_monitor::{addr_spans, verbs, MonitorSession};
 use ue2_core::devices::c64::C64Port;
@@ -84,8 +85,18 @@ impl MonitorHost for Host<'_> {
         (dev == Device::Host(FW)).then_some(self as &mut dyn CpuView)
     }
 
+    /// The C64, every powered drive by its unit (drives A and B, S27), and the firmware's core.
     fn devices(&mut self) -> Vec<Device> {
-        vec![Device::C64, Device::Drive(8), Device::Host(FW)]
+        let m = self.machine();
+        let mut out = vec![Device::C64];
+        for pos in [DrivePosition::A, DrivePosition::B] {
+            let d = m.drive(pos);
+            if d.powered() {
+                out.push(Device::Drive(d.unit()));
+            }
+        }
+        out.push(Device::Host(FW));
+        out
     }
 
     /// S23 §3: the C64's stop is the machine's own, through `C64_STOP`.
@@ -496,7 +507,7 @@ mod tests {
         let mut st = State::default();
         let mut host = Host::new(&mut m, &mut st).expect("a host");
 
-        assert_eq!(host.devices().len(), 3, "c64, drive8, fw");
+        assert_eq!(host.devices(), vec![Device::C64, Device::Host(FW)], "both drives are off at power-on (S27)");
         assert!(host.cpu(Device::C64).is_none(), "the 6502s are the machine's own");
         let view = host.cpu(Device::Host(FW)).expect("the firmware core");
         assert_eq!(view.addr_bits(), 32);

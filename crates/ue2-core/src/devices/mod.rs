@@ -25,7 +25,6 @@ pub fn install_all(map: &mut IoMap, cfg: &MachineConfig) {
     i2c::install(map, cfg);
     c64::install(map, cfg);
     usb::install(map, cfg);
-    drives::install(map, cfg);
     iec::install(map, cfg);
     misc::install(map, cfg);
     rmii::install(map, cfg);

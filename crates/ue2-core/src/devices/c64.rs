@@ -37,9 +37,11 @@ const CHAR_END: u32 = CHAR + 0xFFF;
 /// EEPROM_BASE 0x1004C000: dirty flag and GMOD2 EEPROM, served by the backend's cartridge (W4-CART).
 const EEPROM: u32 = 0x4_C000;
 const EEPROM_END: u32 = EEPROM + 0xFFF;
-/// W4-DRIVE: drive A (devices/drives.rs), served here so it reaches the backend's drive.
+/// W4-DRIVE, S27: drives A (0x10020000) and B (0x10024000) (devices/drives.rs), served here so they reach the
+/// backend's drives. One window of 0x4000 each.
 const DRIVE_A: u32 = 0x2_0000;
-const DRIVE_A_END: u32 = DRIVE_A + 0x3FFF;
+const DRIVE_WINDOW: u32 = 0x4000;
+const DRIVES_END: u32 = DRIVE_A + 2 * DRIVE_WINDOW - 1;
 /// UCI: `CMD_IF_BASE` 0x10044000, the firmware side of the Ultimate Command Interface (iomap.h:16). Served by the
 /// backend's block when it has one, else by the T0 table [`UCI_T0`] (docs/specs/S15-uci.md).
 const UCI: u32 = 0x4_4000;
@@ -57,7 +59,7 @@ const MIXER_BYTES: u32 = 20;
 
 /// (offset, size) of every [`C64Port`] window.
 const WINDOWS: [(u32, u32); 13] = [
-    (DRIVE_A, 0x4000),
+    (DRIVE_A, 2 * DRIVE_WINDOW),
     (CART, 0x100),
     (DMA, 0x1_0000),
     (MATRIX, 0x100),
@@ -296,8 +298,8 @@ pub struct C64Port {
     joystick: u8,
     /// Host RESTORE key held.
     restore: bool,
-    /// W4-DRIVE: drive A registers; the drive behind them is the backend's (`C64Backend::drive`).
-    drive_a: DriveRegs,
+    /// W4-DRIVE, S27: drive A and B registers; the drives behind them are the backend's (`C64Backend::drive`).
+    drives: [DriveRegs; 2],
     /// CARTSLOT: U64_CART_DETECT, shared with `U64Io` (docs/status/cart-slot.md).
     cart_detect: Option<Arc<AtomicU8>>,
     /// UCI 0x10044000 while the backend has no block of its own (S15).
@@ -330,7 +332,7 @@ impl C64Port {
             ],
             joystick: 0xFF,
             restore: false,
-            drive_a: DriveRegs::new(0),
+            drives: [DriveRegs::new(0), DriveRegs::new(1)],
             cart_detect: None,
             uci: RegTable::new("uci", UCI_T0),
             cart_rom: CartRom::LARGE,
@@ -564,6 +566,12 @@ impl C64Port {
         }
     }
 
+    /// Which drive a window offset belongs to (0 = A, 1 = B) and the offset in its window.
+    fn drive_window_of(off: u32) -> (u8, u32) {
+        let rel = off - DRIVE_A;
+        ((rel / DRIVE_WINDOW) as u8, rel % DRIVE_WINDOW)
+    }
+
     fn rom_window(off: u32) -> (C64Rom, u32) {
         match off {
             BASIC..KERNAL => (C64Rom::Basic, off - BASIC),
@@ -686,15 +694,16 @@ impl IoDevice for C64Port {
                 self.update_uci(ctx);
                 val
             }
-            // W4-DRIVE: drive A.
-            DRIVE_A..=DRIVE_A_END => {
+            // W4-DRIVE, S27: drives A and B.
+            DRIVE_A..=DRIVES_END => {
                 // W4-CART: the sync may run the C64, whose cartridge reads DDR; the lease ends before DriveRegs uses ctx.
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 self.return_ddr();
                 self.update_uci(ctx);
-                let drive = self.backend.as_mut().and_then(|b| b.drive(0));
-                self.drive_a.read(off - DRIVE_A, ctx, drive)
+                let (unit, rel) = Self::drive_window_of(off);
+                let drive = self.backend.as_mut().and_then(|b| b.drive(unit));
+                self.drives[usize::from(unit)].read(rel, ctx, drive)
             }
             _ => self.peek8(off),
         }
@@ -779,15 +788,16 @@ impl IoDevice for C64Port {
                     None => self.roms[rom as usize].set(rel, val),
                 }
             }
-            // W4-DRIVE: drive A.
-            DRIVE_A..=DRIVE_A_END => {
+            // W4-DRIVE, S27: drives A and B.
+            DRIVE_A..=DRIVES_END => {
                 // W4-CART: the sync may run the C64, whose cartridge reads DDR; the lease ends before DriveRegs uses ctx.
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 self.return_ddr();
                 self.update_uci(ctx);
-                let drive = self.backend.as_mut().and_then(|b| b.drive(0));
-                self.drive_a.write(off - DRIVE_A, val, ctx, drive);
+                let (unit, rel) = Self::drive_window_of(off);
+                let drive = self.backend.as_mut().and_then(|b| b.drive(unit));
+                self.drives[usize::from(unit)].write(rel, val, ctx, drive);
             }
             _ => {}
         }
@@ -821,8 +831,11 @@ impl IoDevice for C64Port {
                     None => self.roms[rom as usize].get(rel),
                 }
             }
-            // W4-DRIVE: drive A.
-            DRIVE_A..=DRIVE_A_END => self.drive_a.peek(off - DRIVE_A),
+            // W4-DRIVE, S27: drives A and B.
+            DRIVE_A..=DRIVES_END => {
+                let (unit, rel) = Self::drive_window_of(off);
+                self.drives[usize::from(unit)].peek(rel)
+            }
             // The palette (u64_config.cc:2724-2763) and the mixers (1333-1334) are write-only.
             _ => 0,
         }
@@ -837,9 +850,11 @@ impl IoDevice for C64Port {
         self.sync(ctx.now);
         self.return_ddr();
         self.update_uci(ctx);
-        // W4-DRIVE: carry drive A's writes into DDR.
-        let drive = self.backend.as_mut().and_then(|b| b.drive(0));
-        self.drive_a.tick(ctx, drive);
+        // W4-DRIVE, S27: carry the drives' writes into DDR.
+        for unit in 0..2u8 {
+            let drive = self.backend.as_mut().and_then(|b| b.drive(unit));
+            self.drives[usize::from(unit)].tick(ctx, drive);
+        }
     }
 
     /// Power-on register state; an attached backend stays attached, and keys held on the keyboard stay held. The
