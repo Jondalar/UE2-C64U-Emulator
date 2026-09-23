@@ -20,8 +20,8 @@ ue2-net = { path = "../ue2-net", default-features = false }
 ue2-vfat = { path = "../ue2-vfat" }
 c64-bridge = { path = "../c64-bridge", optional = true }
 # S23: the monitor's verbs as a library, and the machine they run against. Same pin as c64-bridge's trx64-core.
-trx64-core = { git = "https://github.com/Jondalar/TRX64", tag = "v0.8.5", optional = true }
-trx64-monitor = { git = "https://github.com/Jondalar/TRX64", tag = "v0.8.5", optional = true }
+trx64-core = { git = "https://github.com/Jondalar/TRX64", tag = "v0.8.7", optional = true }
+trx64-monitor = { git = "https://github.com/Jondalar/TRX64", tag = "v0.8.7", optional = true }
 # --c64-roms writes into the flash disk's FAT volume (the version ue2-vfat uses).
 fatfs = "0.3.6"
 anyhow = "1"
