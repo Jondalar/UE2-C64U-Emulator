@@ -33,9 +33,6 @@ status files.
 - **ACIA** (the SwiftLink/modem cartridge at `$DE00`/`$DF00`, which the firmware bridges to the network as a Hayes
   modem): not modelled. A cartridge device like the freezers, so UE2's (2026-09-23). **Deferred:** C64 programs reach
   the network through UCI, which is enough for now. `carts.md`
-- **SID socket 2** and the second SID of a dual chip (ARM2SID): their probes find nothing. UltiSID 1 and 2 run on
-  reSID in the bridge already; TRX64 only routes the addresses (Spec 855). Chip 0's OSC3/ENV3 reads come from
-  TRX64's fastsid, not reSID — accepted, not planned. `sid-audio.md`
 - **Audio.** Stereo sink, the mixer registers (`U64_AUDIO_MIXER`, `AUDIO_SEL_BASE`), C64_VOICE_ADSR for the LED
   strip, UltiSID filter curves. `sid-audio.md`, `sampler.md`
 - **Disk surface.** An external surface with a write hook and the firmware's per-track bit time is not TRX64's
