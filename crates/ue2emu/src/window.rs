@@ -168,7 +168,7 @@ impl App {
         };
         let snap = self.ctl.display.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
         self.drawn_ms = Some(snap.now_ms);
-        let (sw, sh) = self.renderer.render(&snap, &mut self.pixels);
+        let (sw, sh) = Renderer::canvas(&snap);
         let image = (sw as u32, sh as u32);
         if image != self.image && sw != 0 && sh != 0 {
             // A new output mode brings a new shape: the minimum and the window follow it.
@@ -182,10 +182,13 @@ impl App {
         if surface.resize(w, h).is_err() {
             return;
         }
+        // Rendered straight at the size it fills, so each C64 pixel is rounded once (as trx64-cli does).
+        let (x0, y0, pw, ph) = place(w.get(), h.get(), image.0, image.1);
+        self.renderer.render_scaled(&snap, &mut self.pixels, (pw as usize, ph as usize));
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
         };
-        blit(&self.pixels, sw, sh, &mut buffer, w.get() as usize, h.get() as usize);
+        put(&self.pixels, (pw, ph), &mut buffer, (w.get(), h.get()), (x0, y0));
         let _ = buffer.present();
     }
 
@@ -417,21 +420,16 @@ fn aspect_snap(w: u32, h: u32, prev: (u32, u32), image: (u32, u32), min: (u32, u
     Some((nw, nh))
 }
 
-/// Nearest-neighbour copy of `src` (`sw`×`sh`) into `dst` (`dw`×`dh`) at [`place`], black elsewhere.
-fn blit(src: &[u32], sw: usize, sh: usize, dst: &mut [u32], dw: usize, dh: usize) {
+/// Copy the `size` image `src` into the `dst_size` surface at `at`, black around it.
+fn put(src: &[u32], size: (u32, u32), dst: &mut [u32], dst_size: (u32, u32), at: (u32, u32)) {
     dst.fill(0);
-    if sw == 0 || sh == 0 || src.len() < sw * sh || dst.len() < dw * dh {
+    let ((w, h), (dw, dh), (x0, y0)) = (size, dst_size, at);
+    let (w, h, dw, x0, y0) = (w as usize, h as usize, dw as usize, x0 as usize, y0 as usize);
+    if src.len() < w * h || dst.len() < dw * dh as usize || x0 + w > dw || y0 + h > dh as usize {
         return;
     }
-    let (x0, y0, w, h) = place(dw as u32, dh as u32, sw as u32, sh as u32);
-    let (x0, y0, w, h) = (x0 as usize, y0 as usize, w as usize, h as usize);
-    let xs: Vec<usize> = (0..w).map(|x| x * sw / w).collect();
-    for y in 0..h {
-        let src_row = &src[(y * sh / h) * sw..][..sw];
-        let dst_row = &mut dst[(y0 + y) * dw + x0..][..w];
-        for (d, &sx) in dst_row.iter_mut().zip(&xs) {
-            *d = src_row[sx];
-        }
+    for (y, row) in src.chunks_exact(w.max(1)).take(h).enumerate() {
+        dst[(y0 + y) * dw + x0..][..w].copy_from_slice(row);
     }
 }
 
@@ -514,20 +512,17 @@ mod tests {
     }
 
     #[test]
-    fn blit_scales_and_letterboxes() {
-        let src = [0x11, 0x22];
-        let mut dst = vec![0xFFu32; 6 * 4];
-        blit(&src, 2, 1, &mut dst, 6, 4);
+    fn put_places_the_image_and_blacks_the_rest() {
+        let mut dst = vec![0xFFu32; 4 * 3];
+        put(&[0x11, 0x22, 0x33, 0x44], (2, 2), &mut dst, (4, 3), (1, 1));
         #[rustfmt::skip]
         let want = [
-            0x11, 0x11, 0x11, 0x22, 0x22, 0x22,
-            0x11, 0x11, 0x11, 0x22, 0x22, 0x22,
-            0x11, 0x11, 0x11, 0x22, 0x22, 0x22,
-            0,    0,    0,    0,    0,    0,
+            0, 0,    0,    0,
+            0, 0x11, 0x22, 0,
+            0, 0x33, 0x44, 0,
         ];
         assert_eq!(dst, want);
-
-        blit(&[], 0, 0, &mut dst, 6, 4);
+        put(&[], (0, 0), &mut dst, (4, 3), (0, 0));
         assert!(dst.iter().all(|&p| p == 0), "no frame yet: black");
     }
 }
