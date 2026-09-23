@@ -42,6 +42,9 @@ pub struct Access {
     pub trace: bool,
     /// Print an unmapped report line (one of the first [`UNMAPPED_REPORT_LIMIT`] hits on `addr`).
     pub unmapped: bool,
+    /// Emulated clock of the access (100 MHz ticks). Two lines of the IO trace are only comparable in time
+    /// through this: the firmware's order says nothing about how far apart two writes are.
+    pub now: u64,
 }
 
 /// Unmapped access counts of one address, for the summary at the end of a run.
@@ -234,7 +237,7 @@ impl SystemBus {
         }
         let trace = io && self.trace_io;
         if trace || unmapped {
-            self.accesses.push(Access { write, addr, val, pc: self.pc, trace, unmapped });
+            self.accesses.push(Access { write, addr, val, pc: self.pc, trace, unmapped, now: self.now });
         }
     }
 
@@ -466,7 +469,7 @@ mod tests {
         bus.write8(0x8000_0004, 0x5A);
         assert_eq!(bus.accesses.len(), 5);
         assert!(bus.accesses.iter().all(|a| a.unmapped && !a.trace && a.pc == 0x1234));
-        assert_eq!(bus.accesses[4], Access { write: true, addr: 0x8000_0004, val: 0x5A, pc: 0x1234, trace: false, unmapped: true });
+        assert_eq!(bus.accesses[4], Access { write: true, addr: 0x8000_0004, val: 0x5A, pc: 0x1234, trace: false, unmapped: true, now: bus.now });
         assert_eq!(bus.unmapped[&0x10FF_0010], UnmappedCount { reads: 6, writes: 0 });
         assert_eq!(bus.unmapped[&0x8000_0004], UnmappedCount { reads: 0, writes: 1 });
     }
