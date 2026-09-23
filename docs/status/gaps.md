@@ -24,7 +24,8 @@ status files.
   timers; a replicated NMI check to switch a freezer in before the vector (an IRQ-first freeze runs one KERNAL
   instruction); cart RAM written only while its window is mapped (AR/RR/SS5/Pagefox writes under a banked-out ROM
   are lost); Business BASIC's dynamic mode off. A hook the fix needs has to live in UE2. `carts.md`
-
+  **Planned:** the lost RAM writes — an observer hands every `$8000-$BFFF`/`$E000-$FFFF` write to the cart logic
+  while one of these carts is in.
 - **50/60 Hz outside the C64.** The C64 runs NTSC since S25; the overlay, the window's redraw and the UDP video
   stream still assume 50 Hz. `c64.md`
 - **ACIA** (the SwiftLink/modem cartridge at `$DE00`/`$DF00`, which the firmware bridges to the network as a Hayes
