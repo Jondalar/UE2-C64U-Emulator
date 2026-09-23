@@ -1178,6 +1178,24 @@ impl Slot {
         internal || external || (l.exrom, l.game) == (1, 0)
     }
 
+    /// Whether a cartridge on either side writes its RAM by address alone (S28).
+    pub fn writes_ram_by_address(&self, cart: &CartHandle) -> bool {
+        let logic = |p: &PhysicalCart| matches!(&p.device, Device::Logic(c) if c.logic.writes_ram_by_address());
+        cart.with(|c| c.writes_ram_by_address()) || self.physical.as_ref().is_some_and(logic)
+    }
+
+    /// A write to `$8000-$BFFF` whatever the PLA maps, for each side that takes part in ROM-window accesses (S28).
+    pub fn snoop_ram_write(&mut self, cart: &CartHandle, addr: u16, val: u8) {
+        if serves(self.bus_internal, addr) {
+            cart.with(|c| c.snoop_ram_write(addr, val));
+        }
+        if let Some(p) = self.physical.as_mut().filter(|_| serves(self.bus_external, addr)) {
+            if let Device::Logic(c) = &mut p.device {
+                c.logic.snoop_ram_write(addr, val);
+            }
+        }
+    }
+
     /// The C64's RESET line reaches both cartridges.
     pub fn reset(&mut self, cart: &CartHandle) {
         cart.with(CartLogic::reset_line);

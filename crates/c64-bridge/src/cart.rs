@@ -21,6 +21,7 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use trx64_core::cart::{BankInfo, CartLines, CartMapper, CartState, MapperType};
+use trx64_core::expansion::{Access, ExpansionDevice};
 use ue2_core::c64host::CartRom;
 
 use crate::cart_eeprom::Eeprom;
@@ -374,6 +375,21 @@ impl CartLogic {
             }
         }
         data
+    }
+
+    /// Whether the logic writes its RAM in `$8000-$BFFF` by address alone: Action/Retro Replay, SS5 and Pagefox
+    /// (all_carts_v5.vhd:688-756; S28).
+    pub fn writes_ram_by_address(&self) -> bool {
+        matches!(self.logic, ACTION | SS5 | PAGEFOX)
+    }
+
+    /// A write to `$8000-$BFFF` whatever the PLA maps there: the FPGA writes cart RAM where `allow_write` says so, with
+    /// no look at the lines (slot_slave.vhd:183-199; S28).
+    pub fn snoop_ram_write(&mut self, addr: u16, val: u8) {
+        if let (Map::Ram, true) = self.map(addr) {
+            let off = self.offset(addr, Map::Ram, 0);
+            self.ddr_write(off, val);
+        }
     }
 
     /// A 6510 write in a ROM window or `$DE00-$DFFF`. Returns whether the C64 RAM underneath stays unwritten: always
@@ -893,6 +909,40 @@ impl CartProxy {
     }
 }
 
+/// S28: the port device that hands every write to `$8000-$BFFF` to the cartridge RAM, banked in or not. On the port
+/// only while a cartridge that needs it is in (`Trx64Backend::install_cart`).
+pub struct RamSnoop {
+    cart: CartHandle,
+    slot: SlotHandle,
+    addrs: Vec<u16>,
+}
+
+impl RamSnoop {
+    pub fn new(cart: CartHandle, slot: SlotHandle) -> Self {
+        RamSnoop { cart, slot, addrs: (0x8000..0xC000).collect() }
+    }
+}
+
+impl ExpansionDevice for RamSnoop {
+    fn read(&mut self, _: Access, _: Option<u8>) -> Option<u8> {
+        None
+    }
+
+    fn peek(&self, _: u16, _: Option<u8>) -> Option<u8> {
+        None
+    }
+
+    fn write(&mut self, _: Access, _: u8) {}
+
+    fn snoop_addresses(&self) -> &[u16] {
+        &self.addrs
+    }
+
+    fn snoop_write(&mut self, a: Access, value: u8) {
+        self.slot.with(|s| s.snoop_ram_write(&self.cart, a.addr, value));
+    }
+}
+
 impl CartMapper for CartProxy {
     fn mapper_type(&self) -> MapperType {
         match self.get_lines() {
@@ -1104,6 +1154,30 @@ pub(crate) mod tests {
         assert!(fc3.nmi(), "bit 6 low holds NMI");
         fc3.bus_write(0xDFFF, 0x80 | 0x40, 0, false);
         assert!(!fc3.active());
+    }
+
+    #[test]
+    fn snooped_writes_reach_cart_ram_whatever_the_lines() {
+        let mut ddr = ddr();
+        let mut ar = logic(0x1B, &mut ddr);
+        ar.snoop_ram_write(0x8010, 0x11);
+        ar.bus_write(0xDE00, 0x20, 0, false);
+        ar.snoop_ram_write(0x8011, 0x22);
+        ar.snoop_ram_write(0xA011, 0x23);
+        let mut ss5 = logic(0x1A, &mut ddr);
+        ss5.bus_write(0xDE00, 0x01, 0, false);
+        ss5.snoop_ram_write(0x8020, 0x33);
+        ss5.bus_write(0xDE00, 0x00, 0, false);
+        ss5.snoop_ram_write(0x8021, 0x44);
+        let mut pagefox = logic(0x10, &mut ddr);
+        pagefox.bus_write(0xDE80, 0x18, 0, false);
+        assert_eq!(lines(&pagefox), (1, 1), "lines off, RAM still written");
+        pagefox.snoop_ram_write(0xA030, 0x55);
+        pagefox.snoop_ram_write(0xC030, 0x66);
+        pagefox.set_ddr(None);
+        assert_eq!([ddr[RAM_BASE + 0x10], ddr[RAM_BASE + 0x11], ddr[RAM_BASE + 0x11 + 0x2000]], [0, 0x22, 0]);
+        assert_eq!([ddr[RAM_BASE + 0x20], ddr[RAM_BASE + 0x21]], [0, 0x44], "SS5 RAM in mode 00 only");
+        assert_eq!([ddr[RAM_BASE + 0x2030], ddr[RAM_BASE + 0x0030]], [0x55, 0], "Pagefox $A000 half, not $C000");
     }
 
     #[test]
