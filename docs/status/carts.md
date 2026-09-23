@@ -223,9 +223,11 @@ families need lives in UE2. The items are UE2's to carry, not TRX64 gaps.
 5. ~~**The VIC view has no cartridge ROM**: ULTIMAX carts that serve the VIC (`serve_vic`: CART_TYPE_UMAX, FC3 mode
    10, KCS) showed RAM instead of ROMH at VIC `$3000/$7000/$B000/$F000`.~~ **Closed by TRX64 v0.8.5:**
    `CartMapper::vic_romh`, which the bridge answers for both cartridges (`cart.rs`, `slot.rs`).
-6. **Cartridge writes only in mapped windows.** FullBus calls `CartMapper::write` for `$8000-$BFFF`/`$E000-$FFFF` only
-   when the PLA maps the window (full.rs:803-840); the FPGA writes cart RAM by address alone (slot_slave.vhd:185-199).
-   AR/RR/SS5/Pagefox RAM writes with the ROM window banked out are missed.
+6. ~~**Cartridge writes only in mapped windows.** FullBus calls `CartMapper::write` for `$8000-$BFFF`/`$E000-$FFFF`
+   only when the PLA maps the window (full.rs:1100-1133); the FPGA writes cart RAM by address alone
+   (slot_slave.vhd:183-199).~~ **Closed in UE2 by S28:** while an AR/RR, SS5 or Pagefox logic is in, `cart::RamSnoop`
+   sits on the expansion port and snoops `$8000-$BFFF` (Spec 850's `snoop_write`), so every write cycle reaches the
+   cart RAM where `allow_write` says so (docs/specs/S28-cart-ram-writes.md).
 
 ## Known gaps
 

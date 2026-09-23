@@ -191,6 +191,8 @@ pub struct Trx64Backend {
     videoformat_noted: bool,
     stopped: bool,
     reset_held: bool,
+    /// S28: `cart::RamSnoop` is on the port.
+    ram_snoop: bool,
     ultimax: bool,
     /// The cartridge logic, shared with the mapper TRX64 holds (cart.rs).
     cart: CartHandle,
@@ -308,6 +310,7 @@ impl Trx64Backend {
             videoformat_noted: false,
             stopped: false,
             reset_held: false,
+            ram_snoop: false,
             ultimax: false,
             cart: CartHandle::default(),
             slot: SlotHandle::default(),
@@ -405,6 +408,16 @@ impl Trx64Backend {
         self.m.cartridge = attached.then(|| {
             Box::new(CartProxy::with_slot(self.cart.clone(), self.slot.clone(), self.ultimax)) as Box<dyn CartMapper>
         });
+        // S28: cart RAM that the FPGA writes by address alone hears every write to $8000-$BFFF.
+        let snoop = self.slot.with(|s| s.writes_ram_by_address(&self.cart));
+        if snoop != self.ram_snoop {
+            self.ram_snoop = snoop;
+            if snoop {
+                self.m.attach_expansion_also(Box::new(cart::RamSnoop::new(self.cart.clone(), self.slot.clone())));
+            } else {
+                self.m.detach_expansion_device::<cart::RamSnoop>();
+            }
+        }
         self.update_pla();
     }
 
@@ -1523,6 +1536,28 @@ mod tests {
     }
 
     const CART_ROM: usize = 0x03C0_0000;
+
+    /// S28: an Action Replay in RAM mode keeps its RAM written with ROML banked out, as the FPGA does.
+    #[test]
+    fn cart_ram_takes_writes_with_its_window_banked_out() {
+        const CART_RAM: usize = 0x00EF_0000;
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        let mut ddr = ddr();
+        c64.lend_ddr(Some(&mut ddr));
+        c64.set_reset(true);
+        c64.set_cart(0x1B, &[]);
+        assert!(c64.ram_snoop);
+        c64.dma_write(0xDE00, 0x20, false);
+        c64.dma_write(0x0001, 0x35, false);
+        assert!(!c64.m.memconfig.ultimax && c64.dma_read(0x8123, false) == c64.m.ram[0x8123], "ROML banked out");
+        c64.dma_write(0x8123, 0x5A, false);
+        assert_eq!(c64.m.ram[0x8123], 0x5A, "C64 RAM underneath");
+        c64.set_cart(0x41, &[]);
+        assert!(!c64.ram_snoop, "a normal cartridge takes the snoop off");
+        c64.dma_write(0x8124, 0x6B, false);
+        c64.lend_ddr(None);
+        assert_eq!([ddr[CART_RAM + 0x123], ddr[CART_RAM + 0x124]], [0x5A, 0]);
+    }
 
     #[test]
     fn boot_cart_runs_and_kills_itself() {

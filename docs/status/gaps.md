@@ -19,10 +19,8 @@ or a need shows up), accepted as a limit, or **dropped**.
 - **Cartridges beyond TRX64's families** (freezers, Atomic Power, Business BASIC, Pagefox). TRX64 keeps `CartMapper`
   as it is (2026-09-23), so these stay on the bridge's workarounds: PLA recompute after line-changing reads and on
   timers; a replicated NMI check to switch a freezer in before the vector (an IRQ-first freeze runs one KERNAL
-  instruction); cart RAM written only while its window is mapped (AR/RR/SS5/Pagefox writes under a banked-out ROM
-  are lost); Business BASIC's dynamic mode off. A hook the fix needs has to live in UE2. `carts.md`
-  **Planned:** the lost RAM writes — an observer hands every `$8000-$BFFF`/`$E000-$FFFF` write to the cart logic
-  while one of these carts is in.
+  instruction); Business BASIC's dynamic mode off. A hook the fix needs has to live in UE2. Cart RAM under a
+  banked-out window takes its writes since S28 (TRX64's port snoop). `carts.md`
 - **UDP video stream under NTSC.** The window shows every VIC picture under PAL and NTSC since S26; the UDP video
   stream's framing still assumes PAL. `c64.md`
 - **ACIA** (the SwiftLink/modem cartridge at `$DE00`/`$DF00`, which the firmware bridges to the network as a Hayes
