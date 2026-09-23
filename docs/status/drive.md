@@ -112,9 +112,11 @@ Writing back binary track 18...
   surfaces from DDR; register writes drive the lines with the ROM image; drive writes reach DDR and DIRTY (track, not
   half-track), write busy lasts 2047 ms, MAN_WRITE restarts it and the drive reset clears it; a dark sensor keeps the
   disk unchanged; the drive RAM is mirrored while powered.
-- c64-bridge `drive` (skips without `UE2_FIRMWARE`): an unpowered or held drive is parked and, unpowered, off the IEC
-  bus, and each of RESET bits 0-2 holds or releases it; the 1541 DOS lists, loads and runs a D64 surface and saves a
-  file whose directory entry and block decode back from the written GCR; HW_ADDR 1 moves the DOS to device 9.
+- c64-bridge `drive` (skips without `UE2_FIRMWARE`), on TRX64 0.8.8's drive part (S27): an unpowered drive is off
+  the IEC bus and not clocked, held in reset it is off the bus too, stopped (RESET bit 2 with the C64 frozen) it stays
+  on the bus unclocked, and each of RESET bits 0-2 holds or releases it; the 1541 DOS lists, loads and runs a D64
+  surface and saves a file whose directory entry and block decode back from the written GCR; HW_ADDR 1 is unit 9;
+  drive B at unit 9 lists its own disk while drive A, off, gives DEVICE NOT PRESENT.
 
 ## Performance
 
@@ -136,42 +138,30 @@ runs without ROM and is not connected); after = this branch. MIPS is the last 50
 
 ## TRX64 API gaps
 
-At TRX64 `a448229` (paths relative to `crates/trx64-core/src/`). Each is worked around in `c64-bridge/src/drive.rs`.
+Items 1-5 and 9 of the list kept here until 0.4.5 are closed by TRX64 v0.8.8 (Specs 870/871) and the bridge uses the
+drive part instead (docs/specs/S27-drives-870.md): power, reset held, stopped, the C64's RESET line (cut in TRX64, the
+bridge drives the level), ROM from memory (the whole 32 K), unit 8-11 (the FPGA's range too), and read access to RAM
+and ports. Open, and not TRX64's (2026-09-23):
 
-1. **No held or powered-off drive.** The run loop clocks drive 8 after every C64 instruction (lib.rs:2165-2174) and on
-   every `$DD00` access (full.rs:337-352); `Drive1541::run_cycles` runs whenever a reset is pending, whatever the clock
-   (drive.rs:803), and `stop_clk` is private (drive.rs:443; `pub(crate)` accessors drive.rs:962-969). Workaround: the
-   real drive leaves `Machine::drive8` for a stand-in parked at a clock the catch-up never reaches.
-2. **No drive power on the IEC bus.** Drive 8's port output is folded in unconditionally (lib.rs:2174,
-   iec.rs:390-402); only the IEC status bits select the no-drive callbacks (iec.rs:645-667, 674-699). They live in
-   thread-local arrays (iec.rs:867-874), and `Machine::cold_reset` builds a new `IecCore` with drive 8 on (lib.rs:1015).
-   Workaround: set TRUEDRIVE/DRIVETYPE for unit 8 on each power change and after every C64 reset.
-3. **ROM only from a file.** `Drive1541::rom` is private (drive.rs:401); `load_rom` reads a file of exactly 16 K into
-   $C000-$FFFF (drive.rs:568-576), so $8000-$BFFF stays zero. Workaround: a file in a private temporary directory.
-   Gap: 32 K 1541 ROM images (e.g. with an $8000 extension) lose their lower half.
-4. **Device jumpers fixed at 8.** The VIA1 backend is built with `number: 0` (drive.rs:146-148;
-   driveid viacore.rs:2508-2509). Workaround: HW_ADDR is patched into $77/$78 after the DOS's reset has set them.
-5. **The C64's warm reset resets drive 8** and re-attaches only `Drive1541::disk` (lib.rs:1074-1084). Workaround:
-   the real drive steps out around `Machine::warm_reset`; RESET bit 1 decides.
-6. **No external disk surface or write hook.** `attach_disk` takes D64/G64 file bytes (drive.rs:852-869) and adds an
-   attach delay during which write protect reads set (rotation.rs:1143, 1240-1245). Writes land in `rotation.image`
-   with one dirty flag that a head step clears without a write-back target (rotation.rs:372-377, 1036-1063).
-   Workaround: set the `rotation` fields directly; find written tracks by polling the head, the write mode and the
-   dirty half-track, and compare bytes.
-7. **Bit rate from the speed zone.** The simple engine clocks bits by the VIA2 speed zone (rotation.rs:790-814), not
-   by the firmware's per-track bit time (param word 1 bits 25:16, floppy_stream.vhd:50-66). Standard GCR from D64
-   conversion matches; a G64 track whose length differs from its zone's wraps at a different rate than on hardware.
-8. **1541 only:** one side, 84 half-tracks (gcr.rs:81), no 1571 VIA/CIA or 1581 WD177x.
-9. **No accessors** for VIA2 port state (motor) other than `drive_peek` (drive.rs:1030-1058) and for the RAM other
-   than per byte (`snapshot_ram` is `pub(crate)`, drive.rs:952).
+1. **No external disk surface or write hook.** The firmware's GCR goes into `rotation.image`; every drive reset
+   builds a new rotation model and re-mounts only TRX64's own disk, so the bridge holds the surface across the calls
+   that may reset. Written tracks are found by polling the head, the write mode and the dirty half-track.
+2. **Bit rate from the speed zone**, not the firmware's per-track bit time (param word 1 bits 25:16,
+   floppy_stream.vhd:50-66): a G64 track whose length differs from its zone's wraps at a different rate. Accepted.
+3. **1541 only:** 1571 and 1581 are TRX64's, later.
+4. **A new ROM comes into force at power-on only** (870 §4). The firmware changes the ROM with a reset
+   (c1541.cc:945, 1132); the bridge turns that reset into off-and-on.
 
 ## Known gaps
 
 - **1571/1581:** DRIVETYPE 1/2 keeps drive A off with a one-time notice; MFM tracks, the WD177x path and side 1 are
   not modelled. Extra RAM (RAMMAP bit 7), DISKCHANGE/force ready and the drive sounds are latched only.
-- **Drive B** has registers only. The IEC processor (SoftIEC, printer, UltiCopy) is still T0.
-- **Held drive:** a drive in reset releases the bus lines (the FPGA drive pulls CLK and DATA while its VIA is reset),
-  and ATN edges while it is held are not seen.
+- **Drive B** runs as TRX64's position B (S27), but the firmware only builds it when the capability word has
+  `CAPAB_DRIVE_1541_2` (bit 2, c1541.cc:1263); the default word lacks it, so it takes `--caps 35640226` today.
+  Checked with it: Drive B Settings enabled, `drive.d64` mounted over REST, `LOAD"$",9` and `LIST` show the directory.
+  The IEC processor (SoftIEC, printer, UltiCopy) is still T0.
+- **Held drive:** a drive in reset releases the bus lines (TRX64 leaves Conf0, 870 §10), where the FPGA drive pulls
+  CLK and DATA while its VIA is reset.
 - **Written-track detection** runs at every C64 sync (1 ms, and every DMA or cart register access): a write followed
   by two head steps within one sync period would be missed. The 1541 DOS steps from its 10 ms IRQ.
 - **Write busy** starts when a sync sees the drive writing, not at the first written bit.

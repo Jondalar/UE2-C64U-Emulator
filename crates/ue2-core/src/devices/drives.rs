@@ -1,18 +1,17 @@
 //! Drive windows: registers, DIRTY flags, param RAM and WD177x ([`DriveRegs`]). Registers:
 //! docs/hw/11-drives-iec-periph.md §Drive A.
 //!
-//! Drive A is T1 (docs/specs/S14-c64-trx64.md §W4-DRIVE): `devices::c64::C64Port` serves its window, so each access
-//! reaches the drive of the attached C64 backend (`C64Backend::drive`). The firmware stays the owner of the disk: the
-//! drive gets the GCR bytes the param RAM points at, and what it writes goes back into that DDR with the DIRTY bits
-//! set, as floppy.vhd does. Without a backend, and for drive B (mapped here), the same registers have no drive
-//! behind them, which reads as the T0 stub of docs/specs/S04-board-t0.md.
+//! Drives A and B are T1 (docs/specs/S14-c64-trx64.md §W4-DRIVE, S27): `devices::c64::C64Port` serves both windows,
+//! so each access reaches the drive of the attached C64 backend (`C64Backend::drive`). The firmware stays the owner of
+//! the disk: the drive gets the GCR bytes the param RAM points at, and what it writes goes back into that DDR with the
+//! DIRTY bits set, as floppy.vhd does. Without a backend the same registers have no drive behind them, which reads as
+//! the T0 stub of docs/specs/S04-board-t0.md.
 
 use std::ops::Range;
 
 use crate::c64host::{C64Drive, DriveLines, DriveStatus, DRIVE_HALF_TRACKS};
 use crate::devices::board::{at, Reg, RegTable, Span};
-use crate::io::{IoCtx, IoDevice, IoMap};
-use crate::machine::MachineConfig;
+use crate::io::IoCtx;
 use crate::time::CLOCKS_PER_MS;
 
 /// Drive window parts, split on address bits 12:11 (mm_drive.vhd:142-160). Above 0x1FFF reads 0 (11 OQ4).
@@ -284,40 +283,6 @@ fn bits(mut mask: u128) -> impl Iterator<Item = usize> {
     })
 }
 
-/// Drive B: registers without a drive (T0).
-impl IoDevice for DriveRegs {
-    fn name(&self) -> &'static str {
-        if self.unit == 0 {
-            "drive-a"
-        } else {
-            "drive-b"
-        }
-    }
-
-    fn read8(&mut self, off: u32, ctx: &mut IoCtx) -> u8 {
-        self.read(off, ctx, None)
-    }
-
-    fn write8(&mut self, off: u32, val: u8, ctx: &mut IoCtx) {
-        self.write(off, val, ctx, None);
-    }
-
-    fn peek8(&self, off: u32) -> u8 {
-        self.peek(off)
-    }
-
-    fn reset(&mut self) {
-        *self = DriveRegs::new(self.unit);
-    }
-
-    crate::impl_as_any!();
-}
-
-/// Drive B at 0x10024000. Drive A (0x10020000) is mapped by `devices::c64::install` as part of `C64Port`.
-pub fn install(map: &mut IoMap, _cfg: &MachineConfig) {
-    map.add(0x1002_4000, 0x4000, Box::new(DriveRegs::new(1)));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,10 +292,7 @@ mod tests {
 
     #[test]
     fn c28_wd177x_idle() {
-        let mut rig = Rig::new(|map, cfg| {
-            crate::devices::c64::install(map, cfg);
-            install(map, cfg);
-        });
+        let mut rig = Rig::new(crate::devices::c64::install);
         for base in [0x1002_0000, 0x1002_4000] {
             // C1541 ctor (c1541.cc:119-123).
             rig.w8(base + 0x0D, 0x02);

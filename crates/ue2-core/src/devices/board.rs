@@ -314,7 +314,7 @@ mod tests {
     use super::rig::{cfg, Rig};
     use crate::machine::MachineConfig;
     use super::*;
-    use crate::devices::{c64, drives, i2c, iec, install_all, misc, rmii, usb};
+    use crate::devices::{c64, i2c, iec, install_all, misc, rmii, usb};
 
     #[test]
     fn m1_boardrev_independent() {
@@ -406,8 +406,8 @@ mod tests {
     #[test]
     fn s04_leaves_foreign_windows_free() {
         let mut map = IoMap::new();
-        let installs: [fn(&mut IoMap, &MachineConfig); 8] =
-            [install, i2c::install, c64::install, usb::install, drives::install, iec::install, misc::install, rmii::install];
+        let installs: [fn(&mut IoMap, &MachineConfig); 7] =
+            [install, i2c::install, c64::install, usb::install, iec::install, misc::install, rmii::install];
         for install in installs {
             install(&mut map, &cfg());
         }
