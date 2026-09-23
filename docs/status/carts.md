@@ -215,9 +215,9 @@ C64_CARTRIDGE_TYPE (c64.h:125-163). "Done" means implemented after the VHDL and 
    NMI.~~ **Closed by TRX64 Spec 850:** `INT_SRC_EXPANSION` is a fifth source, driven per cycle from the port and
    from the host's `Machine::set_expansion_lines`. The bridge puts both cartridges' IRQ and NMI there, and RESTORE
    has source 3 to itself again (docs/specs/S15-uci.md §3.4).
-5. **The VIC view has no cartridge ROM** (`VicMemView`, vic.rs; lib.rs:2091-2126 builds it from RAM, CHARGEN, colour
-   RAM): ULTIMAX carts that serve the VIC (`serve_vic`: CART_TYPE_UMAX, FC3 mode 10, KCS) show RAM instead of ROMH at
-   VIC `$3000/$7000/$B000/$F000`.
+5. ~~**The VIC view has no cartridge ROM**: ULTIMAX carts that serve the VIC (`serve_vic`: CART_TYPE_UMAX, FC3 mode
+   10, KCS) showed RAM instead of ROMH at VIC `$3000/$7000/$B000/$F000`.~~ **Closed by TRX64 v0.8.5:**
+   `CartMapper::vic_romh`, which the bridge answers for both cartridges (`cart.rs`, `slot.rs`).
 6. **Cartridge writes only in mapped windows.** FullBus calls `CartMapper::write` for `$8000-$BFFF`/`$E000-$FFFF` only
    when the PLA maps the window (full.rs:803-840); the FPGA writes cart RAM by address alone (slot_slave.vhd:185-199).
    AR/RR/SS5/Pagefox RAM writes with the ROM window banked out are missed.
