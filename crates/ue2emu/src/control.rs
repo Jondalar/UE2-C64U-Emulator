@@ -10,6 +10,9 @@
 //! | `key <name> [ms]` | Hold a key (`keymap::key_by_name`), default 80 ms, then a 40 ms release gap. |
 //! | `type <text>` | Type the text after the separating space, one key at a time (`keymap::key_for_char`). |
 //! | `usbkey <name> [ms]` | Hold a key of the USB keyboard (`usb::usage_by_name`), default 80 ms, then the release gap. |
+//! | `joy <port> <dirs> [ms]` | Hold the physical joystick on C64 control port 1 or 2, default 80 ms, then the release gap (S36). `<dirs>` is `up`, `down`, `left`, `right`, `fire` joined by `+`; `joy <port> none` releases the port. |
+//! | `joy-hold <port> <dirs>` | Hold exactly these directions on the port until the next `joy*` for it. |
+//! | `joy-release <port>` | Release the port. |
 //! | `screen` | Print `render::text_dump` between `--- screen ---` markers. |
 //! | `c64screen` | Print `render::c64_text_dump`, the C64 text screen, between `--- c64 ---` markers (docs/specs/S14-c64-trx64.md §9). |
 //! | `png <path>` | Render the current snapshot to an RGB PNG (parent directories created). |
@@ -29,7 +32,7 @@
 //! RUN/STOP still matches. `expect-console` sees the firmware console since power-on; each match moves its
 //! start past the matched text, so two `expect-console` lines need two occurrences, in order.
 //!
-//! `button`, `key`, `type` and `usbkey` reach the emulation thread as one [`TimedInputs`] sequence that
+//! `button`, `key`, `type`, `usbkey` and `joy` reach the emulation thread as one [`TimedInputs`] sequence that
 //! [`InputTimeline`] applies at exact emulated times. Host speed (`--speed max`) and host scheduling can
 //! neither stretch a hold into key repeat (keyboard_c64.cc:286-293) or a long button press (docs/hw/05
 //! hazard 6), nor shorten it below a keyboard scan.
@@ -96,6 +99,10 @@ pub enum ControlCmd {
     Type(Vec<MatrixKey>),
     /// HID usage and hold time.
     UsbKey(u8, u64),
+    /// S36: `joy <port> <dirs> [ms]`: port, active-low lines, hold time.
+    Joy(u8, u8, u64),
+    /// S36: `joy-hold`, `joy-release` and `joy <port> none`: the port's lines until the next change.
+    JoySet(u8, u8),
     /// S32: `usbmouse <dx> <dy> [buttons]`: move the USB mouse and set its buttons (bit 0 left, 1 right, 2 middle).
     UsbMouse(i32, i32, u8),
     Screen,
@@ -170,6 +177,31 @@ pub fn keys_by_names(names: &str) -> Result<Vec<MatrixKey>, String> {
         .collect()
 }
 
+/// Joystick directions named `up+fire` as active-low port lines (bit 0 up, 1 down, 2 left, 3 right, 4 fire);
+/// `none` is 0xFF.
+pub fn joy_lines_by_names(names: &str) -> Result<u8, String> {
+    if names == "none" {
+        return Ok(0xFF);
+    }
+    names.split('+').try_fold(0xFF, |lines, name| {
+        let bit = match name.to_ascii_lowercase().as_str() {
+            "up" => 0,
+            "down" => 1,
+            "left" => 2,
+            "right" => 3,
+            "fire" => 4,
+            _ => return Err(format!("unknown joystick direction '{name}' (up, down, left, right, fire, none)")),
+        };
+        Ok(lines & !(1u8 << bit))
+    })
+}
+
+/// A C64 control port number, 1 or 2.
+fn joy_port(arg: &str) -> Result<u8, String> {
+    let valid = arg.parse::<u8>().ok().filter(|p| (1..=2).contains(p));
+    valid.ok_or_else(|| format!("'{arg}' is not a control port (1 or 2)"))
+}
+
 /// Parse one line. `Ok(None)` for blank and comment lines.
 pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
     let body = line.trim_end().trim_start();
@@ -227,6 +259,23 @@ pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
             arity(1, 2)?;
             let usage = usb::usage_by_name(args[0]).ok_or_else(|| format!("unknown USB key '{}'", args[0]))?;
             ControlCmd::UsbKey(usage, ms(1, KEY_MS)?)
+        }
+        "joy" => {
+            arity(2, 3)?;
+            let (port, lines) = (joy_port(args[0])?, joy_lines_by_names(args[1])?);
+            match (lines, args.len()) {
+                (0xFF, 2) => ControlCmd::JoySet(port, lines),
+                (0xFF, _) => return Err("'joy <port> none' takes no hold time".into()),
+                _ => ControlCmd::Joy(port, lines, ms(2, KEY_MS)?),
+            }
+        }
+        "joy-hold" => {
+            arity(2, 2)?;
+            ControlCmd::JoySet(joy_port(args[0])?, joy_lines_by_names(args[1])?)
+        }
+        "joy-release" => {
+            arity(1, 1)?;
+            ControlCmd::JoySet(joy_port(args[0])?, 0xFF)
         }
         "usbmouse" => {
             arity(2, 3)?;
@@ -393,6 +442,17 @@ pub fn execute(t: &mut dyn Target, cmd: &ControlCmd, out: &mut dyn Write) -> Res
             }
             t.inputs(seq)?;
         }
+        ControlCmd::Joy(port, lines, ms) => t.inputs(TimedInputs {
+            events: vec![
+                (0, HostInput::JoystickPort { port: *port, lines: *lines }),
+                (*ms, HostInput::JoystickPort { port: *port, lines: 0xFF }),
+            ],
+            len_ms: *ms + RELEASE_MS,
+        })?,
+        ControlCmd::JoySet(port, lines) => t.inputs(TimedInputs {
+            events: vec![(0, HostInput::JoystickPort { port: *port, lines: *lines })],
+            len_ms: 0,
+        })?,
         ControlCmd::UsbMouse(dx, dy, buttons) => t.inputs(TimedInputs {
             events: vec![(0, HostInput::UsbMouse { dx: *dx, dy: *dy, wheel: 0, buttons: *buttons })],
             len_ms: 0,
@@ -1190,6 +1250,60 @@ mod tests {
             ]
         );
         assert_eq!(fake.now, 360);
+    }
+
+    /// S36: `joy`, `joy-hold`, `joy-release`.
+    #[test]
+    fn joy_parses_ports_and_directions() {
+        use ControlCmd::*;
+        let ok = |l: &str| parse_line(l).unwrap();
+        assert_eq!(ok("joy 2 up+fire 50"), Some(Joy(2, 0xEE, 50)));
+        assert_eq!(ok("joy 1 down"), Some(Joy(1, 0xFD, KEY_MS)));
+        assert_eq!(ok("joy 1 Left+RIGHT+left"), Some(Joy(1, 0xF3, KEY_MS)));
+        assert_eq!(ok("joy 2 none"), Some(JoySet(2, 0xFF)));
+        assert_eq!(ok("joy-hold 2 fire"), Some(JoySet(2, 0xEF)));
+        assert_eq!(ok("joy-hold 1 none"), Some(JoySet(1, 0xFF)));
+        assert_eq!(ok("joy-release 1"), Some(JoySet(1, 0xFF)));
+        let cases = [
+            ("joy 3 up", "'3' is not a control port (1 or 2)"),
+            ("joy 0 up", "'0' is not a control port"),
+            ("joy 2", "'joy' takes 2-3 argument(s), got 1"),
+            ("joy 2 jump", "unknown joystick direction 'jump'"),
+            ("joy 2 up+", "unknown joystick direction ''"),
+            ("joy 2 up x", "'x' is not a number"),
+            ("joy 2 none 50", "'joy <port> none' takes no hold time"),
+            ("joy-hold 2", "'joy-hold' takes 2 argument(s), got 1"),
+            ("joy-release", "'joy-release' takes 1 argument(s), got 0"),
+            ("joy-release 2 up", "'joy-release' takes 1 argument(s), got 2"),
+        ];
+        for (line, want) in cases {
+            let err = parse_line(line).expect_err(line);
+            assert!(err.contains(want), "{line:?}: got {err:?}, want {want:?}");
+        }
+    }
+
+    /// S36: a `joy` tap holds its lines `ms`, then releases and waits the release gap; `joy-hold` stays.
+    #[test]
+    fn joy_holds_and_releases_on_time() {
+        let mut fake = Fake::default();
+        run(&mut fake, "joy 2 down
+joy 1 up+fire 30
+joy-hold 2 right
+wait 5
+joy-release 2").0.unwrap();
+        let ev = |port, lines| HostInput::JoystickPort { port, lines };
+        assert_eq!(
+            fake.log,
+            vec![
+                (0, ev(2, 0xFD)),
+                (80, ev(2, 0xFF)),
+                (120, ev(1, 0xEE)),
+                (150, ev(1, 0xFF)),
+                (190, ev(2, 0xF7)),
+                (195, ev(2, 0xFF)),
+            ]
+        );
+        assert_eq!(fake.now, 195);
     }
 
     #[test]

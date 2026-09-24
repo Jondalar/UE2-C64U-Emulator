@@ -7,8 +7,12 @@ use crate::c64host::C64Frame;
 pub enum HostInput {
     /// C64 keyboard matrix position; convention documented on `devices::u64io::U64Io::set_key`.
     Key { row: u8, col: u8, down: bool },
-    /// Joystick lines, active-low mask as read at 0x10100406 (idle 0xFF).
+    /// Physical joystick on C64 control port 2, lines active low (idle 0xFF): `JoystickPort` with port 2.
     Joystick(u8),
+    /// S36: physical joystick on C64 control port `port` (1 or 2), lines active low: bit 0 up, 1 down, 2 left,
+    /// 3 right, 4 fire (idle 0xFF). The C64 sees them ANDed with the firmware's C64_JOYx_SWOUT; U64II_KEYB_JOY
+    /// reads the same. Other ports are dropped.
+    JoystickPort { port: u8, lines: u8 },
     /// ITU menu button (0x1000000A bit 6).
     MenuButton(bool),
     /// Key on the USB keyboard (`MachineConfig::usb`): HID usage ID of the Keyboard/Keypad page 0x07, modifiers

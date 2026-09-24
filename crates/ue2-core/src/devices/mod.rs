@@ -34,4 +34,9 @@ pub fn install_all(map: &mut IoMap, cfg: &MachineConfig) {
     streams::install(map, cfg);
     u64io::install(map, cfg);
     overlay::install(map, cfg);
+    // S36: U64II_KEYB_JOY reads the port lines the C64 port combines.
+    let joy_lines = map.get::<c64::C64Port>().map(c64::C64Port::joy_lines);
+    if let (Some(lines), Some(io)) = (joy_lines, map.get_mut::<u64io::U64Io>()) {
+        io.joy_lines = lines;
+    }
 }

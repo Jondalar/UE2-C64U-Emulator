@@ -90,7 +90,7 @@ pub struct RunOptions {
 
 pub enum Command {
     Input(HostInput),
-    /// A control-language input sequence (`button`, `key`, `type`, `usbkey`), timed on the emulation thread by
+    /// A control-language input sequence (`button`, `key`, `type`, `usbkey`, `joy`), timed on the emulation thread by
     /// `control::InputTimeline`; `done` receives `()` once the sequence has ended in emulated time.
     Inputs { seq: TimedInputs, done: Sender<()> },
     /// `usb-sync` / `usb-replug` (`usbdir::UsbDirs::request`); `done` receives the result when it has finished.
