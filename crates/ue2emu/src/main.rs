@@ -150,6 +150,10 @@ struct RunArgs {
     /// FILE.crt[,rw|,save=OUT.crt][,flash-decode=11|15|both] (docs/status/cart-slot.md)
     #[arg(long, value_name = "SPEC")]
     cart_slot: Option<cartslot::CartSlotSpec>,
+    /// C64 matrix keys held from power-on until the control command `release` lets them go, e.g. `cbm` or
+    /// `cbm+z` (the firmware scans the keyboard once at boot, u64_config.cc:965)
+    #[arg(long, value_name = "KEYS", value_parser = control::keys_by_names)]
+    hold_key: Option<Vec<keymap::MatrixKey>>,
 }
 
 fn parse_hex(s: &str) -> Result<u32, String> {
@@ -253,6 +257,7 @@ fn run(a: RunArgs) -> Result<()> {
         usb_dirs,
         usb_dir_work,
         cart_slot: a.cart_slot,
+        hold_keys: a.hold_key.unwrap_or_default(),
     };
 
     if a.headless {

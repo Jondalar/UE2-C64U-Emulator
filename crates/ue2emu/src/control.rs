@@ -88,6 +88,11 @@ pub enum ControlCmd {
     Wait(u64),
     Button(u64),
     Key(MatrixKey, u64),
+    /// `key cbm+z [ms]`: the keys pressed in order, held together, released in reverse order.
+    Chord(Vec<MatrixKey>, u64),
+    /// `hold <keys>` / `release <keys>`: keys pressed or let go with no timed release (`cbm`, `cbm+z`).
+    Hold(Vec<MatrixKey>),
+    Release(Vec<MatrixKey>),
     Type(Vec<MatrixKey>),
     /// HID usage and hold time.
     UsbKey(u8, u64),
@@ -150,6 +155,15 @@ pub trait Target {
     fn quit(&mut self);
 }
 
+/// Matrix keys named `a+b+c` (or one name, `+` included): `cbm+z`, `ctrl+c`, `lshift+return`.
+pub fn keys_by_names(names: &str) -> Result<Vec<MatrixKey>, String> {
+    let parts: Vec<&str> = if names.len() > 1 && names.contains('+') { names.split('+').collect() } else { vec![names] };
+    parts
+        .iter()
+        .map(|n| keymap::key_by_name(n).ok_or_else(|| format!("unknown key '{n}'")))
+        .collect()
+}
+
 /// Parse one line. `Ok(None)` for blank and comment lines.
 pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
     let body = line.trim_end().trim_start();
@@ -183,8 +197,15 @@ pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
         }
         "key" => {
             arity(1, 2)?;
-            let key = keymap::key_by_name(args[0]).ok_or_else(|| format!("unknown key '{}'", args[0]))?;
-            ControlCmd::Key(key, ms(1, KEY_MS)?)
+            match keys_by_names(args[0])?[..] {
+                [key] => ControlCmd::Key(key, ms(1, KEY_MS)?),
+                ref keys => ControlCmd::Chord(keys.to_vec(), ms(1, KEY_MS)?),
+            }
+        }
+        "hold" | "release" => {
+            arity(1, 1)?;
+            let keys = keys_by_names(args[0])?;
+            if word == "hold" { ControlCmd::Hold(keys) } else { ControlCmd::Release(keys) }
         }
         "type" => {
             if rest.is_empty() {
@@ -326,6 +347,15 @@ pub fn execute(t: &mut dyn Target, cmd: &ControlCmd, out: &mut dyn Write) -> Res
             let mut seq = TimedInputs::default();
             seq.tap(*key, *ms);
             t.inputs(seq)?;
+        }
+        ControlCmd::Chord(keys, ms) => {
+            let mut seq = TimedInputs::default();
+            seq.chord(keys, *ms);
+            t.inputs(seq)?;
+        }
+        ControlCmd::Hold(keys) | ControlCmd::Release(keys) => {
+            let down = matches!(cmd, ControlCmd::Hold(_));
+            t.inputs(TimedInputs { events: key_events(keys, down), len_ms: 0 })?;
         }
         ControlCmd::Type(keys) => {
             let mut seq = TimedInputs::default();
@@ -481,6 +511,32 @@ impl TimedInputs {
             self.events.push((at, ev(LSHIFT, false)));
         }
         self.len_ms = at + RELEASE_MS;
+    }
+
+    /// Append a chord: the keys pressed in order [`SHIFT_LEAD_MS`] apart (modifiers first as written), held `ms`
+    /// together, released at once in reverse order, then the release gap.
+    fn chord(&mut self, keys: &[MatrixKey], ms: u64) {
+        let mut at = self.len_ms;
+        for (i, key) in keys.iter().enumerate() {
+            if i > 0 {
+                at += SHIFT_LEAD_MS;
+            }
+            self.events.extend(key_events(std::slice::from_ref(key), true).into_iter().map(|(_, e)| (at, e)));
+        }
+        at += ms;
+        self.events.extend(key_events(keys, false).into_iter().map(|(_, e)| (at, e)));
+        self.len_ms = at + RELEASE_MS;
+    }
+}
+
+/// Presses of `keys` in order (each with the SHIFT it needs first), or their releases in reverse order.
+pub fn key_events(keys: &[MatrixKey], down: bool) -> Vec<(u64, HostInput)> {
+    let ev = |k: MatrixKey| (0, HostInput::Key { row: k.row, col: k.col, down });
+    let each = |k: &MatrixKey| if k.shift { vec![ev(LSHIFT), ev(*k)] } else { vec![ev(*k)] };
+    if down {
+        keys.iter().flat_map(each).collect()
+    } else {
+        keys.iter().rev().flat_map(|k| each(k).into_iter().rev()).collect()
     }
 }
 
@@ -906,6 +962,11 @@ mod tests {
         assert_eq!(ok("key down"), Some(Key(k("down"), 80)));
         assert_eq!(ok("key RETURN 30"), Some(Key(k("return"), 30)));
         assert_eq!(ok("key A"), Some(Key(MatrixKey { row: 1, col: 2, shift: true }, 80)));
+        assert_eq!(ok("key cbm+z 50"), Some(Chord(vec![k("cbm"), k("z")], 50)));
+        assert_eq!(ok("key +"), Some(Key(k("+"), 80)), "a lone + is the key");
+        assert_eq!(ok("hold cbm"), Some(Hold(vec![k("cbm")])));
+        assert_eq!(ok("release ctrl+c"), Some(Release(vec![k("ctrl"), k("c")])));
+        assert!(parse_line("key cbm+nope").is_err());
         assert_eq!(ok("type Hi 1"), Some(Type(vec![k("H"), k("i"), k("space"), k("1")])));
         assert_eq!(ok("type  x"), Some(Type(vec![k("space"), k("x")])), "one separator, rest verbatim");
         assert_eq!(ok("type #1"), Some(Type(vec![k("#"), k("1")])));
@@ -1072,6 +1133,24 @@ mod tests {
             ]
         );
         assert_eq!(fake.now, 360);
+    }
+
+    #[test]
+    fn a_chord_holds_its_keys_together() {
+        let mut fake = Fake::default();
+        run(&mut fake, "key cbm+z 100\nhold cbm\nrelease cbm").0.unwrap();
+        let (cbm, z) = (k("cbm"), k("z"));
+        assert_eq!(
+            fake.log,
+            vec![
+                (0, key_ev(cbm, true)),
+                (20, key_ev(z, true)),
+                (120, key_ev(z, false)),
+                (120, key_ev(cbm, false)),
+                (160, key_ev(cbm, true)),
+                (160, key_ev(cbm, false)),
+            ]
+        );
     }
 
     #[test]

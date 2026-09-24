@@ -84,6 +84,8 @@ pub struct RunOptions {
     pub usb_dir_work: PathBuf,
     /// `--cart-slot`: a cartridge in the physical expansion port (docs/status/cart-slot.md).
     pub cart_slot: Option<CartSlotSpec>,
+    /// `--hold-key`: matrix keys pressed before the first instruction, until a control `release`.
+    pub hold_keys: Vec<crate::keymap::MatrixKey>,
 }
 
 pub enum Command {
@@ -168,6 +170,7 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
     let (net_opts, c64, armsid) = (opts.net.clone(), opts.c64, opts.audio.armsid);
     let sid_thread = !opts.audio.no_sid_thread;
     let (usb_dirs, usb_dir_work, cart_slot) = (opts.usb_dirs.clone(), opts.usb_dir_work.clone(), opts.cart_slot.clone());
+    let hold = control::key_events(&opts.hold_keys, true);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
 
     let join = thread::Builder::new()
@@ -175,7 +178,10 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
         .spawn(move || {
             let _running = running;
             match build(cfg, net_opts.as_ref(), c64, sink, armsid, sid_thread, &usb_dirs, &usb_dir_work, cart_slot) {
-                Ok((machine, net, dirs, cart)) => {
+                Ok((mut machine, net, dirs, cart)) => {
+                    for (_, ev) in hold {
+                        machine.input(ev);
+                    }
                     let _ = ready_tx.send(Ok(()));
                     emu.run(machine, net, dirs, cart, &command_rx, gdb.map(GdbServer::new), vice)
                 }
