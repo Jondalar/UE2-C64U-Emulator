@@ -96,6 +96,8 @@ pub enum ControlCmd {
     Type(Vec<MatrixKey>),
     /// HID usage and hold time.
     UsbKey(u8, u64),
+    /// S32: `usbmouse <dx> <dy> [buttons]`: move the USB mouse and set its buttons (bit 0 left, 1 right, 2 middle).
+    UsbMouse(i32, i32, u8),
     Screen,
     C64Screen,
     Png(PathBuf),
@@ -221,6 +223,12 @@ pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
             arity(1, 2)?;
             let usage = usb::usage_by_name(args[0]).ok_or_else(|| format!("unknown USB key '{}'", args[0]))?;
             ControlCmd::UsbKey(usage, ms(1, KEY_MS)?)
+        }
+        "usbmouse" => {
+            arity(2, 3)?;
+            let num = |s: &str| s.parse::<i32>().map_err(|_| format!("'{s}' is not a number"));
+            let buttons = args.get(2).map_or(Ok(0), |b| b.parse::<u8>().map_err(|_| format!("'{b}' is not a button mask")))?;
+            ControlCmd::UsbMouse(num(args[0])?, num(args[1])?, buttons & 7)
         }
         "screen" => {
             arity(0, 0)?;
@@ -364,6 +372,10 @@ pub fn execute(t: &mut dyn Target, cmd: &ControlCmd, out: &mut dyn Write) -> Res
             }
             t.inputs(seq)?;
         }
+        ControlCmd::UsbMouse(dx, dy, buttons) => t.inputs(TimedInputs {
+            events: vec![(0, HostInput::UsbMouse { dx: *dx, dy: *dy, wheel: 0, buttons: *buttons })],
+            len_ms: 0,
+        })?,
         ControlCmd::UsbKey(usage, ms) => t.inputs(TimedInputs {
             events: vec![
                 (0, HostInput::UsbKey { usage: *usage, down: true }),
@@ -965,6 +977,8 @@ mod tests {
         assert_eq!(ok("key cbm+z 50"), Some(Chord(vec![k("cbm"), k("z")], 50)));
         assert_eq!(ok("key +"), Some(Key(k("+"), 80)), "a lone + is the key");
         assert_eq!(ok("hold cbm"), Some(Hold(vec![k("cbm")])));
+        assert_eq!(ok("usbmouse 10 -5"), Some(UsbMouse(10, -5, 0)));
+        assert_eq!(ok("usbmouse 0 0 1"), Some(UsbMouse(0, 0, 1)));
         assert_eq!(ok("release ctrl+c"), Some(Release(vec![k("ctrl"), k("c")])));
         assert!(parse_line("key cbm+nope").is_err());
         assert_eq!(ok("type Hi 1"), Some(Type(vec![k("H"), k("i"), k("space"), k("1")])));

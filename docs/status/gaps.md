@@ -13,7 +13,7 @@ or a need shows up), accepted as a limit, or **dropped**.
   after menu, freeze or DMA load. TRX64: medium change in the cycle core (RDY hold on read cycles, R/W history,
   BA-low count), needs a device measurement. No program known to break; revisit when one does. `c64.md`, `carts.md`
 - **Drives:** Specs 870 and 871 are in TRX64 v0.8.8 and UE2 uses them (S27). The 1581 runs at A and B since
-  S31 (TRX64 Specs 872, 875, v0.9.1); the 1571 is TRX64's, later.
+  S31 (TRX64 Specs 872, 875, v0.9.1). The 1571 is **out of scope** (2026-09-24).
 
 ## UE2 (board, firmware side, host)
 
@@ -23,12 +23,12 @@ or a need shows up), accepted as a limit, or **dropped**.
   instruction); Business BASIC's dynamic mode off. A hook the fix needs has to live in UE2. Cart RAM under a
   banked-out window takes its writes since S28 (TRX64's port snoop). `carts.md`
 - **UDP video stream under NTSC.** The window shows every VIC picture under PAL and NTSC since S26; the UDP video
-  stream's framing still assumes PAL. `c64.md`
+  stream's framing still assumes PAL. **Planned.** `c64.md`
 - **ACIA** (the SwiftLink/modem cartridge at `$DE00`/`$DF00`, which the firmware bridges to the network as a Hayes
   modem): not modelled. A cartridge device like the freezers, so UE2's (2026-09-23). **Deferred:** C64 programs reach
   the network through UCI, which is enough for now. `carts.md`
 - **Audio.** Stereo with the mixer's volume and pan for the SIDs and the sampler since S29. Drive sounds (an FPGA
-  sample player reading `snds1541.bin`) and tape sounds have no source here; C64_VOICE_ADSR (the LED strip) and the
+  sample player reading `snds1541.bin`) are **out of scope** (2026-09-24); tape sounds have no source here; C64_VOICE_ADSR (the LED strip) and the
   UltiSID filter curves are dropped. `sid-audio.md`, `sampler.md`
 - **Disk surface.** An external surface with a write hook and the firmware's per-track bit time is not TRX64's
   (2026-09-23): UE2 keeps setting the image in and polling for written tracks; G64 tracks whose length differs from
@@ -37,10 +37,11 @@ or a need shows up), accepted as a limit, or **dropped**.
   (Spec 874). Dropped: the IEC printer and UltiCopy (master mode; UltiCopy needs a real drive). `drive.md`
 - **I2C devices — dropped.** Codec (NAU8822), hub (USB2513), expanders, PLLs ACK and read 0xFF; they configure
   hardware the emulator does not have, and the boot is clean. Revisit only if the firmware stalls on one. `fixes.md`
-- **Peripherals. Planned:** a USB mouse (host mouse → HID mouse → the firmware's 1351 emulation on the joyport, for
-  GEOS), and detach on the root port (the nano's disconnect path, `RAM_STATUS = 0x8000`). Dropped: WiFi beyond the
+- **Peripherals. Planned:** the USB mouse's POT values on the C64 (S32: the USB side is built; POTX/POTY wait for
+  TRX64 Spec 876), and detach on the root port (the nano's disconnect path, `RAM_STATUS = 0x8000`). Dropped: WiFi beyond the
   stub (Ethernet covers the network), AX88772 (same), HDMI hot-plug (no second monitor). `usb.md`, `boot.md`
-- **Never run end to end. Planned** as one test package with smoke scripts: REU preload and "Save REU"; KCS, SS5
+- **Never run end to end. Planned** as one test package with smoke scripts, run as the gate before a minor or
+  major release: REU preload and "Save REU"; KCS, SS5
   and FC1 freezing from the firmware menu; GeoRAM and TwoMegabyter started by the firmware. A failure becomes a fix.
   `reu.md`, `c64.md`
 - **Network — dropped.** No link loss when the vmnet daemon goes away (vmnet mode only, unused); no mDNS, which the
@@ -48,8 +49,7 @@ or a need shows up), accepted as a limit, or **dropped**.
 
 ## Needs a measurement on the device
 
-- **HDMI scan lines. Planned once a photo exists:** accepted and ignored today; a cosmetic darkening of every other
-  line in the renderer, matched to a photo of a C64U with scan lines on. `c64.md`
+- **HDMI scan lines — out of scope (2026-09-24):** accepted and ignored. `c64.md`
 - **Expansion port timing — dropped.** No contention, no PHI2 or address-setup timing; only the DMA byte cost is
   measured. It would take a logic analyser on the port, for exotic hardware carts only. `cart-slot.md`
 - **Top level.** Capability word, BOARDREV, flash part and the freeze button's matrix position are assumptions that

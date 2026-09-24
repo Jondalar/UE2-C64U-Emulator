@@ -26,6 +26,7 @@ pub mod block;
 mod device;
 mod hub;
 mod keyboard;
+mod mouse;
 mod storage;
 
 use std::path::PathBuf;
@@ -39,6 +40,8 @@ use block::BlockBackend;
 use device::{Device, Peripheral, Reply};
 use hub::Hub;
 use keyboard::Keyboard;
+use mouse::Mouse;
+pub use mouse::{BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT};
 use storage::Storage;
 
 pub use block::{ImageFile, BLOCK_SIZE};
@@ -129,7 +132,7 @@ const REPLUG_ACK_TIMEOUT: u64 = 5000 * time::CLOCKS_PER_MS;
 /// Re-check interval while a plug-in waits for that.
 const REPLUG_POLL: u64 = 20 * time::CLOCKS_PER_MS;
 
-/// Devices on the hub ports, in port order: the images, the storage slots, then the keyboard.
+/// Devices on the hub ports, in port order: the images, the storage slots, then the keyboard and the mouse.
 #[derive(Clone, Debug, Default)]
 pub struct UsbConfig {
     /// Raw images attached as mass-storage devices.
@@ -139,19 +142,21 @@ pub struct UsbConfig {
     pub storage_slots: usize,
     /// A HID keyboard fed by `HostInput::UsbKey`.
     pub keyboard: bool,
+    /// S32: a HID mouse fed by `HostInput::UsbMouse`.
+    pub mouse: bool,
 }
 
 impl UsbConfig {
     /// Devices to attach. With any, the frontend advertises [`CAPAB_USB_HOST2`].
     pub fn devices(&self) -> usize {
-        self.images.len() + self.storage_slots + usize::from(self.keyboard)
+        self.images.len() + self.storage_slots + usize::from(self.keyboard) + usize::from(self.mouse)
     }
 }
 
 /// A hub port as [`Usb::port_info`] reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UsbPortInfo {
-    /// `"storage"` or `"keyboard"`; None for an empty port.
+    /// `"storage"`, `"keyboard"` or `"mouse"`; None for an empty port.
     pub device: Option<&'static str>,
     /// The plug is in. A plug-in that is still waiting counts as out.
     pub connected: bool,
@@ -281,6 +286,13 @@ impl Usb {
         }
     }
 
+    /// Move the attached mouse and set its buttons (S32). Ignored without a mouse.
+    pub fn mouse(&mut self, dx: i32, dy: i32, wheel: i32, buttons: u8) {
+        if let Some(mouse) = self.root.mouse() {
+            mouse.update(dx, dy, wheel, buttons);
+        }
+    }
+
     fn hub(&mut self) -> &mut Hub {
         match &mut self.root.function {
             Peripheral::Hub(hub) => hub,
@@ -337,6 +349,7 @@ impl Usb {
         let device = hub.port_peripheral(port).map(|p| match p {
             Peripheral::Storage(_) => "storage",
             Peripheral::Keyboard(_) => "keyboard",
+            Peripheral::Mouse(_) => "mouse",
             Peripheral::Hub(_) => "hub",
         });
         Some(UsbPortInfo { device, connected, enabled, plug_pending: self.plug_due[port - 1].is_some() })
@@ -600,7 +613,7 @@ impl IoDevice for Usb {
     crate::impl_as_any!();
 }
 
-/// Map the window with the devices of `cfg.usb` on the hub ports: images, empty storage slots, keyboard. Port
+/// Map the window with the devices of `cfg.usb` on the hub ports: images, empty storage slots, keyboard, mouse. Port
 /// numbers stay as configured: an image that cannot be opened leaves its port empty. Devices beyond the hub's
 /// ports are reported and left out.
 pub fn install(map: &mut IoMap, cfg: &MachineConfig) {
@@ -617,6 +630,9 @@ pub fn install(map: &mut IoMap, cfg: &MachineConfig) {
     ports.extend((0..cfg.usb.storage_slots).map(|_| None));
     if cfg.usb.keyboard {
         ports.push(Some(Device::new(Peripheral::Keyboard(Keyboard::new()))));
+    }
+    if cfg.usb.mouse {
+        ports.push(Some(Device::new(Peripheral::Mouse(Mouse::new()))));
     }
     if ports.len() > HUB_PORTS {
         eprintln!("usb: the hub has {HUB_PORTS} ports; {} device(s) not attached", ports.len() - HUB_PORTS);
@@ -1027,6 +1043,7 @@ mod tests {
                 .map(|dev| match dev.function {
                     Peripheral::Storage(_) => "storage",
                     Peripheral::Keyboard(_) => "keyboard",
+                    Peripheral::Mouse(_) => "mouse",
                     Peripheral::Hub(_) => "hub",
                 })
                 .collect::<Vec<_>>()
@@ -1035,12 +1052,12 @@ mod tests {
         let mut config = cfg();
         assert!(kinds(&config).is_empty());
         config.usb =
-            UsbConfig { images: vec![img.path().into(), "/nonexistent/usb.img".into()], storage_slots: 0, keyboard: true };
+            UsbConfig { images: vec![img.path().into(), "/nonexistent/usb.img".into()], storage_slots: 0, keyboard: true, mouse: false };
         assert_eq!((config.usb.devices(), kinds(&config)), (3, vec!["storage", "keyboard"]));
         config.usb.images = vec![img.path().into(); 3];
         assert_eq!(kinds(&config), ["storage"; 3], "the keyboard does not fit");
 
-        config.usb = UsbConfig { images: vec!["/nonexistent/usb.img".into()], storage_slots: 1, keyboard: true };
+        config.usb = UsbConfig { images: vec!["/nonexistent/usb.img".into()], storage_slots: 1, keyboard: true, mouse: false };
         let mut map = IoMap::new();
         install(&mut map, &config);
         let usb = map.get_mut::<Usb>().unwrap();

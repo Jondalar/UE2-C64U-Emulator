@@ -3,6 +3,7 @@
 
 use super::hub::Hub;
 use super::keyboard::Keyboard;
+use super::mouse::Mouse;
 use super::storage::Storage;
 
 /// Link speed as the firmware numbers it: `UsbDevice::speed`, from the hub port status (usb_hub.cc:353-354).
@@ -81,6 +82,7 @@ pub(crate) enum Peripheral {
     Hub(Hub),
     Storage(Storage),
     Keyboard(Keyboard),
+    Mouse(Mouse),
 }
 
 impl Peripheral {
@@ -89,6 +91,7 @@ impl Peripheral {
             Peripheral::Hub(f) => f,
             Peripheral::Storage(f) => f,
             Peripheral::Keyboard(f) => f,
+            Peripheral::Mouse(f) => f,
         }
     }
 
@@ -97,6 +100,7 @@ impl Peripheral {
             Peripheral::Hub(f) => f,
             Peripheral::Storage(f) => f,
             Peripheral::Keyboard(f) => f,
+            Peripheral::Mouse(f) => f,
         }
     }
 }
@@ -153,7 +157,16 @@ impl Device {
         match &mut self.function {
             Peripheral::Keyboard(keyboard) => Some(keyboard),
             Peripheral::Hub(hub) => hub.devices().find_map(Device::keyboard),
-            Peripheral::Storage(_) => None,
+            _ => None,
+        }
+    }
+
+    /// The mouse in this subtree, reachable or not: motion adds up until the host polls (S32).
+    pub(crate) fn mouse(&mut self) -> Option<&mut Mouse> {
+        match &mut self.function {
+            Peripheral::Mouse(mouse) => Some(mouse),
+            Peripheral::Hub(hub) => hub.devices().find_map(Device::mouse),
+            _ => None,
         }
     }
 

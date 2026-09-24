@@ -17,6 +17,9 @@ pub enum HostInput {
     /// Plug the device on USB hub port `port` (1-based) in or out (`devices::usb::Usb::set_connected`). A plug-in
     /// waits until the firmware has handled the previous unplug. Dropped for an empty port.
     UsbPlug { port: u8, connected: bool },
+    /// S32: move the USB mouse by `dx`, `dy` (right, down), turn its wheel, and hold `buttons` (`usb::BUTTON_*`).
+    /// Dropped when no USB mouse is attached.
+    UsbMouse { dx: i32, dy: i32, wheel: i32, buttons: u8 },
     /// C64 RESTORE key: NMI level while held (docs/specs/S14-c64-trx64.md §6).
     Restore(bool),
 }
