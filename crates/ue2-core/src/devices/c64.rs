@@ -532,6 +532,17 @@ impl C64Port {
                     }
                 }
             }
+            // While the reset is held the cart logic takes the type on every clock (all_carts_v5.vhd:182-184), so a type
+            // written then counts even if another follows before the release: `start_cartridge` writes 0 first
+            // (c64.cc:1177-1178), which drops `freezer_ena` (213-214) and puts the freezer back to idle
+            // (freezer.vhd:95-99). Without this a cart frozen before stays frozen in the next one.
+            CARTRIDGE_TYPE => {
+                self.cart.set(reg, val);
+                let rom = self.cart_rom;
+                if let Some(b) = self.backend.as_mut().filter(|_| self.mode & MODE_RESET != 0) {
+                    b.set_cart(val, cart_rom(ram, rom));
+                }
+            }
             // REU: both stay the latches the FPGA reads back, and the backend gets the value the latch took — the
             // size first, which is the order the firmware writes them in (c64.cc:315-317, docs/status/reu.md).
             REU_SIZE => {
@@ -1387,6 +1398,30 @@ mod tests {
         b.w8(MATRIX_ADDR + 9, 0);
         b.port().set_restore(false);
         assert_eq!(b.mock.take(), [Call::Nmi(true), Call::Nmi(true), Call::Nmi(true), Call::Nmi(false)]);
+    }
+
+    /// `start_cartridge` writes type 0 under the reset, then the new type (c64.cc:1177-1178, 1281): both reach the
+    /// cart logic, so type 0 can idle the freezer (freezer.vhd:95-99) before the new cart comes up.
+    #[test]
+    fn a_type_written_under_reset_reaches_the_cart_logic() {
+        let mut b = Bench::new();
+        (b.ram[CartRom::LARGE.base], b.ram[CartRom::LARGE.base + CART_ROM_SIZE - 1]) = (0x09, 0xC3);
+        b.w8(TYPE_ADDR, 0x1B);
+        assert!(b.mock.take().is_empty(), "no reset held: the type waits for the release");
+        b.w8(MODE_ADDR, 0x04);
+        b.w8(TYPE_ADDR, 0x00);
+        b.w8(TYPE_ADDR, 0x1C);
+        b.w8(MODE_ADDR, 0x08);
+        assert_eq!(
+            b.mock.take(),
+            [
+                Call::Reset(true),
+                Call::Cart(0x00, 0x09, 0xC3, CART_ROM_SIZE),
+                Call::Cart(0x1C, 0x09, 0xC3, CART_ROM_SIZE),
+                Call::Cart(0x1C, 0x09, 0xC3, CART_ROM_SIZE),
+                Call::Reset(false),
+            ]
+        );
     }
 
     #[test]

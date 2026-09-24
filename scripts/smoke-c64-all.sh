@@ -16,7 +16,11 @@
 #   prg         smoke-c64-prg.ctl      --sd run/sd.img
 #   freeze      smoke-c64-freeze.ctl   --no-overlay-ui on its own flash
 #   sid-tone    smoke-sid-tone.ctl     --sid-socket1 armsid --audio-wav; wav-tone.py --expect 1038
-#   carts       smoke-c64-carts.ctl    --sd run/carts.img (make-test-crts.py) --usb-keyboard: 27 PASS, AR frozen
+#   carts       smoke-c64-carts.ctl    --sd run/carts.img (make-test-crts.py) --usb-keyboard: 28 PASS; AR, KCS,
+#                                      SS5 and FC frozen
+#   georam      smoke-georam.ctl       --settings smoke-georam.cfg: GeoRAM pages through $DE00, $DFFE/$DFFF
+#   reu         smoke-reu.ctl          --settings smoke-reu.cfg --usb-dir: preload, DMA, Save REU Memory; the saved
+#                                      file equals the preload image plus the 4 bytes the C64 stashed
 #   drive       smoke-c64-drive.ctl    --sd run/drive-sd.img: the SAVEd NEW equals TEST in the D64
 #   1581        smoke-1581.py          on the drive run's flash (1541 ROM set), the 1581 ROM added to its SD card
 #   soft-iec    smoke-soft-iec.py      LOAD/SAVE on the Software IEC drive
@@ -106,10 +110,28 @@ add run/carts.img run/carts/*
 emu carts "$repo/scripts/smoke-c64-carts.ctl" --flash run/flash.bin --c64-roms --sd run/carts.img --usb-keyboard \
     --speed max || fail carts "exit code $?"
 passes=$(grep -c " PASS" run/carts.log || true)
-((passes == 27)) || fail carts "$passes of 27 carts passed"
-grep -q "ACTION REPLAY FROZEN" run/carts.log || fail carts "the Action Replay did not freeze"
+((passes == 28)) || fail carts "$passes of 28 carts passed"
+for frozen in "ACTION REPLAY" KCS "SUPER SNAPSHOT" "FINAL CARTRIDGE"; do
+    grep -q "$frozen FROZEN" run/carts.log || fail carts "no $frozen FROZEN"
+done
 ! grep -q "Time out" run/carts.log || fail carts "a time-out"
 pass carts "$start"
+
+cp run/flash.bin run/flash-georam.bin
+smoke georam "$repo/scripts/smoke-georam.ctl" --flash run/flash-georam.bin --c64-roms \
+    --settings "$repo/scripts/smoke-georam.cfg" --speed max
+
+start=$SECONDS
+cp run/flash.bin run/flash-reu.bin
+mkdir -p run/reu-share
+python3 -c 'import sys; sys.stdout.buffer.write(bytes((a + (a >> 8) * 7 + (a >> 16) * 13) & 255 for a in range(1 << 17)))' \
+    >run/reu-share/preload.reu
+cp run/reu-share/preload.reu run/reu-expected.reu
+printf '\x01\x02\x03\x04' | dd of=run/reu-expected.reu bs=1 seek=256 conv=notrunc 2>/dev/null
+emu reu "$repo/scripts/smoke-reu.ctl" --flash run/flash-reu.bin --c64-roms --settings "$repo/scripts/smoke-reu.cfg" \
+    --usb-dir run/reu-share --usb-dir-work run/reu-work --speed max || fail reu "exit code $?"
+cmp run/reu-share/memory.reu run/reu-expected.reu || fail reu "the saved REU differs from the preload plus the stash"
+pass reu "$start"
 
 start=$SECONDS
 sd run/drive-sd.img

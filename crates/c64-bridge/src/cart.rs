@@ -184,6 +184,8 @@ pub struct CartLogic {
     /// `ram_bank(15 downto 13)` in place.
     ram_bank: u32,
     georam_bank: u32,
+    /// `georam_mask` from `size_ctrl`, C64_REU_SIZE (all_carts_v5.vhd:144-152, slot_server_v4.vhd:809).
+    georam_mask: u32,
     ef_write: bool,
     cart_en: bool,
     do_io2: bool,
@@ -228,6 +230,7 @@ impl CartLogic {
             bank: 0,
             ram_bank: 0,
             georam_bank: 0,
+            georam_mask: 0xFFFF,
             ef_write: false,
             cart_en: false,
             do_io2: true,
@@ -245,6 +248,12 @@ impl CartLogic {
     /// Guest DDR for the accesses that follow (`None`: taken back). Without it ROM and RAM windows read as not served.
     pub fn set_ddr(&mut self, ddr: Option<&mut [u8]>) {
         self.ddr = ddr.map(|d| Ddr { ptr: d.as_mut_ptr(), len: d.len() });
+    }
+
+    /// C64_REU_SIZE, `128 << n` KiB: GeoRAM banks beyond it wrap (`size_ctrl`, all_carts_v5.vhd:144-152). The mask
+    /// applies when the bank registers are written (642-645), as in the VHDL.
+    pub fn set_georam_size_kb(&mut self, size_kb: u32) {
+        self.georam_mask = (size_kb * 4).clamp(1, 0x1_0000) - 1;
     }
 
     /// A logic other than none is selected (it may still be disabled).
@@ -842,11 +851,12 @@ impl CartLogic {
                 self.unfreeze();
             }
             GEORAM if io & 0x180 == 0x180 => {
-                if io & 1 == 0 {
-                    self.georam_bank = (self.georam_bank & !0xC03F) | u32::from(v & 0x3F) | (u32::from(v >> 6) << 14);
+                let (bits, field) = if io & 1 == 0 {
+                    (u32::from(v & 0x3F) | (u32::from(v >> 6) << 14), 0xC03F)
                 } else {
-                    self.georam_bank = (self.georam_bank & !0x3FC0) | (u32::from(v) << 6);
-                }
+                    (u32::from(v) << 6, 0x3FC0)
+                };
+                self.georam_bank = (self.georam_bank & !field) | (bits & self.georam_mask);
             }
             _ => {}
         }
@@ -1196,6 +1206,41 @@ pub(crate) mod tests {
         let mut normal = logic(0x41, &mut ddr);
         normal.set_button(true);
         assert!(!normal.run_hints().freeze_pending, "no freezer");
+    }
+
+    /// A freezer still frozen when the firmware starts the next cart: type 0 under the reset idles it (freezer.vhd:95-99),
+    /// so a KCS comes up in 16 K mode, not in its freeze mode "010" (all_carts_v5.vhd:600-605).
+    #[test]
+    fn type_0_under_reset_idles_a_frozen_freezer() {
+        let mut ddr = ddr();
+        let mut c = logic(0x1B, &mut ddr);
+        c.set_button(true);
+        c.enter_freeze();
+        c.set_button(false);
+        assert_eq!(c.freeze, Freeze::Active, "the handler never unfroze");
+        c.configure(0x1C, true, 0);
+        assert_eq!(lines(&c), (1, 0), "KCS straight after: still frozen, ULTIMAX");
+        c.configure(0x00, true, 0);
+        c.configure(0x1C, true, 0);
+        assert_eq!((c.freeze, lines(&c)), (Freeze::Idle, (0, 0)), "type 0 first: idle, 16 K");
+    }
+
+    /// At 512 KB `size_ctrl` "010" masks the GeoRAM bank to 11 bits (all_carts_v5.vhd:144-152, 642-645): block 37 is
+    /// block 5, and $DFFE bits 7:6 are dropped.
+    #[test]
+    fn georam_banks_wrap_at_the_reu_size() {
+        let mut ddr = ddr();
+        let mut geo = logic(0x1F, &mut ddr);
+        geo.bus_write(0xDFFF, 37, 0, false);
+        geo.bus_write(0xDFFE, 0xC0 | 63, 0, false);
+        geo.bus_write(0xDE00, 0x5A, 0, false);
+        assert_eq!(ddr[GEORAM_BASE + ((37 << 6 | 63 | 0xC000) << 8)], 0x5A, "16 MB: no wrap");
+        let mut geo = logic(0x1F, &mut ddr);
+        geo.set_georam_size_kb(512);
+        geo.bus_write(0xDFFF, 37, 0, false);
+        geo.bus_write(0xDFFE, 0xC0 | 63, 0, false);
+        geo.bus_write(0xDE00, 0x22, 0, false);
+        assert_eq!(ddr[GEORAM_BASE + ((5 << 6 | 63) << 8)], 0x22, "512 KB: block 37 is block 5");
     }
 
     #[test]

@@ -65,6 +65,11 @@ implements it over guest DDR.
 (`crates/c64-bridge/src/cart.rs` `GEORAM_BASE`, `Layout::GUEST`). So only 854's REU half is used here, and TRX64's
 GeoRAM device is not attached.
 
+"REU Size" is the GeoRAM size too: `size_ctrl` is `C64_REU_SIZE` (`slot_server_v4.vhd:809`) and masks the bank
+registers when they are written (`all_carts_v5.vhd:144-152, 642-645`), so banks past the size wrap. The bridge had no
+mask until S35; `set_reu_size_kb` now passes the size to the cart logic. `scripts/smoke-georam.ctl` checks it at
+512 KB: block 37 reads block 5.
+
 ## Verified
 
 Release binary, real firmware (`ultimate.elf`), `--headless --speed max`, scratch flash images seeded with
@@ -100,6 +105,13 @@ Re-run after deleting the bridge's REC reset and switching the store to `Option<
 | Firmware, REU enabled through the menu, BASIC stash/fetch | ` 65  66  80` — the bytes went into the REU and came back, and `PEEK($DF00)` = `$50`. Console: `Writing config store 'C64 and Cartridge Settings' to flash..Page: 3 done.` 57.4 s emulated, 133 MIPS |
 | Cartridge regression, `scripts/smoke-c64-carts.ctl` | exit 0, 27/27 `… PASS`, 0 `FAIL`, `ACTION REPLAY FROZEN`, 2 × `Loading SID`, 2 × `Bytes loaded`, no `Time out!`. 153.588 s emulated, 130 MIPS |
 
+### Preload and Save REU (S35)
+
+`scripts/smoke-reu.ctl`, run by `scripts/smoke-c64-all.sh`: a 128 KB image as `preload.reu` on a `--usb-dir` stick,
+`REU Preload` on (`scripts/smoke-reu.cfg`). The preloader loads it when USB0 appears (`reu_preloader.cc:52-117`);
+BASIC fetches 8 bytes from REU `$010203` by DMA and checks them, then stashes 4 bytes to `$000100`. "Save REU Memory"
+from the F5 menu (`c64_subsys.cc:281-327`) writes `memory.reu`, which must equal the image plus those 4 bytes.
+
 ### Firmware DDR is the store
 
 That the region the firmware writes is the region the C64 reads is covered by
@@ -109,10 +121,6 @@ preload does, and the C64's fetch brings that changed byte back.
 
 ## Known gaps
 
-- **The firmware's "REU Preload Image" path was not run end to end.** It needs `REU Preload` enabled plus an image
-  file on a mounted volume (`/Usb0/preload.reu` by default, `reu_preloader.cc:84-118`), which is a string setting in
-  the menu. The equivalent — a byte the host writes into DDR, fetched by the C64 — is covered by the unit test above,
-  but the firmware's own loader task has not been exercised. Neither has `MENU_C64_SAVEREU`.
 - **IO2 precedence with a cartridge.** 854 §7: on a read a port device beats a cartridge that also decodes IO2, and
   every device sees a write. An REU enabled alongside a cartridge that uses `$DF00` (Action Replay, Retro Replay) is
   therefore a conflict the firmware avoids by configuration (`CART_PROHIBIT_ALL_BUT_REU`), not something the bridge

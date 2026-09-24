@@ -33,6 +33,10 @@ player carts are CART_TYPE_16K images built at start-up (filetype_sid.cc:65-96).
   the firmware window `0x1004C000` (dirty flag) / `0x1004C800` (2 K) reaches it through `C64Backend::eeprom_read/write`.
 - The freezer state machine of `cart_slot/vhdl_source/freezer.vhd` runs off MATRIX_KEYB[10] (the firmware sets it from
   USB F11 while the menu is closed, keyboard_usb.cc:228, 419-435). Triggered carts pull NMI (and IRQ) on TRX64's source 3.
+  Only the system reset and the reset button idle the freezer, not a C64 reset; `start_cartridge` does it by writing
+  type 0 under the reset (c64.cc:1177-1178), which drops `freezer_ena` (all_carts_v5.vhd:213-214, freezer.vhd:95-99).
+  So `C64Port` hands every type written under the reset to the cart logic, not only the one at the release. Before
+  S35 it did not, and a KCS started after a frozen AR came up in its freeze mode.
 - `CartProxy` is the `CartMapper` TRX64 holds; it shares `CartLogic` with the backend (`CartHandle`) and folds in the
   firmware's forced ULTIMAX decode (C64_MODE bit 1). Without a cartridge type and without the forced decode TRX64's slot
   stays empty, so the no-cart run path is the phase-A one.
@@ -71,12 +75,14 @@ PRG run relies on that (c64_subsys.cc:178-192).
 
 ## Test files and runs
 
-`scripts/make-test-crts.py <dir>` writes 28 CRTs, a PSID and a MUS file. Each CRT carries a small 6502 program
+`scripts/make-test-crts.py <dir>` writes 32 CRTs, a PSID and a MUS file. Each CRT carries a small 6502 program
 assembled by the script: it sets up the VIC itself, prints `<NAME> START`, copies a stub to RAM `$0C00` (visible in
 every memory mode) and runs it. The stub drives the cart's registers, compares bytes against fillers that name their
 bank (ROML 0x40+n, ROMH 0x80+n, strings `ROML BANK nn`/`ROMH BANK nn`), prints one line per check and ends with
-`<NAME> PASS` or `<NAME> FAIL`. `c28-ar-freeze.crt` waits for the freeze button; its freeze handler prints
-`ACTION REPLAY FROZEN`. `s01-tune.sid` is a PSID v2 (init `$1000`, play `$1003`, triangle voice with a frequency sweep),
+`<NAME> PASS` or `<NAME> FAIL`. `c28`-`c31` (AR, KCS, SS5, FC) wait for the freeze button, the last three with their
+cart switched off first; each has a freeze handler at `$F800` of bank 0, in the ULTIMAX window its freezer maps in
+(all_carts_v5.vhd:174-179 with 530-533, 600-605, 562-563, 625-627), that prints `<NAME> FROZEN`.
+`c32-twomegabyter.crt` has banks 0, 1, `$4D` and `$FF` only, each carrying its own number. `s01-tune.sid` is a PSID v2 (init `$1000`, play `$1003`, triangle voice with a frequency sweep),
 `s02-tune.mus` a Sidplayer file with three HLT voices.
 
 Setup (ROMs installed on `run/flash.bin` as in docs/status/c64.md A2):
@@ -92,12 +98,12 @@ target/release/ue2emu run --headless --speed max $FW --flash run/flash.bin --sd 
 **`scripts/smoke-c64-carts.ctl`** (153.6 s emulated, 30 s wall, exit 0). The overlay menu stays open while a cart runs
 (C64_START_CART releases only a C64-screen client, c64_subsys.cc:273-279), so each cart is one `key down`, RETURN,
 RETURN (Run Cart). Results:
-- 27 `c64screen` dumps end in `<NAME> PASS`: NORMAL 8K, NORMAL 16K, ULTIMAX, OCEAN, MAGIC DESK, EASYFLASH, GMOD2,
+- 28 `c64screen` dumps end in `<NAME> PASS`: NORMAL 8K, NORMAL 16K, ULTIMAX, OCEAN, MAGIC DESK, EASYFLASH, GMOD2,
   ACTION REPLAY, RETRO REPLAY, FINAL CARTRIDGE III, SUPER SNAPSHOT 5, KCS POWER, FINAL CARTRIDGE, EPYX FASTLOAD,
   WESTERMANN, SIMONS BASIC, C64 GAME SYSTEM, ZAXXON, MEGABYTER, SUPER GAMES, COMAL 80, PAGEFOX, BLACKBOX V3,
-  BLACKBOX V4, BLACKBOX V8, BLACKBOX V9, ATOMIC POWER; no FAIL or BAD line.
-- `c28-ar-freeze.crt`: `PRESS FREEZE`; after `button` (menu closed) and `usbkey f11 300` the dump shows
-  `ACTION REPLAY FROZEN` from the cart's freeze handler.
+  BLACKBOX V4, BLACKBOX V8, BLACKBOX V9, ATOMIC POWER, TWOMEGABYTER; no FAIL or BAD line.
+- `c28`-`c31`: `PRESS FREEZE`; after `button` (menu closed) and `usbkey f11 300` the dumps show `ACTION REPLAY
+  FROZEN`, `KCS FROZEN`, `SUPER SNAPSHOT FROZEN` and `FINAL CARTRIDGE FROZEN` from the carts' freeze handlers.
 - `s01-tune.sid`: console `Loading SID..`, `Bytes loaded: 66. $1000-$1042`, no `Time out!`. The C64 shows the player
   (`run/c64-sid.png`), and its clock runs, so the play routine is called every frame:
 
@@ -163,7 +169,7 @@ C64_CARTRIDGE_TYPE (c64.h:125-163). "Done" means implemented after the VHDL and 
 |---|---|---|---|
 | 0 | Normal cartridge | 0x41 8K / 0x01 16K / 0xA1 ULTIMAX | done (c01-c03) |
 | 1 | Action Replay | 0x1B | done (c08); freezer done (c28, USB F11) |
-| 2 | KCS Power Cartridge | 0x1C | done (c12); freezer implemented, unit-tested path shared with c28 |
+| 2 | KCS Power Cartridge | 0x1C | done (c12); freezer done (c29) |
 | 3 | Final Cartridge III | 0x19 (0x39 > 64 K) | done (c10); freezer unit-tested (NMI vector entry) |
 | 4 | Simons Basic | 0x05 | done (c16) |
 | 5 | Ocean type 1 | 0x08 | done (c04). The firmware never selects its 16K variant (`a000_seen` is never set, c64_crt.cc:498) |
@@ -171,11 +177,11 @@ C64_CARTRIDGE_TYPE (c64.h:125-163). "Done" means implemented after the VHDL and 
 | 9 | Atomic Power | 0x5B | done (c27), including mode 110 RAM at `$A000` |
 | 10 | Epyx Fastload | 0x02 | done (c14) |
 | 11 | Westermann | 0x44 | done (c15) |
-| 13 | Final Cartridge I | 0x18 | done (c13); freezer implemented |
+| 13 | Final Cartridge I | 0x18 | done (c13); freezer done (c31) |
 | 15 | C64 Game System | 0x0A | done (c17). A read of IO1 selects bank 0: the VHDL loads the undriven data bus |
 | 18 | Zaxxon | 0x0D | done (c18) |
 | 19 | Magic Desk, Domark, HES Australia | 0x28 | done (c05) |
-| 20 | Super Snapshot 5 | 0x1A (0x3A > 64 K) | done (c11); freezer implemented |
+| 20 | Super Snapshot 5 | 0x1A (0x3A > 64 K) | done (c11); freezer done (c30) |
 | 21 | COMAL 80 | 0x09 (0x29 > 64 K) | done (c21) |
 | 32 | EasyFlash | 0x11 | done (c06, flash writes kept over reset and saved to CRT) |
 | 36 | Retro Replay | 0x3B | done (c09) |
@@ -188,13 +194,13 @@ C64_CARTRIDGE_TYPE (c64.h:125-163). "Done" means implemented after the VHDL and 
 | 66 | Blackbox V4 | 0x24 | done (c24) |
 | 71 | Blackbox V9 | 0x0E | done (c26) |
 | 86 | Protovision Megabyter | 0x0F | done (c19) |
-| 87 | Protovision TwoMegabyter | 0x2F | implemented (16K banks), not run |
+| 87 | Protovision TwoMegabyter | 0x2F | done (c32) |
 | 6, 7, 12, 14, 16, 17, 33-35, 37-43, 45-52, 55-59, 61-63, 67-70, 72-85 | Expert, Fun Play, Rex, Magic Formel, Warpspeed, Dinamic, EasyFlash X-Bank, Capture, AR3, MMC64, MMC Replay, IDE64, SS4, IEEE 488, Game Killer, Prophet 64, Freeze Frame, … GMod3, … Magic Desk 16 | – | not done: the firmware rejects them (`CART_NOT_IMPL`, "Not implemented") |
 | C128 0, 1 | C128 Cartridge (with I/O mirror) | 0x03 / 0x63 / 0xE3 | not done: the logic serves `$8000-$FFFF` of a C128; on a C64 the bridge attaches nothing and says so once |
 | – | Boot cartridge (DMA load) | 0x41 | done (phase A, A4) |
 | – | SID Player Cartridge | 0x01 + UCI `$DFFC` | done (s01). The UCI answers at `$DFFC` since S15 (TRX64 Spec 852); sidcrt uses it only for an invalid header |
 | – | MUS Player Cartridge | 0x01 + UCI `$DFFC` | done (s02) |
-| – | GeoRAM (REU setting "GeoRAM") | 0x1F | implemented (DDR `0x01000000`, unit test); not run. The size mask is taken as 16 MB (REU_SIZE is not passed on) |
+| – | GeoRAM (REU setting "GeoRAM") | 0x1F | done (DDR `0x01000000`, the REU size masks the banks; `scripts/smoke-georam.ctl`) |
 
 ## What TRX64's cartridge API does not cover (and how the bridge works around it)
 
@@ -242,7 +248,6 @@ families need lives in UE2. The items are UE2's to carry, not TRX64 gaps.
   (TRX64 Spec 852), and UE2 serves the firmware side at 0x10044000. Any slot base works, EasyFlash's `$DE1C`
   included. **ACIA** stays unmodelled; the REU is modelled (docs/status/reu.md) and Ultimate Audio since S16 (docs/specs/S16-ultimate-audio.md). A cartridge in the expansion port is `--cart-slot`
   (docs/status/cart-slot.md).
-- **GeoRAM size mask** and **TwoMegabyter**, **KCS/SS5/FC1 freezing** are implemented without a run from the firmware.
 - **Audio** comes from the SID stream (docs/status/sid-audio.md). After the wave-4 merge a cart smoke run with
   `--audio-wav run/carts.wav` holds the `s01-tune.sid` tune: peak-to-peak about 9300 in every second the SID player
   runs (133-146 s emulated), so the player's CPU writes reach reSID through the cartridge run path (`CartObserver`

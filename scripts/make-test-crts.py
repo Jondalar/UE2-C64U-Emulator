@@ -12,8 +12,10 @@ Every bank carries the same code, so a bank switch never pulls it away. Unused R
 their place: ROML of bank n is 0x40+n, ROMH 0x80+n (0x40/0x80 for bank 0). The ROML string `ROML BANK nn` sits at
 $9F00 and the ROMH string at $BF00/$FF00.
 
-c28-ar-freeze.crt only prints `PRESS FREEZE`; its bank 0 carries a freeze handler that prints `ACTION REPLAY FROZEN`
-on line 22 when the freeze button (USB F11, MATRIX_KEYB[10]) switches the cart in.
+c28-c31 are freeze tests: they print `PRESS FREEZE` and loop (c29-c31 switch their cart off first). Bank 0 carries a
+freeze handler, in the window where the freezer maps itself in, that prints `<NAME> FROZEN` on line 22 when the freeze
+button (USB F11, MATRIX_KEYB[10]) switches the cart in. c32-twomegabyter.crt holds four sparse 16 K banks (0, 1, $4D,
+$FF) that each carry their own number.
 
 File names sort in test order (c01-..., s01-..., s02-...); scripts/smoke-c64-carts.ctl runs them from the file
 browser in that order.
@@ -598,27 +600,79 @@ def blackbox9(a):
     result(a, 'BLACKBOX V9')
 
 
-def freeze_ready(a):
-    say(a, 2, 'PRESS FREEZE')
-    hang = a.unique('hang')
-    a.label(hang)
-    a(f'JMP {hang}')
+def freeze_ready(off=''):
+    """Switch the cart off with `off` (nothing for the AR), print PRESS FREEZE and loop."""
+    def stub(a):
+        if off:
+            a(off)
+        say(a, 2, 'PRESS FREEZE')
+        hang = a.unique('hang')
+        a.label(hang)
+        a(f'JMP {hang}')
+    return stub
 
 
-def ar_freezer(img, bank):
-    """The freeze handler: freeze_act switches bank 0 in as ULTIMAX (all_carts_v5.vhd:174-179, 530-533), where the 8 K
-    bank also answers $E000-$FFFF. The NMI vector at $FFFA (bank offset $1FFA) points to $F800 (offset $1800)."""
-    a = Asm(0xF800)
-    a('LDX #0')
-    a.label('loop')
-    a(f'LDA text,X; BEQ done; STA ${0x0400 + 22 * 40:04X},X; INX; BNE loop')
-    a.label('done')
-    a('JMP done')
-    a.label('text')
-    a.data(screen_codes('ACTION REPLAY FROZEN') + b'\0')
-    code = a.assemble()
-    img[0x1800:0x1800 + len(code)] = code
-    img[0x1FFA:0x2000] = struct.pack('<HHH', 0xF800, 0xF800, 0xF800)
+def freezer(text, window, vectors=(0xF800, 0xF800, 0xF800)):
+    """A freeze handler at $F800 printing `text` on line 22. freeze_act switches bank 0 in as ULTIMAX
+    (all_carts_v5.vhd:174-179), so $E000-$FFFF is bank 0's `window`: offset $0000 for 8 K banks (the AR,
+    rom_mode "00", 530-533), $2000 (ROMH) for 16 K banks (KCS 600-605, SS5 562-563, FC 625-627; rom_mode "01").
+    The handler touches neither IO1 nor IO2: an FC access there would unfreeze it (615-623). `vectors` are NMI, RESET
+    and IRQ at $FFFA."""
+    def patch(img, bank):
+        if bank:
+            return
+        a = Asm(0xF800)
+        a('SEI; LDX #0')
+        a.label('loop')
+        a(f'LDA text,X; BEQ done; STA ${0x0400 + 22 * 40:04X},X; INX; BNE loop')
+        a.label('done')
+        a('JMP done')
+        a.label('text')
+        a.data(screen_codes(text) + b'\0')
+        code = a.assemble()
+        at = window + 0x1800
+        assert len(set(img[at:at + len(code)])) == 1, 'the freeze handler overlaps code'
+        img[at:at + len(code)] = code
+        img[window + 0x1FFA:window + 0x2000] = struct.pack('<HHH', *vectors)
+    return patch
+
+
+def twomegabyter(a):
+    for row, bank in ((2, 0x01), (3, 0x4D), (4, 0xFF)):
+        a(f'LDA #${bank:02X}; STA $DE00')
+        check(a, row, 0x9FF0, bank ^ 0x5A, 'ROML')
+        say_from(a, row, 0x9F00, 13)
+    check(a, 5, 0xBFF0, 0xFF ^ 0xA5, 'ROMH')
+    say_from(a, 5, 0xBF00, 13)
+    a('LDA #$02; STA $DE00')
+    check(a, 6, 0x9FF0, 0xFF, 'BANK 2 EMPTY')
+    a('LDA #$4D; STA $DE00; LDA #$01; STA $DE02')
+    check(a, 7, 0xBFF0, 0x4D ^ 0xA5, 'MODE 1: 8K', equal=False)
+    a('LDA #$37; STA $9E10; LDA #$03; STA $DE02')
+    check(a, 8, 0x9E10, 0x37, 'MODE 3: OFF')
+    a('LDA #$00; STA $DE02')
+    check(a, 9, 0xBFF0, 0x4D ^ 0xA5, 'MODE 0: 16K')
+    result(a, 'TWOMEGABYTER')
+
+
+def twomegabyter_crt():
+    """CRT type 87, TwoMegabyter: C64_CARTRIDGE_TYPE MEGABYTER variant 1 (c64_crt.cc:97, 612-613), 256 banks of 16 K
+    (all_carts_v5.vhd:364-384). Banks 0, 1, $4D and $FF only; a bank carries `bank ^ $5A` at $9FF0 and `bank ^ $A5`
+    at $BFF0 and its number in the strings; the firmware fills the rest with $FF (c64_crt.cc:336)."""
+    stub = Asm(STUB)
+    twomegabyter(stub)
+    code, _ = boot(0x8000, stub.assemble(), 'TWOMEGABYTER', False)
+    chips = []
+    for bank in (0x00, 0x01, 0x4D, 0xFF):
+        img = bytearray([0xEA]) * 0x4000
+        for base, name, mark in ((0x0000, 'ROML', 0x5A), (0x2000, 'ROMH', 0xA5)):
+            text = screen_codes(f'{name} BANK {bank:03}')
+            img[base + 0x1F00:base + 0x1F00 + len(text)] = text
+            img[base + 0x1FF0] = bank ^ mark
+        if bank == 0:
+            img[:len(code)] = code
+        chips.append((bank, 0x8000, img, 0))
+    return crt_file(87, 0, 0, 'TWOMEGABYTER', chips)
 
 
 EEPROM_CHUNK = (0, 0xDE00, b'UE' + b'\xFF' * 0x7FE, 0)
@@ -663,7 +717,20 @@ def tests():
         ('c25-blackbox-v8.crt', build('BLACKBOX V8', 64, 0, 0, blackbox8, banks=4, layout='16k')),
         ('c26-blackbox-v9.crt', build('BLACKBOX V9', 71, 1, 0, blackbox9, banks=2, layout='16k', ultimax=True)),
         ('c27-atomic-power.crt', build('ATOMIC POWER', 9, 0, 1, nordic, banks=8)),
-        ('c28-ar-freeze.crt', build('AR FREEZE', 1, 0, 1, freeze_ready, banks=4, patch=ar_freezer)),
+        ('c28-ar-freeze.crt', build('AR FREEZE', 1, 0, 1, freeze_ready(), banks=4,
+                                    patch=freezer('ACTION REPLAY FROZEN', 0x0000))),
+        # KCS off by an IO1 read with address bit 1 set (576-579); frozen: mode "010", ULTIMAX (600-605).
+        ('c29-kcs-freeze.crt', build('KCS FREEZE', 2, 0, 0, freeze_ready('LDA $DE02'), layout='16k',
+                                     patch=freezer('KCS FROZEN', 0x2000))),
+        # SS5 off by bit 3 of $DE00 (558-560); frozen: cart_en on, mode "000", ULTIMAX (174-178, 562-563). It starts in
+        # ULTIMAX, so its RESET vector stays on the boot code.
+        ('c30-ss5-freeze.crt', build('SS5 FREEZE', 20, 1, 0, freeze_ready('LDA #$08; STA $DE00'), layout='16k',
+                                     ultimax=True, patch=freezer('SUPER SNAPSHOT FROZEN', 0x2000,
+                                                                 (0xF800, 0xE000, 0xF800)))),
+        # FC off by an IO1 access (615-618); frozen: ULTIMAX while freeze_act (625-627).
+        ('c31-fc-freeze.crt', build('FC FREEZE', 13, 0, 0, freeze_ready('LDA $DE00'), layout='16k',
+                                    patch=freezer('FINAL CARTRIDGE FROZEN', 0x2000))),
+        ('c32-twomegabyter.crt', twomegabyter_crt()),
     ]
 
 
