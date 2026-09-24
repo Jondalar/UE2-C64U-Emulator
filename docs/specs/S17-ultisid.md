@@ -1,5 +1,7 @@
 # S17 — UltiSID: more than one SID (the host side of TRX64 Spec 855)
 
+**Status:** built (2026-09-17).
+
 TRX64 Spec 855 (pinned at `1ce84b0`) gives a machine several SID register sets: one reSID per handle, a SID map the
 host sets, a write trace `(chip, reg, value, clk)`, and a host read/peek door. S17 is UE2's half: the U64's SID decode,
 the reSID engines behind it, the audio mixer, and the ARMSID behind the door.

@@ -254,9 +254,6 @@ unchanged.
   bridge mirroring, flash erase/program and CRT image, reset keeps flash time, flash decode, EAPI and C64MegaCart
   banks, new packets and EEPROM round trip, u64-logic memory, DMA while stopped), `ue2emu` spec parsing, CRT write with
   backup, control `cart-info`/`cart-save`, C64 port CART_DETECT.
-- **Regressions:** `scripts/smoke-all.sh` all passed; carts smoke exit 0 with 27 × PASS and `ACTION REPLAY FROZEN`;
-  C64 A2-A5 exit 0 (`DMA load complete: $0801-$081C`, `Frozen on Bad line. Raster = 33`, no `Hard stop`);
-  `scripts/mcp-smoke.py` all steps passed; `cargo test --workspace` 364 passed; clippy only the three existing warnings.
 
 ## Limits
 
@@ -285,28 +282,15 @@ unchanged.
   `NAME.bak` is not atomic. A SIGKILL between creating `.NAME.tmp-PID` and the rename leaves that hidden temp file
   behind (the CRT itself stays whole); nothing removes it later.
 
-## After the merge into `main`
+## Checks on an erased flash
 
-Merged on top of `8b11021` (host-tool check in build-firmware.sh), `2e8a4dd` (MCP build tools removed) and `f627ba5`
-(`--c64-roms`). Conflicts in `ue2emu` main.rs/install.rs (both flags kept), `ue2-mcp` tools.rs (cart tools kept, build
-tools stay removed) and docs/status/mcp.md. `CartSlotSpec::read` is marked `allow(dead_code)` without the `trx64`
-feature, so the `--no-default-features` build stays warning-free. Every flash with the C64 ROMs below was made by
-`--c64-roms` on an erased image (no menu setup).
+Every flash with the C64 ROMs below was made by `--c64-roms` on an erased image (no menu setup).
 
 | Check | Result |
 |---|---|
-| Builds | `cargo build --release --workspace` and `-p ue2emu --no-default-features`: no warnings |
-| `cargo test --workspace` | 370 passed, 0 failed, 1 ignored |
-| clippy (`--workspace --all-targets`) | the three existing warnings (ue2-core io.rs ×2, c64-bridge drive.rs) |
-| `scripts/smoke-all.sh` | menu, sd, flash-1, flash-2, negative: PASS |
-| `scripts/smoke-usb-dir.sh` | PASS (25.0 s emulated) |
-| Carts smoke | exit 0, 27 × PASS, `ACTION REPLAY FROZEN`, 0 × `Time out` |
-| C64 A2-A5 | A2 (`--c64-roms`, erased flash): formatted, 3 × written, `READY.`, 38911 bytes free, PNG 384×272. A3 ` 42`. A4 `DMA load complete: $0801-$081C`, `Cart got disabled, now restoring.`, `HELLO FROM UE2EMU`. A5 (`--c64-roms`, fresh flash): `Frozen on Bad line.`, no `Hard stop`, menu in the second dump, third dump equal to the first |
-| Drive smoke (GitNexus flagged the drive flows through `advance_to`/`run_cpu`) | `smoke-c64-drive.ctl` exit 0: directory `"UE2 DRIVE       " U2 2A`, `543 BLOCKS FREE.`, `DRIVE A LOADED OK`, NEW on the D64 equals TEST |
-| `scripts/mcp-smoke.py` | ALL STEPS PASSED |
 | `scripts/cart-slot-acceptance.py` | 72 PASS, 0 failed checks |
 | `--c64-roms` + `--cart-slot` on an erased flash | Magic Desk: `c64-roms: … formatted`, 3 × written, BASIC `READY.` with `30719 BASIC BYTES FREE` (the 8 K cartridge is mapped), REST dump 16/16 banks equal, source hash unchanged |
-| MCP, separate client | 16 tools, none for builds. `emu_start {flash: <new file>, c64_roms: true, net: true, cart_slot: {mode: "save", flash_decode: "both"}}` passes `--c64-roms --cart-slot --net`; MegaByter boots BASIC; `emu_cart_info` MegaByter / trx64-flash / 128 banks / 8K / bus_external 0x0F; a dump through `emu_rest` (pause, writemem, readmem with `save_body_to`) 0/128 banks differ; `emu_cart_save` equals the source; `emu_stop` writes `save_path`; source unchanged. Refused: `c64_roms` with `flash: "none"`, `mode: "save"` without `save_path`, `--cart-slot` in `extra_args` |
+| MCP, separate client | `emu_start {flash: <new file>, c64_roms: true, net: true, cart_slot: {mode: "save", flash_decode: "both"}}` passes `--c64-roms --cart-slot --net`; MegaByter boots BASIC; `emu_cart_info` MegaByter / trx64-flash / 128 banks / 8K / bus_external 0x0F; a dump through `emu_rest` (pause, writemem, readmem with `save_body_to`) 0/128 banks differ; `emu_cart_save` equals the source; `emu_stop` writes `save_path`; source unchanged. Refused: `c64_roms` with `flash: "none"`, `mode: "save"` without `save_path`, `--cart-slot` in `extra_args` |
 
 Independent spot checks (own CRT parser and REST/control client; bank registers as in TRX64's mappers):
 

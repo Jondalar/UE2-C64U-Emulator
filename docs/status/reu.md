@@ -78,13 +78,8 @@ back and prints them, then prints the REU status register at `$DF00`.
 
 | Check | Result |
 |---|---|
-| `cargo build --workspace` | clean, no warnings |
-| `cargo test --workspace` (`UE2_FIRMWARE` set) | 403 passed, 1 ignored, 0 failed |
-| `cargo build -p ue2emu --no-default-features` | clean; `--c64 none` unaffected (the trait methods default to no-ops) |
-| New tests | 12: 6 in `c64-bridge` `reu` (nothing lent, lent, above the fitted size, short lease, lease ends, shared clone), 4 in `c64-bridge` (attach/resize/detach, a real transfer, a transfer with nothing lent, reset), 2 in `ue2-core` (the size table, both registers reaching the backend) |
 | Firmware, REU **Disabled** (default) | BASIC prints ` 0  0`; `PEEK($DF00)` = ` 0`. Nothing answers `$DF00-$DF0A` |
 | Firmware, REU **Enabled** through Memory Configuration → "RAM Expansion Unit", saved to flash | BASIC prints ` 65  66` — the bytes went into the REU and came back — and `PEEK($DF00)` = ` 80` = `$50`, the REU status register. `Writing config store 'C64 and Cartridge Settings' to flash` on the console |
-| Cartridge regression, `scripts/smoke-c64-carts.ctl` (`--flash` with `--c64-roms`, `--sd` with the test CRTs, `--usb-keyboard`) | exit 0, 27/27 `… PASS`, `ACTION REPLAY FROZEN`, 2 × `Loading SID`, 2 × `Bytes loaded`, no `Time out!`. 153.6 s emulated, 134 MIPS. `lend_ddr` now also updates the REU store, and the cartridge path is unchanged |
 
 The menu path is F2 → Memory Configuration → "RAM Expansion Unit" → Enabled; "Size" sits next to it and the store
 writes both registers on save. In the config browser the cursor skips the blank separators and typed letters do
@@ -98,12 +93,8 @@ Re-run after deleting the bridge's REC reset and switching the store to `Option<
 
 | Check | Result |
 |---|---|
-| `cargo build --workspace` | clean, 0 warnings |
-| `cargo test --workspace` (`UE2_FIRMWARE` set) | 403 passed, 1 ignored, 0 failed |
-| `cargo build -p ue2emu --no-default-features` | clean |
 | `a_c64_reset_resets_the_rec_and_keeps_the_ram` | passes with the bridge's own reset **deleted** — TRX64's `warm_reset` puts the REC back to power-on and the DDR byte at `REU_BASE + 0x100` is still `0x77` |
 | Firmware, REU enabled through the menu, BASIC stash/fetch | ` 65  66  80` — the bytes went into the REU and came back, and `PEEK($DF00)` = `$50`. Console: `Writing config store 'C64 and Cartridge Settings' to flash..Page: 3 done.` 57.4 s emulated, 133 MIPS |
-| Cartridge regression, `scripts/smoke-c64-carts.ctl` | exit 0, 27/27 `… PASS`, 0 `FAIL`, `ACTION REPLAY FROZEN`, 2 × `Loading SID`, 2 × `Bytes loaded`, no `Time out!`. 153.588 s emulated, 130 MIPS |
 
 ### Preload and Save REU (S35)
 
@@ -163,16 +154,10 @@ The two findings themselves, both confirmed while building this:
 
 ## Build note
 
-The two changes above need **TRX64 0.7.1**, which is public on TRX64's `main` as `c3d34bb` — there is no tag and no
-release for it, so the pin names the rev. `crates/c64-bridge/Cargo.toml` points there, and an ordinary
-`cargo build` is enough.
-
-Building against a local TRX64 checkout instead is the usual `.cargo/config.toml` route in `docs/status/install.md`,
-"TRX64 dependency", with the same trap as before: when the local crate's version equals or differs from the pinned
-one in the wrong way, cargo keeps the git source until `cargo update -p trx64-core` switches it, and
-`cargo tree -p c64-bridge -i trx64-core` is what proves which source is in the graph.
+The two changes above need TRX64 0.7.1 or later; the pin (tag `v0.9.2` in `crates/c64-bridge/Cargo.toml`) has them.
 
 Building against a local TRX64 checkout instead (for TRX64 work) is the usual `.cargo/config.toml` route described in
 `docs/status/install.md`, "TRX64 dependency". One trap worth repeating: when the local crate's version differs from
-the pinned one, cargo reports "patch … was not used in the crate graph" and silently keeps the GitHub rev;
-`cargo update -p trx64-core` switches between the two.
+the pinned one, cargo reports "patch … was not used in the crate graph" and silently keeps the GitHub source;
+`cargo update -p trx64-core` switches between the two, and `cargo tree -p c64-bridge -i trx64-core` shows which
+source is in the graph.

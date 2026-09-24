@@ -1,5 +1,7 @@
 # S28 — Cart RAM takes its writes whatever the PLA maps
 
+**Status:** built (2026-09-23).
+
 **Owns:**
 - `crates/c64-bridge/src/cart.rs`: `CartLogic::writes_ram_by_address`, `snoop_ram_write`; the `RamSnoop` device
 - `crates/c64-bridge/src/slot.rs`: the same for a physical logic cartridge

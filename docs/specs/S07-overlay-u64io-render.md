@@ -1,5 +1,7 @@
 # S07 — Overlay device, U64 IO page (keyboard matrix), renderer
 
+**Status:** built.
+
 **Owns:**
 - `crates/ue2-core/src/devices/{overlay.rs,u64io.rs}`
 - `crates/ue2-core/src/render.rs`

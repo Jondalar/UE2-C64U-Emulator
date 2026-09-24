@@ -1,5 +1,7 @@
 # S01 — RV32 CPU (rvlite semantics)
 
+**Status:** built.
+
 **Owns:** `crates/rv32/**`, `scripts/build-riscv-tests.sh`
 **Reads:** `docs/hw/01-cpu-boot-memory.md` (CPU sections, H2-H8, T0/T1), `docs/hw/00-memory-map.md` §2 A1, B7-B10, §Interrupts
 

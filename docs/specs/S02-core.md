@@ -1,5 +1,7 @@
 # S02 — Core: SystemBus, loader, symbols, Machine loop, runner
 
+**Status:** built.
+
 **Owns:**
 - `crates/ue2-core/src/{bus.rs,loader.rs,symbols.rs,machine.rs}`
 - `crates/ue2emu/src/runner.rs`

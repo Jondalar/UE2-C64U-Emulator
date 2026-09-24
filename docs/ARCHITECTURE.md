@@ -24,17 +24,17 @@ target `u64ii/riscv/ultimate`; or `ultimate.app`, or the application inside a `.
 UI, file browser, config and network services can be developed and tested without flashing. The FPGA part of the
 firmware does not run. UE2 models the board hardware the application talks to instead. The C64 core inside the FPGA
 is replaced by TRX64 (`trx64-core`, [S14](specs/S14-c64-trx64.md)) behind the same registers, with SID, cartridges,
-drive A, UCI, REU and Ultimate Audio. `--c64 none` keeps the T0 stub that only satisfies the handshakes.
+drives A and B, Software IEC, UCI, REU and Ultimate Audio. `--c64 none` keeps the T0 stub that only satisfies the handshakes.
 
 ### Requirements overview
 
 | Area | What UE2 provides | Details |
 |---|---|---|
 | Boot | ELF, `.app` and `.ue2` boot to the FreeRTOS idle loop, all InitFunctions run | [boot.md](status/boot.md) |
-| Menu and input | Overlay menu in a window or headless; C64 key matrix, menu button, USB HID keyboard | [boot.md](status/boot.md), [usb.md](status/usb.md) |
+| Menu and input | Overlay menu in a window or headless; C64 key matrix, menu button, joysticks on both ports, USB HID keyboard and mouse | [boot.md](status/boot.md), [usb.md](status/usb.md) |
 | Storage | Persistent SPI flash image, SD image, USB images, a host directory as a USB stick | [storage.md](status/storage.md), [usb.md](status/usb.md), [usb-dir.md](status/usb-dir.md) |
 | Network | REST, web UI, FTP, Telnet through libslirp; bridged modes through vmnet or socket_vmnet | [network.md](status/network.md), [e2e.md](status/e2e.md) |
-| C64 | TRX64: DMA, reset/stop, video under the overlay, SID audio, 27 cartridge types, a physical cartridge slot, drive A as a 1541, UCI, REU, Ultimate Audio | [c64.md](status/c64.md) and the docs it links |
+| C64 | TRX64: DMA, reset/stop, PAL and NTSC, video under the overlay, stereo SID audio, the FPGA cartridge types, a physical cartridge slot, drives A and B as 1541 or 1581, Software IEC, UCI, REU, Ultimate Audio, UDP video and audio streams | [c64.md](status/c64.md) and the docs it links |
 | Install | Run the updater of a `.ue2` into a flash image | [install.md](status/install.md) §5 |
 | Automation | Control scripts, TCP control protocol, MCP server | [tooling.md](status/tooling.md), [mcp.md](status/mcp.md) |
 | Debugging | Symbolized logs, fault hooks, CPU trace ring, GDB stub | [Debugging](#debugging) |
@@ -56,12 +56,13 @@ Status:
 - M5: REST, Telnet and FTP through libslirp work, and the upstream E2E smoke profile passes 12 of 12 with the REST
   shim ([network.md](status/network.md), [e2e.md](status/e2e.md)).
 - M6 reached ([usb.md](status/usb.md)).
-- M7 reached: DMA, reset/stop and video behind the overlay (phase A); SID with audio, the FPGA cartridge types and
-  drive A as a 1541 (wave 4); `--c64-roms`; a cartridge in the physical expansion port (`--cart-slot`,
-  [cart-slot.md](status/cart-slot.md)). Since then: UCI ([S15](specs/S15-uci.md)), the REU ([reu.md](status/reu.md)),
-  Ultimate Audio ([S16](specs/S16-ultimate-audio.md)); several SIDs and the mixer land with
-  [S17](specs/S17-ultisid.md). Since then: NTSC ([S25](specs/S25-ntsc.md)), drives A and B on TRX64's drive part ([S27](specs/S27-drives-870.md)), the IEC
-  processor on the bus ([S30](specs/S30-soft-iec.md)).
+- M7 reached ([c64.md](status/c64.md)), and the C64 side has grown past it: the FPGA cartridge types, a cartridge in
+  the physical expansion port ([cart-slot.md](status/cart-slot.md)), UCI ([S15](specs/S15-uci.md)), the REU
+  ([reu.md](status/reu.md)), Ultimate Audio ([S16](specs/S16-ultimate-audio.md)), several SIDs and the mixer
+  ([S17](specs/S17-ultisid.md)) in stereo ([S29](specs/S29-stereo.md)), NTSC ([S25](specs/S25-ntsc.md)), drives A
+  and B ([S27](specs/S27-drives-870.md)) as 1541 or 1581 ([S31](specs/S31-1581.md)), Software IEC
+  ([S30](specs/S30-soft-iec.md)), the USB mouse on the POT lines ([S32](specs/S32-usb-mouse.md)) and joysticks on
+  both ports ([S36](specs/S36-joystick.md)).
 
 ### Quality goals
 
@@ -94,7 +95,7 @@ Status:
 | No firmware and no ROMs in the repository | Users bring `ultimate.elf`/`.ue2` and the `roms/` of a 1541ultimate clone. `.gitignore` keeps firmware, ROM and media images out. Tests that need them skip | [install.md](status/install.md) §2 |
 | The U64-II FPGA top level is closed | Behaviour comes from the firmware sources and the open VHDL of other boards and blocks. Open points are listed as open questions | [boot.md](status/boot.md) §Known gaps, [S15](specs/S15-uci.md) §6, [S16](specs/S16-ultimate-audio.md) §6 |
 | License GPL-3.0-or-later | The cartridge logic is ported from GideonZ/1541ultimate (GPL v3). reSID by Dag Lem (GPL-2.0-or-later) from VICE is compiled in through TRX64 | [README](../README.md), [install.md](status/install.md) §7 |
-| TRX64 is a git dependency pinned by rev | `crates/c64-bridge/Cargo.toml` names the rev (TRX64 v0.7.3 `4ab20e5`, with Spec 855's several SIDs, 856's turbo fast path and 857's CIA alarm check). Cargo fetches it on the first build. The bridge drives TRX64 internals, so the tests and the C64 smokes run before `rev` moves. A local checkout is patched in through an untracked `.cargo/config.toml` | [install.md](status/install.md) "TRX64 dependency" |
+| TRX64 is a git dependency pinned by tag | `crates/c64-bridge/Cargo.toml` and `crates/ue2emu/Cargo.toml` name the tag (`v0.9.2`). Cargo fetches it on the first build. The bridge drives TRX64 internals, so the tests and the C64 smokes run before the tag moves. A local checkout is patched in through an untracked `.cargo/config.toml` | [install.md](status/install.md) "TRX64 dependency" |
 | C++ compiler | `trx64-core` compiles the vendored reSID (default feature `trx64`). `--no-default-features` builds without TRX64, `--c64 none` only | [install.md](status/install.md) §1 |
 | libslirp system library, 4.7 API | `crates/ue2-net/build.rs` searches `SLIRP_LIB_DIR`, else `/opt/homebrew/lib`, else the linker's default paths | [install.md](status/install.md) §1 |
 | Platforms | macOS is the main platform (Apple silicon). Linux builds and passes CI but is not used interactively. Windows (MSVC) builds and tests in CI and ships as a release zip; its networking is `--net user` only ([S22](specs/S22-windows.md)). `--net vmnet-bridged` is macOS only, `socket-vmnet` Unix only | [install.md](status/install.md) "Platforms" |
@@ -116,11 +117,10 @@ Status:
 - **Input:** 8×8 keyboard matrix (COL `0x1010040A` write, ROW `0x1010040B` read). Menu button = ITU
   `0x1000000A` bit 6.
 - **Capabilities:** `0x34000226`, the T0 word `0x34000222` plus CAPAB_DRIVE_1541_2 (bit 2, drive B, which a C64
-  Ultimate lists; S27). The banners below are quoted from before that bit. `--net` adds CAPAB_ETH_RMII (bit 24), a USB device CAPAB_USB_HOST2 (bit 23).
-  The TRX64 C64 adds CAPAB_EEPROM (bit 22, GMOD2 carts), which makes the default boot banner `34400222`;
-  CAPAB_COMMAND_INTF (bit 18, [S15](specs/S15-uci.md), banner `34440222`); and CAPAB_SAMPLER (bit 21,
-  [S16](specs/S16-ultimate-audio.md)). With a USB device as well the word is `34E40222`. An explicit `--caps` is used as
-  given, without these bits ([sampler.md](status/sampler.md) §Known gaps).
+  Ultimate lists; S27). The TRX64 C64 adds CAPAB_EEPROM (bit 22, GMOD2 carts), CAPAB_COMMAND_INTF (bit 18,
+  [S15](specs/S15-uci.md)) and CAPAB_SAMPLER (bit 21, [S16](specs/S16-ultimate-audio.md)), so the default word is
+  `34640226`. `--net` adds CAPAB_ETH_RMII (bit 24); a USB device or `--usb-hub` adds CAPAB_USB_HOST2 (bit 23,
+  `34E40226`). An explicit `--caps` is used as given, without these bits ([sampler.md](status/sampler.md) §Known gaps).
 
 ### Ground truth
 
@@ -224,11 +224,12 @@ flowchart LR
 |---|---|---|---|
 | Command line, config file | clap; `run --config FILE.toml` | `crates/ue2emu/src/main.rs`, `config.rs` | [install.md](status/install.md) §3-4 |
 | Window and keys | winit 0.30 + softbuffer 0.4 | `window.rs`, `keymap.rs` | [Host side](#host-side) |
-| Audio | cpal 0.15 (CoreAudio, ALSA); WAV writer | `audio.rs` | [sid-audio.md](status/sid-audio.md) |
+| Audio | cpal 0.15 (CoreAudio, ALSA, WASAPI), stereo; WAV writer | `audio.rs` | [sid-audio.md](status/sid-audio.md) |
 | Control | One command per line, from `--script` or TCP `--control` | `control.rs` | [S08](specs/S08-frontend-control.md), [tooling.md](status/tooling.md), [mcp.md](status/mcp.md) "Direct API" |
 | MCP | stdio JSON-RPC, `rmcp` 3.3; child processes over the TCP control protocol | `crates/ue2-mcp` | [mcp.md](status/mcp.md) |
 | Network | libslirp (hand-written FFI), vmnet.framework (block2 FFI), socket_vmnet (unix socket, length-prefixed frames); forwards and web UI proxy on 127.0.0.1 | `crates/ue2-net`, `crates/ue2emu/src/net.rs` | [network.md](status/network.md) |
 | Debugger | GDB remote protocol, `gdbstub` 0.7 | `crates/ue2emu/src/gdb.rs` | [Debugging](#debugging) |
+| C64 monitor | `monitor <cmd>` control line; VICE binary monitor protocol (`--vice-monitor`, default 127.0.0.1:6502) | `crates/ue2emu/src/monitor/`, `vice.rs` | [monitor.md](status/monitor.md) |
 | Files | Flash image (16 MiB), SD and USB images, `--usb-dir` volumes with a notify/FSEvents watcher, CRT write-back, WAV, PNG | `devices/flash.rs`, `sdcard.rs`, `usb/`, `crates/ue2-vfat`, `cartslot.rs` | [storage.md](status/storage.md), [usb-dir.md](status/usb-dir.md), [cart-slot.md](status/cart-slot.md) |
 | Console | Firmware UART on stdout, emulator diagnostics and stats on stderr | `runner.rs` | [boot.md](status/boot.md) |
 
@@ -270,7 +271,22 @@ flowchart LR
 | [S19](specs/S19-idle-skip.md) | Idle skip: loops that cannot change anything fast-forward to the next device event | — |
 | [S20](specs/S20-sid-thread.md) | The reSID engines on their own thread | — |
 | [S21](specs/S21-settings.md) | Firmware settings from a `.cfg` into the flash before boot | — |
+| [S18](specs/S18-wifi.md) | WiFi: the u64ctrl model joins a network. Not built, dropped: Ethernet covers the network | — |
 | [S22](specs/S22-windows.md) | Windows port: MSVC build, `--net user` through vcpkg's libslirp, release zip | — |
+| [S23](specs/S23-monitor.md) | Monitor: TRX64's verbs, UE2's own, a VICE binary monitor port | — |
+| [S24](specs/S24-udp-streams.md) | The U64's UDP video and audio streams | — |
+| [S25](specs/S25-ntsc.md) | NTSC: the C64 runs the standard System Mode asks for | — |
+| [S26](specs/S26-frame-pacing.md) | Frame pacing: the window shows every VIC picture | — |
+| [S27](specs/S27-drives-870.md) | Drives A and B on TRX64's drive parts | — |
+| [S28](specs/S28-cart-ram-writes.md) | Cart RAM takes its writes whatever the PLA maps | — |
+| [S29](specs/S29-stereo.md) | Stereo: the mixer's pan reaches the speakers | — |
+| [S30](specs/S30-soft-iec.md) | Software IEC: the IEC processor on TRX64's bus | — |
+| [S31](specs/S31-1581.md) | The 1581 at drive A and B, with the FPGA's WD177x | — |
+| [S32](specs/S32-usb-mouse.md) | USB mouse, through the firmware's mouse emulation to POTX/POTY | — |
+| [S33](specs/S33-usb-plug.md) | USB devices plugged in and out while the machine runs | — |
+| [S34](specs/S34-udp-ntsc.md) | UDP streams under NTSC | — |
+| [S35](specs/S35-release-gate.md) | Release gate: every smoke in one run | — |
+| [S36](specs/S36-joystick.md) | Physical joysticks on both control ports | — |
 
 ## 5. Building Block View
 
@@ -306,8 +322,8 @@ flowchart TD
 | `crates/ue2-core` | `SystemBus` (RAM + IO decode), `IoMap`/`IoDevice`, `IrqState` (ITU interrupt core), loader (ELF, `.app`, `.ue2`, updater records), symbolizer, settings (`.cfg` against the image's config definitions, S21), the firmware's cartridge ROM layout (`fwlayout`, [carts.md](status/carts.md)), `Machine` run loop, device models (`devices/*`, USB in `devices/usb/`), the C64 backend trait (`c64host`), overlay and C64 renderer (`render`), host types (`host`). No emulator dependency. |
 | `crates/ue2-net` | Host network backends behind `host::NetBackend`: libslirp user-mode networking (hand-written FFI, links the system libslirp: `SLIRP_LIB_DIR`, else /opt/homebrew/lib when it exists, else the linker's default paths; build.rs), vmnet.framework bridged mode (`vmnet`, block2 FFI), a client of lima's socket_vmnet daemon (`socket_vmnet`), the web UI proxy (`web_proxy`). |
 | `crates/ue2-vfat` | `--usb-dir`: FAT32 volume built from a host directory (fatfs crate), snapshot parser with a structure check, guest-to-host sync with its safety rules, host watcher (notify/FSEvents), worker thread ([usb-dir.md](status/usb-dir.md)). No emulator dependency beyond `usb::block::BlockBackend`. |
-| `crates/c64-bridge` | `Trx64Backend`: TRX64 (`trx64-core`, git dependency on https://github.com/Jondalar/TRX64 pinned by rev `4ab20e5`) as a `c64host::C64Backend`: `sid` (SID decode, ARMSID identity, reSID sample stream; several engines with S17), `sampler` (Ultimate Audio, S16), `cart` and `cart_eeprom` (all_carts_v5.vhd, freezer.vhd and the GMOD2 EEPROM on guest DDR), `slot` (a cartridge in the physical expansion port: TRX64's mappers, flash boards on TRX64's flash and EEPROM chips, or `cart::CartLogic` fed from the CRT; bus sharing, bridge and CART_DETECT), `drive` (drive A on TRX64's drive 8 as a `c64host::C64Drive`), `reu` (TRX64's REU store over guest DDR), `keys`, `video`, `clock`. The rev is pinned in `crates/c64-bridge/Cargo.toml`; re-run the tests and the C64 smokes before moving it. |
-| `crates/ue2emu` | Binary, `ue2emu run`, `ue2emu install` and `ue2emu settings`: CLI, `--config` TOML (`config`), emulation thread + pacing (`runner`), window (`window`, `keymap`), scripted/TCP control (`control`), network wiring (`net`), USB options (`usb`), `--usb-dir` controller (`usbdir`), SID audio out (`audio`: cpal and WAV), updater install (`install`), C64 ROMs into the flash image (`c64roms`, `--c64-roms`), physical cartridge write-back and `cart-info`/`cart-save` (`cartslot`, `--cart-slot`), GDB stub (`gdb`). Cargo feature `trx64` (default) links c64-bridge. |
+| `crates/c64-bridge` | `Trx64Backend`: TRX64 (`trx64-core`, git dependency on https://github.com/Jondalar/TRX64 pinned by tag `v0.9.2`) as a `c64host::C64Backend`: `sid` (SID decode, ARMSID identity, one reSID per written receiver, stereo sample stream), `sampler` (Ultimate Audio, S16), `cart` and `cart_eeprom` (all_carts_v5.vhd, freezer.vhd and the GMOD2 EEPROM on guest DDR), `slot` (a cartridge in the physical expansion port: TRX64's mappers, flash boards on TRX64's flash and EEPROM chips, or `cart::CartLogic` fed from the CRT; bus sharing, bridge and CART_DETECT), `drive` (drives A and B on TRX64's drive positions as `c64host::C64Drive`s, 1541 or 1581), `wd177x` (the FPGA's WD177x for the 1581), `iec_proc` (the IEC processor on TRX64's IEC bus), `reu` (TRX64's REU store over guest DDR), `keys`, `video`, `clock`. The tag is pinned in `crates/c64-bridge/Cargo.toml`; re-run the tests and the C64 smokes before moving it. |
+| `crates/ue2emu` | Binary, `ue2emu run`, `ue2emu install` and `ue2emu settings`: CLI, `--config` TOML (`config`), emulation thread + pacing (`runner`), window (`window`, `keymap`), scripted/TCP control (`control`), network wiring (`net`), USB options (`usb`), `--usb-dir` controller (`usbdir`), SID audio out (`audio`: cpal and WAV), updater install (`install`), C64 ROMs into the flash image (`c64roms`, `--c64-roms`), physical cartridge write-back and `cart-info`/`cart-save` (`cartslot`, `--cart-slot`), GDB stub (`gdb`), the monitor (`monitor`, S23) and its VICE binary monitor port (`vice`, `--vice-monitor`). Cargo feature `trx64` (default) links c64-bridge. |
 | `crates/ue2-mcp` | Binary `ue2-mcp`: stdio MCP server that starts `ue2emu` instances and drives them through the TCP control protocol ([mcp.md](status/mcp.md)). No crate dependency on the emulator. |
 
 ### Level 2: ue2-core
@@ -349,24 +365,25 @@ The devices, by module:
 | `itu.rs` | `0x10000000-0x100000FF` | ITU register view on `IrqState`, ITU_TIMER, IRQ timer, ms timer, capability word, menu button, UART to the console | [S03](specs/S03-itu-uart.md), [fixes.md](status/fixes.md) §4 |
 | `board.rs` | U2PIO `0x10100000` (with the MDIO PHY), DDR2 PHY, CLOCKMEAS, audio mixer `0x10100500`, LED strip, Blingboard, MMCM `0x10200000` | T0 latches and constants, BOARDREV 0xB8. The mixer window moves to `C64Port` with S17 | [S04](specs/S04-board-t0.md), [S17](specs/S17-ultisid.md) §2.5 |
 | `i2c.rs` | `0x10100700` | I2C master; an EDID EEPROM on channel 0 (1080p60 HDMI); other addresses ACK and read 0xFF | [fixes.md](status/fixes.md) §5 |
-| `u64io.rs` | `0x10100400` | Keyboard matrix scan, joystick lines, HDMI HPD, CART_DETECT | [S07](specs/S07-overlay-u64io-render.md) |
+| `u64io.rs` | `0x10100400` | Keyboard matrix scan, U64II_KEYB_JOY (the selected port's lines, S36), HDMI HPD, CART_DETECT | [S07](specs/S07-overlay-u64io-render.md), [S36](specs/S36-joystick.md) |
 | `overlay.rs` | `0x10140000-0x1014FFFF` | Chargen registers, screen and colour RAM, palette, `snapshot` | [S07](specs/S07-overlay-u64io-render.md) |
 | `flash.rs` | `0x10060200` | S25FL128L SPI NOR, 16 MiB, persistent image, overlay-UI seed, `--settings` records (S21), replaceable unique ID | [S06](specs/S06-spi-flash.md), [storage.md](status/storage.md) |
 | `sdcard.rs` | `0x10060000` | SDHC in SPI mode on an image | [S09](specs/S09-sd-card.md), [storage.md](status/storage.md) |
 | `misc.rs` | RTC `0x10060100`, TRACE, RTC timer `0x10060400` (host UTC), GCR codec `0x10060500`, ICAP, audio select `0x10060700` | T0 | [S04](specs/S04-board-t0.md) |
 | `wifi.rs` | `0x10060900` | DMA UART with a u64ctrl stub, the ESP32 ROM loader for updaters, power requests (`U64Ctrl::power_event`) | [S05](specs/S05-wifi-u64ctrl.md), [install.md](status/install.md) §5 |
 | `rmii.rs` | `0x10060800` | RMII MAC: RX filter, TX, free queue, level IRQ bit 5, DMA buffers | [S12](specs/S11-S14-later.md), [network.md](status/network.md) |
-| `usb/` | `0x10080000-0x10080FFF` | Nano USB CPU protocol HLE, USB2513 hub, mass storage, HID keyboard, hot-plug | [S13](specs/S11-S14-later.md), [usb.md](status/usb.md) |
+| `usb/` | `0x10080000-0x10080FFF` | Nano USB CPU protocol HLE, USB2513 hub, mass storage, HID keyboard and mouse, plugging in and out while running | [S13](specs/S11-S14-later.md), [S32](specs/S32-usb-mouse.md), [S33](specs/S33-usb-plug.md), [usb.md](status/usb.md) |
 | `iec.rs` | ACIA `0x1004A000`, tape `0x100A0000`/`0x100C0000` | T0 tables | [S04](specs/S04-board-t0.md) |
 | `drives.rs` | Drives A `0x10020000` and B `0x10024000` (inside `C64Port`) | `DriveRegs`: each drives a `C64Drive` ([S27](specs/S27-drives-870.md)) | [S14](specs/S14-c64-trx64.md) §W4-DRIVE, [drive.md](status/drive.md) |
-| `c64.rs` | `C64Port` windows (below); T0 tables for legacy SID `0x10042000`, CART_TIMING, PLD, U64 debug, glyph, UltiSID filter RAM `0x10184000`, UDP headers | The C64 behind the FPGA registers, or the T0 stub | [S14](specs/S14-c64-trx64.md)-[S17](specs/S17-ultisid.md) |
+| `streams.rs` | `U64_UDP_BASE` `0x10190000` | The FPGA's UDP stream generators: VIC and audio datagrams behind the firmware's header templates | [S24](specs/S24-udp-streams.md), [S34](specs/S34-udp-ntsc.md) |
+| `c64.rs` | `C64Port` windows (below); T0 tables for legacy SID `0x10042000`, CART_TIMING, PLD, U64 debug, glyph, UltiSID filter RAM `0x10184000` | The C64 behind the FPGA registers, or the T0 stub | [S14](specs/S14-c64-trx64.md)-[S17](specs/S17-ultisid.md) |
 
 #### C64 port
 
 **C64 (`devices::c64::C64Port`):** cart/machine registers `0x10040000`, UCI `0x10044000`, sampler `0x10048000`, EEPROM
-`0x1004C000`, DMA window `0x10050000-0x1005FFFF`, drive A `0x10020000`, MATRIX_KEYB `0x10100300`, core config
-`0x10180000`, palette `0x10180800` and ROM windows `0x10188000-0x1018CFFF` (with S17 also the mixer `0x10100500`), one
-device through `map_origin`.
+`0x1004C000`, DMA window `0x10050000-0x1005FFFF`, drives A `0x10020000` and B `0x10024000`, the IEC processor
+`0x10028000`, MATRIX_KEYB `0x10100300`, the mixer `0x10100500`, core config `0x10180000`, palette `0x10180800` and ROM
+windows `0x10188000-0x1018CFFF`, one device through `map_origin`.
 - Without a backend it is the T0 stub of doc 10 (its CIA1 port B scans the host keys, for firmware UIs on the C64
   screen such as the updater's).
 - `Machine::attach_c64(Box<dyn c64host::C64Backend>)` plugs in a C64. Every access to the cart registers, the DMA
@@ -374,19 +391,21 @@ device through `map_origin`.
   1 ms emulated (S14 §4).
 - `ue2emu --c64 trx64` (default with the `trx64` feature) attaches `c64_bridge::Trx64Backend`, with ROMs seeded
   from `--roms`; `--c64 none` attaches nothing ([S14](specs/S14-c64-trx64.md), [c64.md](status/c64.md)).
-- SID: every core config write also goes to `C64Backend::core_config_write`.
-  - Until S17 the bridge decodes SID socket 1 (an ARMSID with `--sid-socket1 armsid`) and UltiSID 1 onto one reSID.
-    CPU writes reach it at their cycle through a TRX64 observer, DMA reads of the SID range answer from it, and its
-    samples go to `ue2emu::audio` ([sid-audio.md](status/sid-audio.md)).
-  - With S17 (TRX64 Spec 855, landing now) UE2 decodes all four decoders — sockets 1 and 2, UltiSID 1 and 2 — with
-    the split bits (up to four instances per UltiSID), gives each receiver that has been written its own reSID, hands
-    TRX64 a SID map of receiver groups, and fans each traced write out to its group. `C64Port` takes the audio mixer
-    `0x10100500` and passes bytes `0x00-0x13` to `C64Backend::mixer_write`; the SID channel gains weight the stereo mix ([S29](specs/S29-stereo.md))
-    ([S17](specs/S17-ultisid.md)).
+- SID: every core config write also goes to `C64Backend::core_config_write`. The bridge decodes all four decoders —
+  sockets 1 and 2, UltiSID 1 and 2 — with the split bits (up to four instances per UltiSID), gives each receiver that
+  has been written its own reSID, hands TRX64 a SID map of receiver groups, and fans each traced write out to its
+  group. `C64Port` passes mixer bytes `0x00-0x13` to `C64Backend::mixer_write`; the channel gains and pans make the
+  stereo mix ([S17](specs/S17-ultisid.md), [S29](specs/S29-stereo.md), [sid-audio.md](status/sid-audio.md)).
+- Video standard: C64_VIDEOFORMAT picks TRX64's PAL or NTSC row, switched at a frame boundary; the C64 clock, reSID
+  and the audio stream follow the row's CPU clock ([S25](specs/S25-ntsc.md)).
+- Joysticks and mouse: each control port is the physical stick ANDed with the firmware's C64_JOYx_SWOUT
+  ([S36](specs/S36-joystick.md)); the firmware's mouse emulation reaches POTX/POTY through core config
+  ([S32](specs/S32-usb-mouse.md)).
 - Cartridges: every access that can run the C64 lends `IoCtx::ram` to the backend (`C64Backend::lend_ddr`), so the
   cartridge logic serves the firmware's CRT banks, cart RAM and GeoRAM from guest DDR live. The EEPROM window
   `0x1004C000` and MATRIX_KEYB[10] (the freeze button) go to the backend. The bridge ends TRX64 runs where EXROM/GAME
-  can change behind its PLA ([carts.md](status/carts.md)).
+  can change behind its PLA ([carts.md](status/carts.md)). Cart RAM takes its writes with its window banked out,
+  through TRX64's port snoop ([S28](specs/S28-cart-ram-writes.md)).
 - Expansion port: `--cart-slot` puts a second, physical cartridge on TRX64's bus (`c64_bridge::slot`). The firmware's
   C64_BUS_INTERNAL/EXTERNAL/BRIDGE writes decide which side serves IO1, IO2, the ROM windows and the interrupt lines;
   U64_CART_DETECT reads its lines; DMA reads and writes reach it like CPU accesses. Its flash and EEPROM changes can
@@ -395,6 +414,8 @@ device through `map_origin`.
   drives `C64Backend::drive(0)` (a `c64host::C64Drive`) with the register lines and the GCR half-tracks the firmware
   keeps in DDR, and copies written tracks back into DDR with DIRTY set; the firmware writes them into the image.
   Drive B (`0x10024000`) does the same for `drive(1)` ([S27](specs/S27-drives-870.md), [drive.md](status/drive.md)).
+  As a 1581 a position gets the FPGA's WD177x, whose sectors the firmware serves from the D81 by DMA
+  ([S31](specs/S31-1581.md)).
 - The IEC processor (`0x10028000`) goes to the backend (`has_iec`, `iec_read`, `iec_write`) and syncs the C64 first;
   the bridge's engine runs the firmware's microcode on TRX64's IEC bus at slot 4 ([S30](specs/S30-soft-iec.md)).
 - UCI: the window `0x10044000` goes to the backend's block (`has_uci`, `uci_read`, `uci_write`) and syncs the C64
@@ -406,10 +427,12 @@ device through `map_origin`.
   register +0x0E keeps its latch and calls `set_sampler_enabled` ([S16](specs/S16-ultimate-audio.md)).
 
 **USB (`devices::usb`):** HLE of the nano USB CPU protocol with a USB2513 hub as root (3 ports), mass storage
-(Bulk-Only Transport, SCSI) on a `block::BlockBackend` and a HID boot keyboard, configured by `MachineConfig::usb`
-(`--usb IMAGE` repeatable, `--usb-keyboard`). CAPAB_USB_HOST2 is set only with a device ([usb.md](status/usb.md)).
-- Hub ports support hot-plug (`HostInput::UsbPlug`). `Machine::usb_attach_storage` and `usb_replace_backend` let
-  the frontend put media on ports that `UsbConfig::storage_slots` left free.
+(Bulk-Only Transport, SCSI) on a `block::BlockBackend`, a HID boot keyboard and a HID mouse, configured by
+`MachineConfig::usb` (`--usb IMAGE` repeatable, `--usb-keyboard`, `--usb-mouse`). CAPAB_USB_HOST2 is set with a
+device or `--usb-hub` ([usb.md](status/usb.md)).
+- Devices plug in and out while the machine runs (`HostInput::UsbPlug`, the `usb-plug` and `usb-unplug` commands,
+  [S33](specs/S33-usb-plug.md)). `Machine::usb_attach_storage` and `usb_replace_backend` let the frontend put media on
+  ports that `UsbConfig::storage_slots` left free.
 - `ue2emu --usb-dir` uses that for host directories (`crates/ue2emu/src/usbdir.rs`, `crates/ue2-vfat`,
   [usb-dir.md](status/usb-dir.md)).
 
@@ -430,14 +453,16 @@ flowchart LR
         sampler["sampler<br/>8 voices, SamplerMix"]
         cart["cart, cart_eeprom<br/>CartLogic, CartProxy"]
         slot["slot<br/>physical cartridge"]
-        drive["drive<br/>DriveA"]
+        drive["drive, wd177x<br/>DriveSlot A and B"]
+        iec["iec_proc<br/>IEC processor"]
         reu["reu<br/>ReuRam store"]
     end
     subgraph trx["trx64-core"]
         machine["Machine, u64 profile<br/>6510, VIC, CIA, PLA"]
         uci["UCI block<br/>Spec 852"]
         reuDev["Reu<br/>Spec 854"]
-        d1541["Drive1541"]
+        d1541["Drive positions<br/>1541, 1581"]
+        bus["IEC bus"]
     end
     sink["ue2emu audio<br/>AudioSink"]
     port -->|"C64Backend"| backend
@@ -454,7 +479,9 @@ flowchart LR
     slot -->|"CartMapper"| machine
     sampler -->|"expansion device"| machine
     reuDev -->|"reads and writes"| reu
+    backend --> iec
     drive --> d1541
+    iec -->|"slot 4"| bus
     sid -->|"samples"| sampler
     sampler -->|"sum"| sink
 ```
@@ -462,14 +489,16 @@ flowchart LR
 | Module | Role | Doc |
 |---|---|---|
 | `lib.rs` | `Trx64Backend`: machine built with the `u64` profile before the power-on reset, `advance_to` (clock conversion, CPU run slices, drive check, SID and sampler catch-up), reset and hold (`Hold::Cpu`, `Hold::Reset`), DMA, ROM windows, UCI routing from C64_BUS_INTERNAL, turbo strobe, expansion lines, REU attach and resize | [S14](specs/S14-c64-trx64.md) §3-§7, [S15](specs/S15-uci.md) §3.4 |
-| `clock.rs` | 100 MHz clocks to PAL cycles, anchored at attach and after every reset release | [S14](specs/S14-c64-trx64.md) §4 |
+| `clock.rs` | 100 MHz clocks to C64 cycles at the model's clock (PAL or NTSC), anchored at attach, after every reset release and at a model switch | [S14](specs/S14-c64-trx64.md) §4, [S25](specs/S25-ntsc.md) |
 | `keys.rs` | 64-entry table from the U64 matrix position to TRX64 key names; host keys OR MATRIX_KEYB | [S14](specs/S14-c64-trx64.md) §6 |
 | `video.rs` | 384×272 frame indices, firmware palette, screen codes and character set for `c64_text_dump` | [S14](specs/S14-c64-trx64.md) §9 |
-| `sid.rs` | SID decode from the core config latches, ARMSID configuration protocol, reSID engines, write queue, `AudioSink`; S17 adds receiver groups and the mixer | [sid-audio.md](status/sid-audio.md), [S17](specs/S17-ultisid.md) |
+| `sid.rs` | SID decode from the core config latches, ARMSID configuration protocol, receiver groups, reSID engines, write queue, the mixer's gains and pans, stereo `AudioSink` | [sid-audio.md](status/sid-audio.md), [S17](specs/S17-ultisid.md), [S29](specs/S29-stereo.md) |
 | `sampler.rs` | Ultimate Audio: register file, eight voices, mixer, `$DF20-$DFFF` expansion device, its own DDR cell, `SamplerMix` | [S16](specs/S16-ultimate-audio.md), [sampler.md](status/sampler.md) |
 | `cart.rs`, `cart_eeprom.rs` | `CartLogic` (all_carts_v5.vhd, freezer.vhd), `CartProxy` as TRX64's `CartMapper` with the forced ULTIMAX decode, the microwire EEPROM; the capability constants CAPAB_EEPROM, CAPAB_COMMAND_INTF, CAPAB_SAMPLER | [carts.md](status/carts.md) |
 | `slot.rs` | Physical cartridge: TRX64 mappers, flash boards, or `CartLogic` from the CRT; bus sharing, bridge mirroring, CART_DETECT | [cart-slot.md](status/cart-slot.md) |
-| `drive.rs` | `DriveA`: TRX64's drive 8 as a `C64Drive`, parked while held or unpowered, surfaces from DDR GCR, written-track detection | [drive.md](status/drive.md) |
+| `drive.rs` | `DriveSlot` per drive position: TRX64's drive part as a `C64Drive` (power, reset, ROM, unit), surfaces from DDR GCR, written-track detection; a 1581 with the WD177x | [S27](specs/S27-drives-870.md), [drive.md](status/drive.md) |
+| `wd177x.rs` | The FPGA's WD177x for the 1581: registers, command FIFO as the firmware's interrupt, stepper, sector DMA | [S31](specs/S31-1581.md) |
+| `iec_proc.rs` | The IEC processor: the firmware's microcode on an engine at TRX64's IEC bus slot 4, its FIFOs | [S30](specs/S30-soft-iec.md) |
 | `reu.rs` | `ReuRam`: TRX64's `ExpansionRam` over guest DDR at `0x1000000`, `None` when nothing is lent | [reu.md](status/reu.md) |
 
 ### Host side
@@ -479,24 +508,31 @@ Level 2 of `ue2emu`: how the host reaches the machine and what it gets back.
 - **`HostInput`** (`Machine::input`):
   - `Key { row, col, down }` → `U64Io::set_key` and `C64Port::set_key` (TRX64's keyboard or the stub's CIA1).
     While the overlay owns the keyboard (TRANSPARENCY bit 6) key-downs do not reach the C64; releases always do.
-  - `Joystick(bits)` → `U64Io::set_joystick` and C64 port 2
+  - `JoystickPort { port, lines }` → `C64Port::set_joystick` for port 1 or 2; `U64Io` reads the same lines for
+    U64II_KEYB_JOY. `Joystick(lines)` means port 2
   - `MenuButton(pressed)` → `Itu::set_menu_button`
   - `UsbKey { usage, down }` → the USB HID keyboard (dropped without `--usb-keyboard`)
+  - `UsbMouse { dx, dy, wheel, buttons }` → the USB HID mouse (dropped without one)
   - `UsbPlug { port, connected }` → unplug or plug in the device on a hub port (`usb-replug`, `--usb-dir` replugs)
   - `Restore(held)` → the C64 NMI line
-- **Audio** (`ue2emu::audio`, `--audio on|off`, `--audio-wav`): the emulation thread pushes the SID's samples into a
+- **Audio** (`ue2emu::audio`, `--audio on|off`, `--audio-wav`): the emulation thread pushes the stereo samples into a
   150 ms ring that drops the oldest samples when full and plays silence on underrun, so `--speed max` never waits;
   the cpal stream lives in `EmuHandle` on the thread that spawned the emulation. The WAV gets every sample.
 - **`DisplaySnapshot`:** overlay registers, screen RAM, colour RAM and palette, plus `c64: Option<C64Frame>` (frame,
   palette, text screen and character set of an attached C64). Published by the emulation thread at every VIC picture, or
-  every 20 ms emulated without a C64 (S26). `render::Renderer` composites the overlay over the 384×272 C64 frame (overlay only without a C64);
-  `render::text_dump` and `render::c64_text_dump` turn the overlay and the C64 screen into text.
-- **Window:** realtime, held to the rendered image's ratio on resize, opens at 768×576. F12 = menu button, Page Up = RESTORE; other keys go to
-  the matrix, or with `--usb-keyboard` to the USB keyboard.
+  every 20 ms emulated without a C64 (S26). `render::Renderer` builds the image in the output mode the firmware
+  programmed: the C64 frame cropped and scaled by the VIC cropper and the scalers, the overlay on top (overlay only
+  without a C64); `render::text_dump` and `render::c64_text_dump` turn the overlay and the C64 screen into text.
+- **Window:** realtime, held to the rendered image's ratio on resize, opens at 768×576. F12 = menu button, Page Up =
+  RESTORE; with `--usb-mouse` a click captures the host mouse and Page Down lets it go. Other keys go to the matrix,
+  or with `--usb-keyboard` to the USB keyboard. `--hold-key` holds matrix keys from power-on until `release`.
 - **Control:** `--script file` or `--control 127.0.0.1:PORT`, one command per line (S08):
-  `wait <ms>`, `button [ms]`, `key <name> [ms]`, `type <text>`, `usbkey <name> [ms]`, `joy <port> <dirs> [ms]`, `joy-hold`, `joy-release`, `screen`, `c64screen`,
-  `png <path>`, `expect <text> [ms]`, `expect-not <text> [ms]`, `expect-console <text> [ms]`,
-  `usb-sync [--force] [port]`, `usb-replug [--discard] [port]`, `quit`.
+  `wait <ms>`, `button [ms]`, `key <name>[+<name>…] [ms]`, `hold <keys>`, `release <keys>`, `type <text>`,
+  `usbkey <name> [ms]`, `usbmouse <dx> <dy> [buttons]`, `joy <port> <dirs> [ms]`, `joy-hold <port> <dirs>`,
+  `joy-release <port>`, `screen`, `c64screen`, `png <path>`, `expect <text> [ms]`, `expect-not <text> [ms]`,
+  `expect-console <text> [ms]`, `expect-c64 <text> [ms]`, `usb-sync [--force] [port]`, `usb-replug [--discard] [port]`,
+  `usb-plug <port> image <path>|keyboard|mouse`, `usb-unplug <port>`, `monitor <cmd>`, `cart-info`, `cart-save <path>`,
+  `quit`.
   - `button`, `key`, `type`, `usbkey` and `joy` reach the emulation thread as one timed sequence (`Command::Inputs`,
     `control::InputTimeline`), so holds keep their emulated length at any host speed.
   - `expect*` poll the screen text or the console; a timeout prints the screen and fails with the line number, and
@@ -677,9 +713,6 @@ sequenceDiagram
 
 ### Audio
 
-Several SID engines and the mixer land with [S17](specs/S17-ultisid.md); until then one reSID serves socket 1 and
-UltiSID 1.
-
 ```mermaid
 sequenceDiagram
     participant CPU as 6510 in TRX64
@@ -768,7 +801,7 @@ flowchart LR
         repo["UE2-C64U-Emulator<br/>repository"]
         trx["TRX64<br/>repository"]
         tap["homebrew-ue2emu<br/>tap"]
-        ci["GitHub Actions<br/>macOS arm64, Linux x86_64"]
+        ci["GitHub Actions<br/>macOS arm64, Linux x86_64, Windows x86_64"]
     end
     subgraph mac["Developer Mac"]
         build["cargo build --release<br/>in a checkout"]
@@ -795,14 +828,14 @@ flowchart LR
 
 | Node | What runs there | Doc |
 |---|---|---|
-| Checkout | `cargo build --release -p ue2emu -p ue2-mcp`; prerequisites Rust stable, a C++ compiler, libslirp, network on the first build; optional `firmware/1541ultimate` and `tools/bin` for `scripts/build-firmware.sh`. `UE2_FIRMWARE=… cargo test --workspace`, `scripts/smoke-all.sh` | [install.md](status/install.md) §1 |
+| Checkout | `cargo build --release -p ue2emu -p ue2-mcp`; prerequisites Rust stable, a C++ compiler, libslirp, network on the first build; optional `firmware/1541ultimate` and `tools/bin` for `scripts/build-firmware.sh`. `UE2_FIRMWARE=… cargo test --workspace`, `scripts/smoke-all.sh`; before a release `scripts/gate.sh` | [install.md](status/install.md) §1 |
 | Homebrew | `brew install jondalar/ue2emu/ue2emu` builds the tagged release from source with Homebrew's Rust and libslirp and installs `ue2emu` and `ue2-mcp` (tap https://github.com/Jondalar/homebrew-ue2emu). An installed `ue2emu` always needs `--roms`; an installed `ue2-mcp` starts the `ue2emu` next to it and keeps instances in `~/.ue2emu/run/mcp/` | [install.md](status/install.md) §1, §6 |
 | CI | [ci.yml](../.github/workflows/ci.yml) on pushes to main, pull requests and by hand: macos-latest (libslirp from Homebrew), ubuntu-latest (`libslirp-dev`, `libasound2-dev`, `pkg-config`) and windows-latest (libslirp from vcpkg, cached); `cargo build --workspace --locked`, `cargo test --workspace --locked`. No firmware and no ROMs, so those tests skip. [release-binaries.yml](../.github/workflows/release-binaries.yml) builds the Windows zip for a published release | [install.md](status/install.md) "Platforms" |
 | MCP beside the emulator | `ue2-mcp` registered in the project that uses the emulator (`.mcp.json` or `claude mcp add`); env `UE2_REPO`, `UE2EMU_BIN`, `UE2_FIRMWARE_TREE`, `UE2_MCP_RUN`. Each instance is a child `ue2emu run --headless --control 127.0.0.1:<port>` with its own run directory and free localhost ports; several servers share `run/mcp` through claim files | [mcp.md](status/mcp.md) |
 | E2E | `scripts/run-e2e.sh` boots a realtime emulator with forwards (REST 18080, FTP 18021, Telnet 18023, DMA 18064, passive FTP 51000-52999) and runs the firmware tree's `run-tests` with `U64_*_PORT`; `E2E_REST_SHIM=1` for suites that ignore the port | [e2e.md](status/e2e.md) |
 | Network modes | `user`: no privileges, guest 10.0.2.15. `vmnet-bridged`: root or the vm.networking entitlement. `socket-vmnet`: a socket_vmnet daemon running as root | [network.md](status/network.md) |
 
-The workspace version is 0.2.0 ([Cargo.toml](../Cargo.toml)).
+The workspace version is 0.5.0 ([Cargo.toml](../Cargo.toml)).
 
 ## 8. Cross-cutting Concepts
 
@@ -814,17 +847,17 @@ The workspace version is 0.2.0 ([Cargo.toml](../Cargo.toml)).
 - **Devices** schedule themselves through `next_event`/`tick`. The ITU IRQ timer raises edge bit 0 every
   `(reload+1)*256` clocks (0x7A0 → 499 968, the 200 Hz tick); ITU_TIMER counts 1 per 500 clocks; the ms timer is
   `now / 100 000` ([S03](specs/S03-itu-uart.md)).
-- **C64 cycles.** The C64 runs from the PAL master clock, 985 248 Hz: `cycles(now) = now × 985 248 / 100 000 000` in
-  u128 from the attach clock. 1 cycle = 101.497 clocks = 25.4 RV32 instructions; 1 PAL frame = 19 656 cycles ≈
-  19.95 ms. The 0.6 ppm drift is ignored.
+- **C64 cycles.** The C64 runs at its model's CPU clock, PAL 985 248 Hz or NTSC ([S25](specs/S25-ntsc.md)):
+  `cycles(now) = now × hz / 100 000 000` in u128 from the anchor. Under PAL 1 cycle = 101.497 clocks = 25.4 RV32
+  instructions; 1 frame = 19 656 cycles ≈ 19.95 ms. The 0.6 ppm drift is ignored.
 - **1 ms sync.** The C64 never runs ahead of the RV32. Periodic: `C64Port::next_event() = synced + 100 000` (1 ms,
-  about 985 cycles). Lazy: each access to the cart registers, the DMA window, MATRIX_KEYB, the UCI window and drive A
-  first calls `advance_to(ctx.now)`, so polls see the C64 at the exact RV32 instant.
+  about 985 cycles). Lazy: each access to the cart registers, the DMA window, MATRIX_KEYB, the UCI window, the IEC
+  processor and the drives first calls `advance_to(ctx.now)`, so polls see the C64 at the exact RV32 instant.
 - **Instruction boundaries.** The backend runs whole 6510 instructions up to the target and carries the overshoot (at
   most about 7 cycles plus a BA steal). With a cartridge, runs end where EXROM/GAME can change: TRX64's access watch on
   `$DE00-$DFFF`, the Epyx capacitor deadline, single instructions while a freeze waits for the interrupt.
 - **Stop and reset.** STOP is `Hold::Cpu`: VIC, CIAs and SID run on. A held reset is `Hold::Reset`, and the reset wins.
-  The bridge keeps the Epyx capacitor hold time and drive A clocking. TRX64's reset zeroes its clock, so the bridge
+  The bridge keeps the Epyx capacitor hold time and clocks the drives through a held reset. TRX64's reset zeroes its clock, so the bridge
   re-anchors after every release ([S14](specs/S14-c64-trx64.md) §4, §7, [S15](specs/S15-uci.md) §3.4).
 - **Audio clocks.** reSID follows the C64 cycles; the sampler engine runs at 6.25 MHz = `CLOCK_HZ / 16` and is
   resampled to the sink rate.
@@ -866,7 +899,7 @@ It has no TRX64 types.
 - **Why a trait in ue2-core, with the cargo feature on ue2emu only** ([S14](specs/S14-c64-trx64.md) §2): `trx64-core`
   compiles reSID C++ and brings more crates; ue2-core must keep building and testing with no C++ toolchain and no
   TRX64; `C64Port` is unit-tested with a mock backend; `--no-default-features` builds a T0-only ue2emu.
-- **Required methods** (phase A): `advance_to`, `set_reset`, `set_stopped`, `set_ultimax`, `set_nmi`, `dma_read`,
+- **Required methods:** `advance_to`, `set_reset`, `set_stopped`, `set_ultimax`, `set_nmi`, `dma_read`,
   `dma_write`, `dma_peek`, `rom_write`, `rom_read`, `set_cart`, `kill_cart`, `cart_active`, `set_palette_byte`,
   `set_key`, `set_matrix_keyb`, `set_joystick`, `frame`.
 - **Defaulted methods**, added per feature so other backends and the mock keep compiling and `--c64 none` is unchanged:
@@ -881,8 +914,13 @@ It has no TRX64 types.
   | S15 | `has_uci`, `uci_read`, `uci_write`, `uci_irq`, `uci_take_events` |
   | S16 | `has_sampler`, `sampler_read`, `sampler_write`, `set_sampler_enabled` |
   | S17 | `mixer_write` |
+  | S23 | `as_any_mut` (the monitor reaches the TRX64 machine) |
+  | S24 | `frame_counter`, `set_stream_audio`, `take_stream_audio` |
+  | S30 | `has_iec`, `iec_read`, `iec_peek`, `iec_write` |
+  | Cart ROM base | `set_cart_rom` |
 
-- Reads that the firmware side can peek (`uci_read`, `sampler_read`) take `&self`, so `peek8` uses the same call.
+- Reads that the firmware side can peek (`uci_read`, `sampler_read`) take `&self`, so `peek8` uses the same call;
+  `iec_read` takes an entry from a FIFO, so `iec_peek` is separate.
 
 ### DDR lending
 
@@ -894,9 +932,9 @@ It has no TRX64 types.
 - TRX64 holds its REU store for the life of the device, but a borrow cannot be held. `ReuRam` is a second shared
   pointer cell updated on the same lend; the sampler has its own cell of the same shape. When nothing is lent the
   store answers `None` and the device drives its own floating bus ([reu.md](status/reu.md)).
-- Drive A's `DriveRegs` lends DDR around its C64 sync and takes it back before it uses `IoCtx::ram` itself: the drive
-  ROM (`0x00EE8000`) and the GCR half-tracks go to the drive, written tracks and the drive RAM mirror (`0x00EE0000`)
-  come back.
+- Each drive's `DriveRegs` lends DDR around its C64 sync and takes it back before it uses `IoCtx::ram` itself: the
+  drive ROM (drive A `0x00EE8000`) and the GCR half-tracks go to the drive, written tracks and the drive RAM mirror
+  (drive A `0x00EE0000`) come back.
 - `dma_peek` has no DDR lent, so cartridge ROM windows read as unserved there ([carts.md](status/carts.md)).
 
 ### Debugging
@@ -916,6 +954,9 @@ It has no TRX64 types.
   - Software breakpoints (`Machine::breakpoints`), step, continue, Ctrl-C. A fault hook stops GDB with SIGABRT.
   - Detach lets the machine run on; kill ends the emulator.
   - `monitor tasks` lists the FreeRTOS tasks from `pxCurrentTCB` and the kernel lists.
+- C64 monitor ([S23](specs/S23-monitor.md), [monitor.md](status/monitor.md)): TRX64's monitor verbs plus UE2's own,
+  through the `monitor <cmd>` control line and MCP's `emu_monitor`; `--vice-monitor` serves the VICE binary monitor
+  protocol for third-party debuggers.
 
 ### Errors and faults
 
@@ -948,7 +989,7 @@ It has no TRX64 types.
 |---|---|---|
 | Flash image | Created erased if missing; written back after program/erase, debounced (about 0.5 s wall), and on a clean exit. `quit` and closing the window are safe, a kill inside the window loses the last save | [storage.md](status/storage.md) |
 | SD image | Writes go straight to the file; opened once, no hot-plug | [storage.md](status/storage.md) |
-| Drive A disks | The drive writes GCR into DDR with DIRTY set; the firmware writes the image | [drive.md](status/drive.md) |
+| Drive A and B disks | A 1541 writes GCR into DDR with DIRTY set; the firmware writes the image. A 1581's sectors go through the firmware to the D81 file | [drive.md](status/drive.md) |
 | Physical cartridge | `ro` by default; `rw` writes into the CRT with a `.bak`, `save=` into another file | [cart-slot.md](status/cart-slot.md) |
 | `--usb-dir` | Nothing on the host is deleted or overwritten without a copy: trash, conflict copies, a mass-deletion guard, no sync of an image that fails the parse check, resume after a crash | [usb-dir.md](status/usb-dir.md) |
 
@@ -958,13 +999,15 @@ It has no TRX64 types.
   names; `C64Port` with a mock backend; the bridge against TRX64 (tests that need ROMs or the ELF skip without them).
   `cargo test -p ue2-core` never builds TRX64.
 - **Control-script smokes.** `scripts/smoke-all.sh` builds, runs menu, sd, flash-1, flash-2 and a negative control in
-  a temporary directory ([tooling.md](status/tooling.md)). C64 smokes with their setup in the header: `smoke-c64-roms`,
-  `-ready`, `-type`, `-prg`, `-freeze`, `-carts`, `-drive`, `smoke-sid-tone` with `wav-tone.py`
-  ([c64.md](status/c64.md)). USB: `smoke-usb.ctl`, `smoke-usb-dir.sh`. MCP: `scripts/mcp-smoke.py`. Some C64 scripts
-  still rely on `grep` of the dumps, not on `expect`.
+  a temporary directory ([tooling.md](status/tooling.md)). `scripts/smoke-c64-all.sh` runs every C64 smoke on images
+  it builds itself: ready, type, prg, freeze, SID tone, 28 carts and 4 freezes, GeoRAM, REU, drive, 1581, Software
+  IEC, USB, joysticks. USB: `smoke-usb-dir.sh`. MCP: `scripts/mcp-smoke.py`. Some C64 scripts still rely on `grep` of
+  the dumps, not on `expect`.
+- **Release gate.** `scripts/gate.sh` runs the workspace tests, `smoke-all.sh`, `smoke-c64-all.sh`,
+  `smoke-usb-dir.sh` and the upstream E2E smoke, and stops at the first failure ([S35](specs/S35-release-gate.md)).
 - **Upstream E2E.** `scripts/run-e2e.sh smoke|quick` runs the firmware tree's suite against a booted emulator, plus a
   second pass for `uci-targets` ([e2e.md](status/e2e.md)).
-- **CI** builds and tests the workspace on macOS and Linux ([Deployment View](#7-deployment-view)).
+- **CI** builds and tests the workspace on macOS, Linux and Windows ([Deployment View](#7-deployment-view)).
 - **Performance** is measured on M2: `wait 60000`, `--log unmapped`, `--speed max`, one run at a time
   ([c64.md](status/c64.md) §Performance).
 
@@ -990,7 +1033,7 @@ sampler behind it; S17 keeps `run_cpu` and `run_held` unchanged (CRITICAL, 25 sy
 | TRX64 reverse rings off (`TRX64_CPUHISTORY=0`, one-entry rings) | 112 MB RSS and a per-instruction cost | [S14](specs/S14-c64-trx64.md) §7, [c64.md](status/c64.md) §Performance |
 | Cartridge logic ported from all_carts_v5.vhd, served from lent guest DDR | Flash writes land in the firmware's image; no copies | [S14](specs/S14-c64-trx64.md) §W4-CART, [carts.md](status/carts.md) |
 | An ARMSID as the socket-1 chip; socket 1 empty by default | Detection needs no cycle timing; a fitted default shows a first-boot popup | [sid-audio.md](status/sid-audio.md) |
-| Drive A: the firmware owns the image formats, UE2 moves GCR between DDR and TRX64's drive | The firmware already converts D64/G64 to GCR in DDR and saves written tracks back | [S14](specs/S14-c64-trx64.md) §W4-DRIVE |
+| Drives: the firmware owns the image formats, UE2 moves GCR between DDR and TRX64's drives | The firmware already converts D64/G64 to GCR in DDR and saves written tracks back; for a 1581 it serves the D81's sectors itself | [S14](specs/S14-c64-trx64.md) §W4-DRIVE, [S27](specs/S27-drives-870.md), [S31](specs/S31-1581.md) |
 | The UCI block lives in TRX64 (Spec 852); UE2 maps the window and drives the ITU bits | A ue2-core model and a fake `CartProxy` are not needed | [S15](specs/S15-uci.md) §4, [trx64-uci-requirements.md](specs/trx64-uci-requirements.md) |
 | ITU high IRQ 6 dropped on the firmware's `$D038` write | The ITU has no ack register | [S15](specs/S15-uci.md) §3.3 |
 | The REU is TRX64's `Reu` over the firmware's DDR (`ExpansionRam`, Spec 854) | A private 16 MB copy would miss every preload | [reu.md](status/reu.md) |
@@ -1026,8 +1069,8 @@ sampler behind it; S17 keeps `run_cpu` and `run_held` unchanged (CRITICAL, 25 sy
 | Q1 | M2: the upstream ELF runs 60 s emulated | No halt, PC in `prvIdleTask`, 0 unmapped addresses (M1: 166 s, also 0) | [boot.md](status/boot.md) |
 | Q2 | `install` of the upstream `update.ue2` | Power-off request after 15.692 s emulated, application identical to the update file, 5.3 s wall | [install.md](status/install.md) §5 |
 | Q3 | Upstream E2E suite | smoke 12 of 12 with the REST shim; `uci-targets` 46 checks OK | [e2e.md](status/e2e.md) |
-| Q4 | C64 acceptance | A2 `READY.`, A3 ` 42`, A4 PRG run, A5 Freeze UI; 27 cartridge types PASS; drive A LOAD and SAVE with write-back | [c64.md](status/c64.md) |
-| Q5 | SID tone typed in BASIC | WAV dominant 1000.0 Hz, PASS | [sid-audio.md](status/sid-audio.md) |
+| Q4 | C64 acceptance | A2 `READY.`, A3 ` 42`, A4 PRG run, A5 Freeze UI; 28 carts PASS and 4 freezes; drive A LOAD and SAVE with write-back; the rest of `smoke-c64-all.sh` | [c64.md](status/c64.md), [tooling.md](status/tooling.md) |
+| Q5 | SID tone typed in BASIC | WAV dominant 1000.0 Hz under PAL, 1038 Hz under NTSC (the firmware's default System Mode), PASS | [sid-audio.md](status/sid-audio.md) |
 | Q6 | M2 at `--speed max` | `--c64 none` about 208 host MIPS (7.2 s wall); `--c64 trx64` about 124 (12.1 s); drive A, ARMSID and WAV about 111 (13.5 s) | [status/README.md](status/README.md) |
 | Q7 | S14 budget | `--c64 trx64` ≥ 100 host MIPS and ≤ 15 s wall for M2, peak RSS within 60 MB of `--c64 none`; `--c64 none` within 3 % of pre-S14 (212.5 vs 202 MIPS median) | [S14](specs/S14-c64-trx64.md) §12 A6, [c64.md](status/c64.md) |
 | Q8 | Realtime, 60 s | Needs 25 MIPS; with drive A, ARMSID and the audio device 26 % of one core; the pacer fell behind by 0.3 s at most over the minute | [c64.md](status/c64.md) |
@@ -1049,24 +1092,25 @@ realtime with 2004 host forwards keeps 25 MIPS at about 24 % of one core ([e2e.m
 | Closed U64-II FPGA top level | Bus sharing, UCI gating, the SID mixer, sampler generics, BOARDREV and the capability word are inferred | [boot.md](status/boot.md), [S15](specs/S15-uci.md) §6, [S16](specs/S16-ultimate-audio.md) §6, [S17](specs/S17-ultisid.md) §5 |
 | The bridge drives TRX64 internals | A TRX64 change can break the build or behaviour; the pin, tests and C64 smokes guard it | [install.md](status/install.md) "TRX64 dependency" |
 | TRX64's UCI read advances `stalled_on_bus + 1` | UBoot64 stalls reading an existing file; reported to TRX64, not worked around | [xander-tests.md](status/xander-tests.md) |
-| 50/60 Hz outside the C64 | The C64 runs NTSC or PAL (S25); overlay, redraw and the UDP stream assume 50 Hz | [c64.md](status/c64.md) §Known gaps |
 | Stops and DMA on instruction boundaries | STOP_MODE latched only, always "Frozen on Bad line"; raster-timed programs may glitch on freeze | [c64.md](status/c64.md), [carts.md](status/carts.md) |
-| SID gaps after S17 | RES/DIGI/filter curves, socket 2 chip, VOICE_ADSR; `$DE00-$DFFF` precedence unverified | [S17](specs/S17-ultisid.md) §3, §5 |
+| SID gaps | RES/DIGI/filter curves, socket 2 chip, VOICE_ADSR; `$DE00-$DFFF` precedence unverified | [S17](specs/S17-ultisid.md) §3, §5 |
 | Sampler gaps | No read pipeline, no memory contention, REU mirror answers a closed window | [sampler.md](status/sampler.md) |
-| Drives | 1541 and 1581 (no 1571); the IEC processor's master mode (printer, UltiCopy) not run | [drive.md](status/drive.md) |
-| No pointing device reaches the C64; "Run Cart" leaves the keyboard with the menu | Mouse-driven software (GEOS) cannot be used; cartridges need a button press | [xander-tests.md](status/xander-tests.md) |
-| TRX64 cartridge API gaps | No cart ROM in the VIC view; cart writes only in mapped windows; Business Basic's dynamic mode off | [carts.md](status/carts.md) |
+| Drives | 1541 and 1581; the 1571 is out of scope; the IEC processor's master mode (printer, UltiCopy) dropped; G64 tracks of odd length wrap at another rate than on hardware | [drive.md](status/drive.md) |
+| USB mouse POT conversion | Assumed as a 1351's, not measured on a device | [S32](specs/S32-usb-mouse.md) §4 |
+| Joystick swap | U64II_KEYB_JOY selects the port the menu reads; the C64's two ports are not swapped (unknown on the device) | [S36](specs/S36-joystick.md) |
+| "Run Cart" leaves the keyboard with the menu | Cartridges need a button press | [xander-tests.md](status/xander-tests.md) |
+| TRX64 cartridge API gaps | Freezers, Atomic Power, Business BASIC and Pagefox rely on bridge workarounds; Business BASIC's dynamic mode off | [carts.md](status/carts.md) |
 | Physical slot model | Bridge bit 0 only, no port timing, freeze button of a slot freezer not wired | [cart-slot.md](status/cart-slot.md) |
 | Overlapping REST connections reset | E2E rest-api-coverage varies; root cause not isolated | [e2e.md](status/e2e.md) E5 |
 | Network | No link notion on `NetBackend`; multicast dropped (no mDNS); WiFi link always down | [network.md](status/network.md), [boot.md](status/boot.md) |
 | Flash and updater stubs | Flash protection not modelled; ESP32 flash discarded; `run` ignores power requests | [install.md](status/install.md) §5 |
-| USB and SD | Root port never detaches; no mouse or other classes; no SD hot-plug | [usb.md](status/usb.md), [storage.md](status/storage.md) |
-| REU | Preload and save paths not run end to end; IO2 conflicts with cartridges left to the firmware | [reu.md](status/reu.md) |
+| USB and SD | Root port never detaches; no classes beyond mass storage, keyboard and mouse; no SD hot-plug | [usb.md](status/usb.md), [storage.md](status/storage.md) |
+| REU | IO2 conflicts with cartridges left to the firmware | [reu.md](status/reu.md) |
 | Keyboard ownership guessed (05 OQ6) | Host key-downs do not reach CIA1 while the overlay owns the keyboard | [c64.md](status/c64.md) |
 | Window and audio device not checked by agents | Realtime window paths verified headless only | [c64.md](status/c64.md), [sid-audio.md](status/sid-audio.md), [tooling.md](status/tooling.md) |
 | C64 smokes with a fixed wait and no `expect` | Exit 0 with a garbage dump on a heavier flash; read the greps | [c64.md](status/c64.md) §UCI |
-| Control protocol limits | No memory peek, no status query, no wait-for-text | [mcp.md](status/mcp.md) |
-| Platforms | Linux not used interactively; Windows unsupported | [install.md](status/install.md) |
+| Control protocol limits | No status query | [mcp.md](status/mcp.md) |
+| Platforms | Linux not used interactively; Windows networking is `--net user` only | [install.md](status/install.md) |
 
 ## 12. Glossary
 
@@ -1088,7 +1132,7 @@ realtime with 2004 host forwards keeps 25 MIPS at about 24 % of one core ([e2e.m
 | EXROM, GAME, ULTIMAX | Cartridge lines into the PLA; ULTIMAX is GAME low with EXROM high |
 | IO1, IO2 | The cartridge I/O areas `$DE00-$DEFF` and `$DF00-$DFFF` |
 | φ2 (PHI2) | The C64 system clock phase; CLOCK_DETECT bit 0 reports it |
-| PAL | The C64 timing UE2 runs: 985 248 Hz, 19 656 cycles per frame |
+| PAL, NTSC | The C64 timings UE2 runs, picked by the System Mode: PAL 985 248 Hz with 19 656 cycles per frame, NTSC 65 cycles per line at 60 Hz |
 | UCI | Ultimate Command Interface: registers at `$DF1B-$DF1F` (by default) through which a C64 program sends commands to firmware targets |
 | REU | RAM Expansion Unit; on the U64 DDR at `0x1000000`, up to 16 MB |
 | GeoRAM | Paged RAM cartridge, served by the cart logic from the same DDR region |
@@ -1099,6 +1143,8 @@ realtime with 2004 host forwards keeps 25 MIPS at about 24 % of one core ([e2e.m
 | Ultimate Audio, sampler | The U64's eight DMA voices that play PCM from DDR (`0x10048000`, C64 `$DF20-$DFFF`) |
 | CRT | Cartridge image file |
 | GCR | The 1541's disk encoding; the firmware converts D64/G64 to GCR half-tracks in DDR |
+| WD177x | The 1581's floppy controller; on the U64 an FPGA block whose sectors the firmware serves from the D81 |
+| Software IEC | The firmware's IEC drive, run as microcode by the FPGA's IEC processor on the C64's serial bus |
 | Freeze UI | The firmware menu drawn on the C64 screen while the 6510 is held |
 | `Hold::Cpu`, `Hold::Reset` | TRX64 run states: the CPU held with the chips running, or the reset line held |
 | HLE | High-level emulation: the USB nano CPU protocol instead of the nano CPU's code |
@@ -1107,5 +1153,5 @@ realtime with 2004 host forwards keeps 25 MIPS at about 24 % of one core ([e2e.m
 | vmnet, socket_vmnet | macOS bridged networking, directly or through lima's daemon |
 | MCP | Model Context Protocol, the interface `ue2-mcp` offers to Claude Code |
 | Control language | The line commands of scripts and the TCP control port (`wait`, `key`, `expect`, …) |
-| Spec, wave | A step spec `S01`-`S17` in `docs/specs`; waves are groups of specs built together |
+| Spec, wave | A step spec `S01`-`S36` in `docs/specs`; waves are groups of specs built together |
 | M1-M7 | The milestones in [Milestones](#milestones) |

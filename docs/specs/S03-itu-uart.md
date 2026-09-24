@@ -1,5 +1,7 @@
 # S03 — ITU, UART, capabilities, IRQ core
 
+**Status:** built.
+
 **Owns:** `crates/ue2-core/src/devices/itu.rs`, `crates/ue2-core/src/irq.rs` (internals; keep public method names)
 **Reads:** `docs/hw/02-itu-uart.md` (all), `docs/hw/00-memory-map.md` §1b rows 0x10000000-0x1000003F, §2 B1, B4, B9, C1, C2, §3 C2, C12, §Interrupts; `firmware/1541ultimate/fpga/io/itu/vhdl_source/itu.vhd`
 

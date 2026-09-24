@@ -207,7 +207,6 @@ S17 runs used copies of `run/flash.bin` with `--c64-roms`.
 | silence, ARMSID | `--flash run/flash-silent.bin --sid-socket1 armsid --audio-wav run/sid-silent.wav --script scripts/smoke-c64-type.ctl` | ` 42` printed; `wav-tone.py --silent`: peak-to-peak **0**, PASS |
 | tone, default map | `--flash run/flash-ulti.bin --audio-wav run/sid-ulti.wav --script scripts/smoke-sid-tone.ctl` | `$$ SID1 = 0`; 781 794 samples, peak-to-peak 18 799 (28.69 %: UltiSID 1 + 2), dominant **1000.0 Hz**, PASS |
 | two-SID PSID, SID player | `--flash run/flash-stereo.bin --sd run/sid-stereo.img --usb-keyboard --audio-wav run/sid-stereo.wav --script scripts/smoke-sid-stereo.ctl` | player lines above; 822 893 samples, peak-to-peak 8981 (13.70 %: one UltiSID at 172/180), dominant **1000.0 Hz**, PASS |
-| cartridges and players | `--sd run/carts.img --usb-keyboard --script scripts/smoke-c64-carts.ctl` (docs/status/carts.md) | 27 `<NAME> PASS`, no FAIL/BAD, `ACTION REPLAY FROZEN`, both `Bytes loaded`, no `Time out!`; 153.6 s emulated, 32 s wall |
 | device | `--audio on --script` (`wait 8000`) | W4-SID: stream opened on the Mac's default device, no warning; 8.0 s emulated at `--speed max`, 119 MIPS last interval. Not re-run for S17 |
 
 `smoke-sid-tone.ctl` types `poke 54296,15:poke 54277,0:poke 54278,240` and `poke 54273,66:poke 54272,133:poke
@@ -218,11 +217,6 @@ last 32768 samples (mean removed, Hann window, FFT, parabolic peak); pure Python
 $7A = $42, init writes the same voice to $D420-$D438 and leaves SID 1 alone, play is an RTS. The image is
 `scripts/make-sd-image.sh run/sid-stereo.img` plus `scripts/add-sd-files.sh run/sid-stereo.img
 run/sid-stereo/s03-stereo.sid`.
-
-**No regressions (S17):** `UE2_FIRMWARE=… cargo test --workspace` green, 429 tests (c64-bridge 75, ue2-core 202,
-ue2emu 75, ue2-net 20, ue2-vfat 12 + 20, rv32 13 + 1, ue2-mcp 11), no warnings; `cargo build -p ue2emu
---no-default-features` clean. `scripts/smoke-all.sh` and C64 A2-A5 were last run at W4-SID. The window was not
-started (no GUI in this workflow).
 
 ## Tests
 
@@ -243,30 +237,9 @@ started (no GUI in this workflow).
 
 ## Performance
 
-**S17** (one run each, twice, host load average about 3): `wait 60000` on a fresh flash, `--log unmapped`,
-`--speed max`. Default options: 121.2 and 120.5 host MIPS (12.4 s wall). `--audio-wav` + `--sid-socket1 armsid`: 92.9
-and 93.7 host MIPS (16.0 s wall). The boot map puts socket 1 and both UltiSIDs at $D400, so the jingle runs three reSIDs
-where W4-SID ran one: about 3.6 s wall per 60 s emulated instead of 1.4 s.
-
-**W4-SID.** A6 method (docs/status/c64.md): `wait 60000`, `--log unmapped`, fresh flash, `--speed max`, one run at a time,
-variants interleaved. Host MIPS = instructions / wall seconds of the whole process. The fresh flash runs the
-placeholder KERNAL, whose welcome jingle writes the SID. Baseline is main `9b2b7a8` built from the same sources.
-
-| Build / option | Host MIPS per run | Last interval | vs baseline |
-|---|---|---|---|
-| baseline `9b2b7a8` | 128.1, 127.3, 130.9, 130.3, 129.5, 129.6 (median 129.6) | 129-132 | — |
-| W4-SID, default (no sink, socket empty) | 125.0, 125.3, 126.8; one outlier 120.1 | 131-132 | about −3 % (60 s in 11.8-12.0 s wall) |
-| W4-SID, `--audio-wav` + `--sid-socket1 armsid` | 114.0, 113.3 | 117-118 | about −12.5 % (13.2 s wall) |
-
-- **First version:** every CPU write clocked reSID, sink or not. The default path measured 122.3/123.1: the profile
-  (`sample`) showed reSID clocked by the jingle.
-- **Zero-sized tap:** turning `SidTap` into a zero-sized observer changed nothing (122.6/123.9).
-- **Untimed CPU writes without a sink:** the last-interval MIPS equal the baseline, and the profile has no reSID
-  frames.
-- **The remaining ~3 %:** it has no reSID frames and is within this host's run-to-run spread. Other workflows were
-  building and running in parallel; two later rounds at 52-66 MIPS were discarded.
-- **With a sink:** reSID's per-cycle clock, filter and 44.1 kHz resampling cost about 1.4 s wall per 60 s emulated
-  at `--speed max`, about 7 % of one core in realtime.
+`wait 60000` on a fresh flash (the placeholder KERNAL's welcome jingle writes the SID), `--speed max`, Apple M4, two
+runs each: default options 6.0 s wall; `--audio-wav` + `--sid-socket1 armsid` 10.2 s. The boot map puts socket 1 and
+both UltiSIDs at $D400, so the jingle runs three reSIDs. Without a sink CPU writes are not clocked into reSID.
 
 ## Known gaps
 
@@ -282,5 +255,3 @@ placeholder KERNAL, whose welcome jingle writes the SID. Baseline is main `9b2b7
   show the cartridge.
 - ARMSID filter settings are stored and read back but do not change reSID. The mode is not kept across emulator
   starts.
-- PAL clock only (reSID at 985 248 Hz), like the rest of S14.
-- The window's default `--audio on` was not heard by the agent; the device path was checked headless on silence.

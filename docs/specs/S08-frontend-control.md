@@ -1,5 +1,7 @@
 # S08 — Frontend: window, keymap, control/script
 
+**Status:** built.
+
 **Owns:**
 - `crates/ue2emu/src/{window.rs,keymap.rs,control.rs}`
 - the `[dependencies]` of `crates/ue2emu/Cargo.toml` (additions)

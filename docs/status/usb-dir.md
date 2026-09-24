@@ -284,19 +284,6 @@ target/release/ue2emu run --flash run/flash.bin --usb-dir /path/to/share,size=2G
   - `--usb-dir share --usb-dir share/games`, the reverse order, and `share,ro` twice: refused at start.
 - **Regressions:** `scripts/smoke-all.sh` and the S13 smoke (`docs/status/usb.md`) pass unchanged.
 
-### After the merge into main (wave 4: SID/audio, cartridges, drive A)
-
-Merged build, scratch directories only (`run/it-usbdir/`, session scratchpad):
-
-| Check | Result |
-|---|---|
-| Builds | `cargo build --release --workspace` and `-p ue2emu --no-default-features`: no warnings. Clippy: only the three warnings `main` already had (`io.rs`, `drive.rs`) |
-| `cargo test --workspace` | 350 passed, 1 ignored (ue2-core 195, ue2-vfat 12 + 19, ue2emu 54, c64-bridge 33, ue2-net 12, ue2-mcp 11, rv32 13 + 1) |
-| Smokes | `smoke-all.sh` all pass; `smoke-usb-dir.sh` PASS (22.696 s emulated, 6 s wall); S13 PASS (11.836 s emulated); `mcp-smoke.py` ALL STEPS PASSED |
-| Wave 4 | A2 setup (3 ROM copies, 3 config stores), A2 `READY.` and the PNG pixels, A3 ` 42`, A4 `HELLO FROM UE2EMU`, A5 `Frozen on Bad line.`; SID tone 1000.0 Hz PASS; drive smoke with `NEW` equal to `TEST`; carts 27 × PASS, `ACTION REPLAY FROZEN`, no `Time out!` |
-| Review reproductions | Directory renamed under unsynced writes (e2e): `created games/`, `wrote games/lostdisk.d64`, `games2/` intact. `chmod 555` (e2e): `NOT WRITTEN`, `NOT SYNCED`, 1 disconnect, marker and image kept over two restarts, written after `chmod 755`. Corrupt FAT (e2e): 0 disconnects, "host changes wait", `--discard` keeps the image. Symlink to outside (library): the outside tree is byte-identical, the guest data goes to a conflict directory. U+FFFD name (library): skipped at build, the next sync writes |
-| Realtime | `--speed realtime`, C64 with drive A on and one `--usb-dir` stick: 60.004 s emulated in 60 430 ms wall (process start and volume build included), 25 MIPS |
-
 ## Code map
 
 | File | Content |

@@ -529,7 +529,8 @@ normally.")]
 (`m c000 c00f`), disassembly (`d e000`), the debug surfaces (`bk`, `flow`, `bt`), `help` for the full verb list. \
 The verbs are TRX64's, the same monitor its own tools speak (docs/specs/S23-monitor.md). `device` selects the CPU: \
 the C64 (default), the 1541 (`drive8`), or the firmware's RISC-V (`fw`, registers and memory only). It needs an \
-instance started with a C64 (the default). Run control (`g`, `step`) is not in this build yet.")]
+instance started with a C64 (the default). Run control: `g`, `z`/`step`, `n`, `ret`, `until`, `c64 halt|go|step`, \
+`fw halt|go|step`.")]
     async fn emu_monitor(&self, Parameters(p): Parameters<MonitorParams>) -> ToolResult {
         finish(self.monitor(p).await)
     }

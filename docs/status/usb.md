@@ -1,9 +1,10 @@
-# S13 status — USB: mass storage and HID keyboard
+# S13 status — USB: mass storage, HID keyboard and mouse
 
 Spec: `docs/specs/S11-S14-later.md` §S13. Hardware: `docs/hw/09-usb.md` tier T1b (hub root). **Reached.** The
 unmodified firmware (`ultimate.elf`, V1.01 3.15) enumerates the USB2513 hub, a mass-storage device and a HID
 keyboard behind it, lists the stick as `USB0` in the file browser, reads and writes files on it, and takes menu
-input from the USB keyboard.
+input from the USB keyboard. A HID mouse (S32) reaches the C64's control port 1 through the firmware's mouse
+emulation, and devices plug in and out while the machine runs (S33).
 
 ## Commands
 
@@ -30,10 +31,14 @@ grep -q '^HELLO                         PRG  254' run/smoke-usb.log && echo S13 
   names: `a`, `return`, `f10`, `down`, `lshift`, …).
 - `--usb-dir <path>[,size=SIZE][,ro]`: a host directory as a stick, with the guest's changes written back
   (`docs/status/usb-dir.md`). Repeatable; on the ports after the images, before the keyboard.
+- `--usb-mouse`: a HID mouse on the port after the keyboard. In the window a click captures the host mouse, Page Down
+  lets it go; scripts use `usbmouse <dx> <dy> [buttons]` (bit 0 left, 1 right, 2 middle).
+- `--usb-hub`: announce the USB host with no device on it. `usb-plug <port> image <path>|keyboard|mouse` and
+  `usb-unplug <port>` plug devices in and out while the machine runs (S33).
 - `usb-replug [port]` unplugs a device and plugs it back in (hot-plug through the hub, `docs/status/usb-dir.md`
   §Hot-plug); `usb-sync` is for `--usb-dir` sticks.
 - More than 3 devices is an error (the USB2513 has 3 ports). With any device the capability word gets
-  `CAPAB_USB_HOST2` (bit 23); without `--usb`/`--usb-dir`/`--usb-keyboard` it stays `0x34000226` (`0x34000222` before S27 added drive B's bit).
+  `CAPAB_USB_HOST2` (bit 23), and so does `--usb-hub`; without them it stays `0x34000226`.
 
 ## Results
 
@@ -95,11 +100,10 @@ keyboard_c64.cc:325-326).
 
 - 60 s emulated with `--usb run/usb.img --usb-keyboard --log unmapped`: no halt, no USB error lines,
   `unmapped summary: 0 addresses`, 190 MIPS.
-- Without USB flags the boot log still says `No USB2 hardware found. (34000222)` with 0 unmapped addresses.
+- Without USB flags the boot log says `No USB2 hardware found.` with 0 unmapped addresses.
 - `scripts/smoke-sd.ctl` with `--sd` and `--usb` together lists both media; the SD screens are unchanged.
-- `cargo test --workspace` passes, including the USB model tests below.
-- After the wave-3 merge (default `--c64 trx64`, `usbkey` now a timed input sequence like `key`, docs/status/tooling.md):
-  the smoke run above passes its grep block, 11.832 s emulated.
+- `cargo test --workspace` passes, including the USB model tests below. `smoke-usb.ctl` runs in
+  `scripts/smoke-c64-all.sh`.
 
 ## Model (`crates/ue2-core/src/devices/usb/`)
 
@@ -111,6 +115,7 @@ keyboard_c64.cc:325-326).
 | `storage.rs` | Bulk-Only Transport; INQUIRY, REQUEST SENSE, TEST UNIT READY, READ CAPACITY(10), READ(10), WRITE(10); sense codes; read-only media are write protected |
 | `block.rs` | `BlockBackend` (the medium: blocks, read, write, read-only) and `ImageFile`, the raw image of `--usb` |
 | `keyboard.rs` | HID boot keyboard with the HID 1.11 report descriptor; report queue so short taps survive the 20 ms poll; SET_IDLE/GET_IDLE honoured |
+| `mouse.rs` | HID mouse: relative X/Y, buttons 1-3 and a wheel; a report only on change (S32) |
 
 Unit tests drive the model the way `UsbBase` does (`control_exchange`, `bulk_in`/`bulk_out`, autopipes, the
 ISR's FIFO drain): hub and storage enumeration with SCSI I/O against a temp image, keyboard reports on an
@@ -129,11 +134,13 @@ now starts a pipe no earlier than one frame after the write that armed it (`SCAN
   emulator runs (`--usb-dir` does that safely).
 - **Wire details not modelled:** split transactions to the full-speed keyboard, PING, suspend/resume, error
   retries. Every device answers at once and always with the toggle the pipe expects.
-- **Mouse** since S32 (`--usb-mouse`); other classes (CBI, AX88772) are not modelled.
+- **Other classes** (CBI, AX88772) are not modelled.
+- **Mouse position:** the firmware turns it into POTX/POTY; that conversion is assumed as a 1351's and not measured
+  on a C64U (S32 §4).
 - **Mass storage:** one LUN, 512-byte blocks, 32-bit LBAs (images above 2 TiB are cut); commands other than the six
   the driver sends fail with ILLEGAL REQUEST.
-- **Board wiring open (09 Q5):** 3 hub ports; images get the first ports, the keyboard the next free one, so names
-  are `USB0`, `USB1`, `USB2` in that order.
+- **Board wiring open (09 Q5):** 3 hub ports; images get the first ports, then `--usb-dir` sticks, the keyboard and
+  the mouse, so storage names are `USB0`, `USB1`, `USB2` in that order.
 - **Keyboard into the C64:** the firmware also writes the USB keyboard state to MATRIX_KEYB (keyboard_usb.cc:214-229).
   Since S14 `C64Port` forwards MATRIX_KEYB to TRX64 (`docs/status/c64.md`); typing into BASIC from the USB keyboard
   was not tried.

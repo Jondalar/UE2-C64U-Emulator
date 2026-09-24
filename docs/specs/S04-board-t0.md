@@ -1,5 +1,7 @@
 # S04 — Board T0 models
 
+**Status:** built.
+
 **Owns:** `crates/ue2-core/src/devices/{board.rs,i2c.rs,c64.rs,usb.rs,drives.rs,iec.rs,misc.rs,rmii.rs}`
 **Reads:**
 - `docs/hw/00-memory-map.md` §1b (T0 column), §1c, §2 (all hazards) and §3 C4, C11, C12, C14

@@ -1,5 +1,7 @@
 # S19 — Idle skip: the RISC-V CPU fast-forwards loops that cannot change anything
 
+**Status:** built (2026-09-17).
+
 The firmware has no WFI (00 Q-D1). When nothing is to be done, FreeRTOS spins in `prvIdleTask`, and UE2 executes those
 instructions one by one: 25 million a second in realtime. In UltimateDemo2026 at TRX64 `a6e0465` the part of the
 emulation thread outside the C64 is 12-16 %, while the firmware touches a C64 window 0.7 times a second and writes

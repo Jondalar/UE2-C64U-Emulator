@@ -1,5 +1,7 @@
 # S27 — Drives A and B on TRX64's drive parts (TRX64 Specs 870/871)
 
+**Status:** built (2026-09-23) on TRX64 v0.8.8.
+
 **Owns:**
 - `crates/c64-bridge/src/drive.rs`: one `DriveSlot` per position on the 870 API; the stand-in, the TRUEDRIVE
   re-set, the ROM file and the `$77/$78` patch go
@@ -59,4 +61,4 @@ Drive B's registers were a separate T0 device with no drive. They move into `C64
 
 ## 6. Not in this spec
 
-1571 and 1581 (TRX64, later), the disk surface as a TRX64 API (not planned).
+The 1581 (S31), the 1571 (out of scope), the disk surface as a TRX64 API (not planned).

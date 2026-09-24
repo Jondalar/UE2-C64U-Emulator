@@ -1,5 +1,7 @@
 # S09 — SD card over SPI (image-backed)
 
+**Status:** built.
+
 **Owns:** `crates/ue2-core/src/devices/sdcard.rs`
 **Reads:** `docs/hw/07-sd-card-filesystems.md` (all), `docs/hw/00-memory-map.md` §1b row 0x10060000, §2 C3, runtime hazards "SD insert"; firmware `software/io/sd_card/*`, `software/filesystem/sdcard_manager.cc`
 

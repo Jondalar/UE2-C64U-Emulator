@@ -11,7 +11,7 @@ through `$UE2_FIRMWARE`).
 `scripts/gate.sh` runs everything that has to pass before a minor or a major release (S35): the workspace tests,
 `smoke-all.sh`, `smoke-c64-all.sh` (every C64 smoke on images built from nothing: READY, typing, a PRG, the freeze
 UI, the SID tone, 28 carts and 4 cart freezers, GeoRAM, REU preload and Save REU, drive A with write-back, the 1581
-at A and B, Software IEC, a USB stick),
+at A and B, Software IEC, a USB stick, both joystick ports),
 `smoke-usb-dir.sh`, and the upstream suite's smoke profile. It stops at the first failing part. First run
 (2026-09-24): all parts pass in 430 s, 322 of them the C64 smokes.
 
@@ -37,22 +37,29 @@ directory.
 | sd | `smoke-sd.ctl` | `--flash run/flash.bin --sd run/sd.img` | `SD Card Ready`; `/SD/` and `/SD/demo.d64/` listings; console `3 children fetched from SD.`, `2 children fetched from demo.d64.` |
 | flash-1 | `smoke-flash-1.ctl` | `--flash run/flash-ui.bin` (fresh) | Color Scheme = C128 Style; save popup; console `Writing config store 'User Interface Settings' to flash`, `Page: 0 done.` |
 | flash-2 | `smoke-flash-2.ctl` | `--flash run/flash-ui.bin --no-overlay-ui` | browser on the overlay; `Interface Type Overlay on HDMI`; `Color Scheme C128 Style` |
+| settings | `smoke-settings.ctl` | `--flash run/flash-settings.bin` (fresh) `--settings smoke-settings.cfg` | console `REU: 01. REU_SZ: 07, UCI: 01`; the three settings in the menu (S21) |
+| monitor | `smoke-monitor.ctl` | `--flash run/flash-monitor.bin` (fresh) `--settings smoke-settings.cfg` | every `monitor` line answers without an error; the config cycle's value in the log (S23) |
+| uci | `smoke-uci.ctl` | `--flash run/flash-uci.bin` (fresh) `--c64-roms --settings smoke-uci.cfg --usb-dir run/uci` | `uci-probe.prg` prints `UCI OK` |
+| vice | generated | `--flash run/flash-vice.bin --vice-monitor` | `scripts/vice-client.py` talks the VICE binary monitor (S23 §8) |
 | negative | generated | `--flash run/flash.bin` | `expect "NO SUCH TEXT ON THE SCREEN" 500` must exit non-zero and name line 2 |
 
-`make-sd-image.sh run/sd.img` runs between menu and sd. Result on this Mac (upstream `ultimate.elf` V1.01 3.15,
-10 CPUs):
+`make-sd-image.sh run/sd.img` runs between menu and sd. Result at 0.5.0 (upstream `ultimate.elf` V1.01 3.15,
+Apple M4, 10 CPUs):
 
 ```
-PASS menu (2.204 s emulated, 1 s wall)
-PASS sd (1.436 s emulated, 0 s wall)
-PASS flash-1 (4.556 s emulated, 1 s wall)
-PASS flash-2 (2.572 s emulated, 0 s wall)
+PASS menu (2.361 s emulated, 1 s wall)
+PASS sd (1.619 s emulated, 0 s wall)
+PASS flash-1 (4.701 s emulated, 2 s wall)
+PASS flash-2 (2.739 s emulated, 1 s wall)
+PASS settings (2.123 s emulated, 0 s wall)
+PASS monitor (1.587 s emulated, 1 s wall)
+PASS uci (5.597 s emulated, 2 s wall)
+PASS vice
 PASS negative (exit code 1)
 all smoke tests passed
 ```
 
-The suite also passed with one busy loop per CPU running beside it, with the same emulated times to within
-12 ms. The fixed `wait 4000` at the start of each script is now `expect "F3=HELP" 10000`: the
+The fixed `wait 4000` at the start of each script is now `expect "F3=HELP" 10000`: the
 firmware takes the menu button as soon as the browser has drawn its help line, at about 1.1 s emulated. The menu
 script needed 5.8 s emulated before.
 
@@ -63,6 +70,7 @@ script needed 5.8 s emulated before.
 | `expect <text> [ms]` | `render::text_dump` contains `text` | `expect "…": not on the screen within <ms> ms emulated` |
 | `expect-not <text> [ms]` | `text_dump` no longer contains `text` | `expect-not "…": still on the screen after <ms> ms emulated` |
 | `expect-console <text> [ms]` | the console output after the previous `expect-console` match contains `text` | `expect-console "…": not in the console output within <ms> ms emulated` |
+| `expect-c64 <text> [ms]` | the C64 text screen (`c64screen`) contains `text` | `expect-c64 "…": not on the C64 screen within <ms> ms emulated` |
 
 Merged from other branches: `usbkey <name> [ms]` (a timed sequence like `key`, `docs/status/usb.md`) and `c64screen`
 (`docs/status/c64.md`).
@@ -129,7 +137,7 @@ a repeat or a long button press.
 
 ## Tests
 
-`cargo test -p ue2emu` has 39 tests (8 new); `cargo test --workspace` passes 200 tests.
+`cargo test -p ue2emu` covers:
 - **Parsing:** the new commands, quoting and bad input.
 - **Execution (fake target):** expect passes, times out, and a timeout prints the screen and names the line;
   console marks.
@@ -147,5 +155,5 @@ a repeat or a long button press.
   (`/Temp/`), and a hidden overlay still matches `expect`.
 - **Firmware-specific text:** the scripts' texts come from the upstream `ultimate.elf` (V1.01 3.15). They were not
   run against the Commodore C64U 1.1.0 `.ue2`.
-- **Other scripts:** `smoke-usb.ctl` and the `smoke-c64-*.ctl` scripts still use `wait` and screen dumps checked by
-  `grep`, and `smoke-all.sh` does not run them. storage.md, boot.md and README were updated in the wave-3 merge.
+- **Other scripts:** `smoke-usb.ctl` and `smoke-c64-{ready,type,prg,freeze,carts,roms}.ctl` still use `wait` and
+  screen dumps that `smoke-c64-all.sh` checks by `grep`; `smoke-c64-roms.ctl` is in no runner.

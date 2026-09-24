@@ -9,7 +9,7 @@
 //! Our own verbs are S23 M2 and live below, behind the library's dispatch. [`uci`] is what `config` knocks on when
 //! a verb has to reach the *running* firmware rather than the bytes it left behind.
 //!
-//! Not here yet: run control (S23 M3, the library's defaults refuse it in one sentence).
+//! Run control for both CPUs (S23 M3) is [`run`].
 
 mod config;
 mod devices;

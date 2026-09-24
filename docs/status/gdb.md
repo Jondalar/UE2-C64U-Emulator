@@ -6,7 +6,7 @@ as the architecture, in `crates/ue2emu/src/gdb.rs`, and it has been there since 
 (`docs/specs/S11-S14-later.md`).
 
 There is no GDB for the C64 side: GDB has no 6502 target upstream. The C64 core is served by the VICE binary monitor
-protocol instead (`docs/status/monitor.md` §8), which is what the C64 debuggers speak.
+protocol instead (`--vice-monitor`, `docs/status/monitor.md`, S23 §8), which is what the C64 debuggers speak.
 
 ## 1. Turning it on
 

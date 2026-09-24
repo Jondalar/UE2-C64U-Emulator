@@ -32,11 +32,11 @@ firmware's "Load Settings" does by hand (`filetype_prg.cc:212`, `filetype_crt.cc
 
 | Project | How far it gets (2nd pass) | Stopped by |
 |---|---|---|
-| UBoot64 v3.0.1 | **Boots to its menu**: REU 16 MB detected, slot file written, filebrowser over UCI, information and configuration screens all work | Reading an **existing** `DMBSLT.CFG` back over UCI stalls |
+| UBoot64 v3.0.1 | **Boots to its menu**: REU 16 MB detected, slot file written, filebrowser over UCI, information and configuration screens all work | — (reading an existing `DMBSLT.CFG` stalled; fixed in TRX64 0.7.2, gap 2) |
 | mandelbrot-upic v1.0.3 | **Runs and draws its picture** | — |
-| UltimateDemo2026 v1.0.1 | **Runs the whole demo**: UCI, REU 16 MB, turbo 64 MHz; every scene draws | Ultimate Audio `$DF20-$DFFF`: `Audio [Fail] Module not found`, no music |
-| heartbeat-demo v1.0.1 | Hardware detection: UCI, REU 16 MB, turbo all OK | Ultimate Audio: fails the check and **returns to BASIC** |
-| GeoUTools v1.1 | *(3rd pass, §5)* **GEOS 1.2 boots to its DeskTop** in 30 s emulated; GeoUMount and GeoUConfig run and their UCI calls answer | No pointing device reaches the C64, so the DeskTop cannot be driven; GeoUMount finds no drive target and GeoUTime crashes after its NTP call |
+| UltimateDemo2026 v1.0.1 | **Runs the whole demo**: UCI, REU 16 MB, turbo 64 MHz; every scene draws; plays its MOD since S16 | — |
+| heartbeat-demo v1.0.1 | Hardware detection all OK; plays its song since S16 | — |
+| GeoUTools v1.1 | *(3rd pass, §5)* **GEOS 1.2 boots to its DeskTop** in 30 s emulated; GeoUMount and GeoUConfig run and their UCI calls answer | No pointing device reached the C64 then, so the DeskTop could not be driven (mouse and joysticks exist since S32/S36, not re-run); GeoUMount finds no drive target and GeoUTime crashes after its NTP call |
 
 Three emulator gaps, in the order they cost the most:
 
@@ -78,13 +78,10 @@ Three emulator gaps, in the order they cost the most:
    button, and starts the song with it. Whether the firmware is meant to hide the
    menu for a cartridge was not established here; it is recorded as observed, with the workaround.
 
-**A fourth gap, found when GEOS was run (§5): no pointing device reaches the C64.** `HostInput::Joystick(u8)` is
-routed to `U64Io` and `C64Port` (`crates/ue2-core/src/machine.rs:494`) but has no producer outside a unit test: the
-control language, `ue2-mcp` and the window keymap can send keys, the USB keyboard and the menu button and nothing
-else, and the USB stack models no mouse (`docs/status/usb.md`). GEOS boots and then sits there — ten key presses
-change 0 pixels of its DeskTop. Anything mouse-driven is out of reach, headless and in the window alike. A smaller
-one from the same runs: **`--usb-dir` refuses to sync back a stick that holds one file**, because a single changed
-file is 100 % of it and trips the mass-deletion guard (§5).
+**A fourth gap, found when GEOS was run (§5): no pointing device reached the C64.** GEOS booted and then sat there —
+ten key presses changed 0 pixels of its DeskTop. Closed since: the USB mouse (`--usb-mouse`, the `usbmouse` command,
+S32) and the joystick commands (`joy`, S36) reach the control ports; GEOS has not been run with them. A smaller one
+from the same runs, `--usb-dir` refusing to sync back a stick that holds one file, is fixed (§5).
 
 Carried over unchanged from `docs/status/c64.md` ("CIA TOD"), neither worked around: **TOD runs 5.3 % slow while the
 screen is on**, and **the mains frequency comes from CRA bit 7 rather than from the machine**. Nothing in this
@@ -138,7 +135,7 @@ firmware menu — gap 3 above):
   (`shots/uboot64/07-configuration-ntp.png`).
 - **F7 from each screen returns to the menu.** 41.4 s emulated for the whole tour.
 
-**Where it stops now: reading an existing `DMBSLT.CFG`.** Every run on a stick that already has the file stalls at
+**Where it stopped in the second pass: reading an existing `DMBSLT.CFG`** (fixed since, Summary gap 2). Every run on a stick that already has the file stalls at
 
 ```
 REU detected, size: 16384 KB
@@ -243,7 +240,7 @@ applied in full: `Effectuating settings of store 'Audio Mixer' after loading.`, 
 `UCI [ OK ]`, `Type ultimate 64-ii`, `REU [ OK ] 16 MB`, `Turbo [ OK ] 64 MHz`, `Audio [Fail] Module not found`,
 `Press any key to continue.`
 
-**Where it stops: the key press returns it to BASIC.** Four seconds after `key space` the screen is cleared with
+**Where it stopped in the second pass: the key press returned it to BASIC** (it plays since S16, Summary gap 1). Four seconds after `key space` the screen is cleared with
 `READY.` and nothing else (`shots/heartbeat-demo/02-exits-to-basic.png`); 143 s emulated total, no further output.
 The demo does not continue without Ultimate Audio, so **it never attempts its own song load**: the 8 SIDs, the 7
 DMA channels and the tick IRQ stay untested. `Sampler: 00` again, for the reason in §2.
@@ -331,17 +328,9 @@ and nothing changes after that. The whole run — mount, boot, three minutes of 
 **The DeskTop cannot be driven: no pointing device reaches the C64.** A sweep of ten keys (`down`, `up`, `left`,
 `right`, `space`, `a`, `return`, `f1`, `runstop`, `home`, each held 1-2 s emulated) changes **0 pixels** —
 `shots/geos/03-desktop-after-key-sweep.png` is byte for byte `02-desktop.png`. So keys do not bleed into the
-joystick lines either, and no icon and no menu can be opened. What is missing:
-
-- The control language has `key`, `type`, `usbkey` and `button` and nothing else (`crates/ue2emu/src/control.rs`,
-  `docs/specs/S08-frontend-control.md`); `ue2-mcp` exposes the same set, and the window keymap adds none.
-- `HostInput::Joystick(u8)` exists and `Machine::input` routes it to `U64Io` and `C64Port`
-  (`crates/ue2-core/src/machine.rs:494`), but **nothing produces it** outside one unit test (`machine.rs:966`), and
-  `C64Port::set_joystick` drives port 2 only.
-- USB HID is a keyboard only — "**No mouse.** HID mouse and other classes (CBI, AX88772) are not modelled"
-  (`docs/status/usb.md`) — so the firmware's own `C64_JOY1/2_SWOUT` path (`joystick_output.cc`, `usb_hid.cc`) has no
-  device behind it.
-- `HostInput::Restore` has no control command either; RESTORE exists only as Page Up in the window.
+joystick lines either, and no icon and no menu could be opened. At the time the control language had no joystick
+or mouse input and the USB stack no mouse; both exist now (S32, S36). RESTORE still has no control command; it is
+Page Up in the window.
 
 **Getting GeoUTools to GEOS.** Swapping the mounted image is honest but pointless: the D64 does swap, and the
 DeskTop then has to be told to read the new disk, which is a mouse click. So the tools were copied onto a working
@@ -393,7 +382,7 @@ The firmware therefore answers the 3.10f+ device-info command (`Checkcommandsupp
 `src/mount_common.c:120-128`) and the detection runs to its end — and matches nothing. `SetValidDrives` takes a
 drive only when GEOS's own `DRIVETYPES` entry for it is below 4 *and* the UCI device info reports that ID as an
 Ultimate drive; GEOS 1.2 predates the `DRIVETYPES` table GEOS 2.0 keeps, and the Ultimate's own emulated A/B drives
-are its SoftIEC drives, which are still T0 here (`docs/status/drive.md`). Observed, not diagnosed further.
+are its Software IEC drives, which were still T0 then (built since S30, not re-run). Observed, not diagnosed further.
 
 **A GEOS RAM drive was therefore never reachable** — and would not have been anyway: GEOS 1.2 has no REU RAM drive
 (that is GEOS 2.0 with Wheels or MegaPatch), and GeoUMount's mount and `Save REU` paths need a valid target. The REU

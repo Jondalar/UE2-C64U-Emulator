@@ -1,5 +1,7 @@
 # S21 — Firmware settings from a .cfg file
 
+**Status:** built (2026-09-18).
+
 A fresh flash starts with the firmware defaults: REU off, Command Interface off (so no UCI), Freeze UI unless UE2
 seeds the overlay. Tests that need other settings keep a pre-configured flash file around. Firmware 3.15 loads a
 `.cfg` next to a started PRG/CRT/disk (`ConfigIO::S_load_associated_config`), the C64U firmware 1.x does not, and
