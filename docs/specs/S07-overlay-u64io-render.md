@@ -21,8 +21,8 @@
   - LED/PWM/ETHSTREAM latches with read-back.
   - Keyboard scan: COL latch at `0x1010040A`; ROW `0x1010040B` is a pure function of the COL latch and the
     pressed-key set, idle 0xFF, stable between reads (C36, C18).
-  - JOY `0x10100406` = joystick lines (idle 0xFF).
-  - Host API `set_key(row, col, down)`, `set_joystick(lines)`.
+  - JOY `0x10100406` = the lines of the control port bit 0 of the last write selects (idle 0xFF); S36.
+  - Host API `set_key(row, col, down)`; the joystick lines come from `C64Port` (S36).
   - The row/col convention must match `keyboard_c64.cc` (keymap index = row*8+col or as the scanner really
     works). Document it in a doc comment; S08's keymap depends on it.
 - **`render.rs`:**

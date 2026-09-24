@@ -38,6 +38,8 @@
 | `type <text>` | Types the text through the keymap. |
 | `screen` | Prints `text_dump` of the current snapshot between `--- screen ---` markers. |
 | `usbkey <name> [ms]` | Holds a key of the USB keyboard (`--usb-keyboard`, `usb::usage_by_name`), default 80 ms, then the release gap. |
+| `joy <port> <dirs> [ms]` | Holds the physical joystick on control port 1 or 2, default 80 ms, then the release gap (S36). `<dirs>` is `up`, `down`, `left`, `right`, `fire` joined by `+` (`joy 2 up+fire`); `joy <port> none` releases the port. |
+| `joy-hold <port> <dirs>` / `joy-release <port>` | Holds exactly these directions until the next `joy*` for the port, or releases it. |
 | `usbmouse <dx> <dy> [buttons]` | Moves the USB mouse (`--usb-mouse`) and sets its buttons, bit 0 left, 1 right, 2 middle (S32). |
 | `usb-plug <port> image <path> \| keyboard \| mouse` / `usb-unplug <port>` | Puts a device on an empty hub port and plugs it in, or unplugs one and takes it away (S33); `--usb-dir` ports use `usb-replug`. |
 | `png <path>` | Renders the snapshot to a PNG (`png` crate), font from `ControlHandle::rom_dir` (`--roms`). |
@@ -52,7 +54,7 @@
 - `<text>` is one word or a double-quoted string (`\"`, `\\` escapes).
 - Errors name the line number. A timed-out `expect*` prints the screen first; a failing headless script exits
   non-zero.
-- `button`, `key`, `type` and `usbkey` are sent as one timed sequence (`Command::Inputs`) and applied by the emulation thread
+- `button`, `key`, `type`, `usbkey` and `joy` are sent as one timed sequence (`Command::Inputs`) and applied by the emulation thread
   at exact emulated times, so `--speed max` cannot stretch a hold. Status: `docs/status/tooling.md`.
 
 ## Tests

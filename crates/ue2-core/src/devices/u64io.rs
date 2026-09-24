@@ -12,7 +12,7 @@
 //! | 0x03 | U64_CART_DETECT | GAME (bit 0) / EXROM (bit 1) of the physical expansion port: [`U64Io::cart_detect`], 0x03 = no external cart (c64.cc:1514) | — |
 //! | 0x04 | U64_HDMI_PLL_RESET | 0 | latched |
 //! | 0x05 | U64_USERPORT_EN | latch (u64_config.cc:1071-1074) | latched |
-//! | 0x06 | U64II_KEYB_JOY | joystick lines, idle 0xFF (05 #8; 00 §2 C36) | swap bit, latched (u64_config.cc:1064) |
+//! | 0x06 | U64II_KEYB_JOY | lines of the selected control port as the CIA sees them, bits 5-7 high; idle 0xFF (S36) | bit 0 selects the port: 0 port 2, 1 port 1 (u64_config.cc:1064) |
 //! | 0x07 | U64II_BLACKBOARD | 0x01 (assembly.cc:36; 00 §3 C14) | — |
 //! | 0x08-0x09 | HDMI_ENABLE / INT_CONNECTORS | 0 | latched |
 //! | 0x0A | U64II_KEYB_COL | 0 | matrix line select, active low |
@@ -48,8 +48,9 @@ const RESTORE_VALUE: u8 = 0x00;
 const BLACKBOARD_VALUE: u8 = 0x01;
 
 pub struct U64Io {
-    /// Joystick lines (active low, idle 0xFF).
-    pub joystick: u8,
+    /// Lines of control ports 1 and 2 as the CIA sees them (active low, idle 0xFF). `devices::install_all` shares
+    /// `C64Port::joy_lines` here (S36).
+    pub joy_lines: Arc<[AtomicU8; 2]>,
     /// Last value written to each offset 0x00-0x0F.
     pub latch: [u8; 16],
     /// Pressed keys: bit `col` of `matrix[row]`, convention on `set_key`.
@@ -70,7 +71,12 @@ impl U64Io {
         let mut latch = [0; 16];
         // No matrix line selected until the first scan writes the latch.
         latch[KEYB_COL] = 0xFF;
-        U64Io { joystick: 0xFF, latch, matrix: [0; 8], cart_detect: Arc::new(AtomicU8::new(CART_DETECT_NONE)) }
+        U64Io {
+            joy_lines: Arc::new([AtomicU8::new(0xFF), AtomicU8::new(0xFF)]),
+            latch,
+            matrix: [0; 8],
+            cart_detect: Arc::new(AtomicU8::new(CART_DETECT_NONE)),
+        }
     }
 
     /// Press/release a C64 matrix key. Positions outside 0..=7 are ignored.
@@ -102,8 +108,12 @@ impl U64Io {
         }
     }
 
-    pub fn set_joystick(&mut self, lines: u8) {
-        self.joystick = lines;
+    /// U64II_KEYB_JOY: the five lines of the port that bit 0 of the latch selects, 0 port 2 and 1 port 1. The swap
+    /// setting writes `swap & 1` (u64_config.cc:1064); the menu scan's look at the other port takes port 2's
+    /// injected lines as the other port's when the select is 1 (firmware SPEC-07 branch, keyboard_c64.cc:290-291).
+    fn joy_value(&self) -> u8 {
+        let port = if self.latch[KEYB_JOY as usize] & 1 == 0 { 1 } else { 0 };
+        0xE0 | (self.joy_lines[port].load(Ordering::Relaxed) & 0x1F)
     }
 
     /// U64II_KEYB_ROW: a pure function of the COL latch and the pressed keys, so the firmware's
@@ -135,7 +145,7 @@ impl IoDevice for U64Io {
             HDMI_REG => HDMI_REG_VALUE,
             RESTORE_REG => RESTORE_VALUE,
             CART_DETECT => self.cart_detect.load(Ordering::Relaxed),
-            KEYB_JOY => self.joystick,
+            KEYB_JOY => self.joy_value(),
             BLACKBOARD => BLACKBOARD_VALUE,
             KEYB_ROW => self.row_value(),
             USERPORT_EN | LEDSTRIP_EN..=ETHSTREAM_ENA => self.latch[off as usize],
@@ -309,14 +319,22 @@ mod tests {
         });
     }
 
+    /// S36: bit 0 of the write selects the port, the read returns its five lines.
     #[test]
-    fn joystick_lines() {
+    fn joystick_select_and_lines() {
         let mut io = U64Io::new();
+        let lines = io.joy_lines.clone();
         with_ctx(|ctx| {
             assert_eq!(io.read8(KEYB_JOY, ctx), 0xFF);
-            io.set_joystick(0xEF); // fire (keyboard_c64.cc:218)
-            io.write8(KEYB_JOY, 0x00, ctx);
-            assert_eq!(io.read8(KEYB_JOY, ctx), 0xEF, "write is the swap bit, not the lines");
+            lines[1].store(0xEF, Ordering::Relaxed); // port 2 fire (keyboard_c64.cc:218)
+            lines[0].store(0x1D, Ordering::Relaxed); // port 1 down, bits 5-7 low
+            assert_eq!(io.read8(KEYB_JOY, ctx), 0xEF, "select 0 reads port 2");
+            io.write8(KEYB_JOY, 0x01, ctx);
+            assert_eq!(io.read8(KEYB_JOY, ctx), 0xFD, "select 1 reads port 1, bits 5-7 high");
+            io.write8(KEYB_JOY, 0x02, ctx);
+            assert_eq!(io.read8(KEYB_JOY, ctx), 0xEF, "only bit 0 selects");
+            io.write8(KEYB_JOY, 0x03, ctx);
+            assert_eq!(io.read8(KEYB_JOY, ctx), 0xFD);
         });
     }
 

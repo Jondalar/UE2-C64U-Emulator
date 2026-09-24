@@ -604,11 +604,13 @@ impl Machine {
                 }
             }
             HostInput::Joystick(lines) => {
-                if let Some(dev) = io.get_mut::<U64Io>() {
-                    dev.set_joystick(lines);
-                }
                 if let Some(dev) = io.get_mut::<C64Port>() {
-                    dev.set_joystick(lines);
+                    dev.set_joystick(2, lines);
+                }
+            }
+            HostInput::JoystickPort { port, lines } => {
+                if let Some(dev) = io.get_mut::<C64Port>() {
+                    dev.set_joystick(port, lines);
                 }
             }
             HostInput::MenuButton(pressed) => {
@@ -1149,6 +1151,7 @@ mod tests {
         m.input(HostInput::Key { row: 7, col: 7, down: true });
         m.input(HostInput::Key { row: 1, col: 2, down: false });
         m.input(HostInput::Joystick(0xEF));
+        m.input(HostInput::JoystickPort { port: 1, lines: 0xFE });
         m.input(HostInput::Restore(true));
         assert_eq!(
             mock.take(),
@@ -1159,11 +1162,18 @@ mod tests {
                 Call::Key(1, 2, false),
                 Call::Joystick(1, 0xFF),
                 Call::Joystick(2, 0xEF),
+                Call::Joystick(1, 0xFE),
+                Call::Joystick(2, 0xEF),
                 Call::Nmi(true),
             ],
             "key-down dropped while the overlay owns the keyboard"
         );
         assert_eq!(m.bus.io.get::<U64Io>().unwrap().matrix[7], 0x80, "the overlay still sees the key");
+        // S36: U64II_KEYB_JOY reads the port the select picks, through the lines install_all shares.
+        let keyb_joy = |m: &mut Machine| m.bus.io.get_mut::<U64Io>().unwrap().peek8(0x06);
+        assert_eq!(keyb_joy(&mut m), 0xEF, "select 0: port 2");
+        m.bus.io.get_mut::<U64Io>().unwrap().latch[0x06] = 1;
+        assert_eq!(keyb_joy(&mut m), 0xFE, "select 1: port 1");
         // CARTSLOT: U64_CART_DETECT follows the backend's physical cartridge after the next C64 access.
         let cart_detect = |m: &mut Machine| m.bus.io.get_mut::<U64Io>().unwrap().peek8(0x03);
         assert_eq!(cart_detect(&mut m), 0x03, "empty expansion port");

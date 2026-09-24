@@ -314,8 +314,11 @@ pub struct C64Port {
     core: RegTable,
     /// BASIC, KERNAL and CHAR windows while no backend is attached.
     roms: [RegTable; 3],
-    /// Host joystick lines for port 2, active low.
-    joystick: u8,
+    /// Physical joystick lines of control ports 1 and 2, active low (S36).
+    joysticks: [u8; 2],
+    /// What the CIA sees on ports 1 and 2: the physical lines ANDed with C64_JOY1/2_SWOUT. Shared with `U64Io`,
+    /// whose U64II_KEYB_JOY reads it (S36).
+    joy_lines: Arc<[AtomicU8; 2]>,
     /// Host RESTORE key held.
     restore: bool,
     /// W4-DRIVE, S27: drive A and B registers; the drives behind them are the backend's (`C64Backend::drive`).
@@ -352,7 +355,8 @@ impl C64Port {
                 RegTable::new("kernal-rom", ROM_8K),
                 RegTable::new("char-rom", ROM_4K),
             ],
-            joystick: 0xFF,
+            joysticks: [0xFF; 2],
+            joy_lines: Arc::new([AtomicU8::new(0xFF), AtomicU8::new(0xFF)]),
             restore: false,
             drives: [DriveRegs::new(0), DriveRegs::new(1)],
             cart_detect: None,
@@ -424,10 +428,18 @@ impl C64Port {
         self.peek8(DMA + u32::from(addr))
     }
 
-    /// Host joystick for C64 port 2, active low, ANDed with C64_JOY2_SWOUT (S14 §6).
-    pub fn set_joystick(&mut self, lines: u8) {
-        self.joystick = lines;
-        self.apply_joysticks();
+    /// Physical joystick on control port 1 or 2, active low, ANDed with C64_JOY1/2_SWOUT (S36). Other ports are
+    /// ignored.
+    pub fn set_joystick(&mut self, port: u8, lines: u8) {
+        if let 1 | 2 = port {
+            self.joysticks[usize::from(port - 1)] = lines;
+            self.apply_joysticks();
+        }
+    }
+
+    /// The port lines the CIA sees, for `U64Io`'s U64II_KEYB_JOY (S36).
+    pub fn joy_lines(&self) -> Arc<[AtomicU8; 2]> {
+        self.joy_lines.clone()
     }
 
     /// Host RESTORE key, ORed into the NMI line (S14 §6).
@@ -614,12 +626,15 @@ impl C64Port {
         }
     }
 
+    /// Wired AND of the physical stick and the firmware's software output on each port (S36).
     fn apply_joysticks(&mut self) {
-        let port1 = self.core.get(JOY1_SWOUT);
-        let port2 = self.core.get(JOY2_SWOUT) & self.joystick;
+        let lines = [self.core.get(JOY1_SWOUT) & self.joysticks[0], self.core.get(JOY2_SWOUT) & self.joysticks[1]];
+        for (cell, v) in self.joy_lines.iter().zip(lines) {
+            cell.store(v, Ordering::Relaxed);
+        }
         if let Some(b) = &mut self.backend {
-            b.set_joystick(1, port1);
-            b.set_joystick(2, port2);
+            b.set_joystick(1, lines[0]);
+            b.set_joystick(2, lines[1]);
         }
     }
 
@@ -1532,9 +1547,11 @@ mod tests {
             b.w8(MATRIX_ADDR + 0x0B + i as u32, byte);
         }
         b.port().set_key(7, 7, true);
-        b.port().set_joystick(0xEF);
+        b.port().set_joystick(2, 0xEF);
         b.w8(CORE_ADDR + JOY2_SWOUT, 0xFE);
         b.w8(CORE_ADDR + JOY1_SWOUT, 0xE0 | 0x0B);
+        b.port().set_joystick(1, 0xF7);
+        b.port().set_joystick(3, 0x00);
         let mut rows = [0; 8];
         rows[3] = 0x10;
         assert_eq!(
@@ -1549,8 +1566,13 @@ mod tests {
                 Call::Joystick(2, 0xEE),
                 Call::Joystick(1, 0xEB),
                 Call::Joystick(2, 0xEE),
-            ]
+                Call::Joystick(1, 0xE3),
+                Call::Joystick(2, 0xEE),
+            ],
+            "port 3 ignored"
         );
+        let lines = b.port().joy_lines();
+        assert_eq!([0, 1].map(|i| lines[i].load(Ordering::Relaxed)), [0xE3, 0xEE], "the wired AND, shared");
         assert_eq!(b.port().frame().map(|f| f.indices), Some(vec![1, 2]));
         assert_eq!(C64Port::new().frame(), None);
     }

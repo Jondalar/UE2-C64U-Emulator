@@ -24,6 +24,9 @@ or a need shows up), accepted as a limit, or **dropped**.
   banked-out window takes its writes since S28 (TRX64's port snoop). `carts.md`
 - **UDP streams under NTSC** since S34: 240 lines and the NTSC audio rate; the line window is UE2's choice (the
   middle of the canvas), not measured. `c64.md`
+- **Joystick swap on the C64 side:** the swap bit (`U64II_KEYB_JOY` bit 0) selects which port the menu reads, but
+  the C64's two ports are not swapped (S36). The FPGA is closed; whether the same bit swaps the CIA's ports needs a
+  device check. `c64.md`
 - **ACIA** (the SwiftLink/modem cartridge at `$DE00`/`$DF00`, which the firmware bridges to the network as a Hayes
   modem): not modelled. A cartridge device like the freezers, so UE2's (2026-09-23). **Deferred:** C64 programs reach
   the network through UCI, which is enough for now. `carts.md`

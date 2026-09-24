@@ -25,6 +25,8 @@
 #   1581        smoke-1581.py          on the drive run's flash (1541 ROM set), the 1581 ROM added to its SD card
 #   soft-iec    smoke-soft-iec.py      LOAD/SAVE on the Software IEC drive
 #   usb         smoke-usb.ctl          --usb run/usb.img --usb-keyboard
+#   joy         smoke-joy.ctl          both control ports in BASIC, port 2 in the menu (S36)
+#   joy-swap    smoke-joy-swap.ctl     --settings smoke-joy-swap.cfg: port 1 in the menu
 
 set -euo pipefail
 
@@ -162,6 +164,12 @@ echo "PASS soft-iec ($((SECONDS - start)) s wall)"
 
 sd run/usb.img 48
 smoke usb "$repo/scripts/smoke-usb.ctl" --flash run/flash.bin --c64-roms --usb run/usb.img --usb-keyboard
+
+cp run/flash.bin run/flash-joy.bin
+smoke joy "$repo/scripts/smoke-joy.ctl" --flash run/flash-joy.bin --c64-roms --speed max
+cp run/flash.bin run/flash-joy-swap.bin
+smoke joy-swap "$repo/scripts/smoke-joy-swap.ctl" --flash run/flash-joy-swap.bin --c64-roms \
+    --settings "$repo/scripts/smoke-joy-swap.cfg" --speed max
 
 cd /
 rm -rf "$rundir"
