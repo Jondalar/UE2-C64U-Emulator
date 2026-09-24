@@ -1224,6 +1224,7 @@ impl C64Backend for Trx64Backend {
     fn set_reu_size_kb(&mut self, size_kb: u32) {
         self.reu_size_kb = size_kb;
         self.reu.set_size_kb(size_kb);
+        self.cart.with(|c| c.set_georam_size_kb(size_kb));
         if let Some(reu) = self.m.reu_mut() {
             reu.set_size_kb(size_kb);
         }

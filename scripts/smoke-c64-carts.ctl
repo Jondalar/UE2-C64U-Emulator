@@ -3,9 +3,10 @@
 # Image: scripts/make-sd-image.sh run/carts.img; scripts/make-test-crts.py run/carts;
 #        scripts/add-sd-files.sh run/carts.img run/carts/*
 # Run:   --flash run/flash.bin (C64 ROMs installed, docs/status/c64.md A2) --sd run/carts.img --usb-keyboard
-# Pass:  exit 0; the c64screen dump after each cartridge c01-c27 ends with "<NAME> PASS", 27 in all; the dump after
-#        F11 has "ACTION REPLAY FROZEN"; the
-#        console has "Loading SID..", "Bytes loaded" twice and no "Time out!"; the SID dumps show the player screen.
+# Pass:  exit 0; the c64screen dump after each cartridge c01-c27 and c32 ends with "<NAME> PASS", 28 in all; the dumps
+#        after F11 on c28-c31 have "ACTION REPLAY FROZEN", "KCS FROZEN", "SUPER SNAPSHOT FROZEN" and "FINAL CARTRIDGE
+#        FROZEN"; the console has "Loading SID..", "Bytes loaded" twice and no "Time out!"; the SID dumps show the
+#        player screen.
 # The browser lists the CRTs first, in file-name order, then demo.d64, hello.prg, readme.txt, s01-tune.sid,
 # s02-tune.mus. The overlay menu stays open on the file it last ran, so each cart is one `key down` further.
 wait 6000
@@ -244,6 +245,62 @@ c64screen
 png run/c64-freeze-ar.png
 button
 wait 2000
+key down
+wait 300
+# c29-kcs-freeze.crt ("PRESS FREEZE", then "KCS FROZEN" on line 22 after F11).
+key return
+wait 500
+key return
+wait 3000
+c64screen
+button
+wait 2000
+usbkey f11 300
+wait 1500
+c64screen
+png run/c64-freeze-kcs.png
+button
+wait 2000
+key down
+wait 300
+# c30-ss5-freeze.crt ("PRESS FREEZE", then "SUPER SNAPSHOT FROZEN" on line 22 after F11).
+key return
+wait 500
+key return
+wait 3000
+c64screen
+button
+wait 2000
+usbkey f11 300
+wait 1500
+c64screen
+png run/c64-freeze-ss5.png
+button
+wait 2000
+key down
+wait 300
+# c31-fc-freeze.crt ("PRESS FREEZE", then "FINAL CARTRIDGE FROZEN" on line 22 after F11).
+key return
+wait 500
+key return
+wait 3000
+c64screen
+button
+wait 2000
+usbkey f11 300
+wait 1500
+c64screen
+png run/c64-freeze-fc.png
+button
+wait 2000
+key down
+wait 300
+# c32-twomegabyter.crt ("TWOMEGABYTER PASS").
+key return
+wait 500
+key return
+wait 3000
+c64screen
 # s01-tune.sid: past demo.d64, hello.prg and readme.txt. Play Main Tune is first (filetype_sid.cc:517).
 key down
 key down
