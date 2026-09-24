@@ -6,6 +6,14 @@ REVIEW-DEVICES 1 (no assertions; results checked by `grep` on logs) and 2 (key a
 control thread), plus the M4 open issues in `docs/status/storage.md` (no `expect`; `png` finds its font only
 through `$UE2_FIRMWARE`).
 
+## The release gate
+
+`scripts/gate.sh` runs everything that has to pass before a minor or a major release (S35): the workspace tests,
+`smoke-all.sh`, `smoke-c64-all.sh` (every C64 smoke on images built from nothing: READY, typing, a PRG, the freeze
+UI, the SID tone, 27 carts, drive A with write-back, the 1581 at A and B, Software IEC, a USB stick),
+`smoke-usb-dir.sh`, and the upstream suite's smoke profile. It stops at the first failing part. First run
+(2026-09-24): all parts pass in 430 s, 322 of them the C64 smokes.
+
 ## Run
 
 ```sh
