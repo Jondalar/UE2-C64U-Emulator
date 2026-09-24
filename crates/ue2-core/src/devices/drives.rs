@@ -33,6 +33,7 @@ const SIDE: usize = 0x6;
 const MAN_WRITE: usize = 0x7;
 const TRACK: usize = 0x8;
 const STATUS: usize = 0x9;
+const DISKCHNG: usize = 0xC;
 const DRIVETYPE: usize = 0xD;
 
 /// Read-back mask of each register latch; 0 = not a latch (drive_registers.vhd write and read branches). DRIVETYPE
@@ -125,6 +126,8 @@ impl DriveRegs {
         match (off, drive) {
             (0..=REGS_END, Some(drive)) => self.refresh(ctx.now, drive),
             (DIRTY..=DIRTY_END, Some(drive)) => self.sync_disk(ctx, drive),
+            // S31: a 1581's controller answers its window itself.
+            (WD..=WD_END, Some(drive)) if drive.has_wd() => return drive.wd_read(((off - WD) & 0x0F) as u16),
             _ => {}
         }
         self.write_busy = ctx.now < self.write_busy_until;
@@ -143,7 +146,7 @@ impl DriveRegs {
                     RESET if val & 0x01 != 0 => self.write_busy_until = 0,
                     _ => {}
                 }
-                if let (POWER | RESET | HW_ADDR | SENSOR | DRIVETYPE, Some(drive)) = (reg, drive) {
+                if let (POWER | RESET | HW_ADDR | SENSOR | INSERTED | DISKCHNG | DRIVETYPE, Some(drive)) = (reg, drive) {
                     let area = AREA[usize::from(self.unit)];
                     drive.set_lines(self.lines(), &ctx.ram[area + ROM.start..area + ROM.end]);
                 }
@@ -167,7 +170,10 @@ impl DriveRegs {
                     self.stale |= 1 << (at / 8);
                 }
             }
-            WD..=WD_END => self.wd.set(off, val),
+            WD..=WD_END => match drive {
+                Some(drive) if drive.has_wd() => drive.wd_write(((off - WD) & 0x0F) as u16, val, ctx.ram),
+                _ => self.wd.set(off, val),
+            },
             _ => {}
         }
     }
@@ -176,8 +182,7 @@ impl DriveRegs {
     pub fn peek(&self, off: u32) -> u8 {
         match off {
             0..=REGS_END => match (off & 0x0F) as usize {
-                // A 1541 head has one side.
-                SIDE => 0,
+                SIDE => self.status.side,
                 TRACK => self.status.half_track & 0x7F,
                 STATUS => {
                     let powered = self.powered();
@@ -219,6 +224,9 @@ impl DriveRegs {
             device: self.regs[HW_ADDR] & 0x03,
             write_protect: self.regs[SENSOR] & 0x01 == 0,
             drive_type: self.regs[DRIVETYPE] & 0x03,
+            inserted: self.regs[INSERTED] & 0x01 != 0,
+            disk_change: self.regs[DISKCHNG] & 0x01 != 0,
+            force_ready: self.regs[DISKCHNG] & 0x02 != 0,
         }
     }
 
@@ -447,12 +455,15 @@ mod tests {
             device: 1,
             write_protect: false,
             drive_type: 0,
+            inserted: true,
+            disk_change: false,
+            force_ready: false,
         };
-        assert_eq!(b.drive.lines.len(), 5, "INSERTED is not a line: {:?}", b.drive.lines);
+        assert_eq!(b.drive.lines.len(), 6, "INSERTED is a line, the 1581's /RDY (S31): {:?}", b.drive.lines);
         assert_eq!(b.drive.lines.last(), Some(&(on, 0xAA)));
         assert_eq!(b.drive.lines[0].0, DriveLines { power: true, ..DriveLines::default() });
         // Head and motor come from the drive.
-        b.drive.status = DriveStatus { half_track: 36, motor: true, writing: false, led: true };
+        b.drive.status = DriveStatus { half_track: 36, motor: true, writing: false, led: true, side: 0 };
         assert_eq!((b.r8(0x08), b.r8(0x09), b.r8(0x06)), (36, ST_MOTOR, 0));
         b.w8(0x00, 0x00);
         assert_eq!(b.r8(0x09), 0, "no motor without power (mm_drive_cpu.vhd:743)");
@@ -473,7 +484,7 @@ mod tests {
         // The drive wrote one byte of track 18 and reports the neighbouring half-track unchanged.
         b.drive.tracks[34][100] = 0x5A;
         b.drive.written = 1 << 34 | 1 << 35;
-        b.drive.status = DriveStatus { half_track: 34, motor: true, writing: true, led: true };
+        b.drive.status = DriveStatus { half_track: 34, motor: true, writing: true, led: true, side: 0 };
         b.now = 1000;
         b.tick();
         assert_eq!(b.ram[TRACK18 + 100], 0x5A);

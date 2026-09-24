@@ -12,8 +12,8 @@ or a need shows up), accepted as a limit, or **dropped**.
   phase at resume: code that re-syncs each frame shows at most one bad frame, code that syncs once stays shifted
   after menu, freeze or DMA load. TRX64: medium change in the cycle core (RDY hold on read cycles, R/W history,
   BA-low count), needs a device measurement. No program known to break; revisit when one does. `c64.md`, `carts.md`
-- **Drives:** Specs 870 and 871 are in TRX64 v0.8.8 and UE2 uses them (S27). The 1581 is in TRX64 v0.9.0 (Spec
-  872), not used by UE2 yet; the 1571 is TRX64's, later.
+- **Drives:** Specs 870 and 871 are in TRX64 v0.8.8 and UE2 uses them (S27). The 1581 runs at A and B since
+  S31 (TRX64 Specs 872, 875, v0.9.1); the 1571 is TRX64's, later.
 
 ## UE2 (board, firmware side, host)
 

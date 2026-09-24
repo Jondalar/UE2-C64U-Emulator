@@ -120,6 +120,8 @@ const UCI_T0: &[Span] = &[
     span(0x800, 0x1000, RAM),
 ];
 
+/// S31: ITU high IRQ of drive A's WD177x; drive B's is the next (`install_high_irq(1 + drive)`, wd177x.cc:63).
+const WD_IRQ_HIGH_BIT: u8 = 1;
 /// ITU low bit 4 `ITU_INTERRUPT_CMDIF` (itu.h:37): the UCI's firmware interrupt, a level
 /// (command_protocol.vhd:310; docs/hw/02 §Low IRQ byte).
 const UCI_IRQ_BIT: u8 = 4;
@@ -654,6 +656,7 @@ impl C64Port {
     /// low bit 4 is the firmware IRQ level, recomputed every time; low bit 7 is the C64-reset edge and high IRQ 6
     /// the unlock, both taken from the block's event queue. Without a UCI nothing is driven, as before.
     fn update_uci(&mut self, ctx: &mut IoCtx) {
+        self.update_wd_irqs(ctx);
         let Some(b) = self.backend.as_mut().filter(|b| b.has_uci()) else { return };
         let irq = b.uci_irq();
         let events = b.uci_take_events();
@@ -663,6 +666,17 @@ impl C64Port {
         }
         if events.unlock {
             ctx.irq.set_high(UNLOCK_IRQ_HIGH_BIT, true);
+        }
+    }
+}
+
+impl C64Port {
+    /// S31: a 1581 controller's command FIFO is ITU high IRQ 1 (drive A) or 2 (drive B), a level (wd177x.vhd `io_irq`,
+    /// wd177x.cc:63). Taken after everything that may have run the drives or popped a FIFO.
+    fn update_wd_irqs(&mut self, ctx: &mut IoCtx) {
+        for unit in 0..2u8 {
+            let irq = self.backend.as_mut().and_then(|b| b.drive(unit)).is_some_and(|d| d.wd_irq());
+            ctx.irq.set_high(WD_IRQ_HIGH_BIT + unit, irq);
         }
     }
 }
@@ -842,6 +856,7 @@ impl IoDevice for C64Port {
                 let (unit, rel) = Self::drive_window_of(off);
                 let drive = self.backend.as_mut().and_then(|b| b.drive(unit));
                 self.drives[usize::from(unit)].write(rel, val, ctx, drive);
+                self.update_wd_irqs(ctx);
             }
             _ => {}
         }

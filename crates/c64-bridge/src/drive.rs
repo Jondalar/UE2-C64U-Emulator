@@ -4,12 +4,21 @@
 //! `ue2_core::devices::drives::DriveRegs` hands the drive the bytes of each half-track and takes back what it wrote.
 //! Power, reset, the frozen clock, the ROM and the unit number are TRX64's drive part (Spec 870); the surface is
 //! still `rotation.image`, and writes are read back from it (S27 §3).
+//!
+//! S31: DRIVETYPE 2 makes the position a 1581 with the FPGA's WD177x fitted (TRX64 Spec 875, [`crate::wd177x`]): the
+//! firmware serves its sectors from the D81 file, as on the device.
+
+use std::cell::UnsafeCell;
+use std::sync::Arc;
 
 use trx64_core::drive::{pair_catch_up, pair_fold_into_iec, DrivePosition};
+use trx64_core::fdc_controller::{FdcBoardIn, FdcBoardOut, FdcController};
 use trx64_core::gcr::{GcrImage, GcrTrack};
+use trx64_core::iec::DriveType;
 use trx64_core::{Drive1541, Machine};
 use ue2_core::c64host::{C64Drive, DriveLines, DriveStatus, DRIVE_HALF_TRACKS};
 
+use crate::wd177x::{DmaMem, Ram, Wd177x};
 use crate::Trx64Backend;
 
 /// The drive area's ROM image: $8000-$FFFF, a 16 K file mirrored by the firmware (c1541.cc:937-940).
@@ -36,6 +45,8 @@ pub(crate) struct DriveSlot {
     rom_noted: bool,
     type_noted: bool,
     power_noted: bool,
+    /// S31: the WD177x fitted while the position is a 1581, shared with the controller TRX64 holds.
+    fdc: FdcHandle,
 }
 
 impl DriveSlot {
@@ -59,6 +70,44 @@ impl DriveSlot {
             rom_noted: false,
             type_noted: false,
             power_noted: false,
+            fdc: FdcHandle::default(),
+        }
+    }
+
+    /// Whether the position is a 1581 (with the WD177x fitted).
+    fn is_1581(&self, m: &Machine) -> bool {
+        m.drive(self.pos).board_type() == DriveType::Drive1581
+    }
+
+    /// S31: DRIVETYPE 2 fits a 1581 with the firmware's controller, 0 the 1541. TRX64 changes a board only while the
+    /// position is off (Spec 872, 875), where the firmware changes the type powered, with a reset (c1541.cc:906-947):
+    /// the position goes off, changes, and the ROM goes to the new board; the power comes back in `update`.
+    fn fit_board(&mut self, m: &mut Machine, want_1581: bool) {
+        if want_1581 == self.is_1581(m) {
+            return;
+        }
+        let pos = self.pos;
+        if let Err(e) = m.set_drive_power(pos, false) {
+            self.notice_power(&e);
+        }
+        if !want_1581 {
+            let _ = m.detach_fdc_controller(pos);
+        }
+        let board = if want_1581 { DriveType::Drive1581 } else { DriveType::Drive1541 };
+        let fitted = m.set_drive_type(pos, board).and_then(|_| {
+            if want_1581 {
+                m.attach_fdc_controller(pos, Box::new(FdcDevice(self.fdc.clone()))).map(|_| ())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = fitted {
+            eprintln!("c64: drive {}: {e}", self.name());
+        }
+        // The board changed under the image: hand it over again.
+        let rom = std::mem::take(&mut self.rom);
+        if rom.len() == ROM_LEN {
+            self.set_rom(m, &rom);
         }
     }
 
@@ -73,11 +122,12 @@ impl DriveSlot {
     pub(crate) fn set_lines(&mut self, m: &mut Machine, lines: DriveLines, rom: &[u8], stopped: bool, reset: bool) {
         self.set_rom(m, rom);
         // The C1541 constructor probes DRIVETYPE with 2 before any drive type is set (c1541.cc:119-120).
-        if lines.power && lines.drive_type != 0 && !self.type_noted {
-            eprintln!("c64: drive {} type {} (1571/1581) is not modelled; it stays off", self.name(), lines.drive_type);
+        if lines.power && lines.drive_type == 1 && !self.type_noted {
+            eprintln!("c64: drive {} type 1571 is not modelled; it stays off", self.name());
             self.type_noted = true;
         }
         self.lines = lines;
+        self.fdc.with(|f| f.lines = lines);
         m.drive_mut(self.pos).rotation.read_only = i32::from(lines.write_protect);
         self.update(m, stopped, reset);
     }
@@ -90,8 +140,9 @@ impl DriveSlot {
     pub(crate) fn update(&mut self, m: &mut Machine, c64_stopped: bool, c64_reset: bool) {
         let l = self.lines;
         let pos = self.pos;
+        self.fit_board(m, l.drive_type == 2);
         let surface = m.drive_mut(pos).rotation.image.replace(marker());
-        let power = l.power && l.drive_type == 0;
+        let power = l.power && l.drive_type != 1;
         if let Err(e) = m.set_drive_unit(pos, UNIT_BASE + (l.device & 3)) {
             self.notice_power(&e);
         }
@@ -139,6 +190,9 @@ impl DriveSlot {
 
     /// After the drive ran: note the half-tracks it may have written.
     pub(crate) fn after_run(&mut self, m: &mut Machine) {
+        if self.is_1581(m) {
+            return;
+        }
         let d = m.drive_mut(self.pos);
         if !d.powered() {
             return;
@@ -187,6 +241,16 @@ impl DriveSlot {
     }
 
     pub(crate) fn status(&self, m: &Machine) -> DriveStatus {
+        if self.is_1581(m) {
+            let d = m.drive(self.pos);
+            return self.fdc.with(|f| DriveStatus {
+                half_track: f.wd.cur_track(),
+                motor: f.out.motor_on,
+                writing: false,
+                led: d.led_on(),
+                side: u8::from(f.out.side0),
+            });
+        }
         let d = m.drive(self.pos);
         let ports = d.ports();
         DriveStatus {
@@ -194,7 +258,13 @@ impl DriveSlot {
             motor: ports.motor_on,
             writing: !d.rotation.read_write_mode,
             led: d.led_on(),
+            side: 0,
         }
+    }
+
+    /// S31: guest DDR for the controller's DMA while the C64 runs (`C64Backend::lend_ddr`).
+    pub(crate) fn lend_ddr(&mut self, ddr: Option<(*mut u8, usize)>) {
+        self.fdc.with(|f| f.ddr = ddr);
     }
 
     pub(crate) fn read_ram(&self, m: &Machine, out: &mut [u8]) {
@@ -292,6 +362,146 @@ impl C64Drive for Trx64Backend {
 
     fn read_ram(&self, out: &mut [u8]) {
         self.drives[self.drive_sel].read_ram(&self.m, out);
+    }
+
+    fn has_wd(&self) -> bool {
+        self.drives[self.drive_sel].is_1581(&self.m)
+    }
+
+    fn wd_read(&self, off: u16) -> u8 {
+        self.drives[self.drive_sel].fdc.with(|f| f.wd.fw_read(off))
+    }
+
+    fn wd_write(&mut self, off: u16, val: u8, ram: &mut [u8]) {
+        self.drives[self.drive_sel].fdc.with(|f| f.wd.fw_write(off, val, &mut Ram(ram)));
+    }
+
+    fn wd_irq(&self) -> bool {
+        let d = &self.drives[self.drive_sel];
+        d.is_1581(&self.m) && d.fdc.with(|f| f.wd.irq())
+    }
+}
+
+/// S31: the controller's state, shared by the drive slot (the firmware's side) and the controller TRX64 holds.
+#[derive(Clone, Default)]
+struct FdcHandle(Arc<FdcCell>);
+
+#[derive(Default)]
+struct FdcCell(UnsafeCell<Fdc>);
+
+// SAFETY: the backend, TRX64's `Machine` and every copy of the handle live on the emulation thread; `Send` is only
+// required because `FdcController: Send`.
+unsafe impl Send for FdcCell {}
+unsafe impl Sync for FdcCell {}
+
+impl FdcHandle {
+    /// Run `f` on the state. Calls do not nest: the slot never holds one across a call into TRX64, and the controller
+    /// holds one only inside a single `FdcController` call.
+    fn with<R>(&self, f: impl FnOnce(&mut Fdc) -> R) -> R {
+        // SAFETY: single thread, and no two borrows are live at once (see above).
+        f(unsafe { &mut *self.0 .0.get() })
+    }
+}
+
+struct Fdc {
+    wd: Wd177x,
+    /// The drive registers' lines: the mechanism's inputs (inserted, disk change, force ready, write protect).
+    lines: DriveLines,
+    /// What the 1581's CIA drives (PA0 side, PA2 motor).
+    out: FdcBoardOut,
+    /// Guest DDR while the C64 runs.
+    ddr: Option<(*mut u8, usize)>,
+}
+
+impl Default for Fdc {
+    fn default() -> Self {
+        Fdc { wd: Wd177x::new(), lines: DriveLines::default(), out: FdcBoardOut::RELEASED, ddr: None }
+    }
+}
+
+/// Guest DDR through the lease `C64Backend::lend_ddr` gives: reads 0 and drops writes without one.
+struct Lease(Option<(*mut u8, usize)>);
+
+impl DmaMem for Lease {
+    fn read(&mut self, addr: u32) -> u8 {
+        match self.0 {
+            // SAFETY: the lease is `IoCtx::ram`, lent by `C64Port` for the access in progress and taken back before the
+            // access returns; nothing else touches guest DDR while the C64 runs inside that access.
+            Some((ptr, len)) if (addr as usize) < len => unsafe { *ptr.add(addr as usize) },
+            _ => 0,
+        }
+    }
+    fn write(&mut self, addr: u32, val: u8) {
+        if let Some((ptr, _)) = self.0.filter(|&(_, len)| (addr as usize) < len) {
+            // SAFETY: as in `read`.
+            unsafe { *ptr.add(addr as usize) = val };
+        }
+    }
+}
+
+/// The WD177x in TRX64's 1581 (Spec 875). `clk` is the drive clock, 2 MHz.
+struct FdcDevice(FdcHandle);
+
+impl FdcController for FdcDevice {
+    fn name(&self) -> String {
+        "U64 WD177x".into()
+    }
+
+    fn read(&mut self, clk: u64, reg: u8) -> u8 {
+        self.0.with(|f| {
+            f.wd.run_to(clk, f.out.motor_on);
+            f.wd.cpu_read(u16::from(reg), &mut Lease(f.ddr))
+        })
+    }
+
+    fn store(&mut self, clk: u64, reg: u8, val: u8) {
+        self.0.with(|f| {
+            f.wd.run_to(clk, f.out.motor_on);
+            f.wd.cpu_store(u16::from(reg), val, &mut Lease(f.ddr));
+        });
+    }
+
+    fn peek(&self, reg: u8) -> u8 {
+        self.0.with(|f| f.wd.cpu_peek(u16::from(reg)))
+    }
+
+    fn clock_to(&mut self, clk: u64) {
+        self.0.with(|f| f.wd.run_to(clk, f.out.motor_on));
+    }
+
+    fn board_out(&mut self, clk: u64, out: FdcBoardOut) {
+        self.0.with(|f| {
+            f.wd.run_to(clk, f.out.motor_on);
+            f.out = out;
+        });
+    }
+
+    /// mm_drive.vhd:269: /RDY = motor and a disk in, or force ready; /DISK CHANGE and /WPS from the registers
+    /// (drive_registers.vhd:176-177).
+    fn board_in(&self) -> FdcBoardIn {
+        self.0.with(|f| FdcBoardIn {
+            ready: (f.out.motor_on && f.lines.inserted) || f.lines.force_ready,
+            disk_changed: f.lines.disk_change,
+            write_protected: f.lines.write_protect,
+        })
+    }
+
+    fn head(&self) -> (u8, u8) {
+        self.0.with(|f| (f.wd.cur_track(), u8::from(!f.out.side0)))
+    }
+
+    /// `drv_reset` (drive_registers.vhd:138) is the WD's reset; the drive clock restarts.
+    fn drive_reset(&mut self, clk: u64) {
+        self.0.with(|f| {
+            f.wd.set_reset(true);
+            f.wd.set_reset(false);
+            f.wd.rebase(clk);
+            f.out = FdcBoardOut::RELEASED;
+        });
+    }
+
+    fn rebase(&mut self, clk: u64) {
+        self.0.with(|f| f.wd.rebase(clk));
     }
 }
 

@@ -148,14 +148,19 @@ and ports. Open, and not TRX64's (2026-09-23):
    that may reset. Written tracks are found by polling the head, the write mode and the dirty half-track.
 2. **Bit rate from the speed zone**, not the firmware's per-track bit time (param word 1 bits 25:16,
    floppy_stream.vhd:50-66): a G64 track whose length differs from its zone's wraps at a different rate. Accepted.
-3. **1541 only:** 1571 and 1581 are TRX64's, later.
+3. **1541 and 1581:** the 1581 since S31 (TRX64 Specs 872, 875); the 1571 is TRX64's, later.
 4. **A new ROM comes into force at power-on only** (870 §4). The firmware changes the ROM with a reset
    (c1541.cc:945, 1132); the bridge turns that reset into off-and-on.
 
 ## Known gaps
 
-- **1571/1581:** DRIVETYPE 1/2 keeps drive A off with a one-time notice; MFM tracks, the WD177x path and side 1 are
-  not modelled. Extra RAM (RAMMAP bit 7), DISKCHANGE/force ready and the drive sounds are latched only.
+- **1581** (S31): DRIVETYPE 2 makes the position a 1581 with the FPGA's WD177x fitted in place of TRX64's own
+  (Spec 875); the firmware serves the sectors from the D81 file through the command FIFO, ITU high IRQ 1/2 and the
+  DMA, as on the device. Checked (`scripts/smoke-1581.py`): "Set as 1581 ROM" from the menu, D81s created over
+  REST, a program saved and loaded on A (written back into the file), two 1581s at 8 and 9, and A back to a 1541
+  beside B. INSERTED, DISKCHANGE and force ready drive the 1581's /RDY and /DISK CHANGE.
+- **1571:** DRIVETYPE 1 keeps the drive off with a one-time notice. Extra RAM (RAMMAP bit 7) and the drive sounds
+  are latched only.
 - **Drive B** runs as TRX64's position B (S27). The firmware builds it only when the capability word has
   `CAPAB_DRIVE_1541_2` (bit 2, c1541.cc:1263); the default word has it since S27, as a C64 Ultimate does (its REST
   API lists drive B, disabled, bus ID 9). Checked: Drive B Settings enabled, `drive.d64` mounted over REST,
