@@ -666,6 +666,24 @@ impl Machine {
         usb.replace_backend(port, backend)
     }
 
+    /// S33: plug `device` into the empty hub port `port` (1-based) while the machine runs.
+    pub fn usb_plug(&mut self, port: usize, device: devices::usb::UsbDevice) -> Result<(), String> {
+        let now = self.bus.now;
+        let usb = self.bus.io.get_mut::<devices::usb::Usb>().ok_or("no USB device installed")?;
+        usb.plug(port, device, now)?;
+        self.next_deadline = self.bus.next_deadline();
+        Ok(())
+    }
+
+    /// S33: unplug the device on hub port `port` and take it away; returns what it was.
+    pub fn usb_unplug(&mut self, port: usize) -> Result<&'static str, String> {
+        let now = self.bus.now;
+        let usb = self.bus.io.get_mut::<devices::usb::Usb>().ok_or("no USB device installed")?;
+        let kind = usb.unplug(port, now)?;
+        self.next_deadline = self.bus.next_deadline();
+        Ok(kind)
+    }
+
     /// State of USB hub port `port` (1-based); None without the USB device or for a port the hub does not have.
     pub fn usb_port(&self, port: usize) -> Option<devices::usb::UsbPortInfo> {
         self.bus.io.get::<devices::usb::Usb>()?.port_info(port)

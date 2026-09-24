@@ -95,6 +95,8 @@ pub enum Command {
     Inputs { seq: TimedInputs, done: Sender<()> },
     /// `usb-sync` / `usb-replug` (`usbdir::UsbDirs::request`); `done` receives the result when it has finished.
     Usb { req: UsbRequest, done: UsbDone },
+    /// S33: `usb-plug` / `usb-unplug`: a device onto an empty hub port, or the one on it off (None).
+    UsbPlug { port: u8, device: Option<ue2_core::devices::usb::UsbDevice>, done: Sender<Result<String, String>> },
     /// `cart-info` / `cart-save` (`cartslot::CartSlot::request`).
     Cart { req: CartRequest, done: CartDone },
     /// S23: one monitor line, answered with its text. The session lives on the emulation thread, with the machine.
@@ -542,6 +544,25 @@ fn apply_commands(
             Ok(Command::Inputs { seq, done }) => inputs.push(seq, done, machine.now_ms()),
             Ok(Command::Usb { req, done }) => usb_dirs.request(machine, req, done),
             Ok(Command::Cart { req, done }) => cart.request(machine, req, done),
+            Ok(Command::UsbPlug { port, device, done }) => {
+                let port_n = usize::from(port);
+                let result = if usb_dirs.owns(port_n) {
+                    Err(format!("hub port {port} is a --usb-dir stick; usb-replug unplugs and plugs it"))
+                } else {
+                    match device {
+                        Some(device) => {
+                            let what = match &device {
+                                ue2_core::devices::usb::UsbDevice::Image(path) => format!("image {}", path.display()),
+                                ue2_core::devices::usb::UsbDevice::Keyboard => "keyboard".into(),
+                                ue2_core::devices::usb::UsbDevice::Mouse => "mouse".into(),
+                            };
+                            machine.usb_plug(port_n, device).map(|()| format!("hub port {port}: {what} plugged in"))
+                        }
+                        None => machine.usb_unplug(port_n).map(|kind| format!("hub port {port}: {kind} unplugged")),
+                    }
+                };
+                let _ = done.send(result);
+            }
             Ok(Command::Monitor { line, done }) => {
                 let _ = done.send(monitor.exec(machine, &line));
             }
