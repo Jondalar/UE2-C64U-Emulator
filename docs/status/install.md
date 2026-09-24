@@ -160,6 +160,7 @@ option.
 
 | Option | Meaning |
 |---|---|
+| `--hold-key KEYS` | C64 matrix keys held from power-on, e.g. `cbm` or `cbm+z`, until the control command `release` (the firmware scans the keyboard once at boot, u64_config.cc:965) |
 | `--cart-slot SPEC` | `FILE.crt[,rw\|,save=OUT.crt][,flash-decode=11\|15\|both]`: a cartridge in the physical expansion port, independent of the internal one; `rw` writes flash changes back into FILE, `save=` into OUT; needs `--c64 trx64` (`docs/status/cart-slot.md`) |
 
 **SD and USB**

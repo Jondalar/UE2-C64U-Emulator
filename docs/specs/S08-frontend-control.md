@@ -33,7 +33,8 @@
 |---|---|
 | `wait <ms>` | Waits on emulated time via `handle.now_ms`. |
 | `button [ms]` | Default 100 ms. |
-| `key <name> [ms]` | Default 80 ms hold, then a 40 ms release gap. |
+| `key <name> [ms]` | Default 80 ms hold, then a 40 ms release gap. Names joined with `+` are a chord (`key cbm+z`): pressed in order 20 ms apart, held together, released at once. |
+| `hold <names>` / `release <names>` | Presses or lets go of matrix keys (`cbm`, `ctrl+c`) with no timed release; `release` also ends a `--hold-key`. |
 | `type <text>` | Types the text through the keymap. |
 | `screen` | Prints `text_dump` of the current snapshot between `--- screen ---` markers. |
 | `usbkey <name> [ms]` | Holds a key of the USB keyboard (`--usb-keyboard`, `usb::usage_by_name`), default 80 ms, then the release gap. |
