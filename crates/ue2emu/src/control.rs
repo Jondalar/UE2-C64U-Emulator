@@ -50,7 +50,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use ue2_core::devices::usb::HUB_PORTS;
+use ue2_core::devices::usb::{UsbDevice, HUB_PORTS};
 use ue2_core::host::{DisplaySnapshot, HostInput};
 use ue2_core::render::{c64_text_dump, text_dump, Renderer};
 use ue2_core::time;
@@ -113,6 +113,8 @@ pub enum ControlCmd {
     UsbSync { port: Option<u8>, force: bool },
     /// `usb-replug [--discard] [port]`.
     UsbReplug { port: Option<u8>, discard: bool },
+    /// S33: `usb-plug <port> image <path> | keyboard | mouse` and `usb-unplug <port>` (device None).
+    UsbPlug { port: u8, device: Option<UsbDevice> },
     /// One line for the monitor (S23).
     Monitor(String),
     /// `cart-info`.
@@ -149,6 +151,8 @@ pub trait Target {
     fn frame(&mut self) -> Result<(Vec<u32>, usize, usize)>;
     /// Run a `usb-sync` / `usb-replug` request to its end: result lines, and the error of a request that failed.
     fn usb(&mut self, req: UsbRequest) -> Result<(Vec<String>, Option<String>)>;
+    /// S33: plug `device` into hub port `port`, or unplug it (None): a line saying what happened.
+    fn usb_plug(&mut self, port: u8, device: Option<UsbDevice>) -> Result<String>;
     /// Run a `cart-info` / `cart-save` request: its result lines, or the reason it failed.
     fn cart(&mut self, req: CartRequest) -> Result<Vec<String>>;
     /// Run one monitor line (S23) and return its text.
@@ -281,6 +285,23 @@ pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
             } else {
                 ControlCmd::UsbReplug { port, discard: flagged }
             }
+        }
+        "usb-plug" | "usb-unplug" => {
+            let port = args.first().ok_or_else(|| format!("'{word}' needs a hub port"))?;
+            let port = port
+                .parse::<u8>()
+                .ok()
+                .filter(|p| (1..=HUB_PORTS as u8).contains(p))
+                .ok_or_else(|| format!("'{port}' is not a USB hub port (1-{HUB_PORTS})"))?;
+            let device = match (word, &args[1..]) {
+                ("usb-unplug", []) => None,
+                ("usb-plug", ["keyboard"]) => Some(UsbDevice::Keyboard),
+                ("usb-plug", ["mouse"]) => Some(UsbDevice::Mouse),
+                ("usb-plug", ["image", path]) => Some(UsbDevice::Image(PathBuf::from(path))),
+                ("usb-plug", _) => return Err("'usb-plug' takes <port> image <path> | keyboard | mouse".into()),
+                _ => return Err("'usb-unplug' takes <port>".into()),
+            };
+            ControlCmd::UsbPlug { port, device }
         }
         "monitor" => {
             if rest.trim().is_empty() {
@@ -418,6 +439,10 @@ pub fn execute(t: &mut dyn Target, cmd: &ControlCmd, out: &mut dyn Write) -> Res
         }
         ControlCmd::UsbReplug { port, discard } => {
             usb_request(t, out, UsbRequest { action: UsbAction::Replug { discard: *discard }, port: *port })?
+        }
+        ControlCmd::UsbPlug { port, device } => {
+            let line = t.usb_plug(*port, device.clone())?;
+            print_lines(out, &[line])?;
         }
         ControlCmd::Monitor(line) => {
             let text = t.monitor(line)?;
@@ -736,6 +761,12 @@ impl Target for HandleTarget {
         result.recv().map_err(|_| anyhow!("emulator stopped"))
     }
 
+    fn usb_plug(&mut self, port: u8, device: Option<UsbDevice>) -> Result<String> {
+        let (done, result) = mpsc::channel();
+        self.ctl.commands.send(Command::UsbPlug { port, device, done }).map_err(|_| anyhow!("emulator stopped"))?;
+        result.recv().map_err(|_| anyhow!("emulator stopped"))?.map_err(|e| anyhow!(e))
+    }
+
     fn cart(&mut self, req: CartRequest) -> Result<Vec<String>> {
         let (done, result) = mpsc::channel();
         self.ctl.commands.send(Command::Cart { req, done }).map_err(|_| anyhow!("emulator stopped"))?;
@@ -936,6 +967,10 @@ mod tests {
             Ok((vec![format!("port {:?}: done", req.port)], error))
         }
 
+        fn usb_plug(&mut self, port: u8, device: Option<UsbDevice>) -> Result<String> {
+            Ok(format!("port {port}: {device:?}"))
+        }
+
         fn monitor(&mut self, line: &str) -> Result<String> {
             self.monitor.push(line.to_owned());
             match line {
@@ -978,6 +1013,14 @@ mod tests {
         assert_eq!(ok("key +"), Some(Key(k("+"), 80)), "a lone + is the key");
         assert_eq!(ok("hold cbm"), Some(Hold(vec![k("cbm")])));
         assert_eq!(ok("usbmouse 10 -5"), Some(UsbMouse(10, -5, 0)));
+        assert_eq!(ok("usb-unplug 2"), Some(UsbPlug { port: 2, device: None }));
+        assert_eq!(ok("usb-plug 3 mouse"), Some(UsbPlug { port: 3, device: Some(UsbDevice::Mouse) }));
+        assert_eq!(
+            ok("usb-plug 1 image run/stick.img"),
+            Some(UsbPlug { port: 1, device: Some(UsbDevice::Image("run/stick.img".into())) })
+        );
+        assert!(parse_line("usb-plug 1 printer").is_err());
+        assert!(parse_line("usb-unplug 9").is_err());
         assert_eq!(ok("usbmouse 0 0 1"), Some(UsbMouse(0, 0, 1)));
         assert_eq!(ok("release ctrl+c"), Some(Release(vec![k("ctrl"), k("c")])));
         assert!(parse_line("key cbm+nope").is_err());
@@ -1395,6 +1438,9 @@ mod tests {
                         }
                         Ok(Command::Cart { done, .. }) => {
                             let _ = done.send(Err("no cartridge in the fake".into()));
+                        }
+                        Ok(Command::UsbPlug { done, .. }) => {
+                            let _ = done.send(Err("no USB hub in the fake".into()));
                         }
                         Ok(Command::Monitor { done, .. }) => {
                             let _ = done.send(Err("no monitor in the fake".into()));

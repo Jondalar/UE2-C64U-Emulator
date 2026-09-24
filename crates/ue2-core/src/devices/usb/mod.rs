@@ -153,6 +153,15 @@ impl UsbConfig {
     }
 }
 
+/// A device to plug into a hub port while the machine runs (S33).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UsbDevice {
+    /// A raw image as a USB stick.
+    Image(PathBuf),
+    Keyboard,
+    Mouse,
+}
+
 /// A hub port as [`Usb::port_info`] reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UsbPortInfo {
@@ -311,6 +320,30 @@ impl Usb {
     pub fn attach_storage(&mut self, port: usize, backend: Box<dyn BlockBackend>) -> Result<(), String> {
         let storage = Storage::new(backend).map_err(|e| e.to_string())?;
         self.hub().insert(port, Device::new(Peripheral::Storage(storage)))
+    }
+
+    /// S33: unplug the device on hub port `port` (1-based) and take it off the port, so another can go there.
+    pub fn unplug(&mut self, port: usize, now: u64) -> Result<&'static str, String> {
+        let kind = self.port_info(port).ok_or_else(|| format!("the hub has no port {port}"))?.device;
+        let kind = kind.ok_or_else(|| format!("hub port {port} is empty"))?;
+        self.set_connected(port, false, now);
+        self.hub().take(port);
+        Ok(kind)
+    }
+
+    /// S33: put a new device on the empty hub port `port` (1-based) and plug it in, after the usual gap when the
+    /// port was unplugged a moment ago.
+    pub fn plug(&mut self, port: usize, device: UsbDevice, now: u64) -> Result<(), String> {
+        let function = match device {
+            UsbDevice::Image(path) => {
+                Peripheral::Storage(Storage::open(&path).map_err(|e| format!("{}: {e}", path.display()))?)
+            }
+            UsbDevice::Keyboard => Peripheral::Keyboard(Keyboard::new()),
+            UsbDevice::Mouse => Peripheral::Mouse(Mouse::new()),
+        };
+        self.hub().insert_unplugged(port, Device::new(function))?;
+        self.set_connected(port, true, now);
+        Ok(())
     }
 
     /// Swap the medium of the mass-storage device on `port` (1-based); returns the previous medium. Meant for an
@@ -1030,6 +1063,23 @@ mod tests {
         assert_eq!(h.get(0, P_RESULT) & 0x7FFF & 0xF000, RES_ACK);
         h.w8(BRAM, 0);
         assert_eq!(h.usb.next_event(), None, "NANO_START = 0 holds the nano");
+    }
+
+    /// S33: a device plugged into an empty port waits for the plug-in, an unplug empties the port again.
+    #[test]
+    fn devices_plug_in_and_out_while_running() {
+        let mut map = IoMap::new();
+        install(&mut map, &cfg());
+        let usb = map.get_mut::<Usb>().unwrap();
+        let info = |usb: &Usb, port| usb.port_info(port).unwrap();
+        usb.plug(2, UsbDevice::Mouse, 0).unwrap();
+        assert_eq!((info(usb, 2).device, info(usb, 2).plug_pending), (Some("mouse"), true), "plugged in on the next tick");
+        assert!(usb.plug(2, UsbDevice::Keyboard, 0).is_err(), "port 2 is in use");
+        assert!(usb.plug(1, UsbDevice::Image("/nonexistent/usb.img".into()), 0).is_err(), "no such image");
+        assert_eq!(info(usb, 1).device, None, "and the port stays empty");
+        assert_eq!(usb.unplug(2, 0), Ok("mouse"));
+        assert_eq!(info(usb, 2).device, None);
+        assert!(usb.unplug(2, 0).is_err(), "nothing left to unplug");
     }
 
     #[test]

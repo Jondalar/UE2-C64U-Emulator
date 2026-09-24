@@ -123,13 +123,13 @@ now starts a pipe no earlier than one frame after the write that armed it (`SCAN
 
 ## Known gaps
 
-- **Hot-plug on hub ports only:** devices behind the hub can be unplugged and plugged in (`usb-replug`,
-  `HostInput::UsbPlug`, `docs/status/usb-dir.md`). The root port never detaches, so the nano's own disconnect path
-  (`RAM_STATUS = 0x8000`, push 0xFFF0) is still not modelled. Do not modify a `--usb` image on the host while the
+- **Hot-plug on hub ports:** devices behind the hub are plugged in and out while the machine runs (`usb-plug`,
+  `usb-unplug`, `--usb-hub`, S33; `usb-replug` for `--usb-dir` sticks). The root port never detaches: the hub is
+  on the C64U's board, so the nano's own disconnect path (`RAM_STATUS = 0x8000`) cannot happen there either. Do not modify a `--usb` image on the host while the
   emulator runs (`--usb-dir` does that safely).
 - **Wire details not modelled:** split transactions to the full-speed keyboard, PING, suspend/resume, error
   retries. Every device answers at once and always with the toggle the pipe expects.
-- **No mouse.** HID mouse and other classes (CBI, AX88772) are not modelled.
+- **Mouse** since S32 (`--usb-mouse`); other classes (CBI, AX88772) are not modelled.
 - **Mass storage:** one LUN, 512-byte blocks, 32-bit LBAs (images above 2 TiB are cut); commands other than the six
   the driver sends fail with ILLEGAL REQUEST.
 - **Board wiring open (09 Q5):** 3 hub ports; images get the first ports, the keyboard the next free one, so names

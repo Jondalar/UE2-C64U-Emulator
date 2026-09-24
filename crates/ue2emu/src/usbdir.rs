@@ -418,6 +418,11 @@ impl UsbDirs {
     }
 
     /// Queue a `usb-sync` / `usb-replug`; `done` gets the result when it has finished.
+    /// Whether hub port `port` holds one of the `--usb-dir` sticks.
+    pub fn owns(&self, port: usize) -> bool {
+        self.ports.iter().any(|p| p.port == port)
+    }
+
     pub fn request(&mut self, machine: &mut Machine, req: UsbRequest, done: UsbDone) {
         let dir_ports: Vec<usize> = self.ports.iter().map(|p| p.port).collect();
         let (ports, plain) = match req.port.map(usize::from) {

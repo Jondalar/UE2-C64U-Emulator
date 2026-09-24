@@ -31,6 +31,10 @@ pub struct UsbArgs {
     /// emulation puts it on joystick port 1 (S32)
     #[arg(long)]
     usb_mouse: bool,
+    /// Announce the USB host even with no device on it, so devices can be plugged in while the machine runs
+    /// (`usb-plug`, S33)
+    #[arg(long)]
+    usb_hub: bool,
 }
 
 fn parse_dir_spec(s: &str) -> Result<DirSpec, String> {
@@ -50,7 +54,7 @@ pub fn configure(args: UsbArgs, cfg: &mut MachineConfig) -> Result<(Vec<DirSpec>
     if devices > HUB_PORTS {
         bail!("--usb/--usb-dir/--usb-keyboard/--usb-mouse: {devices} devices, but the USB hub has {HUB_PORTS} ports");
     }
-    if devices > 0 {
+    if devices > 0 || args.usb_hub {
         cfg.capabilities |= CAPAB_USB_HOST2;
     }
     cfg.usb = usb;
@@ -192,6 +196,7 @@ mod tests {
             dir_work: PathBuf::from("run/usb-dir"),
             usb_keyboard,
             usb_mouse: false,
+            usb_hub: false,
         }
     }
 

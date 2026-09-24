@@ -161,6 +161,22 @@ impl Hub {
         Some(&self.ports.get(index.checked_sub(1)?)?.device.as_ref()?.function)
     }
 
+    /// Take the device off port `index` (1-based), which is then empty. Unplug it first, so the driver sees it go.
+    pub(crate) fn take(&mut self, index: usize) -> Option<Device> {
+        self.ports.get_mut(index.checked_sub(1)?)?.device.take()
+    }
+
+    /// Put `device` on the empty port `index` (1-based), not plugged in yet: no connection change until it is.
+    pub(crate) fn insert_unplugged(&mut self, index: usize, device: Device) -> Result<(), String> {
+        let port = self.ports.get_mut(index.wrapping_sub(1)).ok_or_else(|| format!("the hub has no port {index}"))?;
+        if port.device.is_some() {
+            return Err(format!("hub port {index} is in use"));
+        }
+        port.device = Some(device);
+        port.connected = false;
+        Ok(())
+    }
+
     /// Put `device` on the empty port `index` (1-based), plugged in.
     pub(crate) fn insert(&mut self, index: usize, device: Device) -> Result<(), String> {
         let port = self.ports.get_mut(index.wrapping_sub(1)).ok_or_else(|| format!("the hub has no port {index}"))?;
