@@ -36,6 +36,20 @@ pub trait DmaMem {
     fn write(&mut self, addr: u32, val: u8);
 }
 
+/// Guest DDR, borrowed for one firmware access.
+pub struct Ram<'a>(pub &'a mut [u8]);
+
+impl DmaMem for Ram<'_> {
+    fn read(&mut self, addr: u32) -> u8 {
+        self.0.get(addr as usize).copied().unwrap_or(0)
+    }
+    fn write(&mut self, addr: u32, val: u8) {
+        if let Some(b) = self.0.get_mut(addr as usize) {
+            *b = val;
+        }
+    }
+}
+
 impl DmaMem for Vec<u8> {
     fn read(&mut self, addr: u32) -> u8 {
         self.get(addr as usize).copied().unwrap_or(0)
@@ -141,6 +155,11 @@ impl Wd177x {
         if held {
             self.reset();
         }
+    }
+
+    /// The drive clock is `clk` without time having passed: TRX64 restarts it at every drive reset (Spec 875).
+    pub fn rebase(&mut self, clk: u64) {
+        (self.clk, self.ms_frac) = (clk, 0);
     }
 
     /// The interrupt to the firmware: a command or a completion waiting (`io_irq <= command_fifo_valid`).

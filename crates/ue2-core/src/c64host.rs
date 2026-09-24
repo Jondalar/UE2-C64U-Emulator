@@ -316,6 +316,11 @@ pub struct DriveLines {
     pub write_protect: bool,
     /// DRIVETYPE bits 1:0: 0 = 1541, 1 = 1571, 2 = 1581.
     pub drive_type: u8,
+    /// S31, for a 1581's mechanism: INSERTED bit 0 (a disk in), DISKCHANGE bit 0 (/DISK CHANGE asserted) and bit 1
+    /// (force ready) (drive_registers.vhd:170-177; mm_drive.vhd:269 `rdy_n`).
+    pub inserted: bool,
+    pub disk_change: bool,
+    pub force_ready: bool,
 }
 
 impl Default for DriveLines {
@@ -329,6 +334,9 @@ impl Default for DriveLines {
             device: 0,
             write_protect: true,
             drive_type: 0,
+            inserted: false,
+            disk_change: false,
+            force_ready: false,
         }
     }
 }
@@ -344,6 +352,8 @@ pub struct DriveStatus {
     pub writing: bool,
     /// Activity LED, VIA2 PB3. No register reports it.
     pub led: bool,
+    /// SIDE bit 0: a 1581's CIA PA0 as it stands (mm_drive_cpu.vhd:556); a 1541 reports 0.
+    pub side: u8,
 }
 
 /// A drive driven by `devices::drives::DriveRegs`. The firmware owns the disk: it hands the drive GCR bytes per
@@ -362,6 +372,22 @@ pub trait C64Drive {
     fn status(&self) -> DriveStatus;
     /// Copy the drive CPU's RAM from $0000 into `out` (at most $0800 bytes).
     fn read_ram(&self, out: &mut [u8]);
+
+    // ---- S31: a 1581's WD177x at drive window + 0x1800 (wd177x.vhd `io_req`) ----
+    /// Whether the drive is a 1581 whose controller serves the WD window. Without one the window stays the T0 table.
+    fn has_wd(&self) -> bool {
+        false
+    }
+    /// The firmware's WD register `off` (0-15). Side-effect free: popping the command FIFO is a write.
+    fn wd_read(&self, _off: u16) -> u8 {
+        0
+    }
+    /// A firmware write of WD register `off`; `ram` is guest DDR, which the DMA reads and writes.
+    fn wd_write(&mut self, _off: u16, _val: u8, _ram: &mut [u8]) {}
+    /// The command FIFO holds an entry: ITU high IRQ 1 (drive A) or 2 (drive B) (wd177x.cc:63).
+    fn wd_irq(&self) -> bool {
+        false
+    }
 }
 
 /// A [`C64Backend`] that records calls, for device and machine tests.

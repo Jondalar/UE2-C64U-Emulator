@@ -1126,6 +1126,10 @@ impl C64Backend for Trx64Backend {
         // S16: the voices read the same DDR, on the same lease — but not through the REU's store, which is gated by
         // `C64_REU_SIZE`; a voice plays with no REU fitted at all.
         self.sampler.with(|s| s.ram()).set_ddr(ddr.as_mut().map(|d| (d.as_mut_ptr(), d.len())));
+        // S31: a 1581 controller's DMA reaches the firmware's sector buffer on the same lease.
+        for d in &mut self.drives {
+            d.lend_ddr(ddr.as_mut().map(|d| (d.as_mut_ptr(), d.len())));
+        }
         self.cart.with(|c| c.set_ddr(ddr));
     }
 

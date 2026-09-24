@@ -1053,7 +1053,7 @@ realtime with 2004 host forwards keeps 25 MIPS at about 24 % of one core ([e2e.m
 | Stops and DMA on instruction boundaries | STOP_MODE latched only, always "Frozen on Bad line"; raster-timed programs may glitch on freeze | [c64.md](status/c64.md), [carts.md](status/carts.md) |
 | SID gaps after S17 | RES/DIGI/filter curves, socket 2 chip, VOICE_ADSR; `$DE00-$DFFF` precedence unverified | [S17](specs/S17-ultisid.md) §3, §5 |
 | Sampler gaps | No read pipeline, no memory contention, REU mirror answers a closed window | [sampler.md](status/sampler.md) |
-| Drives | 1541 only; the IEC processor's master mode (printer, UltiCopy) not run | [drive.md](status/drive.md) |
+| Drives | 1541 and 1581 (no 1571); the IEC processor's master mode (printer, UltiCopy) not run | [drive.md](status/drive.md) |
 | No pointing device reaches the C64; "Run Cart" leaves the keyboard with the menu | Mouse-driven software (GEOS) cannot be used; cartridges need a button press | [xander-tests.md](status/xander-tests.md) |
 | TRX64 cartridge API gaps | No cart ROM in the VIC view; cart writes only in mapped windows; Business Basic's dynamic mode off | [carts.md](status/carts.md) |
 | Physical slot model | Bridge bit 0 only, no port timing, freeze button of a slot freezer not wired | [cart-slot.md](status/cart-slot.md) |
