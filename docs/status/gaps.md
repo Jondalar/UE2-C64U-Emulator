@@ -37,8 +37,8 @@ or a need shows up), accepted as a limit, or **dropped**.
   (Spec 874). Dropped: the IEC printer and UltiCopy (master mode; UltiCopy needs a real drive). `drive.md`
 - **I2C devices — dropped.** Codec (NAU8822), hub (USB2513), expanders, PLLs ACK and read 0xFF; they configure
   hardware the emulator does not have, and the boot is clean. Revisit only if the firmware stalls on one. `fixes.md`
-- **Peripherals. Planned:** the USB mouse's POT values on the C64 (S32: the USB side is built; POTX/POTY wait for
-  TRX64 Spec 876). USB devices plug in and out while running since S33 (the root port itself never detaches:
+- **Peripherals. Planned:** nothing open: the USB mouse reaches POTX/POTY since S32 (TRX64 v0.9.2); its POT
+  conversion is assumed as a 1351's until measured on a C64U. USB devices plug in and out while running since S33 (the root port itself never detaches:
   the hub is on the board). Dropped: WiFi beyond the
   stub (Ethernet covers the network), AX88772 (same), HDMI hot-plug (no second monitor). `usb.md`, `boot.md`
 - **Never run end to end. Planned** as one test package with smoke scripts, run as the gate before a minor or

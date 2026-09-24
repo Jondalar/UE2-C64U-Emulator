@@ -14,4 +14,4 @@ ue2-core = { path = "../ue2-core" }
 # (`memconfig_table`/`pla_index`, the cartridge slot; docs/specs/S14-c64-trx64.md §4-§8), so an upstream refactor can
 # break the build or change behaviour: re-run the tests and the C64 smokes (docs/status/c64.md) before moving `rev`.
 # trx64-core's build.rs compiles vendored reSID C++.
-trx64-core = { git = "https://github.com/Jondalar/TRX64", tag = "v0.9.1" }
+trx64-core = { git = "https://github.com/Jondalar/TRX64", tag = "v0.9.2" }

@@ -60,6 +60,9 @@ const CORE_SPEED_UPDATE: u8 = 0x2E;
 /// C64_VIDEOFORMAT and its cycles-per-line field (u64.h:105,167-169): 63 is PAL timing, 65 NTSC; the colour encoding
 /// and the other bits change nothing the C64 core produces (S25 §1).
 const CORE_VIDEOFORMAT: u8 = 0x01;
+/// S32: C64_PADDLE_1_X .. C64_MOUSE_EN_2 (u64.h:139-144): x/y of port 1, x/y of port 2, the two mouse enables.
+const CORE_PADDLE_1_X: u8 = 0x32;
+const CORE_MOUSE_EN_2: u8 = 0x37;
 const VIDEOFORMAT_CYCLES: u8 = 0x30;
 const VIDEOFORMAT_CYCLES_63: u8 = 0x00;
 const VIDEOFORMAT_CYCLES_65: u8 = 0x20;
@@ -253,6 +256,8 @@ pub struct Trx64Backend {
     checkpoint_hit: Option<u16>,
     /// Ultimate Audio: UE2's own block, shared with the port device TRX64 holds (sampler.rs, S16).
     sampler: sampler::SamplerHandle,
+    /// S32: the core's paddle registers 0x32-0x37 as last written.
+    paddles: [u8; 6],
     /// S30: the IEC processor, shared with the device TRX64 holds on the IEC bus at slot 4 (Spec 874).
     iec: iec_proc::IecHandle,
 }
@@ -350,6 +355,7 @@ impl Trx64Backend {
             checkpoint_exec: None,
             checkpoint_hit: None,
             sampler,
+            paddles: [0; 6],
             iec,
         }
     }
@@ -657,6 +663,19 @@ impl Trx64Backend {
     /// At a frame boundary: put the machine on `model`, and move the clock and reSID to its rate (S25 §2-§3). A VIC
     /// that is not in line 0 (the run was held for the firmware, or overshot) leaves the switch pending. Whether it
     /// happened is returned.
+    /// S32: each port's POT byte from its paddle registers. With the port's mouse enable set the value is a 1351's
+    /// position, which a 1351 puts into POT bits 1-6 with bit 0 as noise; UE2 takes `position << 1`, the reading
+    /// GEOS's 1351 driver expects (how the U64 core converts it is closed and not measured yet, S32 §4). Without it
+    /// the byte is the paddle's own, as the firmware's extra fire buttons write it (0x80 released, 0x00 pressed,
+    /// joystick_output.cc:26-37).
+    fn apply_pots(&mut self) {
+        for port in 0..2 {
+            let (x, y, mouse) = (self.paddles[2 * port], self.paddles[2 * port + 1], self.paddles[4 + port] & 1 != 0);
+            let pot = |v: u8| if mouse { (v & 0x7F) << 1 } else { v };
+            let _ = self.m.set_pot(port as u8 + 1, pot(x), pot(y));
+        }
+    }
+
     /// S34: the audio stream's rate, derived from the video clock: PAL or NTSC (`tests/e2e/lib/streams.py:661-662`).
     fn stream_rate(&self) -> u32 {
         if self.cpu_hz() > 1_000_000 {
@@ -1081,6 +1100,12 @@ impl C64Backend for Trx64Backend {
             CORE_SPEED_PREFER => self.speed_prefer = val,
             CORE_SPEED_UPDATE => self.m.set_u64_turbo(self.turbo_regs_en, self.speed_prefer),
             CORE_VIDEOFORMAT => self.request_model(val),
+            // S32: the paddle values and the mouse enables of both control ports (u64.h:139-144) reach SID POTX/POTY
+            // through TRX64's POT lines (Spec 876).
+            CORE_PADDLE_1_X..=CORE_MOUSE_EN_2 => {
+                self.paddles[usize::from(off - CORE_PADDLE_1_X)] = val;
+                self.apply_pots();
+            }
             // Spec 852 §5: the U64 bus multiplexer decides whether the internal IO1/IO2 range — and with it the UCI
             // window — reaches the C64 bus. `unlock_irq` sets bit 1 for exactly that (u64_config.cc:1015-1016).
             slot::CORE_BUS_INTERNAL => {
@@ -1586,6 +1611,23 @@ mod tests {
     }
 
     const CART_ROM: usize = 0x03C0_0000;
+
+    /// S32: the paddle registers reach TRX64's POT lines; with the mouse enable the 7-bit position is shifted into
+    /// bits 1-7 as a 1351's.
+    #[test]
+    fn paddle_and_mouse_registers_set_the_pots() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        assert_eq!(c64.m.pot(1), None, "nothing set: TRX64's open line");
+        c64.core_config_write(0x32, 0x80);
+        c64.core_config_write(0x33, 0x00);
+        assert_eq!(c64.m.pot(1), Some((0x80, 0x00)), "paddle bytes as written");
+        c64.core_config_write(0x36, 1);
+        c64.core_config_write(0x32, 0x14);
+        c64.core_config_write(0x33, 0x7F);
+        assert_eq!(c64.m.pot(1), Some((0x28, 0xFE)), "mouse: position << 1");
+        c64.core_config_write(0x34, 0x40);
+        assert_eq!(c64.m.pot(2), Some((0x40, 0x00)), "port 2 has no mouse enable");
+    }
 
     /// S28: an Action Replay in RAM mode keeps its RAM written with ROML banked out, as the FPGA does.
     #[test]
