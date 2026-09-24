@@ -377,8 +377,7 @@ impl Trx64Backend {
         }
         let tap = on.then(|| std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
         self.stream_tap = tap.clone();
-        // The rate the receiver derives from the PAL video clock (`tests/e2e/lib/streams.py:661`).
-        self.sid.set_stream_tap(tap, 47_983, self.m.c64_core.clk);
+        self.sid.set_stream_tap(tap, self.stream_rate(), self.m.c64_core.clk);
     }
 
     /// Samples the tap has collected, interleaved stereo, and the tap is empty afterwards.
@@ -658,6 +657,15 @@ impl Trx64Backend {
     /// At a frame boundary: put the machine on `model`, and move the clock and reSID to its rate (S25 §2-§3). A VIC
     /// that is not in line 0 (the run was held for the firmware, or overshot) leaves the switch pending. Whether it
     /// happened is returned.
+    /// S34: the audio stream's rate, derived from the video clock: PAL or NTSC (`tests/e2e/lib/streams.py:661-662`).
+    fn stream_rate(&self) -> u32 {
+        if self.cpu_hz() > 1_000_000 {
+            47_940
+        } else {
+            47_983
+        }
+    }
+
     fn switch_model(&mut self, model: &'static C64Model) -> bool {
         if self.m.vic.raster_line != 0 {
             return false;
@@ -672,6 +680,10 @@ impl Trx64Backend {
         let at = self.clock.map_or(self.now, |c| c.time_of(clk));
         self.clock = Some(Clock::new(at, clk, self.cpu_hz()));
         self.sid.set_clock(self.cpu_hz(), clk);
+        // S34: the audio stream follows the video clock.
+        if let Some(tap) = self.stream_tap.clone() {
+            self.sid.set_stream_tap(Some(tap), self.stream_rate(), clk);
+        }
         true
     }
 

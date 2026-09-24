@@ -56,6 +56,9 @@ const BYTES_PER_LINE: usize = PIXELS_PER_LINE / 2;
 const VIDEO_PAYLOAD: usize = LINES_PER_PACKET * BYTES_PER_LINE;
 /// Application header bytes in front of a VIC payload.
 const VIDEO_HEADER: usize = 12;
+/// Lines a frame has on the wire: 272 under PAL, 240 under NTSC, the receiver's two heights (streams.py:281-286).
+const HEIGHT_PAL: usize = 272;
+const HEIGHT_NTSC: usize = 240;
 /// Bit 15 of the line field marks a frame's last datagram.
 const LAST_PACKET: u16 = 0x8000;
 
@@ -111,11 +114,17 @@ impl Streams {
         (dest_ip != [0, 0, 0, 0]).then_some(&regs[..TEMPLATE])
     }
 
-    /// One VIC frame as datagrams, 68 of them for 272 PAL lines. Indices outside the frame read as 0, so a frame
-    /// of another size still produces a well-formed stream of the size the receiver expects.
+    /// One VIC frame as datagrams: 68 for 272 PAL lines, 60 for 240 NTSC lines (S34). The NTSC canvas has 247 lines;
+    /// the 240 sent are its middle ones, which puts the text window where it is on the PAL stream relative to the
+    /// borders. Indices outside the frame read as 0, so a frame of another size still produces a well-formed stream.
     pub fn send_frame(&mut self, frame: &C64Frame) {
         let Some(template) = self.template(VIC).map(<[u8]>::to_vec) else { return };
-        let height = frame.height;
+        let (height, top) = if frame.height >= HEIGHT_PAL {
+            (HEIGHT_PAL, 0)
+        } else {
+            let height = HEIGHT_NTSC.min(frame.height);
+            (height, (frame.height - height) / 2)
+        };
         let mut line = 0;
         while line < height {
             let last = line + LINES_PER_PACKET >= height;
@@ -134,7 +143,7 @@ impl Streams {
                         if y >= height || x >= frame.width {
                             return 0;
                         }
-                        frame.indices.get(y * frame.width + x).copied().unwrap_or(0) & 0x0F
+                        frame.indices.get((top + y) * frame.width + x).copied().unwrap_or(0) & 0x0F
                     };
                     // Low nibble first: the even pixel is the low half of the byte (streams.py:250-256).
                     packet.push(px(x) | (px(x + 1) << 4));
@@ -345,6 +354,22 @@ mod tests {
         }
         assert_eq!(sum, 0xFFFF, "the IP header checksum covers the length the generator wrote");
         assert_ne!(be(IP_SUM), 0, "and it is not the placeholder");
+    }
+
+    /// S34: an NTSC frame (247 canvas lines) goes out as 240 lines, 60 datagrams, the middle ones.
+    #[test]
+    fn an_ntsc_frame_is_240_lines() {
+        let mut s = armed(VIC);
+        let mut f = frame(384, 247);
+        for (i, px) in f.indices.iter_mut().enumerate() {
+            *px = (i / 384 % 16) as u8;
+        }
+        s.send_frame(&f);
+        let out = s.take();
+        assert_eq!(out.len(), 60);
+        let line = |p: &[u8]| u16::from_le_bytes([p[TEMPLATE + 4], p[TEMPLATE + 5]]);
+        assert_eq!((line(&out[0]), line(&out[59])), (0, 236 | LAST_PACKET), "the last datagram says 240 lines");
+        assert_eq!(out[0][TEMPLATE + VIDEO_HEADER], 3 | 3 << 4, "the first line sent is canvas line 3");
     }
 
     #[test]
