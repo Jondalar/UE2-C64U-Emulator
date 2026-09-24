@@ -1,6 +1,7 @@
 # S35 — The release gate
 
-**Status:** §1 built (2026-09-24): `scripts/gate.sh` passes in 430 s. The tests of §3 are next.
+**Status:** built (2026-09-24). The tests of §3 run in `smoke-c64-all.sh`; they found two bugs, both fixed: a frozen
+freezer stayed frozen into the next cartridge, and the GeoRAM bank ignored the REU size.
 
 **Owns:** `scripts/gate.sh`, `scripts/smoke-c64-all.sh`, the new smoke scripts of §3, `docs/status/tooling.md`.
 
@@ -17,7 +18,7 @@ failure:
    written back into the D64, the 1581 at A and B, Software IEC, a USB stick with the USB keyboard.
 4. `scripts/smoke-usb-dir.sh`: a host directory as a USB stick, written both ways.
 5. `scripts/run-e2e.sh smoke` with `E2E_REST_SHIM=1`: the upstream suite's smoke profile, 12 of 12.
-6. The tests of §3, once built.
+6. The tests of §3, inside `smoke-c64-all.sh`.
 
 It needs the firmware build (`$UE2_FIRMWARE`), a macOS login session for the SD images, and the ports the smokes use
 (6400, 8080, 18021-18080). It prints one PASS line per part and the wall time.

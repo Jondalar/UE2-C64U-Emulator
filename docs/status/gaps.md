@@ -41,10 +41,8 @@ or a need shows up), accepted as a limit, or **dropped**.
   conversion is assumed as a 1351's until measured on a C64U. USB devices plug in and out while running since S33 (the root port itself never detaches:
   the hub is on the board). Dropped: WiFi beyond the
   stub (Ethernet covers the network), AX88772 (same), HDMI hot-plug (no second monitor). `usb.md`, `boot.md`
-- **Never run end to end. Planned** as one test package with smoke scripts, run as the gate before a minor or
-  major release: REU preload and "Save REU"; KCS, SS5
-  and FC1 freezing from the firmware menu; GeoRAM and TwoMegabyter started by the firmware. A failure becomes a fix.
-  `reu.md`, `c64.md`
+- **Never run end to end — closed by S35:** REU preload and "Save REU", KCS/SS5/FC frozen from the firmware,
+  GeoRAM and TwoMegabyter now run in the release gate (`scripts/smoke-c64-all.sh`). `reu.md`, `carts.md`
 - **Network — dropped.** No link loss when the vmnet daemon goes away (vmnet mode only, unused); no mDNS, which the
   hardware's RX filter drops as well. `network.md`
 
