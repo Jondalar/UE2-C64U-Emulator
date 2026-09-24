@@ -21,6 +21,7 @@ mod sampler;
 mod sid;
 mod slot;
 mod video;
+pub mod wd177x;
 
 /// S30: the IEC processor's bus slot (TRX64 Spec 874: 4-7 are folded and belong to no unit).
 const IEC_SLOT: u8 = 4;
