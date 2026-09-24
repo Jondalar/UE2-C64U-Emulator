@@ -112,7 +112,7 @@ Writing back binary track 18...
   surfaces from DDR; register writes drive the lines with the ROM image; drive writes reach DDR and DIRTY (track, not
   half-track), write busy lasts 2047 ms, MAN_WRITE restarts it and the drive reset clears it; a dark sensor keeps the
   disk unchanged; the drive RAM is mirrored while powered.
-- c64-bridge `drive` (skips without `UE2_FIRMWARE`), on TRX64 0.8.8's drive part (S27): an unpowered drive is off
+- c64-bridge `drive` (skips without `UE2_FIRMWARE`), on TRX64's drive part (S27): an unpowered drive is off
   the IEC bus and not clocked, held in reset it is off the bus too, stopped (RESET bit 2 with the C64 frozen) it stays
   on the bus unclocked, and each of RESET bits 0-2 holds or releases it; the 1541 DOS lists, loads and runs a D64
   surface and saves a file whose directory entry and block decode back from the written GCR; HW_ADDR 1 is unit 9;
@@ -160,7 +160,10 @@ and ports. Open, and not TRX64's (2026-09-23):
   `CAPAB_DRIVE_1541_2` (bit 2, c1541.cc:1263); the default word has it since S27, as a C64 Ultimate does (its REST
   API lists drive B, disabled, bus ID 9). Checked: Drive B Settings enabled, `drive.d64` mounted over REST,
   `LOAD"$",9` and `LIST` show the directory.
-  The IEC processor (SoftIEC, printer, UltiCopy) is still T0.
+- **Software IEC** (S30): the IEC processor runs the firmware's microcode on the bus at TRX64 slot 4 (Spec 874).
+  Checked (`scripts/smoke-soft-iec.py`): "IEC Drive" enabled over REST, `LOAD"$",11` lists the RAM disk, a program
+  saved with `SAVE"T",11` loads back and runs. Master mode (printer, UltiCopy, drive-code upload) is not run. A
+  program that holds ATN low without sending a byte hangs the bus while the drive is on, as on the device.
 - **Held drive:** a drive in reset releases the bus lines (TRX64 leaves Conf0, 870 §10), where the FPGA drive pulls
   CLK and DATA while its VIA is reset.
 - **Written-track detection** runs at every C64 sync (1 ms, and every DMA or cart register access): a write followed

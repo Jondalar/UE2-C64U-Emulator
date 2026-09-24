@@ -22,6 +22,9 @@ mod sid;
 mod slot;
 mod video;
 
+/// S30: the IEC processor's bus slot (TRX64 Spec 874: 4-7 are folded and belong to no unit).
+const IEC_SLOT: u8 = 4;
+
 use std::ops::RangeInclusive;
 use std::path::Path;
 
@@ -249,6 +252,8 @@ pub struct Trx64Backend {
     checkpoint_hit: Option<u16>,
     /// Ultimate Audio: UE2's own block, shared with the port device TRX64 holds (sampler.rs, S16).
     sampler: sampler::SamplerHandle,
+    /// S30: the IEC processor, shared with the device TRX64 holds on the IEC bus at slot 4 (Spec 874).
+    iec: iec_proc::IecHandle,
 }
 
 impl Trx64Backend {
@@ -302,6 +307,13 @@ impl Trx64Backend {
         // `$DF20-$DFFF`: TRX64's REU mirrors its registers there, the U64's does not.
         let sampler = sampler::SamplerHandle::default();
         m.attach_expansion_also(Box::new(sampler.clone()));
+        // S30: the IEC processor is on the bus for the life of the machine, as in the FPGA; RESET_ENABLE decides
+        // whether it runs. Slot 4 is TRX64's home for a device with no fixed unit (Spec 874 §4).
+        let iec = iec_proc::IecHandle::default();
+        let hz = u64::from(m.timing().cpu_hz);
+        if let Err(e) = m.attach_iec_device(IEC_SLOT, Box::new(iec_proc::IecBusDevice::new(iec.clone(), hz))) {
+            eprintln!("c64: {e}");
+        }
         Trx64Backend {
             stream_tap: None,
             m,
@@ -337,6 +349,7 @@ impl Trx64Backend {
             checkpoint_exec: None,
             checkpoint_hit: None,
             sampler,
+            iec,
         }
     }
 
@@ -1226,6 +1239,22 @@ impl C64Backend for Trx64Backend {
 
     fn has_uci(&self) -> bool {
         self.m.uci().is_some()
+    }
+
+    fn has_iec(&self) -> bool {
+        true
+    }
+
+    fn iec_read(&mut self, off: u16) -> u8 {
+        self.iec.with(|p| p.read(off))
+    }
+
+    fn iec_peek(&self, off: u16) -> u8 {
+        self.iec.with(|p| p.peek(off))
+    }
+
+    fn iec_write(&mut self, off: u16, val: u8) {
+        self.iec.with(|p| p.write(off, val));
     }
 
     /// During the grace time the firmware reads back the 0 it wrote to CMD_IF_SLOT_ENABLE.

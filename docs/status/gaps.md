@@ -12,7 +12,8 @@ or a need shows up), accepted as a limit, or **dropped**.
   phase at resume: code that re-syncs each frame shows at most one bad frame, code that syncs once stays shifted
   after menu, freeze or DMA load. TRX64: medium change in the cycle core (RDY hold on read cycles, R/W history,
   BA-low count), needs a device measurement. No program known to break; revisit when one does. `c64.md`, `carts.md`
-- **Drives:** Specs 870 and 871 are in TRX64 v0.8.8 and UE2 uses them (S27). 1571 and 1581 are TRX64's, later.
+- **Drives:** Specs 870 and 871 are in TRX64 v0.8.8 and UE2 uses them (S27). The 1581 is in TRX64 v0.9.0 (Spec
+  872), not used by UE2 yet; the 1571 is TRX64's, later.
 
 ## UE2 (board, firmware side, host)
 
@@ -32,9 +33,8 @@ or a need shows up), accepted as a limit, or **dropped**.
 - **Disk surface.** An external surface with a write hook and the firmware's per-track bit time is not TRX64's
   (2026-09-23): UE2 keeps setting the image in and polling for written tracks; G64 tracks whose length differs from
   their zone's wrap at another rate than on hardware. Accepted as a known limit, not planned. `drive.md`
-- **IEC processor. Planned:** Software IEC only (the virtual drive, device 11 by default, loading straight from SD
-  and USB directories). The processor and its microcode come from the open FPGA source; it drives TRX64's IEC lines.
-  Spec not written yet. Dropped: the IEC printer and UltiCopy (needs a real drive). `drive.md`
+- **IEC processor.** Software IEC runs since S30: the firmware's microcode on an engine at TRX64's host IEC slot
+  (Spec 874). Dropped: the IEC printer and UltiCopy (master mode; UltiCopy needs a real drive). `drive.md`
 - **I2C devices — dropped.** Codec (NAU8822), hub (USB2513), expanders, PLLs ACK and read 0xFF; they configure
   hardware the emulator does not have, and the boot is clean. Revisit only if the firmware stalls on one. `fixes.md`
 - **Peripherals. Planned:** a USB mouse (host mouse → HID mouse → the firmware's 1351 emulation on the joyport, for

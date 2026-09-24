@@ -60,7 +60,8 @@ Status:
   drive A as a 1541 (wave 4); `--c64-roms`; a cartridge in the physical expansion port (`--cart-slot`,
   [cart-slot.md](status/cart-slot.md)). Since then: UCI ([S15](specs/S15-uci.md)), the REU ([reu.md](status/reu.md)),
   Ultimate Audio ([S16](specs/S16-ultimate-audio.md)); several SIDs and the mixer land with
-  [S17](specs/S17-ultisid.md). Open: the IEC processor, drive B, NTSC ([c64.md](status/c64.md)).
+  [S17](specs/S17-ultisid.md). Since then: NTSC ([S25](specs/S25-ntsc.md)), drives A and B on TRX64's drive part ([S27](specs/S27-drives-870.md)), the IEC
+  processor on the bus ([S30](specs/S30-soft-iec.md)).
 
 ### Quality goals
 
@@ -356,8 +357,8 @@ The devices, by module:
 | `wifi.rs` | `0x10060900` | DMA UART with a u64ctrl stub, the ESP32 ROM loader for updaters, power requests (`U64Ctrl::power_event`) | [S05](specs/S05-wifi-u64ctrl.md), [install.md](status/install.md) §5 |
 | `rmii.rs` | `0x10060800` | RMII MAC: RX filter, TX, free queue, level IRQ bit 5, DMA buffers | [S12](specs/S11-S14-later.md), [network.md](status/network.md) |
 | `usb/` | `0x10080000-0x10080FFF` | Nano USB CPU protocol HLE, USB2513 hub, mass storage, HID keyboard, hot-plug | [S13](specs/S11-S14-later.md), [usb.md](status/usb.md) |
-| `iec.rs` | IEC `0x10028000`, ACIA `0x1004A000`, tape `0x100A0000`/`0x100C0000` | T0 tables | [S04](specs/S04-board-t0.md) |
-| `drives.rs` | Drive A `0x10020000` (inside `C64Port`), drive B `0x10024000` | `DriveRegs`: drive A drives a `C64Drive`, drive B has registers only | [S14](specs/S14-c64-trx64.md) §W4-DRIVE, [drive.md](status/drive.md) |
+| `iec.rs` | ACIA `0x1004A000`, tape `0x100A0000`/`0x100C0000` | T0 tables | [S04](specs/S04-board-t0.md) |
+| `drives.rs` | Drives A `0x10020000` and B `0x10024000` (inside `C64Port`) | `DriveRegs`: each drives a `C64Drive` ([S27](specs/S27-drives-870.md)) | [S14](specs/S14-c64-trx64.md) §W4-DRIVE, [drive.md](status/drive.md) |
 | `c64.rs` | `C64Port` windows (below); T0 tables for legacy SID `0x10042000`, CART_TIMING, PLD, U64 debug, glyph, UltiSID filter RAM `0x10184000`, UDP headers | The C64 behind the FPGA registers, or the T0 stub | [S14](specs/S14-c64-trx64.md)-[S17](specs/S17-ultisid.md) |
 
 #### C64 port
@@ -393,7 +394,9 @@ device through `map_origin`.
 - Drive A (`0x10020000`) is a `devices::drives::DriveRegs` inside `C64Port`, so each access syncs the C64 first. It
   drives `C64Backend::drive(0)` (a `c64host::C64Drive`) with the register lines and the GCR half-tracks the firmware
   keeps in DDR, and copies written tracks back into DDR with DIRTY set; the firmware writes them into the image.
-  Drive B has registers only ([drive.md](status/drive.md)).
+  Drive B (`0x10024000`) does the same for `drive(1)` ([S27](specs/S27-drives-870.md), [drive.md](status/drive.md)).
+- The IEC processor (`0x10028000`) goes to the backend (`has_iec`, `iec_read`, `iec_write`) and syncs the C64 first;
+  the bridge's engine runs the firmware's microcode on TRX64's IEC bus at slot 4 ([S30](specs/S30-soft-iec.md)).
 - UCI: the window `0x10044000` goes to the backend's block (`has_uci`, `uci_read`, `uci_write`) and syncs the C64
   first. `C64Port` drives ITU low bit 4 (level), low bit 7 (C64 reset edge) and high bit 6 (unlock), and drops high
   bit 6 on the firmware's `C64_POKE(0xD038, 0)`. Without a block the T0 table `UCI_T0` answers ([S15](specs/S15-uci.md)).
@@ -1050,7 +1053,7 @@ realtime with 2004 host forwards keeps 25 MIPS at about 24 % of one core ([e2e.m
 | Stops and DMA on instruction boundaries | STOP_MODE latched only, always "Frozen on Bad line"; raster-timed programs may glitch on freeze | [c64.md](status/c64.md), [carts.md](status/carts.md) |
 | SID gaps after S17 | RES/DIGI/filter curves, socket 2 chip, VOICE_ADSR; `$DE00-$DFFF` precedence unverified | [S17](specs/S17-ultisid.md) §3, §5 |
 | Sampler gaps | No read pipeline, no memory contention, REU mirror answers a closed window | [sampler.md](status/sampler.md) |
-| Drives | 1541 only; drive B registers only; IEC processor (SoftIEC, printer) still T0 | [drive.md](status/drive.md) |
+| Drives | 1541 only; the IEC processor's master mode (printer, UltiCopy) not run | [drive.md](status/drive.md) |
 | No pointing device reaches the C64; "Run Cart" leaves the keyboard with the menu | Mouse-driven software (GEOS) cannot be used; cartridges need a button press | [xander-tests.md](status/xander-tests.md) |
 | TRX64 cartridge API gaps | No cart ROM in the VIC view; cart writes only in mapped windows; Business Basic's dynamic mode off | [carts.md](status/carts.md) |
 | Physical slot model | Bridge bit 0 only, no port timing, freeze button of a slot freezer not wired | [cart-slot.md](status/cart-slot.md) |

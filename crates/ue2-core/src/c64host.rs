@@ -191,6 +191,21 @@ pub trait C64Backend {
     fn has_uci(&self) -> bool {
         false
     }
+
+    // ---- S30: the IEC processor at `IEC_BASE` 0x10028000 (docs/specs/S30-soft-iec.md) ----
+    /// Whether this backend has the IEC processor on its bus. Without one the window stays the T0 table.
+    fn has_iec(&self) -> bool {
+        false
+    }
+    /// A firmware read of the processor's register `off`: reading the up FIFO's data takes the entry.
+    fn iec_read(&mut self, _off: u16) -> u8 {
+        0
+    }
+    /// Register `off` without side effects.
+    fn iec_peek(&self, _off: u16) -> u8 {
+        0
+    }
+    fn iec_write(&mut self, _off: u16, _val: u8) {}
     /// A read of `CMD_IF_BASE` 0x10044000 + `off`: the sixteen registers below 0x800, the 2 K dual-port RAM above
     /// (docs/hw/11 §UltiCommand). Side-effect free, as TRX64's `Uci::fw_read` is — none of the firmware-side reads
     /// in `command_protocol.vhd` has one.
