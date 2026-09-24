@@ -1,5 +1,7 @@
 # S25 — NTSC: the C64 runs the standard System Mode asks for
 
+**Status:** built (2026-09-23).
+
 **Owns:**
 - `crates/c64-bridge/src/lib.rs`: C64_VIDEOFORMAT decoded to a TRX64 model row, the switch at a frame boundary
 - `crates/c64-bridge/src/clock.rs`: the emulator clock → C64 cycle ratio from the model's `cpu_hz`

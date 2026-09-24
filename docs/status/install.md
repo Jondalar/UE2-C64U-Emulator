@@ -34,8 +34,8 @@ scripts/smoke-all.sh                                      # release build, every
 ```
 
 - The firmware tests take the tree from `$UE2_FIRMWARE`, default `firmware/1541ultimate` under the repo root; the
-  loader tests skip when its ELF is missing (`crates/ue2-core/src/loader.rs:238-246`). With the firmware, main
-  `8218a0a` gives 388 passed, 1 ignored.
+  loader tests skip when its ELF is missing (`crates/ue2-core/src/loader.rs:238-246`). With the firmware, 0.5.0
+  (`b9050b9`) gives 523 passed, 1 ignored.
 - `scripts/make-sd-image.sh` (used by `smoke-all.sh`) needs a macOS login session.
 
 ### Platforms
@@ -65,22 +65,23 @@ Without vcpkg, `cargo build --release -p ue2emu --no-default-features --features
 
 ### TRX64 dependency
 
-`crates/c64-bridge` takes `trx64-core` from GitHub, pinned in its `Cargo.toml` to rev
-`c3d34bbc9fba8133264f42307c02008e29d8ae23` (TRX64 main, `trx64-core` 0.7.1; no tag for it); cargo fetches it on the first
-build. Its build.rs compiles the vendored reSID C++, so a C++ compiler is needed.
+`crates/c64-bridge` takes `trx64-core`, and `crates/ue2emu` takes `trx64-core` and `trx64-monitor`, from GitHub,
+pinned by tag in their `Cargo.toml` to `v0.9.2`; cargo fetches it on the first build. Its build.rs compiles the
+vendored reSID C++, so a C++ compiler is needed.
 `cargo build --release -p ue2emu --no-default-features` builds without TRX64 (`--c64 none` only). The bridge drives
-TRX64 internals, so run the tests and the C64 smokes (`docs/status/c64.md`) before moving `rev`.
+TRX64 internals, so run the tests and the C64 smokes (`scripts/smoke-c64-all.sh`) before moving the tag.
 
 To build against a local TRX64 checkout, create an untracked `.cargo/config.toml` in the repo root:
 
 ```toml
 [patch."https://github.com/Jondalar/TRX64"]
 trx64-core = { path = "<TRX64 checkout>/crates/trx64-core" }
+trx64-monitor = { path = "<TRX64 checkout>/crates/trx64-monitor" }
 ```
 
 - The patch key must be exactly `https://github.com/Jondalar/TRX64` (no trailing slash, no `.git`), the URL in
-  `crates/c64-bridge/Cargo.toml`. The local crate's version must match the pinned one (0.7.1); if it does not, cargo
-  says "patch … was not used in the crate graph" and keeps the GitHub rev. `cargo update -p trx64-core` switches
+  `Cargo.toml` files. The local crates' version must match the pinned one (0.9.2); if it does not, cargo
+  says "patch … was not used in the crate graph" and keeps the GitHub tag. `cargo update -p trx64-core` switches
   between the two.
 - `cargo tree -p c64-bridge -i trx64-core` shows the path source while the patch is active.
 - Cargo rewrites `Cargo.lock` while the patch is active (the `source = "git+…"` line of `trx64-core` goes). Do not
@@ -202,6 +203,7 @@ option.
 | `--script FILE` | Execute a control script (`docs/specs/S08-frontend-control.md`, `docs/status/tooling.md`) |
 | `--control ADDR` | Serve the TCP control protocol on ADDR, e.g. `127.0.0.1:6400` (`docs/status/mcp.md`, "Direct API") |
 | `--gdb ADDR` | GDB remote stub, e.g. `127.0.0.1:1234`; the machine waits at reset until the debugger continues (`docs/status/gdb.md`) |
+| `--vice-monitor [ADDR]` | VICE binary monitor for the C64, for third-party debuggers; default `127.0.0.1:6502` (`docs/status/monitor.md`) |
 | `--log LIST` | Logging: `unmapped`, `io`, `irq`, `cart`, comma separated. `cart` traces every access the C64 makes to a cartridge in `--cart-slot`, with the cycle the cartridge is handed -- the flash families time an erase off that cycle, and nothing else shows it |
 | `--no-halt` | Keep running when a firmware fault hook fires |
 | `--trace` | Record the last 256 PCs, printed when a fault hook halts the machine (implied by `--gdb`; about 3 % MIPS) |
@@ -234,7 +236,7 @@ target/release/ue2emu run --flash run/flash.bin --c64-roms --net user --cart-slo
 # Headless: open the menu, check the screen, move the cursor, write run/menu1.png and run/menu2.png.
 target/release/ue2emu run --headless --speed max --flash run/flash.bin --script scripts/smoke-menu.ctl
 
-# Every self-checking smoke script (menu, SD, flash persistence), in a temporary directory.
+# The firmware smoke scripts (menu, SD, flash, settings, monitor, UCI, VICE port), in a temporary directory.
 scripts/smoke-all.sh
 
 # A 1000 Hz BASIC tone into a WAV, checked on the host.
@@ -260,10 +262,11 @@ under the repo root; elsewhere pass `--firmware` and `--roms` (`png` reads its f
 - **Disks:** put `1541.bin` and a `.d64` on the SD image. Choose "Set as 1541 ROM" on `1541.bin` once per flash,
   then "Mount Disk" on the D64, and `load"$",8` on the C64. The firmware writes changed tracks back into the D64 file.
   `scripts/d64tool.py` builds, lists and extracts D64s, also straight out of an SD image (`docs/status/drive.md`).
-  Self-checking C64 scripts, with their setup in the header: `smoke-sid-tone.ctl`, `smoke-c64-carts.ctl` (27 carts,
-  the freezer, the SID and MUS players), `smoke-c64-drive.ctl` (directory, LOAD, SAVE and write-back).
+  Self-checking C64 scripts, with their setup in the header: `smoke-sid-tone.ctl`, `smoke-c64-carts.ctl` (28 carts,
+  4 freezes), `smoke-c64-drive.ctl` (directory, LOAD, SAVE and write-back); `scripts/smoke-c64-all.sh` runs them all
+  (`docs/status/tooling.md`).
 - **USB:** `--usb IMAGE` (repeatable) attaches a USB stick, `--usb-keyboard` a HID keyboard that takes the window's
-  keys. `scripts/make-sd-image.sh` makes stick images too (`docs/status/usb.md`). `--usb-dir DIR[,size=SIZE][,ro]`
+  keys, `--usb-mouse` a HID mouse. `scripts/make-sd-image.sh` makes stick images too (`docs/status/usb.md`). `--usb-dir DIR[,size=SIZE][,ro]`
   (repeatable) shares a host directory as a FAT32 stick. The firmware may write to it; changes are synced back safely
   (deletions go to `DIR/.ue2-trash`, conflicts become copies, a mass-deletion guard asks for `usb-sync --force`), and
   host changes reach the guest by an automatic replug. `scripts/smoke-usb-dir.sh` tests it (`docs/status/usb-dir.md`).
@@ -278,21 +281,20 @@ under the repo root; elsewhere pass `--firmware` and `--roms` (`png` reads its f
 Only `run` takes `--config`. `crates/ue2emu/src/config.rs` turns the file's entries into `--flag=value` arguments after
 `run`, leaves out the flags the command line gives, and parses the whole command line again.
 
-- **Keys** are the long flag names without `--`, spelled like the flag: `firmware`, `roms`, `flash`, `sd`, `c64`,
-  `caps`, `clocks-per-insn`, `speed`, `headless`, `script`, `control`, `max-seconds`, `gdb`, `log`, `no-overlay-ui`,
-  `no-halt`, `trace`, `board`, `net`, `hostfwd`, `web-port`, `usb`, `usb-dir`, `usb-dir-work`, `usb-keyboard`, `audio`,
-  `audio-wav`, `sid-socket1`, `c64-roms`, `c64-roms-force`, `cart-slot`, `settings`.
+- **Keys** are the long flag names of `run` without `--`, spelled like the flag (`firmware`, `flash`, `usb-dir`,
+  `hold-key`, ...); every one of them is a key (`config::tests::every_long_run_flag_is_a_key`).
   - The alias `elf` works for `firmware`; setting both is an error.
   - An unknown key is an error, and so is `config`. `help` is not a key.
 - **Values** are written as on the command line:
   - A flag with a value: a string, integer or float (`web-port = 8080`, `max-seconds = 5`, `caps = "34000222"`,
     `speed = "max"`).
-  - A flag without a value (`headless`, `trace`, `no-halt`, `no-overlay-ui`, `usb-keyboard`, `c64-roms-force`): `true`
+  - A flag without a value (`headless`, `trace`, `no-halt`, `usb-keyboard`, `usb-mouse`, `c64-roms-force`, ...): `true`
     gives it, `false` leaves it out.
   - A repeatable flag (`log`, `hostfwd`, `usb`, `usb-dir`, `settings`): an array, one occurrence per element; a
     single string or number counts as one occurrence. `log` and `hostfwd` split on commas as on the command line, so
     `log = "io,irq"` works.
-  - `c64-roms`: `true` is the bare `--c64-roms`, a string is `--c64-roms=DIR`, `false` leaves it out.
+  - A flag with an optional value (`c64-roms`, `vice-monitor`): `true` is the bare flag, a string is `--c64-roms=DIR`,
+    `false` leaves it out.
   - Anything else is an error: tables, datetimes, nested arrays, an array for a single-value flag, a non-boolean for a
     flag without a value.
   - A value of the right kind that the flag rejects (`speed = "slow"`) gets clap's normal error, which names
@@ -304,7 +306,7 @@ Only `run` takes `--config`. `crates/ue2emu/src/config.rs` turns the file's entr
   - A relative path resolves against the directory containing the TOML file.
   - A leading `~` alone or `~/…` expands to `$HOME`. `~user` is not expanded and counts as relative.
   - Absolute paths and empty strings stay as they are.
-  - This applies to `firmware`/`elf`, `roms`, `flash`, `sd`, `script`, `usb`, `usb-dir-work`, `audio-wav`, a string
+  - This applies to `firmware`/`elf`, `roms`, `flash`, `sd`, `script`, `usb`, `usb-dir-work`, `audio-wav`, `settings`, a string
     `c64-roms`, and to the path parts of specs: PATH in `usb-dir` `PATH[,size=SIZE][,ro]`; FILE.crt and the OUT.crt
     after `save=` in `cart-slot` (options are taken from the end, so FILE may contain commas); PATH in
     `net = "socket-vmnet:PATH"`. A spec that does not parse is passed through unchanged for clap to report.
@@ -324,7 +326,7 @@ Errors, printed as `Error: …` with the cause chain:
 | `config: <file>: '<key>' needs true or false` | a flag without a value |
 | `config: <file>: '<key>' needs a string or a number` | a flag with one value |
 | `config: <file>: '<key>' needs a string, a number or an array of them` | a repeatable flag |
-| `config: <file>: '<key>' needs true, false, a string or a number` | `c64-roms` |
+| `config: <file>: '<key>' needs true, false, a string or a number` | `c64-roms`, `vice-monitor` |
 | `config: <file>: '<a>' and '<b>' are the same flag` | `elf` and `firmware` both set |
 
 The example, `docs/examples/ue2emu.example.toml`, is checked by `config::tests::the_example_file_is_valid`
@@ -464,7 +466,7 @@ All runs start from an erased flash; install runs flat out (`--speed` does not a
     snds1541.bin, snds1571.bin, snds1581.bin, index.html, api.html, openapi.yaml; `Flashing Runtime FPGA..`,
     `Flashing Ultimate Application..`; `WiFi module detected: ESP32 WiFi Bridge V1.14 (1.14)`,
     `No WiFi module update needed!`; `Turning OFF machine in 5 seconds....`
-  - Flash: FPGA bitstream at 0; application at 0x3C0000, the XC7A100T slot for the default capabilities (FPGA type 3 in the top byte, then 0x34000222)
+  - Flash: FPGA bitstream at 0; application at 0x3C0000, the XC7A100T slot for FPGA type 3 in the top byte of the capability word
     (update_u64ii.cc:179-180); FAT flash disk at 0x580000 (`MSDOS5.0`); all 24 config pages erased (0xFE8000 reads FF,
     the answer to "Reset Configuration").
   - On a populated flash "Reformat Flash Disk?" comes first (update_common.h:244-253), then the same two questions.
@@ -574,6 +576,7 @@ wall clock. A failed assertion is a normal result starting `FAIL:`.
 | `emu_expect` | Assert that text appears (or with `absent`, disappears) on the screen or the console within `timeout_ms` |
 | `emu_rest` | HTTP request to the firmware web server, REST under `/v1/` (needs `net: true`) |
 | `emu_control` | One raw line of the control protocol |
+| `emu_monitor` | One command of the C64 monitor (TRX64's verbs; `docs/status/monitor.md`) |
 | `emu_usb_sync` | Sync a `usb_dirs` stick to its host directory now (`force`, `replug`, `discard`) |
 | `emu_cart_info` | Describe the cartridge in the physical expansion port (needs `cart_slot`) |
 | `emu_cart_save` | Write that cartridge, as it is now, to a CRT file |

@@ -1,5 +1,7 @@
 # S05 — WiFi DMA UART + stub u64ctrl
 
+**Status:** built.
+
 **Owns:** `crates/ue2-core/src/devices/wifi.rs`
 **Reads:** `docs/hw/04-esp32-wifi.md` (all, T0 exact), `docs/hw/00-memory-map.md` §2 A7, C25, §Interrupts high bit 3; firmware sources cited there (`software/io/network/dma_uart.*`, `esp32.cc`, `wifi_cmd.cc`, `software/u64ctrl/main/*` for the reply formats)
 

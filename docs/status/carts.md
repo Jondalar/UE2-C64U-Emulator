@@ -1,6 +1,6 @@
 # W4-CART status — cartridge types beyond NORMAL, the SID and MUS players
 
-Stream W4-CART of wave 4 (docs/specs/S14-c64-trx64.md §W4-CART). The unmodified firmware now runs every cartridge
+Spec: docs/specs/S14-c64-trx64.md §W4-CART. The unmodified firmware runs every cartridge
 logic of the U64 FPGA that means something on a C64: it loads a CRT from the file browser, the bridge serves the
 banks from the guest DDR where the firmware's CRT loader put them, and a C64 program banks, writes flash, talks to
 the GMOD2 EEPROM and freezes through the same register semantics as `all_carts_v5.vhd`. The SID and MUS player
@@ -39,7 +39,7 @@ player carts are CART_TYPE_16K images built at start-up (filetype_sid.cc:65-96).
   S35 it did not, and a KCS started after a frozen AR came up in its freeze mode.
 - `CartProxy` is the `CartMapper` TRX64 holds; it shares `CartLogic` with the backend (`CartHandle`) and folds in the
   firmware's forced ULTIMAX decode (C64_MODE bit 1). Without a cartridge type and without the forced decode TRX64's slot
-  stays empty, so the no-cart run path is the phase-A one.
+  stays empty, so the no-cart run path is the plain one.
 
 **How line changes reach TRX64's PLA.** TRX64 re-runs its PLA only after `$00/$01` writes and consumed `$DE00-$DFFF`
 writes (full.rs:237-252, 612-619). The proxy consumes every cart I/O write. For the rest `Trx64Backend::run_cpu` ends
@@ -131,34 +131,12 @@ SONG  : 1 / 1
   packets) from DDR (c64_crt.cc:678-741). Read back from the image: bank 1 `$8000` chip offset 0x123 = `0xA5`, bank 1
   `$A000` chip offset 0x1456 = `0x3C`, the neighbours still hold their fillers.
 
-**Unit tests** (`cargo test -p c64-bridge`, 23 tests; 11 new): cart logic per family (NORMAL variants/kill/force,
+**Unit tests** (`cargo test -p c64-bridge`): cart logic per family (NORMAL variants/kill/force,
 Ocean/Magic Desk/GMOD2, EasyFlash modes, RAM and ULTIMAX writes into DDR, AR/RR/FC3, freeze button, read-triggered KCS
 and timed Epyx lines, forced ULTIMAX and GeoRAM through the proxy), the EEPROM (EWEN/WRITE/READ streaming, ERASE,
 ERAL, WRDIS, start-bit error), and on a running TRX64: the boot cart from DDR, a KCS `$DE00` read that switches
 16K → 8K before the next instruction, and an FC3 freeze entering through the cart's NMI vector from a RAM loop.
 `ue2-core`: `ddr_is_lent_per_access_and_eeprom_and_freeze_reach_the_backend`.
-
-**Regressions.** `cargo test --workspace` green, no warnings. C64 A2 (READY, 38911 BYTES FREE), A3 (` 42`), A4
-(`DMA load complete`, `Cart got disabled, now restoring.`, `HELLO FROM UE2EMU`), A5 (`Frozen on Bad line`, the menu,
-no `Hard stop!!!`) pass; `scripts/smoke-all.sh` passes (menu, sd, flash-1, flash-2, negative).
-
-## Performance
-
-M2 (`wait 60000`, `--log unmapped`, upstream ELF, `--speed max`), one run at a time on the same host:
-
-| Build | Host MIPS | Wall | Peak RSS |
-|---|---|---|---|
-| before (`main` 9b2b7a8), `--c64 trx64` ×3 | 128, 127, 128 | 12.13, 11.99, 11.98 s | 70.4 MB |
-| after, `--c64 trx64` ×3 | 130, 130, 130 | 11.83, 11.58, 11.64 s | 70.4 MB |
-| before, `--c64 none` ×2 | 222, 165 (second run disturbed) | 6.92, 8.19 s | – |
-| after, `--c64 none` ×2 | 218, 228 | 6.94, 6.85 s | – |
-
-M2 runs without a cartridge (TYPE 0 after boot), so TRX64's slot is empty and the run path is the phase-A one; the
-per-access DDR lease in `C64Port` costs nothing measurable (+2 % MIPS is noise). With a cart attached every ROM or I/O
-byte is one call into the shared logic and each C64 sync ends with a PLA recompute. Two runs with a cartridge attached
-for a minute (boot, browser, Run Cart, then `wait 60000` with the menu closed and the cart's stub looping):
-`c06-easyflash.crt` 74.0 s emulated in 14 s wall (123 MIPS last interval), `c14-epyx-fastload.crt` (deadline slices
-until the capacitor times out) 75.0 s in 16 s (133 MIPS), against 60 s in 11.6 s for M2.
 
 ## Every type the firmware knows
 
@@ -197,7 +175,7 @@ C64_CARTRIDGE_TYPE (c64.h:125-163). "Done" means implemented after the VHDL and 
 | 87 | Protovision TwoMegabyter | 0x2F | done (c32) |
 | 6, 7, 12, 14, 16, 17, 33-35, 37-43, 45-52, 55-59, 61-63, 67-70, 72-85 | Expert, Fun Play, Rex, Magic Formel, Warpspeed, Dinamic, EasyFlash X-Bank, Capture, AR3, MMC64, MMC Replay, IDE64, SS4, IEEE 488, Game Killer, Prophet 64, Freeze Frame, … GMod3, … Magic Desk 16 | – | not done: the firmware rejects them (`CART_NOT_IMPL`, "Not implemented") |
 | C128 0, 1 | C128 Cartridge (with I/O mirror) | 0x03 / 0x63 / 0xE3 | not done: the logic serves `$8000-$FFFF` of a C128; on a C64 the bridge attaches nothing and says so once |
-| – | Boot cartridge (DMA load) | 0x41 | done (phase A, A4) |
+| – | Boot cartridge (DMA load) | 0x41 | done (A4) |
 | – | SID Player Cartridge | 0x01 + UCI `$DFFC` | done (s01). The UCI answers at `$DFFC` since S15 (TRX64 Spec 852); sidcrt uses it only for an invalid header |
 | – | MUS Player Cartridge | 0x01 + UCI `$DFFC` | done (s02) |
 | – | GeoRAM (REU setting "GeoRAM") | 0x1F | done (DDR `0x01000000`, the REU size masks the banks; `scripts/smoke-georam.ctl`) |
@@ -237,18 +215,15 @@ families need lives in UE2. The items are UE2's to carry, not TRX64 gaps.
 
 ## Known gaps
 
-- **Stops and DMA** still land on instruction boundaries (phase A); `SERVE_WHILE_STOPPED` is not honoured, the cart
+- **Stops and DMA** land on instruction boundaries; `SERVE_WHILE_STOPPED` is not honoured, the cart
   always serves DMA reads.
 - **`dma_peek`** (debugger, `ue2emu install`) has no DDR lent: cartridge ROM windows read as unserved there.
 - **Freeze entry** is exact for NMI-driven entry; an IRQ taken first (Action Replay, SS5 and KCS pull both) costs one
   KERNAL instruction. Freezing through the firmware's own C64-screen UI path is unrelated and unchanged.
 - **MATRIX_KEYB[10] as the cart freeze button** is inferred from keyboard_usb.cc:228 and freezer.vhd; the U64-II top
   level that wires it is closed.
-- **UCI** (`$DE1C`/`$DF1C`/`$DFFC`) is modelled since S15, in TRX64: the block is part of its `u64` machine profile
-  (TRX64 Spec 852), and UE2 serves the firmware side at 0x10044000. Any slot base works, EasyFlash's `$DE1C`
-  included. **ACIA** stays unmodelled; the REU is modelled (docs/status/reu.md) and Ultimate Audio since S16 (docs/specs/S16-ultimate-audio.md). A cartridge in the expansion port is `--cart-slot`
-  (docs/status/cart-slot.md).
-- **Audio** comes from the SID stream (docs/status/sid-audio.md). After the wave-4 merge a cart smoke run with
-  `--audio-wav run/carts.wav` holds the `s01-tune.sid` tune: peak-to-peak about 9300 in every second the SID player
+- **ACIA** (SwiftLink/modem) is not modelled (`docs/status/gaps.md`). UCI answers at any slot base, EasyFlash's
+  `$DE1C` included (`docs/specs/S15-uci.md`).
+- **Audio** comes from the SID stream (docs/status/sid-audio.md). A cart smoke run with `--audio-wav run/carts.wav` holds the `s01-tune.sid` tune: peak-to-peak about 9300 in every second the SID player
   runs (133-146 s emulated), so the player's CPU writes reach reSID through the cartridge run path (`CartObserver`
   forwards bus writes to the SID tap). The MUS test file (HLT voices) stays silent.

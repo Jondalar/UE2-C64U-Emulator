@@ -27,8 +27,9 @@
 
 ## S13 — USB HLE
 
-**Status:** done (wave 3), `docs/status/usb.md`. Follow-up done: hot-plug on hub ports and `--usb-dir`, a host
-directory as a stick with guest-to-host sync (`crates/ue2-vfat`, `docs/status/usb-dir.md`).
+**Status:** done (wave 3), `docs/status/usb.md`. Follow-ups done: hot-plug on hub ports, `--usb-dir`, a host
+directory as a stick with guest-to-host sync (`crates/ue2-vfat`, `docs/status/usb-dir.md`), the mouse (S32) and
+devices plugged in and out while running (S33).
 
 **Owns:** `crates/ue2-core/src/devices/usb/`, `crates/ue2emu/src/usb.rs`, `scripts/smoke-usb.ctl`,
 `docs/status/usb.md`. Additive elsewhere: `HostInput::UsbKey`, `MachineConfig::usb` and its input route, the
@@ -49,8 +50,9 @@ directory as a stick with guest-to-host sync (`crates/ue2-vfat`, `docs/status/us
 (`docs/status/carts.md`), drive A as a 1541 with write-back into the image (`docs/status/drive.md`). Detailed spec
 `docs/specs/S14-c64-trx64.md`, results `docs/status/c64.md`. Follow-ups done: `--c64-roms` (the C64 ROMs written into
 the flash image before boot, `docs/status/c64.md`) and a cartridge in the physical expansion port (`--cart-slot`, with
-its own flash and EEPROM and write-back into the CRT, `docs/status/cart-slot.md`). Open: UCI, REU, the IEC processor
-(SoftIEC, printer), drive B and 1571/1581, socket 2/UltiSID 2, exact stops, NTSC.
+its own flash and EEPROM and write-back into the CRT, `docs/status/cart-slot.md`). Later specs built UCI (S15), the
+REU (TRX64 853/854), UltiSID 2 (S17), NTSC (S25), drive B and the 1581 (S27, S31) and Software IEC (S30). Exact stops
+are parked; socket 2, the IEC printer and the 1571 are not built (`docs/status/gaps.md`).
 
 - `trx64-core` crate as the C64 behind `c64.rs`:
   - `0x10050000` DMA → `Machine::poke`/`read_full`;

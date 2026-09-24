@@ -1,5 +1,7 @@
 # S20 — The reSID engines on their own thread
 
+**Status:** built (2026-09-17).
+
 heartbeat-demo plays on 8 SIDs while its C64 runs at 64 MHz. In realtime with audio it reaches 95-100 % of realtime at
 92-100 % of one core, so the audio device runs dry and the music stutters (measured 2026-09-17: 0.951 / 0.999 with
 the idle skip, 0.956 / 0.958 without). Everything runs on the emulation thread: the Ultimate CPU, TRX64, and one

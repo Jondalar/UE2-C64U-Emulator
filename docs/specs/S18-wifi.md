@@ -1,5 +1,8 @@
 # S18 — WiFi: the u64ctrl model joins a network
 
+**Status:** not built. WiFi beyond the S05 stub was dropped (2026-09-23): Ethernet covers the network
+(`docs/status/gaps.md`).
+
 S05 built the ESP32 link and a stub control module (doc 04 tier T0): the firmware identifies the module, reads the
 voltages and power settings, and settles in "Link Down". S18 is doc 04 tier T1 for the network half: a virtual
 access point, the module's connect state machine, and Ethernet frames bridged to the same host backends the wired

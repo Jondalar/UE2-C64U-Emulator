@@ -1,5 +1,7 @@
 # S23 — The monitor: TRX64's verbs, our own, and a VICE-compatible port
 
+**Status:** built (2026-09-20).
+
 **Owns:**
 - `crates/c64-bridge/src/monitor.rs` (new): the C64 and drive views, and the accessor the host needs
 - `crates/ue2emu/src/monitor/` (new): the `MonitorHost` implementation, our verb table, the VICE server

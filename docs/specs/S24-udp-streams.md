@@ -1,5 +1,7 @@
 # S24 — The U64's UDP streams: the VIC picture and the audio, on the wire
 
+**Status:** built (2026-09-21).
+
 **Owns:**
 - `crates/ue2-core/src/devices/streams.rs` (new): the `U64_UDP_BASE` header templates and the packet builder
 - `crates/ue2-core/src/devices/u64io.rs`: `ETHSTREAM_ENA` read-back for the streamer

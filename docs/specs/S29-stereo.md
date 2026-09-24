@@ -1,5 +1,7 @@
 # S29 — Stereo: the mixer's pan reaches the speakers
 
+**Status:** built (2026-09-23).
+
 **Owns:**
 - `crates/c64-bridge/src/sid.rs`: `AudioSink` carries interleaved stereo; a left and a right gain per receiver
 - `crates/c64-bridge/src/sampler.rs`: the sampler's L/R pair through mixer channels 4 and 5

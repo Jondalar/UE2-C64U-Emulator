@@ -56,7 +56,6 @@ With `UE2_FIRMWARE_TREE` set, `emu_start` boots that checkout's
   - `flash.bin`
   - `shots/`
   - `instance.json`: pid, ports, argv.
-  - `fwroot/roms`: a symlink, because `png` finds the font through `$UE2_FIRMWARE/roms`.
 - **Ports:** every instance gets free localhost ports.
   - `control` always.
   - With `net: true` also `http`, `telnet`, `ftp`, `dma`: `--net user --web-port <http> --hostfwd …` forwards
@@ -121,7 +120,7 @@ Conventions:
 | `emu_wait` | `id`, `ms` | emulated vs wall time |
 | `emu_expect` | `id`, `text`, `source?` (`screen`/`console`), `timeout_ms?` (10000), `since_offset?`, `ignore_case?`, `absent?`, `require_visible?` | `PASS:`/`FAIL:`, evidence (screen, or console around the match or its tail), JSON with `elapsed_ms`, `match_offset`, `next_offset` |
 | `emu_rest` | `id`, `path`, `method?` (GET), `body?`/`body_file?`, `content_type?`, `headers?`, `timeout_ms?` (20000), `save_body_to?` | `HTTP <status> <reason> (…)`, headers, body. Retries while the web server does not answer yet |
-| `emu_monitor` | `id`, `command` (one monitor command), `timeout_ms?` (60000) | the monitor's text: `r`, `m`, `d`, `bk`, `flow`, `help`, `device c64\|drive8\|fw` (S23). Needs a C64 in the instance; run control is not in this build yet |
+| `emu_monitor` | `id`, `command` (one monitor command), `timeout_ms?` (60000) | the monitor's text: `r`, `m`, `d`, `bk`, `flow`, `help`, `device c64\|drive8\|fw` (S23). Needs a C64 in the instance. Run control: `g`, `z`/`step`, `n`, `ret`, `until`, `c64 halt\|go\|step`, `fw halt\|go\|step` (`docs/status/monitor.md`) |
 | `emu_control` | `id`, `command` (one protocol line), `timeout_ms?` (60000) | raw result lines + `ok` |
 
 **Key names** (`emu_key`, control `key`):
@@ -151,7 +150,7 @@ The calls a session makes, with results trimmed from the verification run below 
 2. `emu_start {"net": true}`:
    ```
    STARTED emu1: firmware booted (258 ms wall clock)
-   { "id": "emu1", "banner": ["*** Ultimate 64-II (V1.01) 3.15 ***", "*** FPGA Capabilities: 35000222 ***", …],
+   { "id": "emu1", "banner": ["*** Ultimate 64-II (V1.01) 3.15 ***", "*** FPGA Capabilities: 35640226 ***", …],
      "ports": {"control": 64602, "http": 64603, "telnet": 64604, "ftp": 64605, "dma": 64606},
      "console_offset": 5150, … }
    ```
@@ -210,6 +209,7 @@ Result on the upstream ELF (3.15): every step passed, 15 tools listed. Boot took
 answered on the first attempt after 5.7 s (DHCP and web server start). The server exited 0. After the `--cart-slot`
 merge the server lists 16 tools (the two build tools removed, `emu_usb_sync`, `emu_cart_info` and `emu_cart_save`
 added) and the smoke passes again; `cart_slot` together with `c64_roms` is checked in `docs/status/cart-slot.md`.
+S23 added `emu_monitor`: 17 tools.
 
 With the web UI proxy (`http` = `--web-port`) the smoke passes unchanged: `rest_url` `http://127.0.0.1:56351`, the
 emulator's stderr `net: web UI http://127.0.0.1:56351/ (proxy to guest port 80 through 127.0.0.1:56355; …)`, and
@@ -252,9 +252,20 @@ Details that matter:
 | `wait <ms>` | run `ms` emulated ms |
 | `button [ms]` | hold the menu button (default 100) |
 | `key <name> [ms]` | hold a key (default 80), then a 40 ms release gap; SHIFT leads shifted keys by 20 ms |
+| `key <a+b> [ms]` | a chord: the keys pressed in order, held together, released |
+| `hold <keys>` / `release <keys>` | press C64 matrix keys until `release` (also the keys of `--hold-key`) |
 | `type <text>` | tap each character (text after the first space, verbatim) |
+| `usbkey <name> [ms]` | a key on the USB keyboard (`docs/status/usb.md`) |
+| `usbmouse <dx> <dy> [buttons]` | a move and the buttons of the USB mouse (S32) |
+| `joy <port> <dirs> [ms]`, `joy-hold <port> <dirs>`, `joy-release <port>` | the joystick on control port 1 or 2; `<dirs>` is `up`, `down`, `left`, `right`, `fire` joined by `+` (S36) |
 | `screen` | overlay text dump between `--- screen ---` markers (ignores visibility) |
-| `png <path>` | render the display to an RGB PNG (font from `$UE2_FIRMWARE/roms/chars.bin`) |
+| `c64screen` | the C64 text screen (`docs/status/c64.md`) |
+| `png <path>` | render the display to an RGB PNG (font from the `--roms` directory) |
+| `expect`, `expect-not`, `expect-console`, `expect-c64` `<text> [ms]` | wait for text on the overlay, the console or the C64 screen (`docs/status/tooling.md`) |
+| `usb-sync [--force] [port]`, `usb-replug [--discard] [port]` | sync a `--usb-dir` stick (`docs/status/usb-dir.md`) |
+| `usb-plug <port> image <path>\|keyboard\|mouse`, `usb-unplug <port>` | plug a USB device in or out while running (S33) |
+| `monitor <cmd>` | one monitor command (`docs/status/monitor.md`) |
+| `cart-info`, `cart-save <path>` | the cartridge in the physical port (`docs/status/cart-slot.md`) |
 | `quit` | stop the emulator |
 
 ```sh
@@ -283,9 +294,7 @@ def cmd(line):
 
 Limits of the protocol today:
 
-- No emulated-time or status query.
 - No overlay-visibility flag. `ue2-mcp` infers visibility from a rendered frame: a hidden overlay is uniform
   backdrop.
-- No memory peek.
-- No wait-for-text: `ue2-mcp` polls.
+- `ue2-mcp` polls the screen and console for `emu_expect` (wall-clock timeout) instead of using `expect`.
 - The emulator does not notice its parent dying, which is why the watchdog exists.

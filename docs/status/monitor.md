@@ -160,8 +160,7 @@ library (`on_stop` has no caller yet).
 
 ### Open
 
-- `r`/`m`/`d` still read the C64 after `device fw`: the library selects the device but does not route those verbs
-  through `CpuView` yet (TRX64 is wiring that next; the `device` validation itself was fixed in v0.8.2 after we
-  reported it).
+- `r`/`m`/`d` still read the C64 after `device fw`: the library (v0.9.2) selects the device but does not route those
+  verbs through `CpuView`; `fw` shows the RISC-V's registers.
 - The verbs of the second half of the extraction (`g`, `until`, `step`, `bk` hits) answer through our fall-through
   until they land upstream.

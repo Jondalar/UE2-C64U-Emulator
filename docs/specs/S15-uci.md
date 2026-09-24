@@ -1,5 +1,7 @@
 # S15 — Ultimate Command Interface (UCI): the integration
 
+**Status:** built (2026-09-16).
+
 The UCI block is C64 hardware, and it lives in TRX64. **TRX64 Spec 852** models `command_protocol.vhd` on the `u64`
 machine profile (Spec 851), on the expansion-port device interface of Spec 850. UE2 serves the firmware side: it maps
 `CMD_IF_BASE`, drives the ITU bits, and routes the window.

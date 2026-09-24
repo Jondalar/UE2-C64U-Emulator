@@ -1,6 +1,6 @@
 # Boot status: M1, M2, M3
 
-State of `main` after wave 1 (S01-S09); §Known gaps notes what later waves changed. The unmodified `ultimate.elf` boots to the FreeRTOS idle loop, runs all
+M1-M3 (S01-S10). The unmodified `ultimate.elf` boots to the FreeRTOS idle loop, runs all
 InitFunctions, shows the overlay menu and reacts to keys. Milestone definitions: `docs/specs/S10-integration.md`.
 
 ## Reproduce
@@ -12,7 +12,7 @@ and export `UE2_FIRMWARE=<fw>` for the tests. `png` reads its font (`chars.bin`)
 
 | M | Command | Wall time | Result |
 |---|---|---|---|
-| M1 | `rm -rf run && mkdir run && target/release/ue2emu run --headless --speed max --max-seconds 20 --log unmapped > run/console.txt` | 20 s | banner `*** FPGA Capabilities: 34000222 ***`, no halt |
+| M1 | `rm -rf run && mkdir run && target/release/ue2emu run --headless --speed max --max-seconds 20 --log unmapped > run/console.txt` | 20 s | banner `*** FPGA Capabilities: 34640226 ***` (the default word plus the EEPROM, command-interface and sampler bits the TRX64 frontend adds), no halt |
 | M2 | `rm -rf run && mkdir run && printf 'wait 60000\nquit\n' > run/m2.ctl && target/release/ue2emu run --headless --speed max --log unmapped --script run/m2.ctl > run/console.txt` | 7 s | 60.012 s emulated, no halt, PC in `prvIdleTask`, 0 unmapped |
 | M3 | `rm -rf run && mkdir run && target/release/ue2emu run --headless --speed max --flash run/flash.bin --script scripts/smoke-menu.ctl > run/m3.txt` | 1 s | menu text in the dump, `run/menu1.png` and `run/menu2.png` show the cursor on SD and on Temp; the script checks itself with `expect` and exits non-zero on a mismatch |
 
@@ -49,7 +49,7 @@ Configuring USB2513.
 USB Hub successfully configured.
 -- Start Scheduler --
 *** Ultimate 64-II (V1.01) 3.15 ***
-*** FPGA Capabilities: 34000222 ***
+*** FPGA Capabilities: 34640226 ***
 
 Executing init functions.
 ----> Initializing SID Cart (0)...
@@ -84,7 +84,7 @@ FTP server starting
 ----> Initializing Modem (105)...
 ---> All Init functions called.
 […]
-No USB2 hardware found. (34000222)
+No USB2 hardware found. (34640226)
 State *Root* reloaded. # of children = 5
 All linked modules have been initialized and are now running.
 [task list, below]
@@ -152,8 +152,8 @@ the boot path and in the idle system hits a modelled window.
 Open questions from `docs/hw` that still affect what the boot shows:
 
 - **Capability word** `0x34000226`: the T0 choice `0x34000222`, not a measured value (00 Q-B1), plus
-  CAPAB_DRIVE_1541_2, since a C64 Ultimate's REST API lists drive B (S27). USB (bit 23) is set only with
-  `--usb`/`--usb-keyboard` and RMII (bit 24) only with `--net`; without them the log says "No USB2 hardware found"
+  CAPAB_DRIVE_1541_2, since a C64 Ultimate's REST API lists drive B (S27). USB (bit 23) is set only with a USB
+  device or `--usb-hub`, and RMII (bit 24) only with `--net`; without them the log says "No USB2 hardware found"
   and there is no Ethernet (`docs/status/usb.md`, `docs/status/network.md`).
 - **Closed U64-II top level.** The CPU instance, IP identity and address aliasing come from the open U2+ RTL (00
   Q-A1, Q-A2, Q-A4). BOARDREV 0xB8 (rev 0x17) and ITU `g_version` 0x25 are assumptions (Q-B2, Q-B3). The flash part
@@ -162,13 +162,13 @@ Open questions from `docs/hw` that still affect what the boot shows:
   appears (`docs/status/fixes.md` §5). The codec, hub, expanders and PLLs still ACK every byte and read 0xFF.
 - **WiFi** is a frame-level u64ctrl stub (doc 04 T0): identify, voltages and power settings answer; scan returns
   no APs; the link stays down.
-- **C64 core:** TRX64 by default since S14 phase A (`docs/status/c64.md`); `--c64 none` is the register stub of doc 10
+- **C64 core:** TRX64 by default since S14 (`docs/status/c64.md`); `--c64 none` is the register stub of doc 10
   T0. With TRX64 the console differs from the stub in the RTC date, the cart register dump of `set_emulation_flags`
   and one stack high-water mark. SID detection reads zeros in both
   modes.
 - **SD card:** no image by default ("No media"); `--sd <image>` attaches one (S09).
 - **Overlay rendering** follows the open chargen IP; palette path, `pixel_opaque`, X_ON/Y_ON origin and big-font
   height are open (05 Q2-Q5).
-- **Time mapping** is a fixed 4 clocks per instruction. Since S19, loops at a fixed point (the FreeRTOS idle loop) are
+- **Time mapping** is a fixed number of clocks per instruction, 4 by default (`--clocks-per-insn`). Since S19, loops at a fixed point (the FreeRTOS idle loop) are
   fast-forwarded to the next device event without changing the result (`docs/specs/S19-idle-skip.md`).
 - **Debugging:** the GDB stub and the CPU trace ring exist since S11 (`docs/ARCHITECTURE.md` §Debugging).

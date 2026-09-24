@@ -1,5 +1,7 @@
 # S06 — SPI flash (NOR, persistent) + overlay-UI config seeding
 
+**Status:** built.
+
 **Owns:** `crates/ue2-core/src/devices/flash.rs`
 **Reads:** `docs/hw/06-spi-flash-config.md` (all), `docs/hw/00-memory-map.md` §2 C6-C10, C23, C35, §3 C7, C8, Q-B5, Q-D2; firmware `software/io/flash/*`, `software/infra/config.cc`, `software/userinterface/userinterface.cc` (CFG_USERIF_ITYPE)
 

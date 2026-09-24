@@ -134,5 +134,5 @@ TEMP_USE_CACHE_SUBFOLDER = 1 (userinterface.h:36-46). The test
   insert/eject command, and the image must not be modified on the host while the emulator runs.
 - **Colours not in the text dump:** `screen` shows no colours or reverse video. The colour-scheme change is
   checked through its menu text, not its effect on the palette.
-- **Flash Disk not written:** the `/Flash` FAT volume (flash block device) was listed as Ready but not browsed
-  or written in these runs.
+- **Flash Disk:** the `/Flash` FAT volume was listed as Ready but not browsed or written in these runs; `ue2emu
+  install` and `--c64-roms` write it (`docs/status/install.md`).

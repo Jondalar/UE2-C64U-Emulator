@@ -21,7 +21,7 @@ The emulator runs the application part of the firmware unmodified: `ultimate.elf
 update file. That is where the menu, file browser, REST API and web UI come from. The FPGA part of the firmware does
 not run; the emulator models the hardware the application talks to instead: flash, SD card, USB, network and the menu
 overlay. The C64 core is replaced by [TRX64](https://github.com/Jondalar/TRX64) behind the same register interface,
-with SID sound, cartridges and a 1541 drive. An MCP server lets Claude Code sessions start and drive emulator
+with SID sound, cartridges and 1541 and 1581 drives. An MCP server lets Claude Code sessions start and drive emulator
 instances for automated tests.
 
 ```mermaid
@@ -33,7 +33,7 @@ flowchart LR
         port["C64 register interface<br/>cart · DMA · core config<br/>UCI window · Ultimate Audio"]
     end
     subgraph trx["TRX64: the C64"]
-        c64["6510 · VIC-II · SID · CIA<br/>1541 drive · cartridges<br/>UCI block · REU"]
+        c64["6510 · VIC-II · SID · CIA<br/>1541/1581 drives · cartridges<br/>UCI block · REU"]
     end
     fw --> cpu
     cpu --> io
@@ -72,6 +72,7 @@ into a TOML file, started with `ue2emu run --config my.toml` ([example](docs/exa
 ## Documentation
 
 - [Usage](docs/status/install.md): build, options, config files, `install`, ROMs, MCP server
+- [Features](docs/FEATURES.md): one line per feature
 - [Status](docs/status/README.md): what works, by area
 - [Architecture](docs/ARCHITECTURE.md)
 

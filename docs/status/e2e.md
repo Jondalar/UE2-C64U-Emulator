@@ -89,9 +89,9 @@ shared one `run/e2e/flash.bin`. The runner writes back every setting a run chang
   - Before every device suite the sweep reads `ping rest ftp telnet ident dma heap raster -> OK`, with `jiffy=skip`.
   - Two entries prove less than on hardware:
     - `ping` reaches the Mac's own loopback.
-    - `raster` moves because the T0 DMA window advances `$D012` on each read (c64.rs:111-161, doc 10 T0), not because
-      a VIC runs.
-  - `jiffy` is skipped by the harness's own rule: `$00A2` static under a moving raster (tests/lib/health.py).
+    - In the tables below, measured on the T0 stub, `raster` moved because the stub's DMA window advanced `$D012` on
+      each read, not because a VIC ran, and `jiffy` was skipped by the harness's own rule: `$00A2` static under a
+      moving raster (tests/lib/health.py). With TRX64 a VIC and the KERNAL run.
 
 ## Smoke profile
 
@@ -201,7 +201,7 @@ upstream: use `rest.url_for` or `target.rest_port`. A device that serves port 80
 - **By hand.** With the shim and `--ftp-advertised-host 10.0.2.2`, all 6 smoke-stage operations pass: create host,
   list host, enter/LIST, root entries, RETR README (52 bytes), remove host. The runner cannot pass that option.
 
-### E1: no C64 CPU (doc 10 T0, S14)
+### E1: no C64 CPU (doc 10 T0) — TRX64 is the default since S14, quick not re-run
 
 The T0 C64 is a 64 K byte array. Nothing executes 6510 code, so there is no KERNAL and no READY prompt.
 
@@ -232,6 +232,9 @@ and the same for `audio`), both streams at once, captured on the host for 10 s:
 The frame the receiver assembles is the picture: 272 lines, 4-bit indices, the BASIC screen with its border
 (`run/shots/stream-frame.png` is one, decoded by the harness's own packing rules).
 
+Under NTSC (S34) a frame is 60 datagrams of 240 lines, the middle of the NTSC canvas, and the audio runs at the
+NTSC rate.
+
 Two things to know about what arrives. The samples are the SIDs' stereo mix (S29), panned by the mixer; the
 sampler is not in the stream, as it joins only on the way to the audio device. And the
 generator sends a frame's datagrams as one burst rather than spread across the frame, which the receiver's
@@ -256,7 +259,8 @@ Left for the suites themselves: `ultimax-cartridge`, which compares a whole fram
   (and `api.html`). Same missing update step; the firmware version is not the cause.
 - **Console:** `Failed to load KERNAL ROM; loading default.` and `Failed to load CHAR ROM; loading default.`
 
-Closing this needs a Flash Disk laid out the way the updater leaves it.
+Closing this needs a Flash Disk laid out the way the updater leaves it: `ue2emu install` writes one
+(`docs/status/install.md` §5), but `scripts/run-e2e.sh` creates its flash erased.
 
 ### E4: second drive not advertised — closed by S27
 

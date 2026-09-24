@@ -1,5 +1,7 @@
 # S16 — Ultimate Audio (the sampler): the integration
 
+**Status:** built (2026-09-16).
+
 The sampler is U64 FPGA hardware, not C64 hardware, so unlike UCI (S15) and the REU (853/854) **none of it is
 TRX64's**. UE2 builds the whole block: the voice engine, both register faces, the mixer, and the IRQ line into the
 C64. TRX64 only carries the line.

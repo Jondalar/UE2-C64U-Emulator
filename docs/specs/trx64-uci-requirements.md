@@ -6,8 +6,7 @@ side. How UCI works and what UE2 builds itself is in `docs/specs/S15-uci.md`.
 Reference prefixes:
 
 - **TRX** = trx64-core at the pin in `crates/c64-bridge/Cargo.toml`. The requirements were written against rev
-  69c9b30; they are built in TRX64 v0.6.0 (rev 2b145c9), Specs 850-852. The pin now names 0.7.1 (c3d34bb), which adds
-  the REU and its borrowed store (853, 854) and the CIA TOD and port-reset fixes. Paths are under
+  69c9b30; they are built in TRX64 v0.6.0 (rev 2b145c9), Specs 850-852. The pin is now tag v0.9.2. Paths are under
   `crates/trx64-core/src/`.
 - **Bridge** = `crates/c64-bridge/src/` in UE2.
 - **cp** = `fpga/io/command_interface/vhdl_source/command_protocol.vhd`, **sl** = `fpga/cart_slot/vhdl_source/slot_slave.vhd`,

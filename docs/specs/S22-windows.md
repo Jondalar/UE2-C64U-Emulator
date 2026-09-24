@@ -1,5 +1,7 @@
 # S22 — Windows port
 
+**Status:** built (2026-09-19).
+
 UE2 builds on macOS and Linux only. Four crates use Unix APIs, networking needs libslirp, and the release is a source
 tarball that Homebrew compiles. S22 makes UE2 build, test and run on Windows 11 x86-64 with MSVC and ships a zip on
 the GitHub release, the way TRX64 does (`release-binaries.yml`). Scoop, winget and an installer are out of scope.

@@ -156,5 +156,3 @@ gdb:     Program received signal SIGABRT ... => 0x432c4 <_Z7get_memj+48>: j 0x43
   drop data and read 0xFF.
 - **The get_mem hook** needs `_Z7get_memj` with a `j .` and a `sw ra, off(sp)` in its body. `.app` and `.ue2` images
   have no symbols, so they get no hooks at all.
-- **Docs:** `docs/status/boot.md` §Known gaps and `docs/ARCHITECTURE.md` §Machine loop 4 were updated in the wave-3
-  merge.
