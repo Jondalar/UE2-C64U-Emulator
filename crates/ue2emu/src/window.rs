@@ -23,15 +23,18 @@ use ue2_core::machine::MachineConfig;
 use ue2_core::render::Renderer;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::control;
 use crate::keymap::{self, MatrixKey, LSHIFT};
 use crate::runner::{self, Command, ControlHandle, EmuHandle, RunOptions};
 use crate::usb::UsbKeys;
+
+/// S32: the host key that lets a captured mouse go again (the window captures it on a click).
+const MOUSE_RELEASE_KEY: KeyCode = KeyCode::PageDown;
 
 /// The window opens at twice this (logical pixels) and is never lower than `BASE_H`; its shape then follows
 /// the rendered image (see `aspect_snap`).
@@ -55,6 +58,7 @@ pub fn run_window(cfg: MachineConfig, opts: RunOptions) -> Result<()> {
 
     let started = Instant::now();
     let usb_keys = cfg.usb.keyboard.then(UsbKeys::default);
+    let mouse = cfg.usb.mouse.then(MouseCapture::default);
     // `_audio` keeps the SID audio stream (`--audio`, on by default here) playing until the window has closed.
     let EmuHandle { ctl, mips, speed_pct, join, audio: _audio } = runner::spawn(cfg, &opts)?;
     if let Some(addr) = &opts.control {
@@ -84,6 +88,7 @@ pub fn run_window(cfg: MachineConfig, opts: RunOptions) -> Result<()> {
         last_size: (0, 0),
         held: HeldKeys::default(),
         usb_keys,
+        mouse,
         menu_down: false,
         restore_down: false,
         window: None,
@@ -127,6 +132,8 @@ struct App {
     held: HeldKeys,
     /// With `--usb-keyboard`, host keys go to the USB keyboard instead of the matrix.
     usb_keys: Option<UsbKeys>,
+    /// With `--usb-mouse`, the host mouse drives the USB mouse while the window has captured it (S32).
+    mouse: Option<MouseCapture>,
     /// F12 state, released on focus loss like the matrix keys.
     menu_down: bool,
     /// `keymap::RESTORE_KEY` state, released on focus loss too.
@@ -194,8 +201,13 @@ impl App {
 
     fn update_title(&self) {
         if let Some(window) = &self.window {
+            let mouse = match &self.mouse {
+                Some(m) if m.captured => " — mouse captured, PageDown releases it",
+                Some(_) => " — click to use the mouse",
+                None => "",
+            };
             window.set_title(&format!(
-                "ue2emu — {:.1} s — {} % — {} MIPS",
+                "ue2emu — {:.1} s — {} % — {} MIPS{mouse}",
                 self.ctl.now_ms.load(Ordering::Relaxed) as f64 / 1000.0,
                 self.speed_pct.load(Ordering::Relaxed),
                 self.mips.load(Ordering::Relaxed)
@@ -212,6 +224,12 @@ impl App {
             return;
         };
         let down = ev.state == ElementState::Pressed;
+        if code == MOUSE_RELEASE_KEY && self.mouse.as_ref().is_some_and(|m| m.captured) {
+            if down {
+                self.uncapture();
+            }
+            return;
+        }
         let inputs = if code == KeyCode::F12 {
             if self.menu_down == down {
                 return;
@@ -241,8 +259,76 @@ impl App {
         self.send(inputs);
     }
 
+    /// S32: hide the cursor and lock it to the window, so every host motion goes to the USB mouse.
+    fn capture(&mut self) {
+        let (Some(window), Some(mouse)) = (&self.window, &mut self.mouse) else { return };
+        let locked = window.set_cursor_grab(CursorGrabMode::Locked);
+        if locked.is_err() && window.set_cursor_grab(CursorGrabMode::Confined).is_err() {
+            return;
+        }
+        window.set_cursor_visible(false);
+        mouse.captured = true;
+        self.update_title();
+    }
+
+    /// Let the host mouse go, with the USB mouse's buttons released.
+    fn uncapture(&mut self) {
+        let Some(mouse) = &mut self.mouse else { return };
+        if !mouse.captured {
+            return;
+        }
+        mouse.captured = false;
+        let release = std::mem::take(&mut mouse.buttons) != 0;
+        if let Some(window) = &self.window {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
+        if release {
+            self.send(vec![HostInput::UsbMouse { dx: 0, dy: 0, wheel: 0, buttons: 0 }]);
+        }
+        self.update_title();
+    }
+
+    /// A click, button or wheel on the window: the first click captures, then everything reaches the USB mouse.
+    fn mouse_event(&mut self, event: &WindowEvent) {
+        let Some(mouse) = &mut self.mouse else { return };
+        let input = match *event {
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                if !mouse.captured {
+                    if pressed && button == MouseButton::Left {
+                        self.capture();
+                    }
+                    return;
+                }
+                let bit = match button {
+                    MouseButton::Left => ue2_core::devices::usb::BUTTON_LEFT,
+                    MouseButton::Right => ue2_core::devices::usb::BUTTON_RIGHT,
+                    MouseButton::Middle => ue2_core::devices::usb::BUTTON_MIDDLE,
+                    _ => return,
+                };
+                mouse.buttons = if pressed { mouse.buttons | bit } else { mouse.buttons & !bit };
+                HostInput::UsbMouse { dx: 0, dy: 0, wheel: 0, buttons: mouse.buttons }
+            }
+            WindowEvent::MouseWheel { delta, .. } if mouse.captured => {
+                let steps = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+                    MouseScrollDelta::PixelDelta(p) => p.y / 16.0,
+                };
+                let wheel = mouse.wheel.take(steps);
+                if wheel == 0 {
+                    return;
+                }
+                HostInput::UsbMouse { dx: 0, dy: 0, wheel, buttons: mouse.buttons }
+            }
+            _ => return,
+        };
+        self.send(vec![input]);
+    }
+
     /// macOS delivers no key releases for a window that lost focus; lift everything held.
     fn release_all(&mut self) {
+        self.uncapture();
         let mut inputs = self.held.release_all();
         if let Some(usb_keys) = &mut self.usb_keys {
             inputs.extend(usb_keys.release_all());
@@ -284,6 +370,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Focused(false) => self.release_all(),
+            WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => self.mouse_event(&event),
             WindowEvent::Resized(size) => {
                 if let Some(window) = &self.window {
                     // winit has no aspect constraint, so the size is corrected after the drag (TRX64 trx64-cli).
@@ -296,6 +383,17 @@ impl ApplicationHandler for App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// S32: raw motion of a captured mouse, unaffected by the cursor being locked in place.
+    fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
+        let DeviceEvent::MouseMotion { delta: (dx, dy) } = event else { return };
+        let Some(mouse) = self.mouse.as_mut().filter(|m| m.captured) else { return };
+        let (dx, dy) = (mouse.x.take(dx), mouse.y.take(dy));
+        if dx != 0 || dy != 0 {
+            let buttons = mouse.buttons;
+            self.send(vec![HostInput::UsbMouse { dx, dy, wheel: 0, buttons }]);
         }
     }
 
@@ -317,6 +415,30 @@ impl ApplicationHandler for App {
             self.update_title();
         }
         el.set_control_flow(ControlFlow::WaitUntil(self.next_poll.min(self.next_title)));
+    }
+}
+
+/// S32: the host mouse as the USB mouse sees it: captured or not, the buttons held, and the fractions of motion and
+/// wheel not sent yet.
+#[derive(Default)]
+struct MouseCapture {
+    captured: bool,
+    buttons: u8,
+    x: Fraction,
+    y: Fraction,
+    wheel: Fraction,
+}
+
+/// Host motion in fractional units, handed on in whole ones.
+#[derive(Default)]
+struct Fraction(f64);
+
+impl Fraction {
+    fn take(&mut self, add: f64) -> i32 {
+        self.0 += add;
+        let whole = self.0.trunc();
+        self.0 -= whole;
+        whole as i32
     }
 }
 

@@ -172,6 +172,7 @@ option.
 | `--usb-dir PATH[,size=SIZE][,ro]` | Host directory as a FAT32 USB stick, the guest's changes written back; repeatable, on the hub ports after the images (`docs/status/usb-dir.md`) |
 | `--usb-dir-work DIR` | Where `--usb-dir` keeps its volume images, manifests and snapshots; default `run/usb-dir` |
 | `--usb-keyboard` | Attach a USB keyboard; the window sends host keys to it instead of the C64 matrix (F12 stays the menu button) |
+| `--usb-mouse` | Attach a USB mouse: a click in the window captures the host mouse, PageDown lets it go; the firmware puts it on joystick port 1 (S32) |
 
 **Network and web UI proxy** (`docs/status/network.md`)
 

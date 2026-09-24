@@ -27,6 +27,10 @@ pub struct UsbArgs {
     /// Attach a USB keyboard; the window sends host keys to it instead of the C64 matrix (F12 stays the menu button)
     #[arg(long)]
     usb_keyboard: bool,
+    /// Attach a USB mouse; a click captures the host mouse for it, PageDown lets it go. The firmware's mouse
+    /// emulation puts it on joystick port 1 (S32)
+    #[arg(long)]
+    usb_mouse: bool,
 }
 
 fn parse_dir_spec(s: &str) -> Result<DirSpec, String> {
@@ -36,10 +40,15 @@ fn parse_dir_spec(s: &str) -> Result<DirSpec, String> {
 /// Put the devices on the hub and, when there are any, advertise the USB host to the firmware (docs/hw/09 H3).
 /// Returns the `--usb-dir` sticks and their work directory; the runner attaches them to the ports left free.
 pub fn configure(args: UsbArgs, cfg: &mut MachineConfig) -> Result<(Vec<DirSpec>, PathBuf)> {
-    let usb = UsbConfig { images: args.images, storage_slots: args.dirs.len(), keyboard: args.usb_keyboard };
+    let usb = UsbConfig {
+        images: args.images,
+        storage_slots: args.dirs.len(),
+        keyboard: args.usb_keyboard,
+        mouse: args.usb_mouse,
+    };
     let devices = usb.devices();
     if devices > HUB_PORTS {
-        bail!("--usb/--usb-dir/--usb-keyboard: {devices} devices, but the USB hub has {HUB_PORTS} ports");
+        bail!("--usb/--usb-dir/--usb-keyboard/--usb-mouse: {devices} devices, but the USB hub has {HUB_PORTS} ports");
     }
     if devices > 0 {
         cfg.capabilities |= CAPAB_USB_HOST2;
@@ -182,6 +191,7 @@ mod tests {
             dirs: Vec::new(),
             dir_work: PathBuf::from("run/usb-dir"),
             usb_keyboard,
+            usb_mouse: false,
         }
     }
 

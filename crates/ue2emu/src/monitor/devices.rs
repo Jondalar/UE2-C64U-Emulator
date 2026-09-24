@@ -19,6 +19,8 @@ use crate::gdb::peek8;
 /// `ITU_BASE` and `C64_CARTREGS_BASE` (iomap.h:10, u64.h).
 const ITU: u32 = 0x1000_0000;
 const CART: u32 = 0x1004_0000;
+/// `C64_IO_BASE` (u64.h:49): the core registers of the C64 side.
+const CORE: u32 = 0x1018_0000;
 
 /// ITU low interrupt sources, bit 0 first (itu.h:33-40).
 const ITU_LOW: [&str; 8] = ["timer", "uart", "usb", "tape", "cmdif", "rmii-rx", "rmii-tx", "reset"];
@@ -51,7 +53,7 @@ pub(super) fn verb(host: &mut Host, verb: &str, args: &[&str]) -> Option<Result<
     }
     if !args.is_empty() {
         return match verb {
-            "itu" | "cart" | "flash" | "sd" | "usb" | "net" | "audio" => {
+            "itu" | "cart" | "joy" | "flash" | "sd" | "usb" | "net" | "audio" => {
                 Some(Err(format!("{verb}: takes no arguments")))
             }
             _ => None,
@@ -60,6 +62,7 @@ pub(super) fn verb(host: &mut Host, verb: &str, args: &[&str]) -> Option<Result<
     match verb {
         "itu" => Some(Ok(itu(host))),
         "cart" => Some(Ok(cart(host))),
+        "joy" => Some(Ok(joy(host))),
         "flash" => Some(flash(host)),
         "sd" => Some(sd(host)),
         "usb" => Some(usb(host)),
@@ -73,6 +76,7 @@ pub(super) fn verb(host: &mut Host, verb: &str, args: &[&str]) -> Option<Result<
 pub(super) const HELP: &str = concat!(
     "  itu               the interrupt controller, the timers and the capability word\n",
     "  cart              what the firmware programmed for the C64: mode, cartridge, REU, the command interface\n",
+    "  joy               the control ports as the firmware drives them: joysticks, paddles, the mouse\n",
     "  flash             the SPI flash: its image, what is not written out yet, the config pages\n",
     "  sd                the SD card\n",
     "  usb               the hub ports and what is on them\n",
@@ -80,6 +84,28 @@ pub(super) const HELP: &str = concat!(
     "  audio             the SIDs the firmware built and the windows it routes to them\n",
     "  dir [PATH]        what is on a medium, read by the firmware itself\n",
 );
+
+/// `joy` — what the firmware drives onto the control ports (u64.h:121-144): the software joystick lines (active low,
+/// bit 4 fire), the paddle and mouse values, and the enables. S32: the USB mouse lands in port 1's.
+fn joy(host: &mut Host) -> String {
+    let byte = |host: &mut Host, off: u32| peek8(&host.m.bus, CORE + off);
+    let mut out = String::new();
+    for port in 0..2u32 {
+        let lines = byte(host, 0x30 + port);
+        let (x, y) = (byte(host, 0x32 + 2 * port), byte(host, 0x33 + 2 * port));
+        let mouse = byte(host, 0x36 + port);
+        out.push_str(&format!(
+            "  port {}        joystick {:02x} {}  paddle x {x:02x} y {y:02x}  mouse {}\n",
+            port + 1,
+            lines,
+            bits(!lines & 0x1F, &["up", "down", "left", "right", "fire", "-", "-", "-"]),
+            if mouse & 1 != 0 { "on" } else { "off" },
+        ));
+    }
+    let (enable, swap) = (byte(host, 0x13), byte(host, 0x1A));
+    out.push_str(&format!("  paddle        override {enable:02x}  swap {swap:02x}\n"));
+    out
+}
 
 /// `itu` — the interrupt controller as the ISR sees it, and the timers the firmware runs on.
 fn itu(host: &mut Host) -> String {

@@ -626,6 +626,11 @@ impl Machine {
                     dev.set_restore(held);
                 }
             }
+            HostInput::UsbMouse { dx, dy, wheel, buttons } => {
+                if let Some(dev) = io.get_mut::<devices::usb::Usb>() {
+                    dev.mouse(dx, dy, wheel, buttons);
+                }
+            }
             HostInput::UsbPlug { port, connected } => {
                 if let Some(dev) = io.get_mut::<devices::usb::Usb>() {
                     dev.set_connected(usize::from(port), connected, now);

@@ -662,7 +662,7 @@ mod tests {
         assert_eq!(exec(&mut m, &mut s, &mut st, "net").unwrap_err(), "this machine has no Ethernet MAC");
 
         let help = exec(&mut m, &mut s, &mut st, "help").expect("help");
-        for verb in ["itu", "cart", "flash", "sd", "usb", "net", "audio"] {
+        for verb in ["itu", "cart", "joy", "flash", "sd", "usb", "net", "audio"] {
             assert!(help.contains(&format!("\n  {verb} ")), "{verb} is in help: {help}");
         }
     }

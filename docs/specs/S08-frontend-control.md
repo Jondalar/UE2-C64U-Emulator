@@ -38,6 +38,7 @@
 | `type <text>` | Types the text through the keymap. |
 | `screen` | Prints `text_dump` of the current snapshot between `--- screen ---` markers. |
 | `usbkey <name> [ms]` | Holds a key of the USB keyboard (`--usb-keyboard`, `usb::usage_by_name`), default 80 ms, then the release gap. |
+| `usbmouse <dx> <dy> [buttons]` | Moves the USB mouse (`--usb-mouse`) and sets its buttons, bit 0 left, 1 right, 2 middle (S32). |
 | `png <path>` | Renders the snapshot to a PNG (`png` crate), font from `ControlHandle::rom_dir` (`--roms`). |
 | `expect <text> [ms]` | Waits until `text_dump` contains the text; default timeout 5000 ms emulated. |
 | `expect-not <text> [ms]` | Waits until `text_dump` no longer contains the text. |
