@@ -6,7 +6,11 @@
 //! Lines are one nibble each way, bit 0 CLK, 1 DATA, 2 ATN, 3 SRQ, `1` = released (high): the engine's drivers are
 //! open collector and the bus is the wired AND of everyone's.
 
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+use trx64_core::iec_device::{IecDevice, IecLines, IecOut};
 
 /// System clocks per microsecond: the engine's clock (`CLOCK_FREQ=100000000`, target/u64ii/riscv/ultimate/Makefile)
 /// against its 1 MHz `tick`.
@@ -318,6 +322,84 @@ impl IecProc {
             | u32::from(inputs & 0xF) << 20
             | (self.out & 0xF_FFFF);
         (iv >> (i >> 24 & 0x1F) & 1 != 0) != (i >> 29 & 1 != 0)
+    }
+}
+
+/// The engine shared by the firmware's register window (`Trx64Backend::iec_*`) and the device TRX64 holds on the bus.
+#[derive(Clone, Default)]
+pub struct IecHandle(Arc<IecCell>);
+
+#[derive(Default)]
+struct IecCell(UnsafeCell<IecProc>);
+
+// SAFETY: the backend, TRX64's `Machine` and every copy of the handle live on the emulation thread; `Send` is only
+// required because `IecDevice: Send`.
+unsafe impl Send for IecCell {}
+unsafe impl Sync for IecCell {}
+
+impl IecHandle {
+    /// Run `f` on the engine. Calls do not nest: the backend never holds one across a call into TRX64, and the device
+    /// holds one only inside a single `IecDevice` call.
+    pub fn with<R>(&self, f: impl FnOnce(&mut IecProc) -> R) -> R {
+        // SAFETY: single thread, and no two borrows are live at once (see above).
+        f(unsafe { &mut *self.0 .0.get() })
+    }
+}
+
+/// The engine on TRX64's IEC bus (Spec 874), in slot 4: C64 cycles turned into the engine's microseconds at the
+/// model's rate, the bus lines as the rest of it drives them, the engine's CLK and DATA pulls back.
+pub struct IecBusDevice {
+    proc: IecHandle,
+    /// C64 cycle the engine has been run to.
+    clk: u64,
+    /// The model's clock, Hz.
+    hz: u64,
+    /// Cycles × 1 000 000 not yet turned into whole microseconds.
+    frac: u64,
+    /// The lines since the last call: the rest of the bus until `clk_to`'s cycle.
+    lines: IecLines,
+}
+
+impl IecBusDevice {
+    pub fn new(proc: IecHandle, hz: u64) -> Self {
+        IecBusDevice { proc, clk: 0, hz: hz.max(1), frac: 0, lines: IecLines::RELEASED }
+    }
+}
+
+/// The engine's input nibble: the rest of the bus ANDed with its own drivers (`inputs_raw`), SRQ released.
+fn wire(rest: IecLines, drivers: u8) -> u8 {
+    u8::from(rest.clk && drivers & 1 != 0)
+        | u8::from(rest.data && drivers & 2 != 0) << 1
+        | u8::from(rest.atn && drivers & 4 != 0) << 2
+        | 8
+}
+
+impl IecDevice for IecBusDevice {
+    fn name(&self) -> String {
+        "Ultimate IEC processor".into()
+    }
+
+    fn clock_to(&mut self, clk: u64, bus: IecLines) {
+        self.frac += clk.saturating_sub(self.clk) * 1_000_000;
+        self.clk = self.clk.max(clk);
+        let us = self.frac / self.hz;
+        self.frac %= self.hz;
+        let rest = self.lines;
+        self.proc.with(|p| p.run_us(us, &mut |d| wire(rest, d)));
+        self.lines = bus;
+    }
+
+    fn outputs(&self) -> IecOut {
+        let d = self.proc.with(|p| p.drivers());
+        IecOut { clk: d & 1 == 0, data: d & 2 == 0 }
+    }
+
+    fn rebase(&mut self, clk: u64, bus: IecLines) {
+        (self.clk, self.frac, self.lines) = (clk, 0, bus);
+    }
+
+    fn set_cpu_hz(&mut self, hz: u32) {
+        self.hz = u64::from(hz).max(1);
     }
 }
 

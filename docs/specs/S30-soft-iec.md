@@ -1,12 +1,13 @@
 # S30 — Software IEC: the IEC processor on the C64's bus
 
-**Status:** the engine is built (`crates/c64-bridge/src/iec_proc.rs`). Attaching it to the bus waits for TRX64 Spec 874
-(a generic host IEC device, accepted 2026-09-23, not yet written).
+**Status:** built (2026-09-24) on TRX64 v0.9.0 (Spec 874).
 
 **Owns:**
 - `crates/c64-bridge/src/iec_proc.rs`: the engine, its code RAM and both FIFOs
-- next: the `C64Port` window for 0x10028000, the clocking in the bridge, the TRX64 attachment; `devices/iec.rs`'s
-  T0 table goes
+- `crates/c64-bridge/src/lib.rs`: the engine at slot 4, `has_iec`/`iec_read`/`iec_peek`/`iec_write`
+- `crates/ue2-core/src/devices/c64.rs`: the `C64Port` window for 0x10028000; `devices/iec.rs`'s T0 table moves here as
+  the fallback without a backend
+- `scripts/smoke-soft-iec.py`
 - `docs/status/drive.md`, `docs/status/gaps.md`
 
 **Reads:** `fpga/io/iec_interface/vhdl_source/iec_processor.vhd`, `iec_processor_io.vhd`,
@@ -32,7 +33,7 @@ the first; a clock that changes nothing (a POP on an empty FIFO, a PUSH on a ful
 ends the microsecond early. The lines are sampled from the bus once per microsecond and again whenever the engine's
 own drivers change.
 
-## 3. On the bus (open)
+## 3. On the bus
 
 The engine has to take part in the wired AND of the IEC lines every C64 cycle, see ATN fall at its cycle and keep
 running while the C64 CPU is held. TRX64 has no API for a host IEC device today. UE2 alone could drive IecCore's pub
@@ -51,7 +52,9 @@ ATN edges at their cycle. 873's folder device sits in the same slot already. Whe
 - Built: registers and FIFOs; LOAD/PUSH/SUB/RET/WAIT/COPY_BIT/IF; a blocking POP; the firmware's program answering
   ATN (DATA pulled, CTRL_ATN_BEGIN) and taking `LISTEN 11` under ATN (ATN begin, slot 1 addressed, ATN end) while
   `LISTEN 9` releases the bus.
-- Once attached: "IEC Drive" on in the menu, `LOAD"$",11` lists the SD card's directory, `LOAD"file",11` and `SAVE`.
+- `scripts/smoke-soft-iec.py`: "IEC Drive" enabled over REST, `LOAD"$",11` lists the RAM disk (`1 "RAMDISK" 00 2A`,
+  `8175 BLOCKS FREE.`), `SAVE"T",11`, `NEW`, `LOAD"T",11`, `RUN` prints the program's line.
+- The drive smoke (drive 8 with the processor on the bus, the setting off) and the carts smoke.
 
 ## 5. Expected behaviour
 

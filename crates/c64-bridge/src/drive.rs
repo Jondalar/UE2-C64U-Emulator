@@ -300,7 +300,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use trx64_core::gcr::{gcr_read_sector, CBMDOS_FDC_ERR_OK};
-    use trx64_core::iec::IecbusCallback;
+    use trx64_core::iec::IECBUS_DEVICE_NONE;
     use ue2_core::c64host::C64Backend;
 
     /// The 1541 DOS ROM file in the firmware's roms directory.
@@ -453,7 +453,9 @@ mod tests {
     #[test]
     fn held_or_unpowered_drive_runs_nothing() {
         let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
-        let off = |c64: &Trx64Backend| matches!(c64.m.iec.iecbus_callback, IecbusCallback::Conf0);
+        // Drive 8's own bus slot: the IEC processor stands at slot 4 for good (S30), so the bus as a whole is never
+        // empty again.
+        let off = |c64: &Trx64Backend| c64.m.iec.iecbus_device[8] == IECBUS_DEVICE_NONE;
         let clocked = |c64: &Trx64Backend| c64.m.drive8.is_clocked();
         assert!(off(&c64) && !clocked(&c64), "power-on: off and in reset");
         c64.advance_to(0);

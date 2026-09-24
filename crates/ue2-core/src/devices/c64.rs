@@ -46,6 +46,10 @@ const DRIVES_END: u32 = DRIVE_A + 2 * DRIVE_WINDOW - 1;
 /// backend's block when it has one, else by the T0 table [`UCI_T0`] (docs/specs/S15-uci.md).
 const UCI: u32 = 0x4_4000;
 const UCI_END: u32 = UCI + 0xFFF;
+/// S30: the IEC processor at `IEC_BASE` 0x10028000 (iomap.h:13). Served by the backend's engine when it has one, else
+/// by the T0 table [`IEC_T0`].
+const IEC: u32 = 0x2_8000;
+const IEC_END: u32 = IEC + 0xFFF;
 /// Ultimate Audio: `SAMPLER_BASE` 0x10048000 (iomap.h:19), the firmware side of the sampler — 256 bytes of register
 /// file aliased over 8 K. Served by the backend's block when it has one, else RAZ/WI as it was before S16
 /// (docs/specs/S16-ultimate-audio.md).
@@ -58,8 +62,9 @@ const MIXER_END: u32 = MIXER + 0xFF;
 const MIXER_BYTES: u32 = 20;
 
 /// (offset, size) of every [`C64Port`] window.
-const WINDOWS: [(u32, u32); 13] = [
+const WINDOWS: [(u32, u32); 14] = [
     (DRIVE_A, 2 * DRIVE_WINDOW),
+    (IEC, 0x1000),
     (CART, 0x100),
     (DMA, 0x1_0000),
     (MATRIX, 0x100),
@@ -72,6 +77,19 @@ const WINDOWS: [(u32, u32); 13] = [
     (UCI, 0x1000),
     (SAMPLER, 0x2000),
     (MIXER, 0x100),
+];
+
+/// IEC processor 0x10028000 without a backend that has one (iec_processor_io.vhd; moved here from devices/iec.rs with
+/// the window, S30). Registers decode `address(3:0)`, CODE RAM is bit 11.
+const IEC_T0: &[Span] = &[
+    // VERSION, only printed (iec_interface.cc:73).
+    at(0x00, Reg::Const(0x25)),
+    // 00 §2 C22, 11 H11/H12: idle FIFOs. TX_FIFO_STATUS 0x01 = down FIFO empty, not full; RX_FIFO_STATUS
+    // 0x01 = up FIFO empty, so the "IEC Server" poll every 2 ticks (iec_interface.cc:182-189) reads nothing.
+    at(0x01, Reg::Const(0x01)),
+    at(0x02, Reg::Const(0x01)),
+    // CODE RAM: 0x768-byte microcode plus the patched device address bytes (iec_interface.cc:71-81,128-145).
+    span(0x800, 0x1000, RAM),
 ];
 
 /// UltiCommand interface 0x10044000 without a backend that has the block (command_protocol.vhd; moved here from
@@ -304,6 +322,8 @@ pub struct C64Port {
     cart_detect: Option<Arc<AtomicU8>>,
     /// UCI 0x10044000 while the backend has no block of its own (S15).
     uci: RegTable,
+    /// The IEC processor 0x10028000 while the backend has none (S30).
+    iec: RegTable,
     /// Where this firmware keeps the cartridge ROM (`Machine::new` reads it from the image).
     cart_rom: CartRom,
 }
@@ -335,6 +355,7 @@ impl C64Port {
             drives: [DriveRegs::new(0), DriveRegs::new(1)],
             cart_detect: None,
             uci: RegTable::new("uci", UCI_T0),
+            iec: RegTable::new("iec", IEC_T0),
             cart_rom: CartRom::LARGE,
         }
     }
@@ -618,6 +639,11 @@ impl C64Port {
         self.backend.as_ref().is_some_and(|b| b.has_uci())
     }
 
+    /// S30: whether the backend has the IEC processor. Without one the window stays the T0 table.
+    fn has_iec(&self) -> bool {
+        self.backend.as_ref().is_some_and(|b| b.has_iec())
+    }
+
     /// Ultimate Audio: whether the backend serves the sampler. Without one the window reads 0 and swallows writes,
     /// which is what the firmware's reset writes need (S16 §3.2).
     fn has_sampler(&self) -> bool {
@@ -684,6 +710,15 @@ impl IoDevice for C64Port {
                 self.update_uci(ctx);
                 val
             }
+            // S30: the engine runs on the C64's clock, so the C64 runs up to this instruction first. A read of the up
+            // FIFO takes the entry.
+            IEC..=IEC_END if self.has_iec() => {
+                self.lend_ddr(ctx);
+                self.sync(ctx.now);
+                let val = self.backend.as_mut().map_or(0, |b| b.iec_read((off - IEC) as u16));
+                self.return_ddr();
+                val
+            }
             // Ultimate Audio: the voices read guest DDR, so the lease is held across the call as it is for UCI, and
             // `sampler_read` has no side effects — reading a status never clears a latch (S16 §2.1).
             SAMPLER..=SAMPLER_END if self.has_sampler() => {
@@ -746,6 +781,15 @@ impl IoDevice for C64Port {
                 self.update_uci(ctx);
             }
             UCI..=UCI_END => self.uci.set(off - UCI, val),
+            IEC..=IEC_END if self.has_iec() => {
+                self.lend_ddr(ctx);
+                self.sync(ctx.now);
+                if let Some(b) = &mut self.backend {
+                    b.iec_write((off - IEC) as u16, val);
+                }
+                self.return_ddr();
+            }
+            IEC..=IEC_END => self.iec.set(off - IEC, val),
             // Ultimate Audio. Without the block the window swallows the write, as the old stub did: the firmware
             // clears the voices on every C64 reset whether or not the FPGA has a sampler (12 Region A).
             SAMPLER..=SAMPLER_END if self.has_sampler() => {
@@ -821,6 +865,10 @@ impl IoDevice for C64Port {
             UCI..=UCI_END => match self.backend.as_ref().filter(|b| b.has_uci()) {
                 Some(b) => b.uci_read((off - UCI) as u16),
                 None => self.uci.get(off - UCI),
+            },
+            IEC..=IEC_END => match self.backend.as_ref().filter(|b| b.has_iec()) {
+                Some(b) => b.iec_peek((off - IEC) as u16),
+                None => self.iec.get(off - IEC),
             },
             // Ultimate Audio: `sampler_read` is side-effect free, so a peek is the same read (S16 §3.1).
             SAMPLER..=SAMPLER_END => self.backend.as_ref().filter(|b| b.has_sampler()).map_or(0, |b| b.sampler_read((off - SAMPLER) as u16)),

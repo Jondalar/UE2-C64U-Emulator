@@ -1,25 +1,13 @@
-//! IEC processor, ACIA, C2N tape (T0).
+//! ACIA, C2N tape (T0).
 //! Spec: docs/specs/S04-board-t0.md. Registers: docs/hw/11-drives-iec-periph.md.
 //!
-//! The UltiCommand interface 0x10044000 used to be a table here; it is a `devices::c64::C64Port` window now, so
-//! the C64's UCI block can serve it (docs/specs/S15-uci.md).
+//! The UltiCommand interface 0x10044000 and the IEC processor 0x10028000 used to be tables here; they are
+//! `devices::c64::C64Port` windows now, so the C64's UCI block and the IEC processor on its bus can serve them
+//! (docs/specs/S15-uci.md, S30-soft-iec.md).
 
 use crate::devices::board::{add_table, at, span, Reg, Span, RAM};
 use crate::io::IoMap;
 use crate::machine::MachineConfig;
-
-/// IEC processor 0x10028000 (iec_processor_io.vhd). Registers decode `address(3:0)`, CODE RAM is bit 11.
-const IEC: &[Span] = &[
-    // VERSION, only printed (iec_interface.cc:73).
-    at(0x00, Reg::Const(0x25)),
-    // 00 §2 C22, 11 H11/H12: idle FIFOs. TX_FIFO_STATUS 0x01 = down FIFO empty, not full; RX_FIFO_STATUS
-    // 0x01 = up FIFO empty, so the "IEC Server" poll every 2 ticks (iec_interface.cc:182-189) reads nothing.
-    at(0x01, Reg::Const(0x01)),
-    at(0x02, Reg::Const(0x01)),
-    // 00 §1c M7, 11 H10: the slot[3] `dst[-1]` write to 0x100287FF (iec_interface.cc:121-126,141) is a no-op.
-    // CODE RAM: 0x768-byte microcode plus the patched device address bytes (iec_interface.cc:71-81,128-145).
-    span(0x800, 0x1000, RAM),
-];
 
 /// ACIA 6551 0x1004A000 (acia6551.vhd). No C64 side, so its registers stay at reset and irq_source is 0:
 /// high IRQ 0 is never raised.
@@ -44,7 +32,6 @@ const ACIA: &[Span] = &[
 const TAPE_PLAY: &[Span] = &[span(0x000, 0x1000, Reg::Const(0x80))];
 
 pub fn install(map: &mut IoMap, _cfg: &MachineConfig) {
-    add_table(map, 0x1002_8000, 0x1000, "iec", IEC);
     add_table(map, 0x1004_A000, 0x1000, "acia", ACIA);
     add_table(map, 0x100A_0000, 0x1000, "tape-play", TAPE_PLAY);
     // C2N record 0x100C0000: RECORD_STATUS 0 (bit7 = FIFO non-empty) and FIFO reads 0, so `flush()`
@@ -59,7 +46,7 @@ mod tests {
 
     #[test]
     fn c22_iec_registers() {
-        let mut rig = Rig::new(install);
+        let mut rig = Rig::new(crate::devices::c64::install);
         assert_eq!([0, 1, 2].map(|o| rig.r8(0x1002_8000 + o)), [0x25, 0x01, 0x01]);
         // IecInterface ctor: reset, code load (iec_interface.cc:71-81).
         rig.w8(0x1002_8003, 0x00);
