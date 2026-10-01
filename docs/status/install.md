@@ -66,7 +66,7 @@ Without vcpkg, `cargo build --release -p ue2emu --no-default-features --features
 ### TRX64 dependency
 
 `crates/c64-bridge` takes `trx64-core`, and `crates/ue2emu` takes `trx64-core` and `trx64-monitor`, from GitHub,
-pinned by tag in their `Cargo.toml` to `v0.9.2`; cargo fetches it on the first build. Its build.rs compiles the
+pinned by tag in their `Cargo.toml` to `v0.11.0`; cargo fetches it on the first build. Its build.rs compiles the
 vendored reSID C++, so a C++ compiler is needed.
 `cargo build --release -p ue2emu --no-default-features` builds without TRX64 (`--c64 none` only). The bridge drives
 TRX64 internals, so run the tests and the C64 smokes (`scripts/smoke-c64-all.sh`) before moving the tag.
