@@ -220,6 +220,13 @@ pub struct Trx64Backend {
     /// badline timing (Spec 851 D2) — so a strobe before any write changes nothing.
     turbo_regs_en: u8,
     speed_prefer: u8,
+    /// The enable word and speed last handed to TRX64, and whether the C64 was reset since. `set_u64_turbo` is the
+    /// menu (TRX64 Spec 890), but the firmware's reset task re-runs `setCpuSpeed` after every C64 reset
+    /// (u64_config.cc:1035-1045), and on a C64 Ultimate that strobe leaves the reset state alone: `$D031` reads `$00`
+    /// in registers mode, `$D030` `$FE` in TurboEnable mode. So the first strobe after a reset that repeats the
+    /// applied values is not a menu set; one with new values is.
+    turbo_applied: Option<(u8, u8)>,
+    reset_since_turbo: bool,
     palette: Palette,
     /// The sockets and UltiSIDs on reSID, the mixer and the sample stream (S17).
     sid: sid::Sid,
@@ -340,6 +347,8 @@ impl Trx64Backend {
             nmi_line: false,
             turbo_regs_en: 0x01,
             speed_prefer: 0x80,
+            turbo_applied: None,
+            reset_since_turbo: false,
             palette: Palette::default(),
             sid,
             drives,
@@ -801,6 +810,17 @@ impl Trx64Backend {
         self.checkpoint_hit.take()
     }
 
+    /// C64_SPEED_UPDATE: hand the latched turbo settings to TRX64 as a menu set, unless this is the reset task's
+    /// repeat of the applied values (see `turbo_applied`).
+    fn speed_update(&mut self) {
+        let set = (self.turbo_regs_en, self.speed_prefer);
+        let repeat = std::mem::take(&mut self.reset_since_turbo) && self.turbo_applied == Some(set);
+        if !repeat {
+            self.m.set_u64_turbo(set.0, set.1);
+            self.turbo_applied = Some(set);
+        }
+    }
+
     /// Spec 850 D7 — the hold TRX64 runs under. The reset line wins over C64_STOP: with CPU, CIAs and SID in reset
     /// only the VIC is clocked (S14 §4).
     fn apply_hold(&mut self) {
@@ -921,6 +941,7 @@ impl C64Backend for Trx64Backend {
         self.apply_hold();
         self.uci_wait = None;
         if held {
+            self.reset_since_turbo = true;
             self.sid.reset();
             // S16: the C64 reset clears the sampler's IRQ latches and nothing else — its register file has no reset
             // branch, which is why the firmware clears the voices in software on every reset (`sampler2.vhd:229-232`).
@@ -1098,7 +1119,7 @@ impl C64Backend for Trx64Backend {
             // as `setCpuSpeed` writes them (u64_config.cc:1634-1636).
             CORE_TURBOREGS_EN => self.turbo_regs_en = val,
             CORE_SPEED_PREFER => self.speed_prefer = val,
-            CORE_SPEED_UPDATE => self.m.set_u64_turbo(self.turbo_regs_en, self.speed_prefer),
+            CORE_SPEED_UPDATE => self.speed_update(),
             CORE_VIDEOFORMAT => self.request_model(val),
             // S32: the paddle values and the mouse enables of both control ports (u64.h:139-144) reach SID POTX/POTY
             // through TRX64's POT lines (Spec 876).
@@ -1438,6 +1459,35 @@ mod tests {
             assert_eq!(c64.m.ram[0x02A6], pal, "{format:#04x}: $02A6, 1 = PAL");
             assert_eq!(c64.frame().height, height, "{format:#04x}");
         }
+    }
+
+    /// TRX64 Spec 890: the reset task's repeat of the applied turbo settings leaves the reset state alone ($D031 reads
+    /// $00 in registers mode, as on a C64 Ultimate); a menu change after the reset applies.
+    #[test]
+    fn the_reset_tasks_speed_strobe_is_not_a_menu_set() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        let mut now = 0;
+        c64.advance_to(now);
+        let strobe = |c64: &mut Trx64Backend, prefer: u8| {
+            c64.core_config_write(CORE_TURBOREGS_EN, 0x01);
+            c64.core_config_write(CORE_SPEED_PREFER, prefer);
+            c64.core_config_write(CORE_SPEED_UPDATE, 1);
+        };
+        strobe(&mut c64, 0x89);
+        run_ms(&mut c64, &mut now, 5);
+        assert_ne!(c64.m.peek_lens(0xD031, "io"), 0x00, "the menu set applies");
+        c64.set_reset(true);
+        run_ms(&mut c64, &mut now, 5);
+        c64.set_reset(false);
+        strobe(&mut c64, 0x89);
+        run_ms(&mut c64, &mut now, 5);
+        assert_eq!(c64.m.peek_lens(0xD031, "io"), 0x00, "the reset task's strobe");
+        strobe(&mut c64, 0x89);
+        assert_ne!(c64.m.peek_lens(0xD031, "io"), 0x00, "a later set with the same values is the menu again");
+        c64.set_reset(true);
+        c64.set_reset(false);
+        strobe(&mut c64, 0x8C);
+        assert_ne!(c64.m.peek_lens(0xD031, "io"), 0x00, "new values after a reset are a menu change");
     }
 
     /// S25 §2-§3: a switch while the C64 runs lands at a frame boundary, and from there the clock counts at the new row's
