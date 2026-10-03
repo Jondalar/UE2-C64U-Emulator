@@ -1,6 +1,6 @@
 # Features
 
-One line per feature, as of 0.5.0 (TRX64 v0.9.2). Details: `docs/status/`, specs: `docs/specs/`. What is missing:
+One line per feature, as of 0.5.1 (TRX64 v0.12.3). Details: `docs/status/`, specs: `docs/specs/`. What is missing:
 `docs/status/gaps.md`.
 
 ## Firmware and board
@@ -42,6 +42,7 @@ One line per feature, as of 0.5.0 (TRX64 v0.9.2). Details: `docs/status/`, specs
 - C64 ROMs written into the flash image (`--c64-roms`).
 - PRG start from the file browser (DMA load).
 - Freeze and the Freeze UI.
+- U64 turbo up to 64 MHz, timed as measured on a C64 Ultimate.
 - Smooth picture: every VIC frame shown, one-step scaling.
 - Ultimate Command Interface (UCI).
 - REU on the firmware's DDR, preload and "Save REU"; GeoRAM.
