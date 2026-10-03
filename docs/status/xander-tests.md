@@ -16,9 +16,14 @@ Firmware: `firmware/1541ultimate` V1.01 3.15 (`v3.15-9-gb617777c`). Every run is
 target/release/ue2emu run --headless --speed max \
     --firmware firmware/1541ultimate/target/u64ii/riscv/ultimate/result/ultimate.elf \
     --roms firmware/1541ultimate/roms --flash <copy of run/flash.bin> --c64-roms \
+    --settings run/xander/pal.cfg \
     --usb-dir run/xander/r2/<share>[,ro] --usb-dir-work run/xander/r2/w-<n> \
     [--net user --hostfwd tcp:23xx:23] --script run/xander/r2/ctl/<script>.ctl
 ```
+
+`pal.cfg` sets `System Mode=PAL`, as on the C64U these programs were tested on. Without it a fresh flash boots the
+firmware's default, NTSC (S25), and mandelbrot-upic's Upic viewer, timed for 312 PAL lines, misses about every
+third frame: the picture flickers. The `run/xander/flash-*.bin` images have PAL saved in them.
 
 The programs, their control scripts, logs and PNGs live under `run/xander` (gitignored): `artefacts/` the unpacked
 releases, `share*/` the USB sticks the firmware sees (release layout: `idi8b/<project>/`), `r2/` the second pass
