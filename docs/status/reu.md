@@ -154,7 +154,7 @@ The two findings themselves, both confirmed while building this:
 
 ## Build note
 
-The two changes above need TRX64 0.7.1 or later; the pin (tag `v0.11.0` in `crates/c64-bridge/Cargo.toml`) has them.
+The two changes above need TRX64 0.7.1 or later; the pin (tag `v0.12.3` in `crates/c64-bridge/Cargo.toml`) has them.
 
 Building against a local TRX64 checkout instead (for TRX64 work) is the usual `.cargo/config.toml` route described in
 `docs/status/install.md`, "TRX64 dependency". One trap worth repeating: when the local crate's version differs from
