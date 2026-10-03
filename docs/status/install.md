@@ -34,8 +34,8 @@ scripts/smoke-all.sh                                      # release build, every
 ```
 
 - The firmware tests take the tree from `$UE2_FIRMWARE`, default `firmware/1541ultimate` under the repo root; the
-  loader tests skip when its ELF is missing (`crates/ue2-core/src/loader.rs:238-246`). With the firmware, 0.5.0
-  (`b9050b9`) gives 523 passed, 1 ignored.
+  loader tests skip when its ELF is missing (`crates/ue2-core/src/loader.rs:238-246`). With the firmware, 0.5.1
+  gives 524 passed, 1 ignored.
 - `scripts/make-sd-image.sh` (used by `smoke-all.sh`) needs a macOS login session.
 
 ### Platforms
