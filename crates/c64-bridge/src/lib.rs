@@ -923,7 +923,7 @@ fn joystick(lines: u8) -> JoystickState {
 impl C64Backend for Trx64Backend {
     /// Whole 6510 instructions up to the target cycle; the overshoot carries into the next call (S14 §4).
     fn advance_to(&mut self, now: u64) {
-        self.now = now;
+        let since = std::mem::replace(&mut self.now, now);
         if self.reu_off_since.is_some_and(|since| now.saturating_sub(since) >= REU_OFF_GRACE) {
             self.reu_off_since = None;
             self.parked_reu = self.m.detach_reu();
@@ -942,11 +942,15 @@ impl C64Backend for Trx64Backend {
                 self.uci_wait = None;
             }
         }
-        // S37: while the machine pause stands no C64 cycle runs, so the CPU, VIC, CIAs, SID and drives stand and no SID
-        // sample is made. The sampler is the FPGA's and runs on. S38: the same while the transport holds the C64 on an
-        // anchor.
+        // S37: while the machine pause stands no C64 cycle runs, so the CPU, VIC, CIAs, SID and drives stand and the
+        // SID makes no sample of its own. The sampler is the FPGA's and runs on. S38: the same while the transport
+        // holds the C64 on an anchor.
         if self.paused || self.ring_holds() {
             self.sampler.with(|s| s.advance_to(now));
+            // The pause mutes (top.v:1059), and the output goes on at its rate: the stretch is zeros, not missing.
+            if self.paused {
+                self.sid.pause_gap(now.saturating_sub(since));
+            }
             return;
         }
         let (clk, hz) = (self.m.c64_core.clk, self.cpu_hz());
@@ -1422,6 +1426,10 @@ impl C64Backend for Trx64Backend {
         }
     }
 
+    fn set_muted(&mut self, muted: bool) {
+        self.sid.set_mute(muted, self.m.c64_core.clk);
+    }
+
     fn frame_clocks(&self) -> u64 {
         let t = self.m.timing();
         u64::from(t.lines_per_frame) * u64::from(t.cycles_per_line) * ue2_core::time::CLOCK_HZ / self.cpu_hz()
@@ -1864,6 +1872,57 @@ mod tests {
         let mean = tail.iter().map(|&s| f64::from(s)).sum::<f64>() / tail.len() as f64;
         let rising = tail.windows(2).filter(|w| f64::from(w[0]) < mean && f64::from(w[1]) >= mean).count();
         assert!((495..=505).contains(&rising), "{rising} periods in 0.5 s");
+    }
+
+    /// S37: TRX64-Ultimate's `c64_mute` (top.v:1059). C64_STOP alone cuts the output to zeros while the SID runs on
+    /// beneath; the machine pause keeps the output going at its rate with zeros while the SID stands; each release
+    /// brings the tone back at once.
+    #[test]
+    fn c64_mute_cuts_the_output_and_the_release_brings_the_tone_back() {
+        let Some((mut c64, mut now)) = booted() else { return };
+        let pcm = Rc::new(RefCell::new(Vec::new()));
+        c64.set_audio(44_100, Box::new(Collect(Rc::clone(&pcm))));
+        let mut code = Vec::new();
+        for (reg, val) in [(0x18, 15), (0x05, 0), (0x06, 0xF0), (0x01, 66), (0x00, 133), (0x04, 0x21)] {
+            code.extend([0xA9, val, 0x8D, reg, 0xD4]);
+        }
+        let [lo, hi] = (0xC000 + code.len() as u16).to_le_bytes();
+        code.extend([0x4C, lo, hi]);
+        for (i, &b) in code.iter().enumerate() {
+            c64.dma_write(0xC000 + i as u16, b, false);
+        }
+        c64.m.c64_core.reg_pc = 0xC000;
+        let mut stretch = |c64: &mut Trx64Backend, now: &mut u64| {
+            pcm.borrow_mut().clear();
+            run_ms(c64, now, 100);
+            let got = std::mem::take(&mut *pcm.borrow_mut());
+            let swing = got.iter().max().copied().unwrap_or(0) as i32 - got.iter().min().copied().unwrap_or(0) as i32;
+            (got.len(), swing)
+        };
+        let (_, tone) = stretch(&mut c64, &mut now);
+        assert!(tone > 1000, "the tone plays: {tone}");
+        // C64_STOP alone: the chips run, the output is zeros.
+        c64.set_stopped(true);
+        c64.set_muted(true);
+        let clk = c64.m.c64_core.clk;
+        let (n, swing) = stretch(&mut c64, &mut now);
+        assert!(n.abs_diff(4_410) <= 2 && swing == 0, "100 ms of zeros: {n} samples, swing {swing}");
+        assert!(c64.m.c64_core.clk > clk, "the SID ran on");
+        c64.set_muted(false);
+        c64.set_stopped(false);
+        assert!(stretch(&mut c64, &mut now).1 > 1000, "the release: the tone again");
+        // The machine pause: no C64 cycle, and still 100 ms of zeros.
+        c64.set_stopped(true);
+        c64.set_muted(true);
+        c64.set_paused(true);
+        let clk = c64.m.c64_core.clk;
+        let (n, swing) = stretch(&mut c64, &mut now);
+        assert!(n.abs_diff(4_410) <= 2 && swing == 0, "paused: 100 ms of zeros: {n} samples, swing {swing}");
+        assert_eq!(c64.m.c64_core.clk, clk, "the SID stood");
+        c64.set_paused(false);
+        c64.set_muted(false);
+        c64.set_stopped(false);
+        assert!(stretch(&mut c64, &mut now).1 > 1000, "the release: the tone from where it stood");
     }
 
     /// S17 §4.3: the SID player's two-SID map, UltiSID 2 at $D420. A 6510 program's tone there plays through UltiSID 2's

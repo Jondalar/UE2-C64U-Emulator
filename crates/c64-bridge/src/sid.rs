@@ -31,11 +31,17 @@ use trx64_core::{BusKind, Machine, Observer, Resid, ResidConfig};
 /// of a left and a right sample, interleaved (S29).
 pub trait AudioSink {
     fn samples(&mut self, pcm: &[i16]);
+    /// S37: TRX64-Ultimate's `c64_mute` (top.v:1059) changed, from the next samples on. The SIDs' samples arrive as
+    /// zeros while it stands; a sink that adds sources of its own silences them too. Ignored by default.
+    fn mute(&mut self, _on: bool) {}
 }
 
 impl<T: AudioSink + ?Sized> AudioSink for Box<T> {
     fn samples(&mut self, pcm: &[i16]) {
         (**self).samples(pcm);
+    }
+    fn mute(&mut self, on: bool) {
+        (**self).mute(on);
     }
 }
 
@@ -394,6 +400,10 @@ struct Engines {
     /// demand: a reSID read of $1B/$1C sets the bus value the write-only registers read back (sid.cc `read`), so it
     /// may only happen where it did before S20 — right after clocking, never after a write.
     cache: [u32; RECEIVERS],
+    /// S37: TRX64-Ultimate's `c64_mute`: every sample leaves as 0, to the sink and the tap alike.
+    mute: bool,
+    /// Emulator clocks × sample rate not yet turned into silence during the machine pause ([`Engines::gap`]).
+    gap_pace: u64,
 }
 
 impl Engines {
@@ -409,6 +419,8 @@ impl Engines {
             audio: None,
             stream: None,
             cache: [0; RECEIVERS],
+            mute: false,
+            gap_pace: 0,
         }
     }
 
@@ -480,21 +492,62 @@ impl Engines {
             if !listening {
                 continue;
             }
-            let pcm = if self.order.is_empty() { vec![0; 2 * self.silence(n)] } else { mixed_down(&mixed) };
-            if let Some(sink) = &mut self.audio {
-                sink.samples(&pcm);
+            let mut pcm = if self.order.is_empty() { vec![0; 2 * self.silence(n)] } else { mixed_down(&mixed) };
+            if self.mute {
+                pcm.fill(0);
             }
-            if let Some(tap) = &self.stream {
-                if let Ok(mut buf) = tap.lock() {
-                    buf.extend_from_slice(&pcm);
-                    let over = buf.len().saturating_sub(STREAM_TAP_CAP).next_multiple_of(2);
-                    if over > 0 {
-                        buf.drain(..over);
-                    }
+            self.emit(&pcm);
+        }
+        self.cache_readback();
+    }
+
+    /// One block of stereo samples to the sink and the tap.
+    fn emit(&mut self, pcm: &[i16]) {
+        if let Some(sink) = &mut self.audio {
+            sink.samples(pcm);
+        }
+        if let Some(tap) = &self.stream {
+            if let Ok(mut buf) = tap.lock() {
+                buf.extend_from_slice(pcm);
+                let over = buf.len().saturating_sub(STREAM_TAP_CAP).next_multiple_of(2);
+                if over > 0 {
+                    buf.drain(..over);
                 }
             }
         }
-        self.cache_readback();
+    }
+
+    /// The sink from now on; it hears a mute that already stands.
+    fn attach(&mut self, mut sink: Box<dyn AudioSink>) {
+        if self.mute {
+            sink.mute(true);
+        }
+        self.audio = Some(sink);
+    }
+
+    /// S37: `c64_mute` set or cleared, from the next sample on: a cut, no ramp (top.v:817-821).
+    fn set_mute(&mut self, on: bool) {
+        if on == self.mute {
+            return;
+        }
+        self.mute = on;
+        if let Some(sink) = &mut self.audio {
+            sink.mute(on);
+        }
+    }
+
+    /// S37: `clocks` emulator clocks of the machine pause. No C64 cycle runs, so the engines stand where they are,
+    /// but the output goes on at its rate with the muted zeros (top.v:817-821, the 48 kHz frame of `mclk`).
+    fn gap(&mut self, clocks: u64) {
+        if !self.listening() {
+            return;
+        }
+        self.gap_pace += clocks * u64::from(self.sample_rate);
+        let n = self.gap_pace / ue2_core::time::CLOCK_HZ;
+        self.gap_pace %= ue2_core::time::CLOCK_HZ;
+        if n > 0 {
+            self.emit(&vec![0; 2 * n as usize]);
+        }
     }
 
     /// Refresh [`Engines::cache`] from the engines.
@@ -574,6 +627,10 @@ enum Cmd {
     Reanchor(u64),
     /// The C64's clock in Hz changed.
     ClockFreq(u64),
+    /// S37: TRX64-Ultimate's `c64_mute`.
+    Mute(bool),
+    /// S37: emulator clocks of the machine pause, as muted samples.
+    Gap(u64),
     /// A firmware DMA read: the answer goes back before the emulation thread continues (S20 §3).
     Read { mask: u16, reg: u8, clk: u64, reply: SyncSender<u8> },
 }
@@ -633,6 +690,8 @@ impl Worker {
                             Cmd::Reset => engines.reset(),
                             Cmd::Reanchor(clk) => engines.clk = clk,
                             Cmd::ClockFreq(hz) => engines.set_clock(hz),
+                            Cmd::Mute(on) => engines.set_mute(on),
+                            Cmd::Gap(clocks) => engines.gap(clocks),
                             Cmd::Read { mask, reg, clk, reply } => {
                                 engines.clock_to(clk);
                                 let _ = reply.send(engines.read(mask, reg));
@@ -770,7 +829,7 @@ impl Sid {
     pub fn set_audio(&mut self, sample_rate: u32, sink: Box<dyn AudioSink>, clk: u64) {
         let engines = self.engines_for_audio(clk);
         engines.set_rate(sample_rate);
-        engines.audio = Some(sink);
+        engines.attach(sink);
         self.listening = true;
         self.gains();
         self.refresh_readback();
@@ -780,7 +839,7 @@ impl Sid {
     pub fn set_audio_threaded(&mut self, sample_rate: u32, sink: Box<dyn AudioSink + Send>, clk: u64) {
         let engines = self.engines_for_audio(clk);
         engines.set_rate(sample_rate);
-        engines.audio = Some(sink);
+        engines.attach(sink);
         let Host::Inline(engines) = std::mem::replace(&mut self.host, Host::Inline(Engines::new(sample_rate))) else {
             unreachable!("inline above");
         };
@@ -961,6 +1020,26 @@ impl Sid {
         self.finish();
     }
 
+    /// S37: TRX64-Ultimate's `c64_mute` (top.v:1059) at cycle `clk`: what was owed up to there is heard, everything
+    /// after leaves as 0 until it is cleared. The engines keep their clocking: under C64_STOP alone the chips run on
+    /// beneath the cut.
+    pub fn set_mute(&mut self, on: bool, clk: u64) {
+        self.drain(self.clocking());
+        if self.listening {
+            self.command(Cmd::ClockTo(clk));
+        }
+        self.command(Cmd::Mute(on));
+        self.finish();
+    }
+
+    /// S37: `clocks` emulator clocks of the machine pause, with no C64 cycle: the output carries zeros for them.
+    pub fn pause_gap(&mut self, clocks: u64) {
+        if self.listening && clocks > 0 {
+            self.command(Cmd::Gap(clocks));
+            self.finish();
+        }
+    }
+
     /// TRX64 restarted its cycle counter at `clk` (warm reset, c64_6510core.rs:677).
     pub fn reanchor(&mut self, clk: u64) {
         self.command(Cmd::Reanchor(clk));
@@ -1107,6 +1186,8 @@ impl Sid {
                 Cmd::Reset => engines.reset(),
                 Cmd::Reanchor(clk) => engines.clk = clk,
                 Cmd::ClockFreq(hz) => engines.set_clock(hz),
+                Cmd::Mute(on) => engines.set_mute(on),
+                Cmd::Gap(clocks) => engines.gap(clocks),
                 Cmd::Read { mask, reg, clk, reply } => {
                     engines.clock_to(clk);
                     let _ = reply.send(engines.read(mask, reg));

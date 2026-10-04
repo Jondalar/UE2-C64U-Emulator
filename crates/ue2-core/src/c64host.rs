@@ -258,6 +258,11 @@ pub trait C64Backend {
     /// stand and the SID is silent. A release runs on from the same cycle; the clock is re-anchored at the release.
     /// The DMA window, keys and ROM windows work while paused. Ignored by default.
     fn set_paused(&mut self, _paused: bool) {}
+    /// TRX64-Ultimate's `c64_mute` (top.v:1059, `c64_halted | C64_STOP`): from the C64's current cycle on, the audio
+    /// output — the device, the WAV and the UDP stream — carries zeros, cut without a ramp, until it is cleared. The
+    /// chips are not touched: under C64_STOP alone they run on beneath the cut. Gideon's bitstream has no such cut,
+    /// so only `--trx-io` calls it. Ignored by default.
+    fn set_muted(&mut self, _muted: bool) {}
     /// One VIC frame in emulator clocks (lines × cycles per line at the row's clock), 0 when unknown.
     fn frame_clocks(&self) -> u64 {
         0
@@ -563,6 +568,8 @@ pub(crate) mod mock {
         pub(crate) sampler: Rc<RefCell<Option<Sampler>>>,
         /// S37: what `frame_counter` returns.
         pub(crate) frames: Rc<RefCell<u64>>,
+        /// S37: `set_muted` calls, kept apart from `calls`.
+        pub(crate) mutes: Rc<RefCell<Vec<bool>>>,
     }
 
     impl Mock {
@@ -724,6 +731,9 @@ pub(crate) mod mock {
         }
         fn set_paused(&mut self, paused: bool) {
             self.push(Call::Paused(paused));
+        }
+        fn set_muted(&mut self, muted: bool) {
+            self.mutes.borrow_mut().push(muted);
         }
     }
 }

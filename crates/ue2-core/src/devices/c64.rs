@@ -340,6 +340,8 @@ pub struct C64Port {
     trx: Option<Link>,
     /// S37: the machine pause as last given to the backend.
     paused: bool,
+    /// S37: TRX64-Ultimate's `c64_mute` as last given to the backend.
+    muted: bool,
     /// S37: a still frame for guest DDR (address, bytes), written when the access hands DDR back.
     still_out: Option<(u32, Vec<u8>)>,
 }
@@ -376,6 +378,7 @@ impl C64Port {
             cart_rom: CartRom::LARGE,
             trx: None,
             paused: false,
+            muted: false,
             still_out: None,
         }
     }
@@ -578,6 +581,12 @@ impl C64Port {
             }
         }
         l.paused = self.paused;
+        // top.v:1059 `c64_mute <= c64_halted | app_s2[1]`: the pause, or C64_STOP alone.
+        let muted = self.paused || lines.stop;
+        if muted != self.muted {
+            self.muted = muted;
+            b.set_muted(muted);
+        }
         l.session.step(lines, b);
     }
 
@@ -1762,6 +1771,28 @@ mod tests {
         fn link(&mut self) -> Link {
             self.port().trx.clone().expect("linked")
         }
+    }
+
+    /// top.v:1059 `c64_mute <= c64_halted | app_s2[1]`: with `--trx-io` C64_STOP mutes, alone or as the pause, and its
+    /// release unmutes; without it nothing mutes (Gideon's bitstream plays on).
+    #[test]
+    fn c64_stop_mutes_only_with_trx_io() {
+        use crate::devices::trx::GATE_CTRL;
+        let mut b = Bench::trx();
+        b.w8(STOP_ADDR, 1);
+        b.w8(STOP_ADDR, 0);
+        assert_eq!(*b.mock.mutes.borrow(), [true, false], "C64_STOP alone");
+        b.w32(TRX_ADDR + GATE_CTRL, 1);
+        b.w8(STOP_ADDR, 1);
+        assert_eq!(b.mock.mutes.borrow().last(), Some(&true), "the pause");
+        b.w8(MODE_ADDR, MODE_RESET);
+        b.w8(MODE_ADDR, MODE_UNRESET);
+        b.w8(STOP_ADDR, 0);
+        assert_eq!(*b.mock.mutes.borrow(), [true, false, true, false], "one cut while C64_STOP stands, reset or not");
+        let mut b = Bench::new();
+        b.w8(STOP_ADDR, 1);
+        b.w8(STOP_ADDR, 0);
+        assert!(b.mock.mutes.borrow().is_empty(), "no --trx-io: no mute");
     }
 
     #[test]

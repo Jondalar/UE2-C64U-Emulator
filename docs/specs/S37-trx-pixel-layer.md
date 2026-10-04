@@ -1,7 +1,7 @@
 # S37 — The TRX64-Ultimate pixel layer (LVGL UI)
 
 **Status:** phase A built (2026-10-04), phases B1 and B2 (the freeze, §5) built (2026-10-04), B3 (`overlay.v`'s
-box, §5.10) built (2026-10-04), local branch `s37-trx-pixel-layer`, not pushed. See "As built" at the end.
+box, §5.10) built (2026-10-04), the sound's mute (top.v:1059) built (2026-10-04), local branch `s37-trx-pixel-layer`, not pushed. See "As built" at the end.
 
 **Why:** TRX64-Ultimate (Alex's own FPGA for the C64U, `/Users/alex/Development/TRX64-Ultimate`, Gitea
 `TREX/TRX64-Ultimate`) adds an RGB565 pixel layer over the C64 picture. Its app fork (`software/ultimate-app`,
@@ -207,7 +207,7 @@ C64_STOP (the debugger owner of top.v:1070 is page 3, not in UE2).
 - TRX64 v0.12.3 has no hold for the whole machine (`Hold::Cpu` keeps the chips running, expansion.rs:68-75). The
   bridge gets `C64Backend::set_paused(bool)`: while paused `advance_to` runs no cycle, so the C64's cycle count,
   VIC, CIAs, SID and the drives stand. At the release the clock is re-anchored at the current time, as after a reset.
-  No SID samples while paused: silence.
+  The output carries zeros while paused (the mute, "As built (the mute)").
 - The DMA window, the keys and the ROM apertures work while paused, as under `Hold::Cpu`.
 - The reset line wins: reset held is `Hold::Reset`, as today.
 - The device resumes the VIC only after whole frames, to keep its output lock (c64_core.v:358-365). UE2 has no lock
@@ -458,13 +458,12 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
 - The `trx64/main` app on UE2 beyond the layer:
   - With CAPS = `$C0` it touches pages 0 and 6 only (As built).
   - The boot ROM and flash layout (T15) do not matter: UE2 loads the ELF.
-- The fade: the smoke sees the `PX_GALPHA` writes but checks no intermediate picture.
+- The fade, decided (Alex, 2026-10-04): the smoke's check of the `PX_GALPHA` writes is enough for now; no intermediate
+  picture is checked.
 - Phase B, for the FPGA side:
   - **RTL bug, confirmed by the FPGA side (2026-10-04), fix in progress:** the still at 60 Hz. pix_layer.v's window is 270 lines from line 16 in every System Mode
     (`Y0S`, :505), so a 263-line VIC never reaches line 285, no frame completes (:535), and the freeze shows only the
     menu background behind the text. UE2 models it as it is.
-  - top.v:1059 mutes the sound with C64_STOP alone (`c64_mute <= c64_halted | app_s2[1]`), also without FRZ. UE2's
-    CPU-only stop (`Hold::Cpu`) keeps the SID playing, as before.
 - Phase B, decided (Alex, 2026-10-04): B1 and B2 together; `GATE_CTRL` b9 read as b8; the resume at once; B3 (overlay.v
   placement for "Overlay on HDMI") is built next (Alex, 2026-10-04).
 
@@ -528,3 +527,24 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
   pointer 0, TRANSPARENCY 0xC0 (index 0). menu.png is 1920 × 1080 with the box at (320, 202)-(1599, 876): outside it
   the picture before the menu, inside it the C64 at half brightness wherever the cells are index 0, and the rest in
   at most 16 opaque colours (6 or 7 per run). After the second `button` the picture is 960 × 540 again.
+
+## As built (the mute)
+
+- **Device:** top.v:1059 `c64_mute <= c64_halted | app_s2[1]`: the machine pause (`c64_halted`, c64_core.v's halt,
+  top.v:1216) or C64_STOP itself (`app_s2[1]`, ultimate_sys.vhd:1301 `c64_pause_req <= c64_stop`), with or without FRZ
+  and whoever owns run control. Two `mclk` stages later (top.v:815-821) `snd_l`/`snd_r` are 0 instead of c64_core's
+  mixed SID output: a cut, no ramp. Everything that leaves takes `snd_l`/`snd_r`: the UDP audio stream (top.v:1035),
+  I2S to the codec and speaker (:1460) and HDMI (:1472). The chips are not touched: under C64_STOP alone the SIDs run
+  on beneath the cut; under the pause they stand with the machine and go on from where they stood. The 48 kHz frame
+  goes on, so the stretch is zeros, not missing.
+- **UE2, with `--trx-io` only:** `C64Port` hands `C64Backend::set_muted(pause || C64_STOP)` to the bridge on each
+  change; Gideon's bitstream has no such cut, so without the block nothing changes. The bridge clocks the SIDs up to
+  the C64's current cycle and then zeroes every sample to the sink and the UDP stream's tap; the sampler mix
+  (`SamplerMix`) zeroes its sum too, its voices drained beneath. While the pause stands no C64 cycle runs, so the
+  bridge puts the elapsed emulator time into the output as zeros (`Sid::pause_gap`); the WAV keeps the wall-clock
+  length. The S38 transport hold is UE2's own and still makes no samples.
+- **Tests:** `c64_stop_mutes_only_with_trx_io` (ue2-core), `c64_mute_cuts_the_output_and_the_release_brings_the_tone_back`
+  (c64-bridge: 100 ms of zeros under C64_STOP alone with the SID running, 100 ms of zeros paused with the SID standing,
+  the 1000 Hz tone back after each release), `the_mute_silences_the_voices_and_drains_them` (sampler).
+  `scripts/smoke-trx-freeze.sh` plays a 1000 Hz tone before the freeze into `--audio-wav`: the WAV holds one stretch
+  of zeros over 2 s with the tone right before and after it, and ends on the tone.

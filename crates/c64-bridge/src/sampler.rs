@@ -556,11 +556,13 @@ pub struct SamplerMix<S> {
     sink: S,
     voices: Vec<i16>,
     mixed: Vec<i16>,
+    /// S37: TRX64-Ultimate's `c64_mute` cuts the sum, so the voices go silent with the SIDs; they play on beneath.
+    muted: bool,
 }
 
 impl<S: AudioSink> SamplerMix<S> {
     pub fn new(queue: SampleQueue, sink: S) -> Self {
-        SamplerMix { queue, sink, voices: Vec::new(), mixed: Vec::new() }
+        SamplerMix { queue, sink, voices: Vec::new(), mixed: Vec::new(), muted: false }
     }
 }
 
@@ -570,7 +572,14 @@ impl<S: AudioSink> AudioSink for SamplerMix<S> {
         self.queue.drain(&mut self.voices, pcm.len());
         self.mixed.clear();
         self.mixed.extend(pcm.iter().zip(&self.voices).map(|(&sid, &voice)| sid.saturating_add(voice)));
+        if self.muted {
+            self.mixed.fill(0);
+        }
         self.sink.samples(&self.mixed);
+    }
+    fn mute(&mut self, on: bool) {
+        self.muted = on;
+        self.sink.mute(on);
     }
 }
 
@@ -584,6 +593,29 @@ impl Sampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S37: `c64_mute` cuts the sum, the voices included; they are drained all the same, so they play on beneath.
+    #[test]
+    fn the_mute_silences_the_voices_and_drains_them() {
+        struct Keep(std::rc::Rc<std::cell::RefCell<Vec<i16>>>);
+        impl AudioSink for Keep {
+            fn samples(&mut self, pcm: &[i16]) {
+                self.0.borrow_mut().extend_from_slice(pcm);
+            }
+        }
+        let out = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let queue = SampleQueue::default();
+        let mut mix = SamplerMix::new(queue.clone(), Keep(out.clone()));
+        queue.push(&[100; 8]);
+        mix.samples(&[1; 4]);
+        assert_eq!(*out.borrow(), [101; 4]);
+        mix.mute(true);
+        mix.samples(&[1; 4]);
+        assert_eq!(out.borrow()[4..], [0; 4], "cut");
+        mix.mute(false);
+        mix.samples(&[1; 4]);
+        assert_eq!(out.borrow()[8..], [1; 4], "the voices went on: their samples were spent under the cut");
+    }
 
     /// Emulator clocks one output sample covers at 48 kHz.
     const CLOCKS_PER_SAMPLE: u64 = 100_000_000 / 48_000;
