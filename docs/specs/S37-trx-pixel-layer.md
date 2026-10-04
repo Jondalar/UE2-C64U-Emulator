@@ -537,13 +537,14 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
   I2S to the codec and speaker (:1460) and HDMI (:1472). The chips are not touched: under C64_STOP alone the SIDs run
   on beneath the cut; under the pause they stand with the machine and go on from where they stood. The 48 kHz frame
   goes on, so the stretch is zeros, not missing.
-- **UE2, with `--trx-io` only:** `C64Port` hands `C64Backend::set_muted(pause || C64_STOP)` to the bridge on each
-  change; Gideon's bitstream has no such cut, so without the block nothing changes. The bridge clocks the SIDs up to
+- **UE2:** with `--trx-io`, `C64Port` hands `C64Backend::set_muted(pause || C64_STOP)` to the bridge on each
+  change. Without the block C64_STOP mutes too (Alex, 2026-10-04: a stopped C64 is silent), although Gideon's
+  bitstream plays on. The bridge clocks the SIDs up to
   the C64's current cycle and then zeroes every sample to the sink and the UDP stream's tap; the sampler mix
   (`SamplerMix`) zeroes its sum too, its voices drained beneath. While the pause stands no C64 cycle runs, so the
   bridge puts the elapsed emulator time into the output as zeros (`Sid::pause_gap`); the WAV keeps the wall-clock
   length. The S38 transport hold is UE2's own and still makes no samples.
-- **Tests:** `c64_stop_mutes_only_with_trx_io` (ue2-core), `c64_mute_cuts_the_output_and_the_release_brings_the_tone_back`
+- **Tests:** `c64_stop_mutes` (ue2-core), `c64_mute_cuts_the_output_and_the_release_brings_the_tone_back`
   (c64-bridge: 100 ms of zeros under C64_STOP alone with the SID running, 100 ms of zeros paused with the SID standing,
   the 1000 Hz tone back after each release), `the_mute_silences_the_voices_and_drains_them` (sampler).
   `scripts/smoke-trx-freeze.sh` plays a 1000 Hz tone before the freeze into `--audio-wav`: the WAV holds one stretch
