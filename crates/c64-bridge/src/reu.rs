@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use trx64_core::expansion::ExpansionRam;
 
+use crate::hwlog::{HwLog, Space};
+
 /// `REU_MEMORY_BASE` (c64.h:14): where the REU's RAM lives in guest DDR. The same region the U64 cart logic serves as
 /// GeoRAM (`cart::GEORAM_BASE`), which is why the firmware has one setting for both (c64.cc:90).
 pub const REU_BASE: usize = 0x0100_0000;
@@ -33,8 +35,9 @@ pub const REU_MAX_SIZE: u32 = 0x0100_0000;
 pub const DEFAULT_SIZE_KB: u32 = REU_MAX_SIZE / 1024;
 
 /// Guest DDR at [`REU_BASE`] as the REU's store, shared between the backend (which lends) and the `Reu` TRX64 holds.
+/// S38: every byte the REU's DMA writes goes to the write log as well (hwlog.rs).
 #[derive(Clone, Default)]
-pub struct ReuRam(Arc<Cell>);
+pub struct ReuRam(Arc<Cell>, HwLog);
 
 #[derive(Default)]
 struct Cell(UnsafeCell<State>);
@@ -54,6 +57,11 @@ struct State {
 }
 
 impl ReuRam {
+    /// A store whose writes go to `log`.
+    pub fn with_log(log: HwLog) -> ReuRam {
+        ReuRam(Arc::default(), log)
+    }
+
     fn get(&self) -> State {
         // SAFETY: `State` is `Copy`; this reads it out without holding a reference across anything.
         unsafe { *self.0 .0.get() }
@@ -110,6 +118,8 @@ impl ExpansionRam for ReuRam {
 
     fn write(&mut self, off: u32, value: u8) {
         if let Some(p) = self.at(off) {
+            // SAFETY: as in `read`.
+            self.1.note(Space::Ddr, REU_BASE + off as usize, unsafe { *p }, value);
             // SAFETY: as in `read`.
             unsafe { *p = value };
         }

@@ -12,6 +12,8 @@ use trx64_core::checkpoint_ring::RuntimeCheckpointRing;
 use trx64_monitor::addr_spans::{self, Role, Space};
 use trx64_monitor::host::Files;
 use trx64_monitor::{verbs, MonitorHost, MonitorSession};
+use ue2_core::c64host::C64Backend;
+use ue2_core::devices::c64::C64Port;
 
 use super::{trx64, Host};
 
@@ -155,6 +157,33 @@ fn backend<'h>(host: &'h mut Host) -> &'h mut Trx64Backend {
     trx64(host.m).expect("a host has a C64")
 }
 
+/// The backend with guest DDR lent for the call, as the firmware's accesses lend it: a restore puts UE2's memories
+/// (cartridge, REU, GeoRAM) back into it from the write log (S38 §4.1).
+fn with_ddr<R>(host: &mut Host, f: impl FnOnce(&mut Trx64Backend) -> R) -> R {
+    let bus = &mut host.m.bus;
+    let b = bus
+        .io
+        .get_mut::<C64Port>()
+        .and_then(|p| p.backend_mut())
+        .and_then(|b| b.as_any_mut())
+        .and_then(|a| a.downcast_mut::<Trx64Backend>())
+        .expect("a host has a C64");
+    b.lend_ddr(Some(&mut bus.ram[..]));
+    let out = f(b);
+    b.lend_ddr(None);
+    out
+}
+
+/// What the last restore could not put back, one line each under the status line.
+fn with_notes(host: &mut Host, mut line: String) -> String {
+    if let Some(ring) = backend(host).ring() {
+        for n in &ring.notes {
+            line.push_str(&format!("\n  note: {n}"));
+        }
+    }
+    line
+}
+
 /// The ring, or the sentence for its absence.
 fn ring_of<'h>(host: &'h mut Host, verb: &str) -> Result<&'h mut c64_bridge::Ring, String> {
     backend(host).ring_mut().ok_or_else(|| format!("{verb}: the rings are off (--ring=off)"))
@@ -255,8 +284,9 @@ fn move_to(host: &mut Host, index: usize, mode: RingMode) -> Result<String, Stri
         return Err("transport: the checkpoint ring is empty \u{2014} nothing to rewind to (it fills while the C64 runs at 1 MHz)".into());
     }
     let id = ids[index.min(ids.len() - 1)].0.clone();
-    backend(host).ring_goto(&id, mode).map_err(|e| format!("transport: {e}"))?;
-    Ok(status_line(host))
+    with_ddr(host, |b| b.ring_goto(&id, mode)).map_err(|e| format!("transport: {e}"))?;
+    let line = status_line(host);
+    Ok(with_notes(host, line))
 }
 
 /// `goto <frame> | goto c<cycle> | goto @<cycle> | goto <mark>` (trx64-daemon `transport_goto`).
@@ -317,6 +347,11 @@ fn rewind(host: &mut Host) -> Result<String, String> {
         (ring.anchors.max_entries(), ring.cadence_frames.max(1), ring.window_seconds, ring.ids().is_empty());
     let mut lines = vec![status_line(host), range_line(host)];
     lines.push(format!("  cap {cap} anchors   cadence every {cadence} frame(s)   window {window:.1}s"));
+    let (recs, bytes) = backend(host).ue2_log();
+    lines.push(format!(
+        "  UE2 write log: {recs} write(s), {:.1} MiB (cartridge, REU, GeoRAM, EEPROM)",
+        bytes as f64 / (1024.0 * 1024.0)
+    ));
     if empty {
         lines.push("  nothing captured yet \u{2014} the ring fills while the C64 runs at 1 MHz".into());
     }
@@ -460,8 +495,8 @@ fn ringdump(host: &mut Host, args: &[&str]) -> Result<String, String> {
 fn ringload(host: &mut Host, args: &[&str]) -> Result<String, String> {
     let [path] = args else { return Err("ringload: usage: ringload <path.c64rering>".into()) };
     let bytes = host.state.files.read(path).map_err(|e| format!("ringload: {e}"))?;
-    let info = backend(host).ring_load(&bytes).map_err(|e| format!("ringload: {e}"))?;
-    Ok(format!(
+    let info = with_ddr(host, |b| b.ring_load(&bytes)).map_err(|e| format!("ringload: {e}"))?;
+    let line = format!(
         "ringload: restored {} anchor(s), {} delta entr(ies), {} cpu-history from {path}  (current={}, cycles {}\u{2013}{})\n  now: `goto`, `frame`, `rstep`, `whowrote`, `chis` work on this buffer; `run` continues from here",
         info.anchors,
         info.delta_entries,
@@ -469,7 +504,8 @@ fn ringload(host: &mut Host, args: &[&str]) -> Result<String, String> {
         info.current_id.as_deref().unwrap_or("none"),
         info.cycle_first,
         info.cycle_last
-    ))
+    );
+    Ok(with_notes(host, line))
 }
 
 /// `rstep [n]`: undo the last n instructions from the delta ring (TRX64 `Machine::reverse_step`). The C64 is stopped

@@ -24,7 +24,8 @@ use trx64_core::cart::{BankInfo, CartLines, CartMapper, CartState, MapperType};
 use trx64_core::expansion::{Access, ExpansionDevice};
 use ue2_core::c64host::CartRom;
 
-use crate::cart_eeprom::Eeprom;
+use crate::cart_eeprom::{Eeprom, EepromRegs};
+use crate::hwlog::{HwLog, Space};
 use crate::slot::SlotHandle;
 
 /// C64_CARTRIDGE_TYPE bits 4:0 select the logic, bits 7:5 the variant (c64.h:115-163, cart_slot_registers.vhd).
@@ -131,6 +132,7 @@ struct Ddr {
 
 /// freezer.vhd states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum Freeze {
     Idle,
     /// Button pushed: the cart pulls NMI (and IRQ) and waits for the 6510's interrupt pushes.
@@ -139,6 +141,33 @@ enum Freeze {
     Active,
     /// Unfrozen; waiting for the button to be released.
     Button,
+}
+
+impl Freeze {
+    const ALL: [Freeze; 4] = [Freeze::Idle, Freeze::Triggered, Freeze::Active, Freeze::Button];
+}
+
+/// S38: what the C64 program set in the logic, for an anchor (docs/specs/S38-trx64-ring.md §4.1). Not here, because
+/// the firmware or the host owns them: the GeoRAM mask (C64_REU_SIZE), the freeze button, the ROM's place in DDR and
+/// the DDR itself. The memory the logic writes is in the write log, not here.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CartRegs {
+    /// The type the registers belong to: `cart_logic_d` and the variant.
+    pub logic: u8,
+    pub variant: u8,
+    mode: u8,
+    bank: u32,
+    ram_bank: u32,
+    georam_bank: u32,
+    ef_write: bool,
+    cart_en: bool,
+    do_io2: bool,
+    allow_bank: bool,
+    hold_nmi: bool,
+    freeze: u8,
+    epyx_armed: u64,
+    clk: u64,
+    eeprom: EepromRegs,
 }
 
 /// What `CartMapper::read`/`write` resolve to (all_carts_v5.vhd `addr_map`).
@@ -201,6 +230,8 @@ pub struct CartLogic {
     ddr: Option<Ddr>,
     /// Where ROM, cart RAM and GeoRAM are in the lent memory.
     layout: Layout,
+    /// S38: the write log the logic's memory writes go to, and the space they are in.
+    log: Option<(HwLog, Space)>,
 }
 
 impl Default for CartLogic {
@@ -242,7 +273,66 @@ impl CartLogic {
             epyx_armed: 0,
             clk: 0,
             ddr: None,
+            log: None,
         }
+    }
+
+    /// S38: log every write the logic makes into its memory, as `space`. The internal cartridge's EEPROM logs too.
+    pub fn set_log(&mut self, log: HwLog, space: Space) {
+        if space == Space::Ddr {
+            self.eeprom.set_log(Some(log.clone()));
+        }
+        self.log = Some((log, space));
+    }
+
+    /// S38: the registers the C64 program set, for an anchor.
+    pub fn regs(&self) -> CartRegs {
+        CartRegs {
+            logic: self.logic,
+            variant: self.variant,
+            mode: self.mode,
+            bank: self.bank,
+            ram_bank: self.ram_bank,
+            georam_bank: self.georam_bank,
+            ef_write: self.ef_write,
+            cart_en: self.cart_en,
+            do_io2: self.do_io2,
+            allow_bank: self.allow_bank,
+            hold_nmi: self.hold_nmi,
+            freeze: self.freeze as u8,
+            epyx_armed: self.epyx_armed,
+            clk: self.clk,
+            eeprom: self.eeprom.regs(),
+        }
+    }
+
+    /// S38: an anchor's registers back. Refused, and nothing changes, when they belong to another type.
+    pub fn set_regs(&mut self, r: &CartRegs) -> Result<(), String> {
+        if (r.logic, r.variant) != (self.logic, self.variant) {
+            return Err(format!(
+                "the anchor's cartridge type is {:#04x}, the live one {:#04x}",
+                r.logic | (r.variant << 5),
+                self.logic | (self.variant << 5)
+            ));
+        }
+        (self.mode, self.bank, self.ram_bank, self.georam_bank) = (r.mode, r.bank, r.ram_bank, r.georam_bank);
+        (self.ef_write, self.cart_en, self.do_io2, self.allow_bank) = (r.ef_write, r.cart_en, r.do_io2, r.allow_bank);
+        self.hold_nmi = r.hold_nmi;
+        self.freeze = Freeze::ALL.get(usize::from(r.freeze)).copied().unwrap_or(Freeze::Idle);
+        (self.epyx_armed, self.clk) = (r.epyx_armed, r.clk);
+        self.eeprom.set_regs(&r.eeprom);
+        self.settle();
+        Ok(())
+    }
+
+    /// S38: a byte of the internal GMOD2 EEPROM the write log puts back.
+    pub fn eeprom_poke(&mut self, addr: usize, val: u8) {
+        self.eeprom.poke(addr, val);
+    }
+
+    /// The type and variant as C64_CARTRIDGE_TYPE writes them.
+    pub fn type_variant(&self) -> u8 {
+        self.logic | (self.variant << 5)
     }
 
     /// Guest DDR for the accesses that follow (`None`: taken back). Without it ROM and RAM windows read as not served.
@@ -630,7 +720,13 @@ impl CartLogic {
     fn ddr_write(&mut self, off: usize, val: u8) {
         if let Some(ddr) = self.ddr.filter(|d| off < d.len) {
             // SAFETY: as in `ddr_read`.
-            unsafe { *ddr.ptr.add(off) = val };
+            let p = unsafe { ddr.ptr.add(off) };
+            if let Some((log, space)) = &self.log {
+                // SAFETY: as in `ddr_read`.
+                log.note(*space, off, unsafe { *p }, val);
+            }
+            // SAFETY: as in `ddr_read`.
+            unsafe { *p = val };
         }
     }
 
