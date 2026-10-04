@@ -2511,6 +2511,60 @@ mod tests {
         assert!(screen_has(&c64, "READY."));
     }
 
+    /// `goto` shows the anchor's picture at once: the frame the VIC showed when the anchor was taken, not the last one
+    /// drawn live. Showing it runs nothing: the C64's state, its cycle, UE2's memories and the UCI block are what the
+    /// restore left.
+    #[test]
+    fn goto_shows_the_anchors_picture_without_running_anything() {
+        let Some((mut c64, mut now)) = ringed() else { return };
+        // No cursor blink, so the screen stands still between frames.
+        c64.m.ram[0xCC] = 1;
+        run_ms(&mut c64, &mut now, 100);
+        let shown = c64.frame().indices;
+        let id = c64.ring().unwrap().ids().last().unwrap().0.clone();
+        let cycles = c64.ring().unwrap().anchors.get(&id).unwrap().cycles;
+        c64.m.write_full(0xD020, 2);
+        run_ms(&mut c64, &mut now, 100);
+        let live = c64.frame().indices;
+        assert_ne!(live, shown, "the border went red");
+        let (distinct, _) = c64.ring().unwrap().pictures();
+        assert!(distinct >= 2, "a changed picture is a new one: {distinct}");
+
+        c64.ring_goto(&id, RingMode::StepBack).unwrap();
+        assert_eq!(c64.frame().indices, shown, "the anchor's picture");
+        let notes = &c64.ring().unwrap().notes;
+        assert!(!notes.iter().any(|n| n.contains("picture")), "the session kept it: {notes:?}");
+        assert_eq!(c64.m.c64_core.clk, cycles);
+
+        // Showing it again, from the kept picture and drawn from the registers, changes nothing but the picture.
+        let state = |c: &Trx64Backend| {
+            let cp = trx64_core::c64re_snapshot::capture_runtime_checkpoint_with(
+                &c.m,
+                "",
+                "",
+                None,
+                None,
+                None,
+                None,
+                trx64_core::c64re_snapshot::CaptureOpts { omit_framebuffer: true, omit_expansion_ram: true },
+            );
+            (cp, c.ue2_log(), c.cart.with(|l| l.regs()), c.m.uci().map(|u| u.status()))
+        };
+        let before = state(&c64);
+        let note = c64.show_picture(None).expect("drawn from the registers says so");
+        assert!(note.contains("no raster splits"), "{note}");
+        let drawn = c64.frame().indices;
+        assert_eq!((drawn[4 * 384 + 4], drawn[220 * 384 + 340]), (14, 6), "the anchor's border and background");
+        assert!(state(&c64) == before, "drawing changed the machine");
+        c64.ring_goto(&id, RingMode::StepBack).unwrap();
+        assert_eq!(c64.frame().indices, shown);
+
+        // The release runs on from the anchor, and the live frames follow.
+        c64.ring_release();
+        run_ms(&mut c64, &mut now, 100);
+        assert_eq!(c64.frame().indices, shown, "the border was blue at the anchor and stays so");
+    }
+
     /// The firmware's parts stay live through a restore: the UCI block stays enabled, the turbo enable word stays
     /// the firmware's, and the anchor's model must be the one the firmware runs.
     #[test]
@@ -2543,17 +2597,23 @@ mod tests {
     fn ringdump_and_ringload_round_trip() {
         let Some((mut c64, mut now)) = ringed() else { return };
         c64.m.ram[0xC000] = 0x33;
+        c64.m.ram[0xCC] = 1;
         run_ms(&mut c64, &mut now, 100);
         let ids = c64.ring().unwrap().ids();
         c64.ring_mut().unwrap().anchors.set_mark(&ids[2].0, "here").unwrap();
         let (bytes, info) = c64.ring_dump().unwrap();
+        let shown = c64.frame().indices;
         assert_eq!(&bytes[..8], b"C64RERNG");
         assert_eq!(info.anchors, ids.len() as u64);
         let (head, delta, chis) = (ids.last().unwrap().clone(), c64.m.delta_ring.len(), c64.m.cpu_history.len());
 
         c64.m.ram[0xC000] = 0x44;
+        c64.m.write_full(0xD020, 2);
         run_ms(&mut c64, &mut now, 100);
         let loaded = c64.ring_load(&bytes).unwrap();
+        assert_eq!(c64.frame().indices, shown, "this session's picture of the file's anchor");
+        let notes = &c64.ring().unwrap().notes;
+        assert!(!notes.iter().any(|n| n.contains("picture")), "{notes:?}");
         assert_eq!(loaded.anchors, ids.len() as u64);
         assert_eq!(c64.ring().unwrap().ids(), ids);
         assert_eq!(c64.ring().unwrap().anchors.mark_id("here"), Some(ids[2].0.clone()));
