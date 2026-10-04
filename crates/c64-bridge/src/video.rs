@@ -49,7 +49,18 @@ pub fn frame(m: &Machine, palette: &Palette) -> C64Frame {
         0x1800 => C64Charset::Lower,
         _ => C64Charset::Ram,
     };
-    C64Frame { width, height, indices, palette: palette.rgb(), screen, charset }
+    let window = &m.model().window;
+    C64Frame {
+        width,
+        height,
+        indices,
+        palette: palette.rgb(),
+        screen,
+        charset,
+        text_x: usize::from(window.border_left),
+        first_line: usize::from(window.first_line),
+        raster_lines: usize::from(window.raster_lines),
+    }
 }
 
 #[cfg(test)]
@@ -74,6 +85,7 @@ mod tests {
         m.vic.write_reg(VIC_MEM_PTR, 0x14);
         let shot = frame(&m, &Palette::default());
         assert_eq!((shot.width, shot.height, shot.indices.len()), (384, 272, 384 * 272));
+        assert_eq!((shot.text_x, shot.first_line, shot.raster_lines), (32, 16, 312), "PAL: 32 border pixels, line 16");
         assert_eq!((shot.screen.len(), shot.screen[0], shot.screen[999]), (SCREEN_CELLS, 0x08, 0x2E), "$D018 $14: $0400");
         assert_eq!(shot.charset, C64Charset::Upper);
         m.vic.write_reg(VIC_MEM_PTR, 0x86);

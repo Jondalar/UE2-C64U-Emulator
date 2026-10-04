@@ -14,4 +14,4 @@ pub mod settings;
 pub mod symbols;
 pub mod time;
 
-pub use machine::{Machine, MachineConfig, RunExit};
+pub use machine::{Machine, MachineConfig, RunExit, TrxIo};

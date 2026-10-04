@@ -18,7 +18,7 @@ use crate::devices::overlay::{
     REG_ACTIVE_LINES, REG_CHARS_PER_LINE, REG_CHAR_HEIGHT, REG_CHAR_WIDTH, REG_POINTER_HI, REG_POINTER_LO,
     REG_TRANSPARENCY, REG_X_ON_HI, REG_X_ON_LO, REG_Y_ON_HI, REG_Y_ON_LO, TEXT_RAM_SIZE,
 };
-use crate::host::DisplaySnapshot;
+use crate::host::{DisplaySnapshot, TrxLayer};
 
 /// Colour of transparent pixels and of the whole image while the overlay is hidden, where no C64 frame shows
 /// through.
@@ -200,6 +200,8 @@ pub struct Renderer {
     pub big_font: Vec<u64>,
     /// The overlay drawn at canvas size, [`CLEAR`] where it shows nothing; kept between frames for its allocation.
     layer: Vec<u32>,
+    /// S37: the TRX composite at its own size, when the image is made at another; kept for its allocation.
+    composite: Vec<u32>,
 }
 
 impl Renderer {
@@ -212,7 +214,7 @@ impl Renderer {
                 wide | (wide << 12) | (wide << 24)
             })
             .collect();
-        Renderer { font: font.to_vec(), big_font, layer: Vec::new() }
+        Renderer { font: font.to_vec(), big_font, layer: Vec::new(), composite: Vec::new() }
     }
 
     /// Render the overlay into 0x00RRGGBB pixels; returns (width, height).
@@ -227,15 +229,26 @@ impl Renderer {
     /// transparent overlay pixels show the C64 through, as the chargen's `pixel_opaque` does (05 §B, OQ 3).
     ///
     /// Before that, and without a C64, the canvas covers frame and grid, both centred, as it always did.
+    ///
+    /// While the TRX pixel layer is on (`snap.trx`, S37) the image is the TRX output instead: 1920 × 1080 or half
+    /// that ([`trx_canvas`]).
     pub fn render(&mut self, snap: &DisplaySnapshot, out: &mut Vec<u32>) -> (usize, usize) {
         let canvas = Self::canvas(snap);
         self.render_scaled(snap, out, canvas);
         canvas
     }
 
-    /// The size of the image [`Renderer::render`] makes for `snap`: the output mode once the firmware has programmed
-    /// one, else frame and grid covered.
+    /// The size of the image [`Renderer::render`] makes for `snap`: the TRX composite while its pixel layer is on
+    /// (S37), else the output mode once the firmware has programmed one, else frame and grid covered.
     pub fn canvas(snap: &DisplaySnapshot) -> (usize, usize) {
+        match &snap.trx {
+            Some(layer) => trx_canvas(snap, layer),
+            None => Self::output_canvas(snap),
+        }
+    }
+
+    /// [`Renderer::canvas`] without the TRX layer: the canvas the overlay window is placed on.
+    fn output_canvas(snap: &DisplaySnapshot) -> (usize, usize) {
         let geo = Geometry::new(&snap.regs);
         let (w, h) = (geo.cols * geo.char_width, geo.rows * geo.lines().len());
         let (gw, gh) = if w == 0 || h == 0 { DEFAULT_SIZE } else { (w, h) };
@@ -250,12 +263,13 @@ impl Renderer {
     /// image instead rounds twice, through the output mode's own non-integer ratios, and the C64 font comes out
     /// uneven. At `size` = [`Renderer::canvas`] it is `render`.
     pub fn render_scaled(&mut self, snap: &DisplaySnapshot, out: &mut Vec<u32>, size: (usize, usize)) {
-        let geo = Geometry::new(&snap.regs);
-        let lines = geo.lines();
-        let (w, h) = (geo.cols * geo.char_width, geo.rows * lines.len());
+        if let Some(layer) = &snap.trx {
+            self.render_trx(snap, layer, out, size);
+            return;
+        }
         let output = Output::new(&snap.hdmi);
         let picture = Picture::new(&snap.hdmi, &snap.cropper);
-        let (cw, ch) = Self::canvas(snap);
+        let canvas = Self::output_canvas(snap);
         let (tw, th) = size;
         out.clear();
         out.resize(tw * th, BACKDROP);
@@ -263,8 +277,53 @@ impl Renderer {
             return;
         }
         if let Some(frame) = &snap.c64 {
-            draw_c64(frame, output.is_some().then_some(picture.as_ref()), out, (cw, ch), size);
+            draw_c64(frame, output.is_some().then_some(picture.as_ref()), out, canvas, size);
         }
+        self.blend_overlay(snap, out, size);
+    }
+
+    /// S37: the TRX output picture (docs/specs/S37-trx-pixel-layer.md §1), made at [`trx_canvas`] and resampled to
+    /// `size`: the C64 as vic_scaler.v places it, the overlay window over it as [`Renderer::render_scaled`] puts it,
+    /// and the pixel layer on top.
+    fn render_trx(&mut self, snap: &DisplaySnapshot, layer: &TrxLayer, out: &mut Vec<u32>, size: (usize, usize)) {
+        let canvas = trx_canvas(snap, layer);
+        let (cw, ch) = canvas;
+        let (tw, th) = size;
+        let direct = canvas == size;
+        let mut comp = if direct { std::mem::take(out) } else { std::mem::take(&mut self.composite) };
+        comp.clear();
+        comp.resize(cw * ch, 0);
+        if let Some(frame) = &snap.c64 {
+            draw_c64_trx(frame, &mut comp, canvas);
+        }
+        self.blend_overlay(snap, &mut comp, canvas);
+        draw_layer(layer, &mut comp, canvas);
+        if direct {
+            *out = comp;
+            return;
+        }
+        out.clear();
+        out.resize(tw * th, BACKDROP);
+        if tw != 0 && th != 0 {
+            let xs: Vec<usize> = (0..tw).map(|x| x * cw / tw).collect();
+            for y in 0..th {
+                let row = &comp[(y * ch / th) * cw..][..cw];
+                for (px, &x) in out[y * tw..][..tw].iter_mut().zip(&xs) {
+                    *px = row[x];
+                }
+            }
+        }
+        self.composite = comp;
+    }
+
+    /// The overlay window at half strength over `out`, a `size` image of the output canvas.
+    fn blend_overlay(&mut self, snap: &DisplaySnapshot, out: &mut [u32], size: (usize, usize)) {
+        let geo = Geometry::new(&snap.regs);
+        let lines = geo.lines();
+        let (w, h) = (geo.cols * geo.char_width, geo.rows * lines.len());
+        let output = Output::new(&snap.hdmi);
+        let (cw, ch) = Self::output_canvas(snap);
+        let (tw, th) = size;
         if w != 0 && h != 0 && geo.visible {
             let origin = match &output {
                 Some(o) => (geo.x_on.saturating_sub(o.x0), geo.y_on.saturating_sub(o.y0)),
@@ -414,6 +473,127 @@ fn axis(target: usize, canvas: usize, (off, len, span): (usize, usize, usize), h
         .collect()
 }
 
+/// S37: the size the TRX composite is made at. 960 × 540 when every layer pixel is a 2 × 2 block on even output
+/// coordinates (S = 2, x0 and y0 even, LVGL's case) and no overlay window is up, whose text is drawn 1:1 in the output
+/// mode; 1920 × 1080 otherwise.
+fn trx_canvas(snap: &DisplaySnapshot, layer: &TrxLayer) -> (usize, usize) {
+    let geo = Geometry::new(&snap.regs);
+    let overlay = geo.visible && geo.cols * geo.char_width != 0 && geo.rows != 0;
+    if layer.scale == 2 && layer.x0 % 2 == 0 && layer.y0 % 2 == 0 && !overlay {
+        (TRX_W / 2, TRX_H / 2)
+    } else {
+        (TRX_W, TRX_H)
+    }
+}
+
+/// The TRX output frame (vic_scaler.v).
+const TRX_W: usize = 1920;
+const TRX_H: usize = 1080;
+/// vic_scaler.v: the C64 window's first raster column and line (50 Hz `X0`, `Y0`; 60 Hz `Y0_60`), the raster column
+/// of the first text-area pixel (its `x_text` calibration, T40: 136 in PAL and NTSC), and where its 1600 output
+/// pixels start (`X_WIN0`).
+const TRX_X0: usize = 96;
+const TRX_Y0: usize = 16;
+const TRX_Y0_60: usize = 31;
+const TRX_X_TEXT: usize = 136;
+const TRX_X_WIN0: usize = 160;
+/// vic_scaler.v: the 400 VIC columns of the window, and the line where a 60 Hz window wraps to line 0.
+const TRX_WIN_W: usize = 400;
+const TRX_WRAP_60: usize = 263;
+/// vic_scaler.v `palette`: the bitstream's own colours, whatever the firmware writes to C64_PALETTE.
+const TRX_PALETTE: [u32; 16] = [
+    0x000000, 0xFFFFFF, 0x813338, 0x75CEC8, 0x8E3C97, 0x56AC4D, 0x2E2C9B, 0xEDF171, 0x8E5029, 0x553800, 0xC46C71,
+    0x4A4A4A, 0x7B7B7B, 0xA9FF9F, 0x706DEB, 0xB2B2B2,
+];
+
+/// S37: the C64 frame as vic_scaler.v puts it into the 1920 × 1080 output, on a `canvas` of that or half its size:
+/// a window of 400 VIC columns from raster column 96, four output pixels each, from x 160 (black bars of 160 left and
+/// right); 270 lines from raster line 16 at four output lines each, or at 60 Hz (a frame of fewer than 300 lines) 240
+/// lines from line 31 at 5, 4, 5, 4 output lines (`acc` += 2 per line, the next VIC line at 9).
+///
+/// The frame is TRX64's canvas, which starts elsewhere in the raster and is narrower than the window: columns map
+/// through the text area's first pixel, lines through the frame's first line, and the window's columns beyond the
+/// canvas repeat its edge pixel.
+fn draw_c64_trx(frame: &C64Frame, out: &mut [u32], canvas: (usize, usize)) {
+    let (cw, ch) = canvas;
+    if frame.width == 0 || frame.height == 0 {
+        return;
+    }
+    let k = TRX_W / cw;
+    let (text_x, first, lines) = match frame.raster_lines {
+        0 => (32, 16, 312),
+        n => (frame.text_x, frame.first_line, n),
+    };
+    let v60 = lines < 300;
+    let cols: Vec<Option<usize>> = (0..cw)
+        .map(|x| {
+            let fx = (x * k).checked_sub(TRX_X_WIN0).filter(|&fx| fx < TRX_WIN_W * 4)?;
+            let col = (TRX_X0 + fx / 4 + text_x).saturating_sub(TRX_X_TEXT);
+            Some(col.min(frame.width - 1))
+        })
+        .collect();
+    for y in 0..ch {
+        let fy = y * k;
+        let line = if v60 {
+            let ln = fy / 9 * 2 + usize::from(fy % 9 >= 5);
+            (TRX_Y0_60 + ln) % TRX_WRAP_60
+        } else {
+            TRX_Y0 + fy / 4
+        };
+        let row = if line < first { line + lines } else { line } - first;
+        let src = &frame.indices[row.min(frame.height - 1) * frame.width..][..frame.width];
+        for (px, col) in out[y * cw..][..cw].iter_mut().zip(&cols) {
+            if let Some(col) = col {
+                *px = TRX_PALETTE[usize::from(src[*col] & 0x0F)];
+            }
+        }
+    }
+}
+
+/// S37: the pixel layer over `out`, a `canvas` of the 1920 × 1080 output or of half its size (pix_layer.v): source
+/// pixel (p, m) covers output pixels x0 + S·p .. + S, y0 + S·m .. + S, clipped at the frame's edge. A pixel equal to the
+/// key is transparent, every other one is blended with the global alpha.
+fn draw_layer(layer: &TrxLayer, out: &mut [u32], canvas: (usize, usize)) {
+    let (cw, ch) = canvas;
+    let k = TRX_W / cw;
+    let s = layer.scale.max(1);
+    for y in layer.y0.div_ceil(k)..ch {
+        let m = (y * k - layer.y0) / s;
+        if m >= layer.h {
+            break;
+        }
+        let src = &layer.pixels[m * layer.w..][..layer.w];
+        for x in layer.x0.div_ceil(k)..cw {
+            let p = (x * k - layer.x0) / s;
+            if p >= layer.w {
+                break;
+            }
+            if layer.key != Some(src[p]) {
+                let px = &mut out[y * cw + x];
+                *px = trx_blend(widen_565(src[p]), *px, layer.alpha);
+            }
+        }
+    }
+}
+
+/// RGB565 to 0x00RRGGBB, each channel widened by repeating its top bits (pix_layer.v `fg888`), so 0 and full scale
+/// stay 0 and 255.
+pub fn widen_565(c: u16) -> u32 {
+    let c = u32::from(c);
+    let (r, g, b) = (c >> 11, (c >> 5) & 0x3F, c & 0x1F);
+    (r << 3 | r >> 2) << 16 | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2)
+}
+
+/// `fg` over `bg` per channel with the blend factor `a` (0-256): `bg + ((fg - bg) · a) >> 8`, the shift arithmetic
+/// (pix_layer.v E5-E8). The result never leaves 0-255: it lies between bg and fg.
+pub fn trx_blend(fg: u32, bg: u32, a: u16) -> u32 {
+    let mix = |shift: u32| {
+        let (f, b) = (((fg >> shift) & 0xFF) as i32, ((bg >> shift) & 0xFF) as i32);
+        ((b + (((f - b) * i32::from(a)) >> 8)) as u32) << shift
+    };
+    mix(16) | mix(8) | mix(0)
+}
+
 /// Whether `font` is a C64 character ROM rather than the firmware's overlay font (issue #3). The overlay font
 /// (`roms/chars.bin`, 2 KB) has its glyphs at their ASCII codes, so 'A' is glyph 0x41; the C64 ROM (4 KB) puts 'A'
 /// at screen code 1 and a graphics symbol at 0x41. A roms directory built from C64 ROMs therefore draws the whole
@@ -525,7 +705,7 @@ mod tests {
         for (i, rgb) in PAL.iter().enumerate() {
             palette[i * 4..i * 4 + 3].copy_from_slice(&rgb.to_be_bytes()[1..]);
         }
-        DisplaySnapshot { regs, screen: vec![0x20; 4096], color: vec![0; 4096], palette, hdmi: [0; 0x1E], cropper: [0; 4], now_ms: 0, c64: None }
+        DisplaySnapshot { regs, screen: vec![0x20; 4096], color: vec![0; 4096], palette, hdmi: [0; 0x1E], cropper: [0; 4], now_ms: 0, c64: None, trx: None }
     }
 
     /// A `w` × `h` C64 frame of colour index 3 = `C64_BLUE`.
@@ -852,5 +1032,150 @@ mod tests {
         s.regs[REG_ACTIVE_LINES] = 1;
         assert_eq!(text_dump(&s), "+-+\n");
         assert_eq!(text_dump(&DisplaySnapshot::default()), "");
+    }
+
+    /// pix_layer.v E5-E8 bit for bit: a 9-bit signed difference times the 9-bit factor, bits 15:8 of the product
+    /// added to bg in 8 bits.
+    fn verilog_blend(fg: u8, bg: u8, galpha: u8) -> u8 {
+        let a = i32::from(galpha) + i32::from(galpha >> 7);
+        let product = (i32::from(fg) - i32::from(bg)) * a;
+        let p8 = (product as u32 >> 8) & 0xFF;
+        (u32::from(bg) + p8) as u8
+    }
+
+    #[test]
+    fn rgb565_widens_by_repeating_the_top_bits() {
+        assert_eq!(widen_565(0x0000), 0x00_0000);
+        assert_eq!(widen_565(0xFFFF), 0xFF_FFFF);
+        assert_eq!((widen_565(0xF800), widen_565(0x07E0), widen_565(0x001F)), (0xFF_0000, 0x00_FF00, 0x00_00FF));
+        assert_eq!(widen_565(0x8410), 0x84_8284, "R 10000 -> 10000100, G 100000 -> 10000010");
+    }
+
+    #[test]
+    fn the_blend_is_the_verilogs_arithmetic() {
+        for galpha in [0u8, 1, 127, 128, 200, 254, 255] {
+            let a = u16::from(galpha) + u16::from(galpha >> 7);
+            for fg in (0..=255u8).step_by(5) {
+                for bg in (0..=255u8).step_by(3) {
+                    let want = verilog_blend(fg, bg, galpha);
+                    let got = trx_blend(u32::from(fg) << 16 | u32::from(bg), u32::from(bg) << 16 | u32::from(fg), a);
+                    assert_eq!((got >> 16) as u8, want, "fg {fg} bg {bg} G {galpha}");
+                    assert_eq!(got as u8, verilog_blend(bg, fg, galpha), "the other way round");
+                }
+            }
+        }
+        assert_eq!(trx_blend(0x12_3456, 0xAB_CDEF, 256), 0x12_3456, "G 255: the layer, exactly");
+        assert_eq!(trx_blend(0x12_3456, 0xAB_CDEF, 0), 0xAB_CDEF, "G 0: the picture below");
+        assert_eq!(trx_blend(0xFF_0000, 0x00_00FF, 129), 0x80_007E, "G 128: a = 129, the shift floors");
+    }
+
+    /// A snapshot with the TRX layer `layer` on, no overlay window and no C64.
+    fn trx_snap(layer: TrxLayer) -> DisplaySnapshot {
+        DisplaySnapshot { trx: Some(layer), ..DisplaySnapshot::default() }
+    }
+
+    fn trx_layer(x0: usize, y0: usize, w: usize, h: usize, scale: usize, pixels: Vec<u16>) -> TrxLayer {
+        TrxLayer { x0, y0, w, h, scale, alpha: 256, key: None, pixels }
+    }
+
+    const RED: u32 = 0xFF_0000;
+    const BLUE: u32 = 0x00_00FF;
+
+    #[test]
+    fn the_layer_scales_by_s_and_clips_at_the_frame() {
+        let mut r = Renderer::new(&font());
+        let mut out = Vec::new();
+        let s = trx_snap(trx_layer(10, 20, 2, 1, 3, vec![0xF800, 0x001F]));
+        assert_eq!(r.render(&s, &mut out), (1920, 1080));
+        let px = |out: &[u32], x: usize, y: usize| out[y * 1920 + x];
+        assert!((10..13).all(|x| (20..23).all(|y| px(&out, x, y) == RED)), "3 x 3");
+        assert!((13..16).all(|x| px(&out, x, 22) == BLUE));
+        assert_eq!((px(&out, 9, 20), px(&out, 16, 20), px(&out, 10, 23)), (0, 0, 0));
+
+        let s = trx_snap(trx_layer(5, 7, 2, 1, 1, vec![0xF800, 0x001F]));
+        r.render(&s, &mut out);
+        assert_eq!((px(&out, 5, 7), px(&out, 6, 7), px(&out, 7, 7), px(&out, 5, 8)), (RED, BLUE, 0, 0), "1 x 1");
+
+        let s = trx_snap(trx_layer(1918, 1079, 4, 3, 1, vec![0xFFFF; 12]));
+        r.render(&s, &mut out);
+        assert_eq!(out.iter().filter(|&&p| p != 0).count(), 2, "clipped to 1918-1919 of line 1079");
+    }
+
+    #[test]
+    fn scale_2_on_even_coordinates_is_built_at_half_size() {
+        let mut r = Renderer::new(&font());
+        let mut out = Vec::new();
+        let s = trx_snap(trx_layer(100, 50, 2, 2, 2, vec![0xF800, 0x001F, 0x001F, 0xF800]));
+        assert_eq!(r.render(&s, &mut out), (960, 540));
+        let px = |out: &[u32], x: usize, y: usize| out[y * 960 + x];
+        assert_eq!((px(&out, 50, 25), px(&out, 51, 25), px(&out, 50, 26), px(&out, 52, 25)), (RED, BLUE, BLUE, 0));
+        let s = trx_snap(trx_layer(101, 50, 2, 2, 2, vec![0xF800; 4]));
+        assert_eq!(Renderer::canvas(&s), (1920, 1080), "odd x0");
+        let mut s = trx_snap(trx_layer(100, 50, 2, 2, 2, vec![0xF800; 4]));
+        s.regs = snap(40, 25, 0x09, 0x80).regs;
+        assert_eq!(Renderer::canvas(&s), (1920, 1080), "an overlay window up: its text is drawn 1:1");
+        // Resampled to the window's size in one step.
+        let s = trx_snap(trx_layer(0, 0, 1, 1, 2, vec![0xF800]));
+        r.render_scaled(&s, &mut out, (480, 270));
+        assert_eq!((out.len(), out[0], out[1]), (480 * 270, RED, 0));
+    }
+
+    #[test]
+    fn the_key_is_transparent_and_alpha_blends() {
+        let mut r = Renderer::new(&font());
+        let mut out = Vec::new();
+        let mut layer = trx_layer(0, 0, 2, 1, 1, vec![0x1234, 0xFFFF]);
+        layer.key = Some(0x1234);
+        layer.alpha = 129;
+        let mut s = trx_snap(layer);
+        let mut frame = c64_frame(384, 272);
+        frame.indices.fill(1);
+        (frame.text_x, frame.first_line, frame.raster_lines) = (32, 16, 312);
+        s.c64 = Some(frame);
+        r.render(&s, &mut out);
+        assert_eq!(out[0], 0, "keyed: the bar below");
+        assert_eq!(out[1], trx_blend(0xFF_FFFF, 0, 129));
+        let row = &out[100 * 1920..][..1920];
+        assert_eq!((row[159], row[160], row[1759], row[1760]), (0, 0xFF_FFFF, 0xFF_FFFF, 0), "bars of 160");
+    }
+
+    #[test]
+    fn the_c64_sits_at_4x_as_vic_scaler_puts_it() {
+        let mut r = Renderer::new(&font());
+        let mut out = Vec::new();
+        let mut s = trx_snap(trx_layer(0, 0, 1, 1, 1, vec![0]));
+        s.trx.as_mut().unwrap().key = Some(0);
+        let mut frame = c64_frame(384, 272);
+        frame.indices.fill(0);
+        (frame.text_x, frame.first_line, frame.raster_lines) = (32, 16, 312);
+        frame.indices[32] = 1; // line 16, the first text-area column
+        frame.indices[0] = 2;
+        frame.indices[269 * 384 + 383] = 7; // line 285, the window's last
+        s.c64 = Some(frame);
+        r.render(&s, &mut out);
+        let px = |x: usize, y: usize| out[y * 1920 + x];
+        let white = TRX_PALETTE[1];
+        assert!((320..324).all(|x| (0..4).all(|y| px(x, y) == white)), "raster column 136 at x 160 + 4 * 40");
+        assert_eq!((px(319, 0), px(324, 0), px(320, 4)), (0, 0, 0));
+        assert!((160..196).all(|x| px(x, 0) == TRX_PALETTE[2]), "columns 96-104 left of the canvas repeat its edge");
+        assert_eq!(px(196, 0), 0);
+        assert_eq!((px(1724, 1079), px(1724, 1076)), (TRX_PALETTE[7], TRX_PALETTE[7]), "canvas column 383 is window 391");
+        assert_eq!(px(1724, 1075), 0);
+
+        // 60 Hz: 240 lines from line 31 at 5, 4, 5, 4 output lines; TRX64's NTSC canvas starts at line 28.
+        let mut frame = c64_frame(384, 247);
+        frame.indices.fill(0);
+        (frame.text_x, frame.first_line, frame.raster_lines) = (32, 28, 263);
+        frame.indices[3 * 384 + 32] = 1; // line 31
+        frame.indices[4 * 384 + 32] = 2; // line 32
+        frame.indices[242 * 384 + 32] = 7; // line 7 of the next frame, the window's last
+        s.c64 = Some(frame);
+        r.render(&s, &mut out);
+        let px = |x: usize, y: usize| out[y * 1920 + x];
+        let col: Vec<u32> = (0..10).map(|y| px(320, y)).collect();
+        assert_eq!(col[..5], [white; 5]);
+        assert_eq!(col[5..9], [TRX_PALETTE[2]; 4]);
+        assert_eq!((px(320, 1079), px(320, 1076)), (TRX_PALETTE[7], TRX_PALETTE[7]), "the last 4 of 9");
+        assert_ne!(px(320, 1075), TRX_PALETTE[7]);
     }
 }

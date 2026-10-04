@@ -49,6 +49,28 @@ pub struct DisplaySnapshot {
     pub now_ms: u64,
     /// C64 frame under the overlay; None without an attached C64 (docs/specs/S14-c64-trx64.md §9).
     pub c64: Option<C64Frame>,
+    /// S37: the TRX pixel layer as the last frame start set it up, with its pixels read from the front buffer; None
+    /// while it is off or without `--trx-io`. Filled by `devices::trx::Trx::layer`.
+    pub trx: Option<TrxLayer>,
+}
+
+/// S37: what the pixel layer shows in one frame (pix_layer.v, the `f_*` values of its frame start).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrxLayer {
+    /// Output pixel of the top left in the 1920 × 1080 frame; x0 < 1920, y0 < 1080.
+    pub x0: usize,
+    pub y0: usize,
+    /// Source pixels, w ≤ 960, h ≤ 1080, both at least 1.
+    pub w: usize,
+    pub h: usize,
+    /// Output pixels per source pixel in both directions, 1-3.
+    pub scale: usize,
+    /// Blend factor 0-256: the global alpha G plus G bit 7.
+    pub alpha: u16,
+    /// RGB565 colour key, when on.
+    pub key: Option<u16>,
+    /// `w × h` RGB565 pixels, row by row.
+    pub pixels: Vec<u16>,
 }
 
 /// Host end of the wired Ethernet segment behind the RMII MAC (docs/hw/08-network-rmii.md T1 §8). Frames are

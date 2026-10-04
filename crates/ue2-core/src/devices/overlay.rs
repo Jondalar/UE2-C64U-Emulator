@@ -95,6 +95,7 @@ impl Overlay {
             cropper: self.cropper,
             now_ms,
             c64: None,
+            trx: None,
         }
     }
 }

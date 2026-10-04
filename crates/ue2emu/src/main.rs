@@ -58,6 +58,17 @@ enum SpeedArg {
     Max,
 }
 
+/// S37: `--trx-io`, the board's bitstream.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TrxIoArg {
+    /// On when the firmware image is TRX firmware
+    Auto,
+    /// The TRX bitstream
+    On,
+    /// Gideon's bitstream: 0x101A0000 unmapped, the ID reads 0
+    Off,
+}
+
 /// The C64 behind the cart/DMA registers (docs/specs/S14-c64-trx64.md).
 #[derive(Clone, Copy, ValueEnum)]
 enum C64Arg {
@@ -121,6 +132,11 @@ struct RunArgs {
     /// Which label the board wears: u64ii (default) or c64u, the same hardware with the Bling Board present
     #[arg(long, value_name = "MODEL", value_parser = ["u64ii", "c64u"])]
     board: Option<String>,
+    /// TRX64-Ultimate's IO block at 0x101A0000: its ID, the interrupt (ITU high IRQ 2, so drive B cannot be a 1581)
+    /// and the RGB565 pixel layer over the C64. auto: on for TRX firmware; a bare --trx-io is on
+    /// (docs/specs/S37-trx-pixel-layer.md)
+    #[arg(long, value_enum, value_name = "MODE", num_args = 0..=1, default_missing_value = "on", default_value = "auto")]
+    trx_io: TrxIoArg,
     /// Do not seed the overlay user interface into blank flash config
     #[arg(long)]
     no_overlay_ui: bool,
@@ -216,6 +232,11 @@ fn run(a: RunArgs) -> Result<()> {
     if a.board.as_deref() == Some("c64u") {
         cfg.board = ue2_core::devices::board::Board::C64U;
     }
+    cfg.trx_io = match a.trx_io {
+        TrxIoArg::Auto => ue2_core::TrxIo::Auto,
+        TrxIoArg::On => ue2_core::TrxIo::On,
+        TrxIoArg::Off => ue2_core::TrxIo::Off,
+    };
     cfg.halt_on_fault = !a.no_halt;
     cfg.trace = a.trace || a.gdb.is_some();
     cfg.idle_skip = !a.no_idle_skip;

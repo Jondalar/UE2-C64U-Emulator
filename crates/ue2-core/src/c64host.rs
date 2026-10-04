@@ -54,6 +54,12 @@ pub struct C64Frame {
     /// The 1000 screen codes the VIC shows: 40×25 at `$D018 >> 4 << 10` in the VIC bank.
     pub screen: Vec<u8>,
     pub charset: C64Charset,
+    /// S37: where the frame sits in the VIC's raster, for the TRX composite's window: the column of the first
+    /// text-area pixel, the raster line of row 0 and the lines per frame. A wrapped window (NTSC) continues past the
+    /// last line with line 0. All 0 when the backend does not say; the composite then takes PAL's 32, 16 and 312.
+    pub text_x: usize,
+    pub first_line: usize,
+    pub raster_lines: usize,
 }
 
 /// What the UCI block saw on the C64 side that the firmware cannot see for itself (TRX64 `uci::UciEvents`, Spec 852
