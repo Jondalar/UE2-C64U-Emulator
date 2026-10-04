@@ -444,19 +444,19 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
 
 - Where the resident UI's buffers live (T24 open question 2). This does not matter to UE2: it reads whatever
   `PX_FRONT` says.
-- Picture-in-picture: registers not designed yet (T24 §14).
+- Picture-in-picture: waits for the RTL (Alex, 2026-10-04): built once the FPGA side defines its registers (T24 §14).
 - The `trx64/main` app on UE2 beyond the layer:
   - With CAPS = `$C0` it touches pages 0 and 6 only (As built).
   - The boot ROM and flash layout (T15) do not matter: UE2 loads the ELF.
 - The fade: the smoke sees the `PX_GALPHA` writes but checks no intermediate picture.
 - Phase B, for the FPGA side:
-  - **Suspected RTL issue:** the still at 60 Hz. pix_layer.v's window is 270 lines from line 16 in every System Mode
+  - **RTL bug, confirmed by the FPGA side (2026-10-04), fix in progress:** the still at 60 Hz. pix_layer.v's window is 270 lines from line 16 in every System Mode
     (`Y0S`, :505), so a 263-line VIC never reaches line 285, no frame completes (:535), and the freeze shows only the
     menu background behind the text. UE2 models it as it is.
   - top.v:1059 mutes the sound with C64_STOP alone (`c64_mute <= c64_halted | app_s2[1]`), also without FRZ. UE2's
     CPU-only stop (`Hold::Cpu`) keeps the SID playing, as before.
-- Phase B, decided (Alex, 2026-10-04): B1 and B2 together; `GATE_CTRL` b9 read as b8; the resume at once; B3 later,
-  not part of this work.
+- Phase B, decided (Alex, 2026-10-04): B1 and B2 together; `GATE_CTRL` b9 read as b8; the resume at once; B3 (overlay.v
+  placement for "Overlay on HDMI") is built next (Alex, 2026-10-04).
 
 ## As built (phase A)
 
