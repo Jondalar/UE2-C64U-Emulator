@@ -102,6 +102,8 @@ pub struct DriveRegs {
     write_busy: bool,
     /// The drive's head and motor as of the last access; peeks report it.
     status: DriveStatus,
+    /// S37: `--trx-io` takes drive B's interrupt, so this position cannot be a 1581; set once a 1581 was refused.
+    no_1581: Option<bool>,
 }
 
 impl DriveRegs {
@@ -118,7 +120,14 @@ impl DriveRegs {
             write_busy_until: 0,
             write_busy: false,
             status: DriveStatus::default(),
+            no_1581: None,
         }
+    }
+
+    /// S37: refuse DRIVETYPE 2, the 1581, from now on. The write keeps the 1541, so the firmware's probe
+    /// (c1541.cc:119-123) finds no multi-mode drive and offers this position as a 1541 only.
+    pub fn refuse_1581(&mut self) {
+        self.no_1581 = Some(false);
     }
 
     /// A read at window offset `off`. Registers and DIRTY first bring in the drive's state.
@@ -139,6 +148,20 @@ impl DriveRegs {
         match off {
             0..=REGS_END => {
                 let reg = (off & 0x0F) as usize;
+                let val = match self.no_1581 {
+                    Some(said) if reg == DRIVETYPE && val & 0x03 == 2 => {
+                        if !said {
+                            eprintln!(
+                                "trx: drive {} is a 1541 only with --trx-io, the 1581 is refused: its WD177x interrupt \
+                                 (ITU high IRQ 2) is the TRX block's, and the TRX bitstream has no drive B",
+                                char::from(b'A' + self.unit)
+                            );
+                            self.no_1581 = Some(true);
+                        }
+                        val & !0x03
+                    }
+                    _ => val,
+                };
                 self.regs[reg] = val & MASK[reg];
                 match reg {
                     MAN_WRITE => self.write_busy_until = ctx.now + WRITE_BUSY_CLOCKS,
@@ -328,6 +351,24 @@ mod tests {
             rig.w8(base + 0x1804, 0x01);
             assert_eq!((rig.r8(base + 0x1804), rig.r8(base + 0x1805)), (0x20, 0x20));
             assert_eq!((rig.r8(base + 0x1801), rig.r8(base + 0x180F), rig.r8(base + 0x01)), (0x01, 0x0C, 0x07));
+        }
+    }
+
+    /// S37: with `--trx-io` the firmware's multi-mode probe finds drive B a 1541 only; drive A keeps the 1581.
+    #[test]
+    fn trx_io_refuses_a_1581_at_drive_b() {
+        let mut cfg = crate::devices::board::rig::cfg();
+        cfg.trx_io = crate::TrxIo::On;
+        let install = |map: &mut crate::io::IoMap, cfg: &crate::MachineConfig| {
+            crate::devices::c64::install(map, cfg);
+            crate::devices::trx::install(map, cfg);
+        };
+        let mut rig = Rig::with_cfg(install, &cfg);
+        for (base, want) in [(0x1002_0000, 2), (0x1002_4000, 0)] {
+            rig.w8(base + 0x0D, 0x02);
+            assert_eq!(rig.r8(base + 0x0D) & 3, want, "{base:#x}");
+            rig.w8(base + 0x0D, 0x00);
+            assert_eq!(rig.r8(base + 0x0D) & 3, 0);
         }
     }
 

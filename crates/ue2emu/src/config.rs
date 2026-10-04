@@ -78,11 +78,14 @@ fn file_args(run: &Command, path: &Path, table: &Table, given: impl Fn(&str) -> 
             _ => None,
         };
         let optional = arg.get_num_args().is_some_and(|n| n.min_values() == 0);
+        let has_off = arg.get_possible_values().iter().any(|v| v.get_name() == "off");
         // One entry per occurrence: None for the bare flag.
         let occurrences: Option<Vec<Option<String>>> = match (arg.get_action(), value) {
             (ArgAction::SetTrue, Value::Boolean(b)) => Some(if *b { vec![None] } else { vec![] }),
             (ArgAction::SetTrue, _) => None,
             (ArgAction::Append, Value::Array(items)) => items.iter().map(|v| scalar(v).map(Some)).collect(),
+            // `false` is the value `off` where the flag has one (`trx-io`), else the flag left out (`c64-roms`).
+            (ArgAction::Set, Value::Boolean(false)) if optional && has_off => Some(vec![Some("off".into())]),
             (ArgAction::Set, Value::Boolean(b)) if optional => Some(if *b { vec![None] } else { vec![] }),
             (_, v) => scalar(v).map(|s| vec![Some(s)]),
         };
@@ -242,6 +245,15 @@ mod tests {
         assert_eq!(m.get_many::<String>("log").unwrap().collect::<Vec<_>>(), ["io", "irq"]);
         let (m, _) = parse("headless = false\n", &["--headless"]).unwrap();
         assert!(m.get_flag("headless"));
+        // S37: true, false or a mode.
+        let mode = |file: &str| {
+            let (m, _) = parse(file, &[]).unwrap();
+            m.get_one::<crate::TrxIoArg>("trx_io").map(|v| format!("{v:?}"))
+        };
+        assert_eq!(mode("trx-io = true\n").as_deref(), Some("On"));
+        assert_eq!(mode("trx-io = false\n").as_deref(), Some("Off"));
+        assert_eq!(mode("trx-io = 'auto'\n").as_deref(), Some("Auto"));
+        assert_eq!(mode("").as_deref(), Some("Auto"), "the default");
     }
 
     #[test]

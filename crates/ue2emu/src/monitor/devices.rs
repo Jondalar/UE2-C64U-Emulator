@@ -11,6 +11,8 @@ use ue2_core::devices::c64::C64Port;
 use ue2_core::devices::flash::SpiFlash;
 use ue2_core::devices::rmii::Rmii;
 use ue2_core::devices::sdcard::SdCard;
+use ue2_core::devices::trx::{self, Trx};
+use ue2_core::io::IoDevice;
 use ue2_core::devices::usb::Usb;
 
 use super::{uci, Host};
@@ -39,6 +41,9 @@ const CART_TYPES: [&str; 32] = [
 /// `reu_size[]` (c64.cc:60).
 const REU_SIZES: [&str; 8] = ["128 KB", "256 KB", "512 KB", "1 MB", "2 MB", "4 MB", "8 MB", "16 MB"];
 
+/// TRX IRQ_CAUSE bits (trx_io.v); UE2 raises only vsync and flip.
+const TRX_CAUSES: [&str; 8] = ["stop", "engine", "log", "capture", "flash", "eeprom", "vsync", "flip"];
+
 /// `C64_CLOCK_DETECT` bits (c64.h:88-95).
 const CLOCK_DETECT: [&str; 6] = ["phi2", "vcc", "exrom", "game", "reset", "nmi"];
 
@@ -53,7 +58,7 @@ pub(super) fn verb(host: &mut Host, verb: &str, args: &[&str]) -> Option<Result<
     }
     if !args.is_empty() {
         return match verb {
-            "itu" | "cart" | "joy" | "flash" | "sd" | "usb" | "net" | "audio" => {
+            "itu" | "cart" | "joy" | "flash" | "sd" | "usb" | "net" | "audio" | "trx" => {
                 Some(Err(format!("{verb}: takes no arguments")))
             }
             _ => None,
@@ -68,6 +73,7 @@ pub(super) fn verb(host: &mut Host, verb: &str, args: &[&str]) -> Option<Result<
         "usb" => Some(usb(host)),
         "net" => Some(net(host)),
         "audio" => Some(Ok(audio(host))),
+        "trx" => Some(trx(host)),
         _ => None,
     }
 }
@@ -82,6 +88,7 @@ pub(super) const HELP: &str = concat!(
     "  usb               the hub ports and what is on them\n",
     "  net               the Ethernet MAC: the address, the filter and the queues\n",
     "  audio             the SIDs the firmware built and the windows it routes to them\n",
+    "  trx               the TRX64-Ultimate block (--trx-io): ID, interrupt, pixel layer\n",
     "  dir [PATH]        what is on a medium, read by the firmware itself\n",
 );
 
@@ -105,6 +112,48 @@ fn joy(host: &mut Host) -> String {
     let (enable, swap) = (byte(host, 0x13), byte(host, 0x1A));
     out.push_str(&format!("  paddle        override {enable:02x}  swap {swap:02x}\n"));
     out
+}
+
+/// `trx` — the TRX64-Ultimate block of `--trx-io` (S37): page 0's ID, CAPS and interrupt, page 6's layer registers as
+/// the app last committed them, and whether the last frame start showed the layer.
+fn trx(host: &mut Host) -> Result<String, String> {
+    let t = host.m.bus.io.get::<Trx>().ok_or("this machine has no TRX block (--trx-io)")?;
+    let id: String = (0..4).map(|off| char::from(t.peek8(off))).collect();
+    let reg = |off: u32| t.reg(off);
+    let ctrl = reg(trx::PX_CTRL);
+    let (size, pos, key, status) = (reg(trx::PX_SIZE), reg(trx::PX_POS), reg(trx::PX_KEY), reg(trx::PX_STATUS));
+    let mut out = String::new();
+    out.push_str(&format!("  id            {id}  caps {:#04x}  caps2 {:#04x}\n", trx::CAPS, trx::CAPS2));
+    out.push_str(&format!("  irq enabled   {}\n", bits(t.irq_en(), &TRX_CAUSES)));
+    out.push_str(&format!("  irq cause     {}\n", bits(t.cause(), &TRX_CAUSES)));
+    out.push_str(&format!(
+        "  px_ctrl       {ctrl:#04x}  {}, format {}, scale {}  (shown: {})\n",
+        on(ctrl & 1 != 0),
+        ctrl >> 1 & 7,
+        (ctrl >> 4 & 3).max(1),
+        yes(t.shown()),
+    ));
+    out.push_str(&format!(
+        "  px_front      {:#010x}  px_back {:#010x}  flip pending: {}\n",
+        reg(trx::PX_FRONT),
+        reg(trx::PX_BACK),
+        yes(status & 1 != 0),
+    ));
+    out.push_str(&format!("  px_size       {} x {}  stride {}\n", size & 0xFFFF, size >> 16, reg(trx::PX_STRIDE)));
+    out.push_str(&format!("  px_pos        x0 {} y0 {}\n", pos & 0xFFFF, pos >> 16));
+    out.push_str(&format!(
+        "  px_galpha     {}  px_key {:#06x} {}\n",
+        reg(trx::PX_GALPHA),
+        key & 0xFFFF,
+        on(key & 0x1_0000 != 0),
+    ));
+    out.push_str(&format!("  px_status     {status:#010x}  frames {}\n", status >> 16));
+    out.push_str(&format!(
+        "  still         {}  base {:#010x}  (no capture yet)\n",
+        on(reg(trx::STILL_CTRL) & 1 != 0),
+        reg(trx::STILL_BASE),
+    ));
+    Ok(out)
 }
 
 /// `itu` — the interrupt controller as the ISR sees it, and the timers the firmware runs on.

@@ -62,6 +62,49 @@ pub struct MachineConfig {
     /// `.cfg` files whose settings go into the flash config pages before the firmware runs, in order
     /// (docs/specs/S21-settings.md).
     pub settings: Vec<PathBuf>,
+    /// S37: TRX64-Ultimate's IO block at 0x101A0000 with the pixel layer (`devices::trx`), on ITU high IRQ 2 in place
+    /// of drive B's WD177x. [`Machine::new`] turns `Auto` into on or off from the firmware image; a machine built
+    /// from parts takes `Auto` as off.
+    pub trx_io: TrxIo,
+}
+
+/// S37: whether the board carries the TRX bitstream's IO block (`--trx-io[=auto|on|off]`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TrxIo {
+    /// On for TRX firmware ([`trx_firmware`]), off for any other.
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+/// S37: `mode` with auto decided by the image's TRX `marker`, and the line that says which way it went (none for
+/// stock firmware with the block off on request).
+fn resolve_trx_io(mode: TrxIo, marker: Option<&str>) -> (TrxIo, Option<String>) {
+    match (mode, marker) {
+        (TrxIo::Auto, Some(why)) => (TrxIo::On, Some(format!("trx-io: on (TRX firmware: {why})"))),
+        (TrxIo::Auto, None) => (TrxIo::Off, Some("trx-io: off (stock firmware)".into())),
+        (TrxIo::On, _) => (TrxIo::On, Some("trx-io: on (--trx-io=on)".into())),
+        (TrxIo::Off, Some(_)) => {
+            (TrxIo::Off, Some("trx-io: off (--trx-io=off: TRX firmware on Gideon's bitstream, the ID reads 0)".into()))
+        }
+        (TrxIo::Off, None) => (TrxIo::Off, None),
+    }
+}
+
+/// S37: the marker that makes the loaded image TRX firmware, or None for any other. The symbol `trx_lv_open`
+/// (trx_lv_port.cc) when the image has symbols, else the console prefix `[TRX UI]` (trx_ui.cc) in a loaded segment.
+pub fn trx_firmware(symbols: &Symbols, ram: &[u8], segments: &[(u32, u32)]) -> Option<&'static str> {
+    if symbols.syms.iter().any(|s| s.name == "trx_lv_open" || s.name.starts_with("trx_lv_open(")) {
+        return Some("trx_lv_open");
+    }
+    const UI: &[u8] = b"[TRX UI]";
+    let found = segments.iter().any(|&(addr, len)| {
+        let start = (addr & RAM_MASK) as usize;
+        ram.get(start..start.saturating_add(len as usize).min(ram.len()))
+            .is_some_and(|seg| seg.windows(UI.len()).any(|w| w == UI))
+    });
+    found.then_some("\"[TRX UI]\" in the image")
 }
 
 impl MachineConfig {
@@ -82,6 +125,7 @@ impl MachineConfig {
             log: LogFlags::default(),
             idle_skip: true,
             settings: Vec::new(),
+            trx_io: TrxIo::Auto,
         }
     }
 }
@@ -256,11 +300,28 @@ struct IdleSlot {
 impl Machine {
     /// Bus with all devices installed, the ELF loaded (`pc = entry`, registers 0) and its symbols. Fails for an
     /// unreadable image and for `clocks_per_insn` 0, which would stop emulated time (ARCHITECTURE §Machine loop 1).
-    pub fn new(cfg: MachineConfig) -> anyhow::Result<Self> {
+    pub fn new(mut cfg: MachineConfig) -> anyhow::Result<Self> {
         anyhow::ensure!(cfg.clocks_per_insn > 0, "clocks_per_insn must be at least 1, or emulated time stands still");
         let mut bus = SystemBus::new();
-        devices::install_all(&mut bus.io, &cfg);
+        // The image first: whether the TRX block is installed can depend on it (S37).
         let fw = loader::load_firmware(&cfg.elf, &mut bus.ram)?;
+        let symbols = match fw.format {
+            loader::ImageFormat::Elf => Symbols::from_elf(&cfg.elf)?,
+            format => {
+                eprintln!(
+                    "{}: {format:x?} image, entry {:#010x}: no symbols, logs show raw addresses and fault hooks are off",
+                    cfg.elf.display(),
+                    fw.entry
+                );
+                Symbols::empty()
+            }
+        };
+        let (trx_io, why) = resolve_trx_io(cfg.trx_io, trx_firmware(&symbols, &bus.ram, &fw.segments));
+        if let Some(why) = why {
+            eprintln!("{why}");
+        }
+        cfg.trx_io = trx_io;
+        devices::install_all(&mut bus.io, &cfg);
         // The FPGA reads the cartridge ROM where this firmware puts it (docs/status/carts.md, "Cartridge ROM in DDR").
         let cart_rom = crate::fwlayout::cart_rom(&bus.ram, &fw.segments).unwrap_or_else(|| {
             eprintln!("c64: the cartridge ROM address is not in the firmware image; assuming 3.15's 0x03C00000");
@@ -278,17 +339,6 @@ impl Machine {
             let flash = bus.io.get_mut::<devices::flash::SpiFlash>().expect("the flash is always installed");
             crate::settings::apply(&cfg.settings, &bus.ram, &fw.segments, flash)?;
         }
-        let symbols = match fw.format {
-            loader::ImageFormat::Elf => Symbols::from_elf(&cfg.elf)?,
-            format => {
-                eprintln!(
-                    "{}: {format:x?} image, entry {:#010x}: no symbols, logs show raw addresses and fault hooks are off",
-                    cfg.elf.display(),
-                    fw.entry
-                );
-                Symbols::empty()
-            }
-        };
         let mut machine = Self::from_parts(cfg, bus, fw.entry, symbols);
         machine.segments = fw.segments;
         Ok(machine)
@@ -692,7 +742,8 @@ impl Machine {
     }
 
     /// Overlay snapshot from `devices::overlay::Overlay`, or blank buffers of the sizes documented on
-    /// `DisplaySnapshot` when no overlay is installed, plus the frame of an attached C64.
+    /// `DisplaySnapshot` when no overlay is installed, plus the frame of an attached C64 and the TRX pixel layer
+    /// while it is on (S37).
     pub fn display(&self) -> DisplaySnapshot {
         let now_ms = self.now_ms();
         let mut snap = match self.bus.io.get::<Overlay>() {
@@ -706,9 +757,11 @@ impl Machine {
                 cropper: [0; 4],
                 now_ms,
                 c64: None,
+                trx: None,
             },
         };
         snap.c64 = self.bus.io.get::<C64Port>().and_then(C64Port::frame);
+        snap.trx = self.bus.io.get::<devices::trx::Trx>().and_then(|trx| trx.layer(&self.bus.ram));
         snap
     }
 
@@ -1329,5 +1382,57 @@ mod tests {
             on.idle_insns,
             100.0 * on.idle_insns as f64 / off.cpu.insns as f64
         );
+    }
+    /// S37: the TRX marker, synthetic: the symbol, else the string inside a loaded segment.
+    #[test]
+    fn trx_firmware_is_found_by_symbol_or_string() {
+        let sym = |name: &str| Symbol { addr: 0x30000, size: 4, name: name.into(), mangled: String::new() };
+        let mut ram = vec![0u8; 0x1000];
+        let none = Symbols::empty();
+        assert_eq!(trx_firmware(&Symbols::from_symbols(vec![sym("trx_lv_open()")]), &ram, &[]), Some("trx_lv_open"));
+        assert_eq!(trx_firmware(&Symbols::from_symbols(vec![sym("trx_lv_close()")]), &ram, &[]), None);
+        ram[0x800..0x808].copy_from_slice(b"[TRX UI]");
+        assert_eq!(trx_firmware(&none, &ram, &[(0x100, 0x700)]), None, "outside the segments");
+        assert!(trx_firmware(&none, &ram, &[(0x100, 0x710)]).is_some());
+    }
+
+    /// S37: auto follows the marker, an explicit mode wins.
+    #[test]
+    fn trx_io_auto_follows_the_firmware_and_explicit_wins() {
+        let mode = |m, marker| resolve_trx_io(m, marker).0;
+        assert_eq!(mode(TrxIo::Auto, Some("trx_lv_open")), TrxIo::On);
+        assert_eq!(mode(TrxIo::Auto, None), TrxIo::Off);
+        assert_eq!(mode(TrxIo::On, None), TrxIo::On);
+        assert_eq!(mode(TrxIo::Off, Some("trx_lv_open")), TrxIo::Off);
+        assert_eq!(resolve_trx_io(TrxIo::Auto, Some("trx_lv_open")).1.unwrap(), "trx-io: on (TRX firmware: trx_lv_open)");
+    }
+
+    /// S37: the real images. The stock ELF has no marker; TRX64-Ultimate's `trx64/main` build (`UE2_TRX_FIRMWARE`, or
+    /// software/ultimate-app beside this repo) has the symbol in its ELF and the string in its .app.
+    #[test]
+    fn trx_firmware_on_the_real_images() {
+        if let Some(root) = firmware_root() {
+            let elf = root.join(FIRMWARE_ELF);
+            let mut ram = vec![0; crate::bus::RAM_SIZE];
+            let fw = loader::load_firmware(&elf, &mut ram).unwrap();
+            assert_eq!(trx_firmware(&Symbols::from_elf(&elf).unwrap(), &ram, &fw.segments), None, "stock");
+        }
+        let app = std::env::var_os("UE2_TRX_FIRMWARE").map(PathBuf::from).unwrap_or_else(|| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../TRX64-Ultimate/software/ultimate-app")
+        });
+        let elf = app.join(FIRMWARE_ELF);
+        if !elf.is_file() {
+            eprintln!("skipping: TRX firmware ELF not found at {}", elf.display());
+            return;
+        }
+        let mut ram = vec![0; crate::bus::RAM_SIZE];
+        let fw = loader::load_firmware(&elf, &mut ram).unwrap();
+        assert_eq!(trx_firmware(&Symbols::from_elf(&elf).unwrap(), &ram, &fw.segments), Some("trx_lv_open"));
+        let image = app.join("u64ii/ultimate.app");
+        if image.is_file() {
+            let mut ram = vec![0; crate::bus::RAM_SIZE];
+            let fw = loader::load_firmware(&image, &mut ram).unwrap();
+            assert_eq!(trx_firmware(&Symbols::empty(), &ram, &fw.segments), Some("\"[TRX UI]\" in the image"));
+        }
     }
 }

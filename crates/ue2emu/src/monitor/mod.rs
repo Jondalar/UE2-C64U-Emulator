@@ -662,9 +662,26 @@ mod tests {
         assert_eq!(exec(&mut m, &mut s, &mut st, "net").unwrap_err(), "this machine has no Ethernet MAC");
 
         let help = exec(&mut m, &mut s, &mut st, "help").expect("help");
-        for verb in ["itu", "cart", "joy", "flash", "sd", "usb", "net", "audio"] {
+        assert_eq!(exec(&mut m, &mut s, &mut st, "trx").unwrap_err(), "this machine has no TRX block (--trx-io)");
+        for verb in ["itu", "cart", "joy", "flash", "sd", "usb", "net", "audio", "trx"] {
             assert!(help.contains(&format!("\n  {verb} ")), "{verb} is in help: {help}");
         }
+    }
+
+    /// S37: `trx` reads the block of `--trx-io`.
+    #[test]
+    fn trx_shows_the_block() {
+        let mut cfg = MachineConfig::new(PathBuf::new(), PathBuf::new());
+        cfg.trx_io = ue2_core::TrxIo::On;
+        let mut bus = SystemBus::new();
+        c64::install(&mut bus.io, &cfg);
+        ue2_core::devices::trx::install(&mut bus.io, &cfg);
+        let mut m = Machine::from_parts(cfg, bus, 0x30000, Symbols::empty());
+        m.attach_c64(Box::new(Trx64Backend::new(Path::new("/nonexistent"))));
+        let out = exec(&mut m, &mut MonitorSession::new(), &mut State::default(), "trx").expect("trx");
+        assert!(out.contains("id            TRX2  caps 0xc0  caps2 0x00"), "{out}");
+        assert!(out.contains("px_ctrl       0x22  off, format 1, scale 2  (shown: no)"), "{out}");
+        assert!(out.contains("px_size       960 x 540  stride 1920"), "{out}");
     }
 
     /// S23 M3: both CPUs have run control, and they are not symmetric.

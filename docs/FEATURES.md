@@ -45,6 +45,7 @@ One line per feature, as of 0.5.1 (TRX64 v0.12.3). Details: `docs/status/`, spec
 - U64 turbo up to 64 MHz, timed as measured on a C64 Ultimate.
 - Smooth picture: every VIC frame shown, one-step scaling.
 - Ultimate Command Interface (UCI).
+- TRX64-Ultimate pixel layer (`--trx-io`, auto for TRX firmware): RGB565 layer with flip, key and alpha (S37).
 - REU on the firmware's DDR, preload and "Save REU"; GeoRAM.
 
 ## Cartridges
@@ -73,7 +74,7 @@ One line per feature, as of 0.5.1 (TRX64 v0.12.3). Details: `docs/status/`, spec
 
 - GDB on the firmware's RISC-V with symbols and FreeRTOS tasks (`--gdb`).
 - VICE binary monitor port for the C64 (`--vice-monitor`).
-- Monitor verbs: firmware, C64, cart, ITU, USB, net, SD, flash, audio, joy; step, next, until, return.
+- Monitor verbs: firmware, C64, cart, ITU, USB, net, SD, flash, audio, joy, trx; step, next, until, return.
 - Control port and scripts (`--control`, `--script`): keys, type, wait, expect, screenshots, USB, joy.
 - MCP server (`ue2-mcp`): Claude Code sessions start, drive and screenshot emulator instances.
 - Release gate `scripts/gate.sh`: workspace tests, firmware and C64 smokes, upstream E2E smoke profile.

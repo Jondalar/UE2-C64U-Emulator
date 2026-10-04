@@ -5,7 +5,7 @@
 //! Without a backend [`C64Port`] is the T0 stub of doc 10 §T0. `Machine::attach_c64` plugs in a [`C64Backend`], and
 //! the same windows then drive a real C64 (S14 §5).
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::c64host::{C64Backend, C64CartSlot, C64Frame, C64Rom, CartRom};
@@ -120,7 +120,8 @@ const UCI_T0: &[Span] = &[
     span(0x800, 0x1000, RAM),
 ];
 
-/// S31: ITU high IRQ of drive A's WD177x; drive B's is the next (`install_high_irq(1 + drive)`, wd177x.cc:63).
+/// S31: ITU high IRQ of drive A's WD177x; drive B's is the next (`install_high_irq(1 + drive)`, wd177x.cc:63). With
+/// `--trx-io` the next one is the TRX block's (S37), and drive B's controller drives nothing.
 const WD_IRQ_HIGH_BIT: u8 = 1;
 /// ITU low bit 4 `ITU_INTERRUPT_CMDIF` (itu.h:37): the UCI's firmware interrupt, a level
 /// (command_protocol.vhd:310; docs/hw/02 §Low IRQ byte).
@@ -331,6 +332,9 @@ pub struct C64Port {
     iec: RegTable,
     /// Where this firmware keeps the cartridge ROM (`Machine::new` reads it from the image).
     cart_rom: CartRom,
+    /// S37: `--trx-io`. Drive B has no WD177x interrupt and no 1581, and every sync publishes the VIC frame count
+    /// here for `devices::trx::Trx`.
+    trx_frames: Option<Arc<AtomicU64>>,
 }
 
 impl Default for C64Port {
@@ -363,7 +367,15 @@ impl C64Port {
             uci: RegTable::new("uci", UCI_T0),
             iec: RegTable::new("iec", IEC_T0),
             cart_rom: CartRom::LARGE,
+            trx_frames: None,
         }
+    }
+
+    /// S37: `--trx-io`. High IRQ 2 is the TRX block's, so drive B's WD177x does not drive it and drive B cannot be a
+    /// 1581; `frames` gets the VIC frame count after every sync.
+    pub fn set_trx_io(&mut self, frames: Arc<AtomicU64>) {
+        self.drives[1].refuse_1581();
+        self.trx_frames = Some(frames);
     }
 
     /// Attach the C64 at clock `now`, which anchors its clock (S14 §3).
@@ -475,6 +487,9 @@ impl C64Port {
             if now > self.synced {
                 b.advance_to(now);
                 self.synced = now;
+                if let Some(frames) = &self.trx_frames {
+                    frames.store(b.frame_counter(), Ordering::Relaxed);
+                }
             }
         }
     }
@@ -700,7 +715,8 @@ impl C64Port {
     /// S31: a 1581 controller's command FIFO is ITU high IRQ 1 (drive A) or 2 (drive B), a level (wd177x.vhd `io_irq`,
     /// wd177x.cc:63). Taken after everything that may have run the drives or popped a FIFO.
     fn update_wd_irqs(&mut self, ctx: &mut IoCtx) {
-        for unit in 0..2u8 {
+        let units = if self.trx_frames.is_some() { 1 } else { 2 };
+        for unit in 0..units {
             let irq = self.backend.as_mut().and_then(|b| b.drive(unit)).is_some_and(|d| d.wd_irq());
             ctx.irq.set_high(WD_IRQ_HIGH_BIT + unit, irq);
         }
@@ -946,13 +962,18 @@ impl IoDevice for C64Port {
         }
     }
 
-    /// Power-on register state; an attached backend stays attached, and keys held on the keyboard stay held. The
+    /// Power-on register state; an attached backend stays attached, keys held on the keyboard stay held, and so does
+    /// `--trx-io` (S37), which is the bitstream's, not a register's. The
     /// backend's own UCI block is not reset here either: only the FPGA system reset clears it
     /// (command_protocol.vhd:292-306), which on TRX64 is `Machine::new` (Spec 852 §2).
     fn reset(&mut self) {
         let (backend, synced, keys, cart_detect) = (self.backend.take(), self.synced, self.dma.keys, self.cart_detect.take());
+        let trx_frames = self.trx_frames.take();
         *self = C64Port::new();
         (self.backend, self.synced, self.dma.keys, self.cart_detect) = (backend, synced, keys, cart_detect);
+        if let Some(frames) = trx_frames {
+            self.set_trx_io(frames);
+        }
     }
 
     crate::impl_as_any!();
