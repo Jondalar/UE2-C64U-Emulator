@@ -75,6 +75,7 @@ One line per feature, as of 0.5.1 (TRX64 v0.12.3). Details: `docs/status/`, spec
 
 - GDB on the firmware's RISC-V with symbols and FreeRTOS tasks (`--gdb`).
 - VICE binary monitor port for the C64 (`--vice-monitor`).
+- C64 time travel with TRX64's rings: `rstep`, `whowrote`, `chis`, marks, `goto`, `ringdump`; on by default (`--ring=off`).
 - Monitor verbs: firmware, C64, cart, ITU, USB, net, SD, flash, audio, joy, trx; step, next, until, return.
 - Control port and scripts (`--control`, `--script`): keys, type, wait, expect, screenshots, USB, joy.
 - MCP server (`ue2-mcp`): Claude Code sessions start, drive and screenshot emulator instances.

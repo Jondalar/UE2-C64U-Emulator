@@ -530,7 +530,8 @@ normally.")]
 The verbs are TRX64's, the same monitor its own tools speak (docs/specs/S23-monitor.md). `device` selects the CPU: \
 the C64 (default), the 1541 (`drive8`), or the firmware's RISC-V (`fw`, registers and memory only). It needs an \
 instance started with a C64 (the default). Run control: `g`, `z`/`step`, `n`, `ret`, `until`, `c64 halt|go|step`, \
-`fw halt|go|step`.")]
+`fw halt|go|step`. Time travel on TRX64's rings: `mark`, `goto`, `frame`, `run`, `rstep`, `whowrote`, `chis`, \
+`ringdump`/`ringload` (files under the instance's --monitor-dir).")]
     async fn emu_monitor(&self, Parameters(p): Parameters<MonitorParams>) -> ToolResult {
         finish(self.monitor(p).await)
     }

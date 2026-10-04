@@ -17,6 +17,7 @@ mod drive;
 pub mod iec_proc;
 mod keys;
 mod reu;
+mod ring;
 mod sampler;
 mod sid;
 mod slot;
@@ -48,6 +49,7 @@ use keys::Keys;
 use reu::ReuRam;
 use slot::{PhysicalCart, SlotHandle};
 
+pub use ring::{Mode as RingMode, Ring};
 pub use slot::FlashDecode;
 use video::Palette;
 
@@ -70,7 +72,7 @@ const VIDEOFORMAT_CYCLES_63: u8 = 0x00;
 const VIDEOFORMAT_CYCLES_65: u8 = 0x20;
 /// Cycles past the computed frame end a switching run aims at: TRX64 reports line 0 from the cycle after the frame
 /// boundary, and the switch has to land early in line 0 (S25 §2).
-const BOUNDARY_SLACK: u64 = 2;
+pub(crate) const BOUNDARY_SLACK: u64 = 2;
 /// C64_BUS_INTERNAL bits that gate the internal IO1 and IO2 ranges, and with them the UCI window (c64.cc:1536-1590;
 /// u64_config.cc:1015-1016; Spec 852 §5).
 const BUS_IO1: u8 = 0x01;
@@ -82,6 +84,8 @@ const CPUHISTORY_ENV: &str = "TRX64_CPUHISTORY";
 /// Depth of the delta ring in seconds, read in `Machine::new` (delta_ring.rs:270-278). Switched-off rings are still
 /// allocated at their depth.
 const REVERSE_SECONDS_ENV: &str = "TRX64_REVERSE_SECONDS";
+/// `TRX64_REVERSE_SECONDS` as the user gave it, read before [`Trx64Backend::new`] sets its own (S38 `set_ring`).
+static USER_REVERSE_SECONDS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// ROM images seeded from the firmware roms directory (S14 §5.5). The firmware has no BASIC fallback (c64.cc:1103).
 const BASIC_ROM: &str = "basic.bin";
@@ -271,6 +275,8 @@ pub struct Trx64Backend {
     paddles: [u8; 6],
     /// S30: the IEC processor, shared with the device TRX64 holds on the IEC bus at slot 4 (Spec 874).
     iec: iec_proc::IecHandle,
+    /// S38: the checkpoint ring and its transport while TRX64's rings are on (`set_ring`).
+    ring: Option<Box<Ring>>,
 }
 
 impl Trx64Backend {
@@ -283,10 +289,12 @@ impl Trx64Backend {
     /// A powered-on C64 (S14 §7) with BASIC, KERNAL and CHAR ROM seeded from `rom_dir` where present.
     ///
     /// Unless `TRX64_CPUHISTORY` is set, TRX64's reverse-debug rings are switched off (a per-instruction cost) and
-    /// kept at one entry instead of their default depth (about 110 MB). An explicit `TRX64_CPUHISTORY` leaves both to
-    /// TRX64.
+    /// kept at one entry instead of their default depth (about 110 MB); S38's [`Self::set_ring`] turns them on. An
+    /// explicit `TRX64_CPUHISTORY` leaves both to TRX64 until then.
     pub fn new(rom_dir: &Path) -> Self {
         let rings_off = std::env::var_os(CPUHISTORY_ENV).is_none();
+        // S38: the depth the user asked for, before the line below may set its own.
+        USER_REVERSE_SECONDS.get_or_init(|| std::env::var(REVERSE_SECONDS_ENV).ok());
         if rings_off {
             std::env::set_var(CPUHISTORY_ENV, "0");
             if std::env::var_os(REVERSE_SECONDS_ENV).is_none() {
@@ -371,6 +379,7 @@ impl Trx64Backend {
             sampler,
             paddles: [0; 6],
             iec,
+            ring: None,
         }
     }
 
@@ -917,8 +926,9 @@ impl C64Backend for Trx64Backend {
             }
         }
         // S37: while the machine pause stands no C64 cycle runs, so the CPU, VIC, CIAs, SID and drives stand and no SID
-        // sample is made. The sampler is the FPGA's and runs on.
-        if self.paused {
+        // sample is made. The sampler is the FPGA's and runs on. S38: the same while the transport holds the C64 on an
+        // anchor.
+        if self.paused || self.ring_holds() {
             self.sampler.with(|s| s.advance_to(now));
             return;
         }
@@ -937,7 +947,14 @@ impl C64Backend for Trx64Backend {
                 }
             }
         }
-        self.run_to(target);
+        // S38: TRX64's rings record this slice only if the C64 runs at 1 MHz with nothing holding it, and then the
+        // slice stops at each frame boundary for the checkpoint ring.
+        self.arm_rings();
+        if self.ring_recording() {
+            self.run_recording(target);
+        } else {
+            self.run_to(target);
+        }
         self.sid.advance(self.m.c64_core.clk);
         // S16: the voices are FPGA-clocked, so they follow the emulator's clock rather than the C64's — and they run
         // whether or not anyone is listening, because a finished voice sets the status bit `audio_detect()` polls.
@@ -952,6 +969,8 @@ impl C64Backend for Trx64Backend {
         self.apply_hold();
         self.uci_wait = None;
         if held {
+            // S38: a reset replaces the machine, so its anchors go.
+            self.ring_discard();
             self.reset_since_turbo = true;
             self.sid.reset();
             // S16: the C64 reset clears the sampler's IRQ latches and nothing else — its register file has no reset
@@ -2358,5 +2377,168 @@ mod tests {
         assert_eq!(c64.uci_read(UCI_SLOT_ENABLE), 0);
         c64.uci_write(UCI_SLOT_ENABLE, 1);
         assert!(enabled(&c64));
+    }
+
+    // ---- S38: TRX64's rings (docs/specs/S38-trx64-ring.md §7) ----
+
+    /// A booted C64 with the rings on, and the anchors it holds.
+    fn ringed() -> Option<(Trx64Backend, u64)> {
+        let (mut c64, now) = booted()?;
+        c64.set_ring(true);
+        Some((c64, now))
+    }
+
+    fn anchors(c64: &Trx64Backend) -> usize {
+        c64.ring().map_or(0, |r| r.anchors.list().len())
+    }
+
+    /// At 1 MHz all three rings record, one anchor per frame; in turbo, with the 6510 stopped and in reset they
+    /// stand, and they go on afterwards. A reset drops what they held.
+    #[test]
+    fn the_ring_records_at_1_mhz_and_stands_in_turbo_and_while_held() {
+        let Some((mut c64, mut now)) = ringed() else { return };
+        // Past the post-reset hold, in which the C64 is a 1 MHz 6510 whatever is set (TRX64 BUG-061).
+        while c64.m.vic.u64_reset_hold > 0 {
+            run_ms(&mut c64, &mut now, 100);
+        }
+        let n0 = anchors(&c64);
+        run_ms(&mut c64, &mut now, 200);
+        let (n, d) = (anchors(&c64), c64.m.delta_ring.len());
+        assert!((9..=11).contains(&(n - n0)), "10 PAL frames, one anchor each: {n0} -> {n}");
+        assert!(d > 10_000 && c64.m.cpu_history.len() > 10_000, "per instruction: {d}");
+
+        // Turbo: the U64 turbo registers are on after a reset (Spec 851 D2), so $D031 selects the speed.
+        c64.m.write_full(0xD031, 0x0F);
+        assert!(c64.m.turbo_engaged());
+        run_ms(&mut c64, &mut now, 100);
+        assert_eq!((anchors(&c64), c64.m.delta_ring.len()), (n, d), "turbo: nothing recorded");
+        c64.m.write_full(0xD031, 0x00);
+        assert!(!c64.m.turbo_engaged());
+        run_ms(&mut c64, &mut now, 100);
+        let (n, d) = (anchors(&c64), c64.m.delta_ring.len());
+        assert!(n > n0 + 14 && d > 0, "1 MHz again: {n}");
+
+        c64.set_stopped(true);
+        run_ms(&mut c64, &mut now, 100);
+        assert_eq!((anchors(&c64), c64.m.delta_ring.len()), (n, d), "C64_STOP: nothing recorded");
+        c64.set_stopped(false);
+        c64.set_paused(true);
+        run_ms(&mut c64, &mut now, 100);
+        assert_eq!((anchors(&c64), c64.m.delta_ring.len()), (n, d), "machine pause: nothing recorded");
+        c64.set_paused(false);
+        run_ms(&mut c64, &mut now, 100);
+        assert!(anchors(&c64) > n);
+
+        c64.set_reset(true);
+        assert_eq!((anchors(&c64), c64.m.delta_ring.len(), c64.m.cpu_history.len()), (0, 0, 0), "a reset drops them");
+        run_ms(&mut c64, &mut now, 50);
+        assert_eq!(anchors(&c64), 0, "held in reset: nothing recorded");
+        c64.set_reset(false);
+        run_ms(&mut c64, &mut now, 100);
+        assert!(anchors(&c64) > 0);
+    }
+
+    /// `--ring=off`: nothing is recorded, as before S38.
+    #[test]
+    fn with_the_ring_off_nothing_is_recorded() {
+        let Some((mut c64, mut now)) = booted() else { return };
+        run_ms(&mut c64, &mut now, 100);
+        assert!(c64.ring().is_none());
+        assert_eq!((c64.m.delta_ring.len(), c64.m.cpu_history.len()), (0, 0));
+        assert!(c64.ring_dump().is_err());
+    }
+
+    /// `goto` puts the C64 back on an anchor — RAM, registers, cycle — and holds it there while the firmware's time
+    /// runs on; the release continues from the anchor and cuts the anchors after it, marks excepted.
+    #[test]
+    fn goto_restores_the_c64_and_holds_it_until_the_release() {
+        let Some((mut c64, mut now)) = ringed() else { return };
+        c64.m.ram[0xC000] = 0x11;
+        run_ms(&mut c64, &mut now, 100);
+        let ids = c64.ring().unwrap().ids();
+        let (back, _, cycles) = ids[ids.len() - 3].clone();
+        let marked = ids[ids.len() - 2].0.clone();
+        c64.ring_mut().unwrap().anchors.set_mark(&marked, "keep").unwrap();
+        c64.m.ram[0xC000] = 0x22;
+        run_ms(&mut c64, &mut now, 100);
+        let total = anchors(&c64);
+
+        let a = c64.ring_goto(&back, RingMode::StepBack).unwrap();
+        assert_eq!(a.cycles, cycles);
+        assert_eq!(c64.m.c64_core.clk, cycles, "the anchor's cycle");
+        assert_eq!(c64.m.ram[0xC000], 0x11, "the anchor's RAM");
+        assert!(c64.ring_holds());
+        let regs = |c: &Trx64Backend| (c.m.c64_core.reg_pc, c.m.c64_core.reg_a, c.m.c64_core.reg_sp, c.m.c64_core.clk);
+        let held = regs(&c64);
+        run_ms(&mut c64, &mut now, 50);
+        assert_eq!(regs(&c64), held, "held: no C64 cycle runs");
+        assert_eq!(anchors(&c64), total, "held: nothing recorded, nothing cut");
+
+        // Twice onto the same anchor gives the same machine: a restore, not a replay.
+        c64.ring_goto(&ids[ids.len() - 1].0, RingMode::StepFwd).unwrap();
+        c64.ring_goto(&back, RingMode::StepBack).unwrap();
+        assert_eq!(regs(&c64), held);
+
+        let dropped = c64.ring_release();
+        let left = c64.ring().unwrap().ids();
+        assert_eq!(left.iter().position(|(i, _, _)| *i == back), Some(left.len() - 2), "cut after the anchor");
+        assert_eq!(left.last().unwrap().0, marked, "the mark survives the cut");
+        assert_eq!(dropped as usize, total - left.len());
+        run_ms(&mut c64, &mut now, 10);
+        let ran = c64.m.c64_core.clk - cycles;
+        assert!(ran.abs_diff(9_852) < 200, "10 ms from the anchor's cycle: {ran}");
+        assert!(screen_has(&c64, "READY."));
+    }
+
+    /// The firmware's parts stay live through a restore: the UCI block stays enabled, the turbo enable word stays
+    /// the firmware's, and the anchor's model must be the one the firmware runs.
+    #[test]
+    fn a_restore_keeps_the_firmwares_side() {
+        let Some((mut c64, mut now)) = ringed() else { return };
+        run_ms(&mut c64, &mut now, 60);
+        let first = c64.ring().unwrap().ids()[0].0.clone();
+        c64.uci_write(UCI_SLOT_ENABLE, 1);
+        let enabled = |c: &Trx64Backend| c.m.uci().is_some_and(|u| u.status().enabled);
+        assert!(enabled(&c64));
+        let regs_en = c64.m.vic.u64_regs_en;
+        c64.ring_goto(&first, RingMode::StepBack).unwrap();
+        assert!(enabled(&c64), "the UCI block is the firmware's");
+        assert_eq!(c64.m.vic.u64_regs_en, regs_en);
+        c64.ring_release();
+
+        // An anchor of another model is refused, and nothing changes.
+        let mut cp = c64.ring().unwrap().anchors.restore_snapshot(&first).unwrap();
+        let ntsc = model::find("c64-ntsc").unwrap();
+        cp["vic"]["model"] = serde_json::json!(ntsc.vicii_id);
+        let clk = c64.m.c64_core.clk;
+        let err = c64.restore_c64(&mut cp).unwrap_err();
+        assert!(err.contains("firmware runs"), "{err}");
+        assert_eq!(c64.m.c64_core.clk, clk);
+    }
+
+    /// ringdump and ringload round-trip the three rings with their marks, and the load stands the C64 on the file's
+    /// current anchor.
+    #[test]
+    fn ringdump_and_ringload_round_trip() {
+        let Some((mut c64, mut now)) = ringed() else { return };
+        c64.m.ram[0xC000] = 0x33;
+        run_ms(&mut c64, &mut now, 100);
+        let ids = c64.ring().unwrap().ids();
+        c64.ring_mut().unwrap().anchors.set_mark(&ids[2].0, "here").unwrap();
+        let (bytes, info) = c64.ring_dump().unwrap();
+        assert_eq!(&bytes[..8], b"C64RERNG");
+        assert_eq!(info.anchors, ids.len() as u64);
+        let (head, delta, chis) = (ids.last().unwrap().clone(), c64.m.delta_ring.len(), c64.m.cpu_history.len());
+
+        c64.m.ram[0xC000] = 0x44;
+        run_ms(&mut c64, &mut now, 100);
+        let loaded = c64.ring_load(&bytes).unwrap();
+        assert_eq!(loaded.anchors, ids.len() as u64);
+        assert_eq!(c64.ring().unwrap().ids(), ids);
+        assert_eq!(c64.ring().unwrap().anchors.mark_id("here"), Some(ids[2].0.clone()));
+        assert_eq!((c64.m.delta_ring.len(), c64.m.cpu_history.len()), (delta, chis));
+        assert_eq!(c64.m.c64_core.clk, head.2, "on the current anchor");
+        assert_eq!(c64.m.ram[0xC000], 0x33);
+        assert!(c64.ring_holds());
     }
 }

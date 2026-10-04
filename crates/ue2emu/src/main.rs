@@ -69,6 +69,13 @@ enum TrxIoArg {
     Off,
 }
 
+/// S38: `--ring`, TRX64's rings.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RingArg {
+    On,
+    Off,
+}
+
 /// The C64 behind the cart/DMA registers (docs/specs/S14-c64-trx64.md).
 #[derive(Clone, Copy, ValueEnum)]
 enum C64Arg {
@@ -137,6 +144,14 @@ struct RunArgs {
     /// (docs/specs/S37-trx-pixel-layer.md)
     #[arg(long, value_enum, value_name = "MODE", num_args = 0..=1, default_missing_value = "on", default_value = "auto")]
     trx_io: TrxIoArg,
+    /// TRX64's time-travel rings on the C64 (delta ring, CPU history, a checkpoint per frame); they record while the
+    /// C64 runs at 1 MHz (docs/specs/S38-trx64-ring.md)
+    #[arg(long, value_enum, value_name = "MODE", num_args = 0..=1, default_missing_value = "on", default_value = "on")]
+    ring: RingArg,
+    /// The directory the monitor's file verbs (asm-file, ringdump, ringload, ls, cd) are confined to [default: the
+    /// current directory]
+    #[arg(long, value_name = "DIR")]
+    monitor_dir: Option<PathBuf>,
     /// Do not seed the overlay user interface into blank flash config
     #[arg(long)]
     no_overlay_ui: bool,
@@ -279,6 +294,16 @@ fn run(a: RunArgs) -> Result<()> {
         usb_dir_work,
         cart_slot: a.cart_slot,
         hold_keys: a.hold_key.unwrap_or_default(),
+        ring: matches!(a.ring, RingArg::On),
+        monitor_dir: match a.monitor_dir {
+            Some(dir) => {
+                if !dir.is_dir() {
+                    bail!("--monitor-dir {}: not a directory", dir.display());
+                }
+                dir
+            }
+            None => std::env::current_dir()?,
+        },
     };
 
     if a.headless {
