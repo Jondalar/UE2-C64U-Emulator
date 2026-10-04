@@ -251,6 +251,69 @@ pub trait C64Backend {
     /// `U64_AUDIO_MIXER` 0x10100500 + `off`, `off` < 20: two bytes per channel, 0 UltiSID 1, 1 UltiSID 2, 2 socket 1,
     /// 3 socket 2, 4-5 sampler, 6-7 drives, 8-9 tape (u64_config.cc:1349-1358). Write-only.
     fn mixer_write(&mut self, _off: u8, _val: u8) {}
+
+    // ---- S37 phase B: TRX64-Ultimate's machine pause and freeze session (docs/specs/S37-trx-pixel-layer.md §5) ----
+
+    /// The whole machine stands (top.v `c64_halt_req`): no C64 cycle runs, so CPU, VIC, CIAs, SID and the drives
+    /// stand and the SID is silent. A release runs on from the same cycle; the clock is re-anchored at the release.
+    /// The DMA window, keys and ROM windows work while paused. Ignored by default.
+    fn set_paused(&mut self, _paused: bool) {}
+    /// One VIC frame in emulator clocks (lines × cycles per line at the row's clock), 0 when unknown.
+    fn frame_clocks(&self) -> u64 {
+        0
+    }
+    /// Raster lines per VIC frame, 0 when unknown.
+    fn frame_lines(&self) -> usize {
+        0
+    }
+    /// `$D000-$DFFF` as a read shows it, without its side effects and whatever the PLA maps there (the state bus of
+    /// c64_core.v: raster, collisions and IRQ flags not cleared, timers and TOD as they stand).
+    fn io_peek(&self, _addr: u16) -> u8 {
+        0xFF
+    }
+    /// C64 RAM itself, whatever the PLA maps at `addr`.
+    fn ram_peek(&self, addr: u16) -> u8 {
+        self.dma_peek(addr)
+    }
+    /// The 6510 port: (`$00` direction, `$01` output latch).
+    fn cpu_port(&self) -> (u8, u8) {
+        (0x2F, 0x37)
+    }
+    /// The cartridge's own lines before a forced Ultimax: (present, EXROM, GAME), true = high (c64_core.v's glue
+    /// word). No cartridge: (false, true, true).
+    fn cart_lines(&self) -> (bool, bool, bool) {
+        (false, true, true)
+    }
+    /// CIA 1 (`cia` 0) or CIA 2 (1): the register file as written (PRA, PRB, DDRA, DDRB, …).
+    fn cia_regs(&self, _cia: u8) -> [u8; 16] {
+        [0; 16]
+    }
+    /// CIA 1's port A and B as a read shows them with these port registers, the keys and the joysticks.
+    fn cia1_ports(&self, pra: u8, ddra: u8, prb: u8, ddrb: u8) -> (u8, u8) {
+        (pra | !ddra, prb | !ddrb)
+    }
+    /// A cartridge read of `addr` (ROML, ROMH, IO1, IO2) without its side effects.
+    fn cart_peek(&self, _addr: u16) -> CartPeek {
+        CartPeek::Miss
+    }
+    /// Real bus writes to `$D000-$DFFF` with I/O mapped whatever the CPU port says (freeze_resp.v's commit: Ultimax
+    /// forced), in this order.
+    fn io_commit(&mut self, writes: &[(u16, u8)]) {
+        for &(addr, val) in writes {
+            self.dma_write(addr, val, false);
+        }
+    }
+}
+
+/// S37: what the cartridge answers to a read without its side effects (freeze_resp.v `pk_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CartPeek {
+    /// The cartridge or a device on the port drives the read.
+    Hit(u8),
+    /// Nothing drives it.
+    Miss,
+    /// The cartridge is on the physical port: no read without a bus cycle.
+    External,
 }
 
 // ---- CARTSLOT: a physical cartridge in the expansion port (docs/status/cart-slot.md) ----
@@ -473,6 +536,8 @@ pub(crate) mod mock {
         SamplerEnable(bool),
         /// U64_AUDIO_MIXER write (offset, value).
         Mixer(u8, u8),
+        /// S37: the machine pause.
+        Paused(bool),
     }
 
     /// Shared with the test after the backend moved into the device.
@@ -496,6 +561,8 @@ pub(crate) mod mock {
         pub(crate) reu_size: Rc<RefCell<u32>>,
         /// Sampler: `Some` when the mock has the block, so `has_sampler` is true (S16).
         pub(crate) sampler: Rc<RefCell<Option<Sampler>>>,
+        /// S37: what `frame_counter` returns.
+        pub(crate) frames: Rc<RefCell<u64>>,
     }
 
     impl Mock {
@@ -650,6 +717,13 @@ pub(crate) mod mock {
 
         fn mixer_write(&mut self, off: u8, val: u8) {
             self.push(Call::Mixer(off, val));
+        }
+
+        fn frame_counter(&self) -> u64 {
+            *self.frames.borrow()
+        }
+        fn set_paused(&mut self, paused: bool) {
+            self.push(Call::Paused(paused));
         }
     }
 }

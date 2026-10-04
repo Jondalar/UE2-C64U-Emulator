@@ -5,12 +5,14 @@
 //! Without a backend [`C64Port`] is the T0 stub of doc 10 §T0. `Machine::attach_c64` plugs in a [`C64Backend`], and
 //! the same windows then drive a real C64 (S14 §5).
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::c64host::{C64Backend, C64CartSlot, C64Frame, C64Rom, CartRom};
 use crate::devices::board::{add_table, at, span, Reg, RegTable, Span, RAM, RAM_PAGE};
 use crate::devices::drives::DriveRegs;
+use crate::devices::trx::{self, Link};
+use crate::devices::trx_session::Lines;
 use crate::io::{IoCtx, IoDevice, IoMap, IO_BASE};
 use crate::machine::MachineConfig;
 use crate::time;
@@ -332,9 +334,14 @@ pub struct C64Port {
     iec: RegTable,
     /// Where this firmware keeps the cartridge ROM (`Machine::new` reads it from the image).
     cart_rom: CartRom,
-    /// S37: `--trx-io`. Drive B has no WD177x interrupt and no 1581, and every sync publishes the VIC frame count
-    /// here for `devices::trx::Trx`.
-    trx_frames: Option<Arc<AtomicU64>>,
+    /// S37: `--trx-io`. Drive B has no WD177x interrupt and no 1581; the machine pause, the freeze session and the
+    /// still capture are shared with `devices::trx::Trx` through the link, and every sync publishes the VIC frame
+    /// count there.
+    trx: Option<Link>,
+    /// S37: the machine pause as last given to the backend.
+    paused: bool,
+    /// S37: a still frame for guest DDR (address, bytes), written when the access hands DDR back.
+    still_out: Option<(u32, Vec<u8>)>,
 }
 
 impl Default for C64Port {
@@ -367,15 +374,17 @@ impl C64Port {
             uci: RegTable::new("uci", UCI_T0),
             iec: RegTable::new("iec", IEC_T0),
             cart_rom: CartRom::LARGE,
-            trx_frames: None,
+            trx: None,
+            paused: false,
+            still_out: None,
         }
     }
 
     /// S37: `--trx-io`. High IRQ 2 is the TRX block's, so drive B's WD177x does not drive it and drive B cannot be a
-    /// 1581; `frames` gets the VIC frame count after every sync.
-    pub fn set_trx_io(&mut self, frames: Arc<AtomicU64>) {
+    /// 1581; `link` carries the pause, the session and the still between this port and the block.
+    pub fn set_trx_io(&mut self, link: Link) {
         self.drives[1].refuse_1581();
-        self.trx_frames = Some(frames);
+        self.trx = Some(link);
     }
 
     /// Attach the C64 at clock `now`, which anchors its clock (S14 §3).
@@ -391,6 +400,11 @@ impl C64Port {
     /// downcasts through `C64Backend::as_any_mut`).
     pub fn backend_mut(&mut self) -> Option<&mut (dyn C64Backend + 'static)> {
         self.backend.as_deref_mut()
+    }
+
+    /// The attached backend, for reads (S37: the TRX text layer).
+    pub fn backend(&self) -> Option<&(dyn C64Backend + 'static)> {
+        self.backend.as_deref()
     }
 
     /// Where this firmware keeps the cartridge ROM (docs/status/carts.md, "Cartridge ROM in DDR"); passed on to the
@@ -483,15 +497,107 @@ impl C64Port {
     }
 
     fn sync(&mut self, now: u64) {
+        if self.trx.is_some() {
+            self.trx_sync(now);
+            return;
+        }
         if let Some(b) = &mut self.backend {
             if now > self.synced {
                 b.advance_to(now);
                 self.synced = now;
-                if let Some(frames) = &self.trx_frames {
-                    frames.store(b.frame_counter(), Ordering::Relaxed);
-                }
             }
         }
+    }
+
+    /// S37 phase B: [`Self::sync`] with `--trx-io`. A GATE_CTRL write since the last sync takes effect at its clock;
+    /// the pause and the session follow the lines; after the run the VIC frame count goes to the block, and when
+    /// frames ended the newest is captured into the still (§5.5).
+    fn trx_sync(&mut self, now: u64) {
+        let Some(link) = self.trx.clone() else { return };
+        if self.backend.is_none() {
+            return;
+        }
+        let writes = std::mem::take(&mut trx::lock(&link).frz_writes);
+        for (at, frz) in writes {
+            if let Some(b) = self.backend.as_deref_mut().filter(|_| at > self.synced && at < now) {
+                b.advance_to(at);
+                self.synced = at;
+            }
+            self.trx_apply(frz);
+        }
+        self.trx_update();
+        let Some(b) = self.backend.as_deref_mut() else { return };
+        if now <= self.synced {
+            return;
+        }
+        b.advance_to(now);
+        self.synced = now;
+        let frames = b.frame_counter();
+        let mut l = trx::lock(&link);
+        if frames > l.frames && l.frames != 0 && l.still.on {
+            let base = l.still.base & trx::DDR_ADDR_MASK;
+            let lines = b.frame_lines();
+            let complete = lines == 0 || lines >= trx::STILL_Y0 + trx::STILL_H;
+            let ended = frames - l.frames;
+            let slot = l.still.frames(ended, complete);
+            // The default base lies past UE2's 64 MB: nothing to write, so no frame to build.
+            if (base as usize) < crate::bus::RAM_SIZE {
+                let bytes = trx::still_window(&b.frame());
+                self.still_out = Some((base + u32::from(slot) * trx::STILL_SLOT, bytes));
+            }
+        }
+        l.frames = frames;
+        l.frame_clocks = b.frame_clocks();
+    }
+
+    /// S37 phase B: the lines as the session sees them.
+    fn trx_lines(&self, frz: bool) -> Lines {
+        Lines { frz, stop: self.stop, ultimax: self.mode & MODE_ULTIMAX != 0, reset: self.mode & MODE_RESET != 0 }
+    }
+
+    /// S37 phase B: after the lines changed, the pause (`GATE_CTRL` FRZ with C64_STOP, no reset held) goes to the
+    /// backend, and the session starts or ends (its commit list runs).
+    fn trx_update(&mut self) {
+        if let Some(link) = &self.trx {
+            let frz = trx::lock(link).frz;
+            self.trx_apply(frz);
+        }
+    }
+
+    /// [`Self::trx_update`] with FRZ as `frz`.
+    fn trx_apply(&mut self, frz: bool) {
+        let Some(link) = self.trx.clone() else { return };
+        let mut l = trx::lock(&link);
+        let lines = self.trx_lines(frz);
+        let Some(b) = self.backend.as_deref_mut() else { return };
+        if lines.paused() != self.paused {
+            self.paused = lines.paused();
+            b.set_paused(self.paused);
+            if self.paused {
+                l.pause_starts += 1;
+            }
+        }
+        l.paused = self.paused;
+        l.session.step(lines, b);
+    }
+
+    /// S37 phase B: a window access in a freeze session, answered by the session (`None` outside one, and for
+    /// mem-only accesses, which go to the RAM's second port as before).
+    fn session_access(&mut self, addr: u16, write: Option<u8>, mem_only: bool) -> Option<u8> {
+        let link = self.trx.clone().filter(|_| !mem_only)?;
+        let mut l = trx::lock(&link);
+        if !l.session.active {
+            return None;
+        }
+        let lines = self.trx_lines(l.frz);
+        let b = self.backend.as_deref_mut()?;
+        Some(match write {
+            Some(val) => {
+                l.session.write(addr, val, lines, b);
+                val
+            }
+            None => l.session.read(addr, lines, b),
+        })
     }
 
     fn mem_only(&self) -> bool {
@@ -526,6 +632,12 @@ impl C64Port {
                 }
                 let changed = old ^ self.mode;
                 let (cart_type, rom) = (self.cart.get(CARTRIDGE_TYPE), self.cart_rom);
+                // S37: a reset in a freeze session first writes the session's VIC registers for real and ends it.
+                if let (Some(link), Some(b)) = (&self.trx, self.backend.as_deref_mut()) {
+                    if changed & self.mode & MODE_RESET != 0 {
+                        trx::lock(link).session.reset(b);
+                    }
+                }
                 if let Some(b) = &mut self.backend {
                     if changed & MODE_RESET != 0 {
                         // S14 §7: a release rebuilds the cartridge from DDR, then warm-resets.
@@ -541,12 +653,14 @@ impl C64Port {
                 if changed & MODE_NMI != 0 {
                     self.apply_nmi();
                 }
+                self.trx_update();
             }
             STOP => {
                 self.stop = val & 1 != 0;
                 if let Some(b) = &mut self.backend {
                     b.set_stopped(self.stop);
                 }
+                self.trx_update();
             }
             CARTRIDGE_KILL => {
                 let (cart_type, rom) = (self.cart.get(CARTRIDGE_TYPE), self.cart_rom);
@@ -662,9 +776,15 @@ impl C64Port {
         }
     }
 
-    fn return_ddr(&mut self) {
+    fn return_ddr(&mut self, ram: &mut [u8]) {
         if let Some(b) = &mut self.backend {
             b.lend_ddr(None);
+        }
+        // S37: the still capture writes guest DDR, once the backend holds none of it; bytes past its end are dropped.
+        if let Some((addr, bytes)) = self.still_out.take() {
+            let start = (addr as usize).min(ram.len());
+            let n = bytes.len().min(ram.len() - start);
+            ram[start..start + n].copy_from_slice(&bytes[..n]);
         }
         // CARTSLOT: every access that lends DDR may have run the C64 or reached its cartridges.
         self.refresh_cart_detect();
@@ -715,7 +835,7 @@ impl C64Port {
     /// S31: a 1581 controller's command FIFO is ITU high IRQ 1 (drive A) or 2 (drive B), a level (wd177x.vhd `io_irq`,
     /// wd177x.cc:63). Taken after everything that may have run the drives or popped a FIFO.
     fn update_wd_irqs(&mut self, ctx: &mut IoCtx) {
-        let units = if self.trx_frames.is_some() { 1 } else { 2 };
+        let units = if self.trx.is_some() { 1 } else { 2 };
         for unit in 0..units {
             let irq = self.backend.as_mut().and_then(|b| b.drive(unit)).is_some_and(|d| d.wd_irq());
             ctx.irq.set_high(WD_IRQ_HIGH_BIT + unit, irq);
@@ -739,7 +859,7 @@ impl IoDevice for C64Port {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 let val = self.peek8(off);
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 self.update_uci(ctx);
                 val
             }
@@ -747,11 +867,14 @@ impl IoDevice for C64Port {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 let (addr, mem_only) = ((off - DMA) as u16, self.mem_only());
-                let val = match &mut self.backend {
-                    Some(b) => b.dma_read(addr, mem_only),
-                    None => self.dma.read(addr),
+                let val = match self.session_access(addr, None, mem_only) {
+                    Some(val) => val,
+                    None => match &mut self.backend {
+                        Some(b) => b.dma_read(addr, mem_only),
+                        None => self.dma.read(addr),
+                    },
                 };
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 ctx.stall += time::DMA_BYTE_CLOCKS;
                 self.update_uci(ctx);
                 val
@@ -762,7 +885,7 @@ impl IoDevice for C64Port {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 let val = self.backend.as_ref().map_or(0, |b| b.uci_read((off - UCI) as u16));
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 self.update_uci(ctx);
                 val
             }
@@ -772,7 +895,7 @@ impl IoDevice for C64Port {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 let val = self.backend.as_mut().map_or(0, |b| b.iec_read((off - IEC) as u16));
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 val
             }
             // Ultimate Audio: the voices read guest DDR, so the lease is held across the call as it is for UCI, and
@@ -781,7 +904,7 @@ impl IoDevice for C64Port {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 let val = self.backend.as_ref().map_or(0, |b| b.sampler_read((off - SAMPLER) as u16));
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 self.update_uci(ctx);
                 val
             }
@@ -790,7 +913,7 @@ impl IoDevice for C64Port {
                 // W4-CART: the sync may run the C64, whose cartridge reads DDR; the lease ends before DriveRegs uses ctx.
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 self.update_uci(ctx);
                 let (unit, rel) = Self::drive_window_of(off);
                 let drive = self.backend.as_mut().and_then(|b| b.drive(unit));
@@ -806,18 +929,20 @@ impl IoDevice for C64Port {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 self.cart_write(off & 0x0F, val, ctx.ram);
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 self.update_uci(ctx);
             }
             DMA..=DMA_END => {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 let (addr, mem_only) = ((off - DMA) as u16, self.mem_only());
-                match &mut self.backend {
-                    Some(b) => b.dma_write(addr, val, mem_only),
-                    None => self.dma.mem[usize::from(addr)] = val,
+                if self.session_access(addr, Some(val), mem_only).is_none() {
+                    match &mut self.backend {
+                        Some(b) => b.dma_write(addr, val, mem_only),
+                        None => self.dma.mem[usize::from(addr)] = val,
+                    }
                 }
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 // UCI: `unlock_irq` acks high IRQ 6 with `C64_POKE(0xD038, 0)`; the ITU has no ack register of its
                 // own, so this write is the only thing that drops the source (u64_config.cc:1012-1014, 02 H8).
                 if addr == UNLOCK_ACK_ADDR && val == 0 && self.has_uci() {
@@ -833,7 +958,7 @@ impl IoDevice for C64Port {
                 if let Some(b) = &mut self.backend {
                     b.uci_write((off - UCI) as u16, val);
                 }
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 self.update_uci(ctx);
             }
             UCI..=UCI_END => self.uci.set(off - UCI, val),
@@ -843,7 +968,7 @@ impl IoDevice for C64Port {
                 if let Some(b) = &mut self.backend {
                     b.iec_write((off - IEC) as u16, val);
                 }
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
             }
             IEC..=IEC_END => self.iec.set(off - IEC, val),
             // Ultimate Audio. Without the block the window swallows the write, as the old stub did: the firmware
@@ -854,14 +979,14 @@ impl IoDevice for C64Port {
                 if let Some(b) = &mut self.backend {
                     b.sampler_write((off - SAMPLER) as u16, val);
                 }
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 self.update_uci(ctx);
             }
             MATRIX..=MATRIX_END => {
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
                 self.matrix_write(off - MATRIX, val);
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 self.update_uci(ctx);
             }
             EEPROM..=EEPROM_END => {
@@ -893,7 +1018,7 @@ impl IoDevice for C64Port {
                 // W4-CART: the sync may run the C64, whose cartridge reads DDR; the lease ends before DriveRegs uses ctx.
                 self.lend_ddr(ctx);
                 self.sync(ctx.now);
-                self.return_ddr();
+                self.return_ddr(ctx.ram);
                 self.update_uci(ctx);
                 let (unit, rel) = Self::drive_window_of(off);
                 let drive = self.backend.as_mut().and_then(|b| b.drive(unit));
@@ -953,7 +1078,7 @@ impl IoDevice for C64Port {
     fn tick(&mut self, ctx: &mut IoCtx) {
         self.lend_ddr(ctx);
         self.sync(ctx.now);
-        self.return_ddr();
+        self.return_ddr(ctx.ram);
         self.update_uci(ctx);
         // W4-DRIVE, S27: carry the drives' writes into DDR.
         for unit in 0..2u8 {
@@ -968,11 +1093,13 @@ impl IoDevice for C64Port {
     /// (command_protocol.vhd:292-306), which on TRX64 is `Machine::new` (Spec 852 §2).
     fn reset(&mut self) {
         let (backend, synced, keys, cart_detect) = (self.backend.take(), self.synced, self.dma.keys, self.cart_detect.take());
-        let trx_frames = self.trx_frames.take();
+        let (link, paused) = (self.trx.take(), self.paused);
         *self = C64Port::new();
         (self.backend, self.synced, self.dma.keys, self.cart_detect) = (backend, synced, keys, cart_detect);
-        if let Some(frames) = trx_frames {
-            self.set_trx_io(frames);
+        // The backend keeps a pause until the next sync takes it away (C64_STOP is 0 now).
+        self.paused = paused;
+        if let Some(link) = link {
+            self.set_trx_io(link);
         }
     }
 
@@ -1596,5 +1723,142 @@ mod tests {
         assert_eq!([0, 1].map(|i| lines[i].load(Ordering::Relaxed)), [0xE3, 0xEE], "the wired AND, shared");
         assert_eq!(b.port().frame().map(|f| f.indices), Some(vec![1, 2]));
         assert_eq!(C64Port::new().frame(), None);
+    }
+
+    // ---- S37 phase B: the pause, the session and the still with `--trx-io` ----
+
+    const TRX_ADDR: u32 = crate::devices::trx::BASE;
+
+    impl Bench {
+        /// The port and the TRX block, linked, with a mock C64 attached.
+        fn trx() -> Self {
+            let mut cfg = cfg();
+            cfg.trx_io = crate::machine::TrxIo::On;
+            let mut map = IoMap::new();
+            install(&mut map, &cfg);
+            crate::devices::trx::install(&mut map, &cfg);
+            let mock = Mock::default();
+            map.get_mut::<C64Port>().unwrap().attach(Box::new(mock.clone()), 0);
+            mock.take();
+            Bench { map, irq: IrqState::new(), ram: vec![0; RAM_SIZE], console: Vec::new(), now: 0, mock }
+        }
+
+        fn w32(&mut self, addr: u32, val: u32) {
+            for (i, b) in val.to_le_bytes().into_iter().enumerate() {
+                self.w8(addr + i as u32, b);
+            }
+        }
+
+        fn r32(&mut self, addr: u32) -> u32 {
+            u32::from_le_bytes(std::array::from_fn(|i| self.r8(addr + i as u32)))
+        }
+
+        /// The port's periodic sync at `now`.
+        fn tick_at(&mut self, now: u64) {
+            self.now = now;
+            self.with_ctx(STOP_ADDR, |dev, _, ctx| dev.tick(ctx));
+        }
+
+        fn link(&mut self) -> Link {
+            self.port().trx.clone().expect("linked")
+        }
+    }
+
+    #[test]
+    fn c64_stop_pauses_the_whole_machine_only_with_frz() {
+        use crate::devices::trx::{CAUSE_STOP, GATE_CTRL, IRQ_CAUSE};
+        let mut b = Bench::trx();
+        b.w8(STOP_ADDR, 1);
+        assert_eq!(b.mock.take().last(), Some(&Call::Stopped(true)), "C64_STOP alone: the CPU");
+        b.w8(STOP_ADDR, 0);
+        b.w32(TRX_ADDR + GATE_CTRL, 1);
+        b.mock.take();
+        b.now = 500;
+        b.w8(STOP_ADDR, 1);
+        let calls = b.mock.take();
+        assert_eq!(calls[calls.len() - 2..], [Call::Stopped(true), Call::Paused(true)]);
+        assert_eq!(b.r32(TRX_ADDR + GATE_CTRL), 0x301);
+        assert_eq!(b.r8(TRX_ADDR + IRQ_CAUSE) & CAUSE_STOP, CAUSE_STOP, "b0: the pause came into effect");
+        // A held reset wins: Hold::Reset, no pause.
+        b.w8(MODE_ADDR, MODE_RESET);
+        assert!(b.mock.take().contains(&Call::Paused(false)));
+        b.w8(MODE_ADDR, MODE_UNRESET);
+        assert!(b.mock.take().contains(&Call::Paused(true)));
+        b.w8(STOP_ADDR, 0);
+        assert!(b.mock.take().ends_with(&[Call::Stopped(false), Call::Paused(false)]));
+        assert_eq!(b.r32(TRX_ADDR + GATE_CTRL), 0x001);
+        // FRZ written while C64_STOP stands: each write takes effect at its clock, the C64 running up to it first.
+        b.w8(STOP_ADDR, 1);
+        b.w32(TRX_ADDR + GATE_CTRL, 0);
+        b.mock.take();
+        b.now = 1000;
+        b.w32(TRX_ADDR + GATE_CTRL, 1);
+        b.tick_at(1500);
+        assert_eq!(b.mock.take()[..4], [Call::Paused(false), Call::Advance(1000), Call::Paused(true), Call::Advance(1500)]);
+    }
+
+    #[test]
+    fn the_session_answers_the_window_and_mem_only_goes_to_ram() {
+        use crate::devices::trx::{GATE_CTRL, PAGE5, SH_STATUS};
+        let mut b = Bench::trx();
+        b.w32(TRX_ADDR + GATE_CTRL, 1);
+        b.w8(STOP_ADDR, 1);
+        b.w8(MODE_ADDR, MODE_ULTIMAX);
+        assert_eq!(b.r32(TRX_ADDR + PAGE5 + SH_STATUS), 0x0001_0001);
+        b.mock.take();
+        b.w8(DMA_ADDR + 0xD3D8, 0x13);
+        b.w8(DMA_ADDR + 0x0400, 0x01);
+        assert_eq!(b.r8(DMA_ADDR + 0xD018), 0x13, "the overlay");
+        assert_eq!(b.mock.take(), [Call::DmaWrite(0x0400, 0x01, true)], "VIC writes never reach the chip; RAM is real");
+        // Mem-only: the RAM's second port, outside the session.
+        b.w8(CORE_ADDR + DMA_MEMONLY, 1);
+        b.w8(DMA_ADDR + 0xD018, 0x77);
+        b.w8(CORE_ADDR + DMA_MEMONLY, 0);
+        assert_eq!(b.mock.take().into_iter().filter(|c| matches!(c, Call::DmaWrite(..))).collect::<Vec<_>>(), [Call::DmaWrite(0xD018, 0x77, true)]);
+        assert_eq!(trx::lock(&b.link()).session.vic_view().d018, 0x12, "mem-only writes do not count");
+        // C64_STOP falls: the list runs as real bus cycles, the session ends.
+        b.w8(MODE_ADDR, 0);
+        b.w8(STOP_ADDR, 0);
+        let calls = b.mock.take();
+        assert!(calls.contains(&Call::DmaWrite(0xD3D8, 0x13, false)), "at the address as written: {calls:?}");
+        assert_eq!(b.r32(TRX_ADDR + PAGE5 + SH_STATUS), 0x0001_0000);
+        // A reset in a session writes the VIC registers for real, ends the session and goes on.
+        b.w8(STOP_ADDR, 1);
+        b.w8(MODE_ADDR, MODE_ULTIMAX);
+        assert_eq!(b.r32(TRX_ADDR + PAGE5 + SH_STATUS), 0x0002_0001);
+        b.w8(DMA_ADDR + 0xD020, 0x05);
+        b.mock.take();
+        b.w8(MODE_ADDR, MODE_RESET);
+        let calls = b.mock.take();
+        let commit = calls.iter().position(|c| *c == Call::DmaWrite(0xD020, 0x05, false)).expect("replayed");
+        assert!(commit < calls.iter().position(|c| *c == Call::Reset(true)).expect("reset"), "{calls:?}");
+        assert_eq!(b.r32(TRX_ADDR + PAGE5 + SH_STATUS), 0x0002_0000);
+    }
+
+    #[test]
+    fn the_still_lands_in_ddr_at_the_frame_end() {
+        use crate::devices::trx::{PAGE6, STILL_BASE, STILL_CTRL, STILL_STATUS};
+        let mut b = Bench::trx();
+        let frame = |b: &mut Bench, n: u64, at: u64| {
+            *b.mock.frames.borrow_mut() = n;
+            b.tick_at(at);
+        };
+        frame(&mut b, 1, 100);
+        frame(&mut b, 2, 200);
+        assert_eq!(b.r32(TRX_ADDR + PAGE6 + STILL_STATUS), 1 << 8 | 1, "counted; the default base is past 64 MB");
+        assert!(b.ram.iter().all(|&v| v == 0), "and nothing written");
+        b.w32(TRX_ADDR + PAGE6 + STILL_BASE, 0x10_0000);
+        frame(&mut b, 3, 300);
+        // The mock's 2 x 1 frame of colours 1 and 2: window columns 0-8 show canvas column 0, the rest column 1.
+        assert_eq!(b.r32(TRX_ADDR + PAGE6 + STILL_STATUS), 2 << 8 | 1 << 1 | 1);
+        assert_eq!(b.ram[0x11_0000..0x11_0006], [0x11, 0x11, 0x11, 0x11, 0x21, 0x22], "slot 1");
+        assert_eq!(b.ram[0x11_0000 + 53_999], 0x22, "270 lines");
+        frame(&mut b, 4, 400);
+        assert_eq!((b.r32(TRX_ADDR + PAGE6 + STILL_STATUS), b.ram[0x10_0004]), (3 << 8 | 1, 0x21), "slot 0");
+        // STILL_CTRL 0: nothing written, the status kept.
+        b.w32(TRX_ADDR + PAGE6 + STILL_CTRL, 0);
+        b.ram[0x11_0004] = 0;
+        frame(&mut b, 5, 500);
+        assert_eq!((b.r32(TRX_ADDR + PAGE6 + STILL_STATUS), b.ram[0x11_0004]), (3 << 8 | 1, 0));
     }
 }

@@ -38,7 +38,9 @@ use trx64_core::model::{self, C64Model};
 use trx64_core::reu::Reu;
 use trx64_core::vic::SpeedProfile;
 use trx64_core::{AccessCtx, BusKind, CpuHistoryRing, DeltaRing, Machine, Observer};
-use ue2_core::c64host::{C64Backend, C64CartSlot, C64Drive, C64Frame, C64Rom, CartRom, CartSlotInfo, UciEvents};
+use trx64_core::c64cia::{cia1_read_pa, cia1_read_pb};
+use trx64_core::ciacore::CiaPins;
+use ue2_core::c64host::{C64Backend, C64CartSlot, C64Drive, C64Frame, C64Rom, CartPeek, CartRom, CartSlotInfo, UciEvents};
 
 use cart::{CartHandle, CartLogic, CartProxy, RunHints};
 use clock::Clock;
@@ -198,6 +200,8 @@ pub struct Trx64Backend {
     /// C64_VIDEOFORMAT asked for a cycle count no row has; noticed once.
     videoformat_noted: bool,
     stopped: bool,
+    /// S37 phase B: TRX64-Ultimate's machine pause: no C64 cycle runs (`C64Backend::set_paused`).
+    paused: bool,
     reset_held: bool,
     /// S28: `cart::RamSnoop` is on the port.
     ram_snoop: bool,
@@ -335,6 +339,7 @@ impl Trx64Backend {
             pending_model: None,
             videoformat_noted: false,
             stopped: false,
+            paused: false,
             reset_held: false,
             ram_snoop: false,
             ultimax: false,
@@ -911,6 +916,12 @@ impl C64Backend for Trx64Backend {
                 self.uci_wait = None;
             }
         }
+        // S37: while the machine pause stands no C64 cycle runs, so the CPU, VIC, CIAs, SID and drives stand and no SID
+        // sample is made. The sampler is the FPGA's and runs on.
+        if self.paused {
+            self.sampler.with(|s| s.advance_to(now));
+            return;
+        }
         let (clk, hz) = (self.m.c64_core.clk, self.cpu_hz());
         let mut target = self.clock.get_or_insert(Clock::new(now, clk, hz)).cycles(now);
         if target <= clk {
@@ -1353,6 +1364,109 @@ impl C64Backend for Trx64Backend {
         let events = self.m.uci_mut().map(|u| u.take_events()).unwrap_or_default();
         UciEvents { c64_reset: events.c64_reset, unlock: events.unlock }
     }
+
+    // ---- S37 phase B: TRX64-Ultimate's machine pause and freeze session (docs/specs/S37-trx-pixel-layer.md §5) ----
+
+    /// TRX64 has no hold for the whole machine (`Hold::Cpu` keeps the chips running), so the pause is here:
+    /// `advance_to` runs no cycle while it stands, and the release re-anchors the clock at the C64's cycle, as a reset
+    /// release does.
+    fn set_paused(&mut self, paused: bool) {
+        if paused == self.paused {
+            return;
+        }
+        self.paused = paused;
+        if !paused {
+            self.clock = Some(Clock::new(self.now, self.m.c64_core.clk, self.cpu_hz()));
+        }
+    }
+
+    fn frame_clocks(&self) -> u64 {
+        let t = self.m.timing();
+        u64::from(t.lines_per_frame) * u64::from(t.cycles_per_line) * ue2_core::time::CLOCK_HZ / self.cpu_hz()
+    }
+
+    fn frame_lines(&self) -> usize {
+        usize::from(self.m.timing().lines_per_frame)
+    }
+
+    /// TRX64's I/O peek: no IRQ latch, collision or ICR cleared.
+    fn io_peek(&self, addr: u16) -> u8 {
+        self.m.peek_lens(addr, "io")
+    }
+
+    fn ram_peek(&self, addr: u16) -> u8 {
+        self.m.ram[usize::from(addr)]
+    }
+
+    fn cpu_port(&self) -> (u8, u8) {
+        (self.m.port_dir, self.m.port_data)
+    }
+
+    /// The internal and the physical cartridge's lines as the bus sharing routes them, without the forced Ultimax.
+    fn cart_lines(&self) -> (bool, bool, bool) {
+        let present = self.cart.with(|c| c.present()) || self.slot.with(|s| s.physical().is_some());
+        let cart = &self.cart;
+        let l = self.slot.with(|s| s.lines(cart, false));
+        (present, l.exrom != 0, l.game != 0)
+    }
+
+    fn cia_regs(&self, cia: u8) -> [u8; 16] {
+        if cia == 0 {
+            self.m.cia1.c_cia
+        } else {
+            self.m.cia2.c_cia
+        }
+    }
+
+    /// TRX64's own port function (VICE `read_ciapa`/`read_ciapb`) over CIA 1 with these port registers.
+    fn cia1_ports(&self, pra: u8, ddra: u8, prb: u8, ddrb: u8) -> (u8, u8) {
+        let mut c_cia = self.m.cia1.c_cia;
+        (c_cia[0], c_cia[1], c_cia[2], c_cia[3]) = (pra, prb, ddra, ddrb);
+        let pins = CiaPins { c_cia, old_pa: pra | !ddra, old_pb: prb | !ddrb };
+        let (kb, clk, j1, j2) = (&self.m.keyboard, self.m.clk, &self.m.joystick1, &self.m.joystick2);
+        (cia1_read_pa(&pins, kb, clk, j1, j2), cia1_read_pb(&pins, kb, clk, j1, j2))
+    }
+
+    /// The cartridge logic's peek, and in IO1/IO2 the port's devices (the UCI, the REU, the sampler) before it, as
+    /// TRX64's `port_peek` asks them, without its open-bus fallback. A cartridge on the physical port is not read.
+    fn cart_peek(&self, addr: u16) -> CartPeek {
+        if self.slot.with(|s| s.physical().is_some()) {
+            return CartPeek::External;
+        }
+        let cart = self.cart.with(|c| c.peek(addr));
+        let device = if (0xDE00..0xE000).contains(&addr) {
+            let profile = self.m.port_profile.as_ref().and_then(|d| d.peek(addr, cart));
+            profile.or_else(|| self.m.expansion.as_ref().and_then(|d| d.peek(addr, cart)))
+        } else {
+            None
+        };
+        device.or(cart).map_or(CartPeek::Miss, CartPeek::Hit)
+    }
+
+    /// TRX64's banked write, with the forced Ultimax decode put in for the writes when I/O is not mapped (TRX64 has
+    /// no host write to I/O whatever the PLA says).
+    fn io_commit(&mut self, writes: &[(u16, u8)]) {
+        if writes.is_empty() {
+            return;
+        }
+        let forced = !self.m.memconfig.io;
+        let ultimax = self.ultimax;
+        if forced {
+            self.ultimax = true;
+            self.install_cart();
+        }
+        for &(addr, val) in writes {
+            self.m.write_full(addr, val);
+        }
+        self.sid.dma_written(self.m.c64_core.clk);
+        if forced {
+            self.ultimax = ultimax;
+            self.install_cart();
+        }
+        if self.m.cartridge.is_some() {
+            self.cart_changed();
+        }
+    }
 }
 
 /// CARTSLOT: `cart-info`, `cart-save` and the write-back of `--cart-slot` (docs/status/cart-slot.md).
@@ -1512,6 +1626,138 @@ mod tests {
         assert!(c64.pending_model.is_none(), "64 cycles: no row");
         c64.core_config_write(CORE_VIDEOFORMAT, 0x2A);
         assert!(c64.pending_model.is_none(), "already NTSC");
+    }
+
+    /// S37 phase B: the machine pause stands the whole C64 — cycle count, VIC frame, CIA timer, the drives'
+    /// reference — while C64_STOP alone (`Hold::Cpu`) keeps the chips running; after the release the C64 runs on from
+    /// the cycle it stood at.
+    #[test]
+    fn the_pause_stands_the_whole_machine_and_resumes_from_the_same_cycle() {
+        let Some((mut c64, mut now)) = booted() else { return };
+        let state = |c: &Trx64Backend| (c.m.c64_core.clk, c.m.vic.frame, c.m.peek_lens(0xDC04, "io"), c.m.drive_c64_ref);
+        c64.set_stopped(true);
+        let before = state(&c64);
+        run_ms(&mut c64, &mut now, 50);
+        let held = state(&c64);
+        assert!(held.0 > before.0 && held.1 > before.1, "C64_STOP alone: the chips run");
+        c64.set_paused(true);
+        run_ms(&mut c64, &mut now, 100);
+        assert_eq!(state(&c64), held, "paused: nothing moves");
+        assert_eq!(c64.frame_clocks(), 312 * 63 * ue2_core::time::CLOCK_HZ / c64.cpu_hz(), "one PAL frame");
+        c64.set_paused(false);
+        c64.set_stopped(false);
+        run_ms(&mut c64, &mut now, 10);
+        let ran = c64.m.c64_core.clk - held.0;
+        assert!(ran.abs_diff(9_852) < 100, "10 ms from the cycle it stood at: {ran}");
+    }
+
+    /// S37 phase B: what the session reads and writes of the C64: the commit's writes reach I/O whatever the CPU port
+    /// maps, and CIA 1's ports follow the keys with the port registers the session holds.
+    #[test]
+    fn the_session_reaches_io_through_any_banking_and_scans_the_keys() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        c64.advance_to(0);
+        c64.dma_write(0x0001, 0x34, false);
+        assert!(!c64.m.memconfig.io, "all RAM");
+        c64.io_commit(&[(0xD020, 0x02), (0xD800, 0x05)]);
+        assert_eq!((c64.m.vic.regs[0x20] & 0x0F, c64.io_peek(0xD800)), (0x02, 0xF5));
+        assert_eq!((c64.m.ram[0xD020], c64.m.memconfig.io), (0, false), "the RAM below and the banking as they were");
+        assert_eq!(c64.cpu_port().1, 0x34);
+        assert_eq!(c64.cart_lines(), (false, true, true), "no cartridge");
+        assert_eq!(c64.cart_peek(0x8000), CartPeek::Miss);
+        let scan = |c64: &Trx64Backend| (0..8).map(|c| c64.cia1_ports(!(1u8 << c), 0xFF, 0xFF, 0x00).1).collect::<Vec<_>>();
+        assert!(scan(&c64).iter().all(|&pb| pb == 0xFF), "no key");
+        c64.set_key(1, 2, true);
+        assert_eq!(scan(&c64).iter().filter(|&&pb| pb != 0xFF).count(), 1, "one column sees the key");
+    }
+
+    /// S37 phase B (spec §5.8): a raster interrupt frozen and resumed ten times through the session, with Gideon's
+    /// freeze protocol under PROTO and a menu between, keeps every interrupt's line and cycle and misses none.
+    #[test]
+    fn a_raster_irq_keeps_its_line_and_cycle_through_ten_freezes() {
+        use ue2_core::devices::trx_session::{Lines, Session, SH_PROTO};
+        let Some((mut c64, mut now)) = booted() else { return };
+        // $C000: CIA 1 interrupts off, a raster interrupt at line $80, CIA 1 timer A free-running over one PAL frame
+        // (19,656 cycles); the handler stores timer A's low byte and $D012 at an index and acknowledges.
+        #[rustfmt::skip]
+        let program: &[u8] = &[
+            0x78,                   // sei
+            0xA9, 0x7F, 0x8D, 0x0D, 0xDC, 0xAD, 0x0D, 0xDC, // CIA 1 interrupts off
+            0xA9, 0x35, 0x8D, 0x14, 0x03, 0xA9, 0xC0, 0x8D, 0x15, 0x03, // ($0314) = $C035
+            0xA9, 0x1B, 0x8D, 0x11, 0xD0, 0xA9, 0x80, 0x8D, 0x12, 0xD0, // line $80
+            0xA9, 0x01, 0x8D, 0x1A, 0xD0, // raster interrupt on
+            0xA9, 0xC7, 0x8D, 0x04, 0xDC, 0xA9, 0x4C, 0x8D, 0x05, 0xDC, // timer A latch $4CC7
+            0xA9, 0x11, 0x8D, 0x0E, 0xDC, // start, force load, continuous
+            0x58,                   // cli
+            0x4C, 0x32, 0xC0,       // $C032: jmp $C032
+            // $C035: the handler
+            0xAD, 0x04, 0xDC, 0xAE, 0x00, 0xC1, 0x9D, 0x00, 0xC2, // timer A low to $C200,x
+            0xAD, 0x12, 0xD0, 0x9D, 0x00, 0xC3, // $D012 to $C300,x
+            0xEE, 0x00, 0xC1,       // the index
+        ];
+        let tail: [u8; 8] = [0xA9, 0x01, 0x8D, 0x19, 0xD0, 0x4C, 0x81, 0xEA]; // ack, jmp $EA81
+        for (i, &b) in program.iter().chain(&tail).enumerate() {
+            c64.dma_write(0xC000 + i as u16, b, true);
+        }
+        c64.dma_write(0xC100, 0, true);
+        c64.m.c64_core.reg_pc = 0xC000;
+        let first = c64.m.vic.frame;
+        run_ms(&mut c64, &mut now, 100);
+        let lines = |stop, ultimax| Lines { frz: true, stop, ultimax, reset: false };
+        let mut session = Session::default();
+        for _ in 0..10 {
+            run_ms(&mut c64, &mut now, 37);
+            // trx_video_freeze_enter: PROTO, then FRZ; stop(): C64_STOP pauses; goUltimax() starts the session.
+            session.write_ctrl(1 | SH_PROTO);
+            c64.set_stopped(true);
+            c64.set_paused(true);
+            c64.set_ultimax(true);
+            session.step(lines(true, true), &mut c64);
+            assert!(session.active);
+            // stop() and determine_d012(): the registers, the raster interrupt acknowledged and polled for.
+            for addr in [0xD012, 0xD011, 0xD01A, 0xD019] {
+                session.read(addr, lines(true, true), &mut c64);
+            }
+            session.write(0xD01A, 0x01, lines(true, true), &mut c64);
+            session.write(0xD019, 0x81, lines(true, true), &mut c64);
+            session.read(0xD019, lines(true, true), &mut c64);
+            // init_io().
+            for (addr, val) in [(0xDD02, 0x3C), (0xDC03, 0x00), (0xDC02, 0xFF), (0xD018, 0x12), (0xD011, 0x1B), (0xD012, 0xF8), (0xD020, 0x00)] {
+                session.write(addr, val, lines(true, true), &mut c64);
+            }
+            // The menu, listed: the keyboard scan and the screen.
+            session.write_ctrl(1);
+            for row in [0xFE, 0xFD, 0xFB, 0x00] {
+                session.write(0xDC00, row, lines(true, true), &mut c64);
+                session.read(0xDC01, lines(true, true), &mut c64);
+            }
+            session.write(0x0400, 0x01, lines(true, true), &mut c64);
+            run_ms(&mut c64, &mut now, 20);
+            // restore_io() and resume(), Gideon's protocol again: everything put back.
+            session.write_ctrl(1 | SH_PROTO);
+            for (addr, val) in [(0xDC00, 0x7F), (0xDC02, 0xFF), (0xDC03, 0x00), (0xDD02, 0x3F), (0xD018, 0x15), (0xD011, 0x1B), (0xD012, 0x80), (0xD020, 0x0E), (0xD019, 0x81), (0xD01A, 0x01)] {
+                session.write(addr, val, lines(true, true), &mut c64);
+            }
+            c64.dma_write(0x0400, 0x20, true);
+            c64.set_ultimax(false);
+            session.step(lines(true, false), &mut c64);
+            session.read(0xD000, lines(true, false), &mut c64);
+            c64.set_stopped(false);
+            c64.set_paused(false);
+            session.step(lines(false, false), &mut c64);
+            assert!(!session.active);
+        }
+        run_ms(&mut c64, &mut now, 100);
+        // The first entry is the flag the raster had latched before `cli`.
+        let n = usize::from(c64.m.ram[0xC100]);
+        let frames = (c64.m.vic.frame - first) as usize;
+        assert!((n - 1).abs_diff(frames) <= 1 && n > 25, "{n} interrupts in {frames} frames: none missed");
+        let timer = &c64.m.ram[0xC201..0xC200 + n];
+        let line = &c64.m.ram[0xC301..0xC300 + n];
+        assert_eq!(line[0], 0x80);
+        assert!(line.iter().all(|&l| l == line[0]), "every interrupt on the same line: {line:?}");
+        assert!(timer.iter().all(|&t| t == timer[0]), "every interrupt at the same cycle: {timer:?}");
+        assert_eq!(session.last_commit, 0, "the menu's writes were put back: nothing to commit");
     }
 
     #[test]

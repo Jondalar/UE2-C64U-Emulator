@@ -13,7 +13,7 @@ use crate::bus::{Access, SystemBus, IO_BIT, RAM_MASK};
 use crate::c64host::{C64Backend, C64CartSlot};
 use crate::devices::overlay::{Overlay, REG_TRANSPARENCY};
 use crate::devices::{self, c64::C64Port, itu::Itu, u64io::U64Io};
-use crate::host::{DisplaySnapshot, HostInput};
+use crate::host::{DisplaySnapshot, HostInput, TrxOutput};
 use crate::loader;
 use crate::symbols::Symbols;
 use crate::time;
@@ -742,8 +742,8 @@ impl Machine {
     }
 
     /// Overlay snapshot from `devices::overlay::Overlay`, or blank buffers of the sizes documented on
-    /// `DisplaySnapshot` when no overlay is installed, plus the frame of an attached C64 and the TRX pixel layer
-    /// while it is on (S37).
+    /// `DisplaySnapshot` when no overlay is installed, plus the frame of an attached C64 and the TRX output while the
+    /// pixel layer is on or the machine pause stands, with the text layer while it is shown (S37).
     pub fn display(&self) -> DisplaySnapshot {
         let now_ms = self.now_ms();
         let mut snap = match self.bus.io.get::<Overlay>() {
@@ -761,13 +761,31 @@ impl Machine {
             },
         };
         snap.c64 = self.bus.io.get::<C64Port>().and_then(C64Port::frame);
-        snap.trx = self.bus.io.get::<devices::trx::Trx>().and_then(|trx| trx.layer(&self.bus.ram));
+        snap.trx = self.bus.io.get::<devices::trx::Trx>().and_then(|trx| {
+            let (layer, paused) = (trx.layer(&self.bus.ram), trx.paused());
+            let backend = self.bus.io.get::<C64Port>().and_then(C64Port::backend);
+            let text = trx.text().zip(backend).map(|((view, opaque), c64)| devices::trx::text_layer(view, opaque, c64));
+            (layer.is_some() || paused).then_some(TrxOutput { layer, paused, text })
+        });
+        // The text dump shows what the text layer draws while it is shown, not what the paused VIC points at.
+        if let (Some(frame), Some(text)) = (snap.c64.as_mut(), snap.trx.as_ref().and_then(|t| t.text.as_ref())) {
+            (frame.screen, frame.charset) = (text.screen.clone(), text.charset);
+        }
         snap
     }
 
     /// The attached C64's VIC frame counter, or 0 when there is no C64 or its backend does not count frames.
     pub fn frame_counter(&self) -> u64 {
         self.bus.io.get::<C64Port>().map_or(0, C64Port::frame_counter)
+    }
+
+    /// What the picture follows: the VIC frame counter, or with `--trx-io` the TRX output's frame starts, which go on
+    /// while the machine pause stands the VIC (S37).
+    pub fn picture_counter(&self) -> u64 {
+        match self.bus.io.get::<devices::trx::Trx>() {
+            Some(trx) => trx.frame_starts(),
+            None => self.frame_counter(),
+        }
     }
 
     /// The UDP stream generators, once per call: a new VIC frame becomes datagrams, and everything waiting goes

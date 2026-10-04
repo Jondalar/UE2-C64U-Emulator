@@ -114,8 +114,9 @@ fn joy(host: &mut Host) -> String {
     out
 }
 
-/// `trx` — the TRX64-Ultimate block of `--trx-io` (S37): page 0's ID, CAPS and interrupt, page 6's layer registers as
-/// the app last committed them, and whether the last frame start showed the layer.
+/// `trx` — the TRX64-Ultimate block of `--trx-io` (S37): page 0's ID, CAPS, interrupt and gate, the pause, page 5's
+/// freeze session, page 6's layer, still and text registers as the app last committed them, whether the last frame
+/// start showed the layer, and TRX64's VIC frame count.
 fn trx(host: &mut Host) -> Result<String, String> {
     let t = host.m.bus.io.get::<Trx>().ok_or("this machine has no TRX block (--trx-io)")?;
     let id: String = (0..4).map(|off| char::from(t.peek8(off))).collect();
@@ -148,11 +149,51 @@ fn trx(host: &mut Host) -> Result<String, String> {
         on(key & 0x1_0000 != 0),
     ));
     out.push_str(&format!("  px_status     {status:#010x}  frames {}\n", status >> 16));
+    let still = reg(trx::STILL_STATUS);
     out.push_str(&format!(
-        "  still         {}  base {:#010x}  (no capture yet)\n",
+        "  still         {}  base {:#010x}  status {still:#010x}  valid {}, slot {}, frames {}\n",
         on(reg(trx::STILL_CTRL) & 1 != 0),
         reg(trx::STILL_BASE),
+        yes(still & 1 != 0),
+        still >> 1 & 1,
+        still >> 8,
     ));
+    let gate = t.sys_reg(trx::GATE_CTRL);
+    out.push_str(&format!(
+        "  gate_ctrl     {gate:#010x}  frz {}  paused: {}\n",
+        on(gate & trx::GATE_FRZ != 0),
+        yes(gate & trx::GATE_HALTED != 0),
+    ));
+    let (ctrl, status) = (t.sys_reg(trx::PAGE5 + trx::SH_CTRL), t.sys_reg(trx::PAGE5 + trx::SH_STATUS));
+    out.push_str(&format!(
+        "  sh_ctrl       {ctrl:#010x}  mode {}, sidefx {}, proto {}\n",
+        ctrl & 3,
+        on(ctrl & 4 != 0),
+        on(ctrl & 8 != 0),
+    ));
+    out.push_str(&format!(
+        "  sh_status     {status:#010x}  session: {}, sessions {}\n",
+        yes(status & 1 != 0),
+        status >> 16,
+    ));
+    let list = t.sys_reg(trx::PAGE5 + trx::SH_LIST);
+    out.push_str(&format!(
+        "  sh_counts     accesses {}  real {}  unmapped {}  list {} (dropped {})  last commit {}\n",
+        t.sys_reg(trx::PAGE5 + trx::SH_ACCESSES),
+        t.sys_reg(trx::PAGE5 + trx::SH_REAL),
+        t.sys_reg(trx::PAGE5 + trx::SH_UNMAPPED),
+        list & 0xFF,
+        list >> 16,
+        t.sys_reg(trx::PAGE5 + trx::SH_COMMIT),
+    ));
+    let (tx, tx_status) = (t.tx_reg(trx::TX_CTRL), t.tx_reg(trx::TX_STATUS));
+    out.push_str(&format!(
+        "  tx_ctrl       {tx:#010x}  show {}, opaque {}  tx_status {tx_status:#010x} (shown: {})\n",
+        on(tx & 1 != 0),
+        on(tx & 2 != 0),
+        yes(tx_status & 1 != 0),
+    ));
+    out.push_str(&format!("  vic frames    {}\n", t.vic_frames()));
     Ok(out)
 }
 

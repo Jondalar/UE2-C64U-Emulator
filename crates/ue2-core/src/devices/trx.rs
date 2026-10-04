@@ -1,19 +1,26 @@
-//! TRX64-Ultimate's IO block 0x101A0000-0x101AFFFF (`--trx-io`): page 0, the ID and the interrupt, and page 6, the
-//! pixel layer. Spec: docs/specs/S37-trx-pixel-layer.md. The hardware is TRX64-Ultimate's designs/c64_basic/trx_io.v
-//! (page 0) and pix_layer.v (page 6).
+//! TRX64-Ultimate's IO block 0x101A0000-0x101AFFFF (`--trx-io`): page 0, the ID, the interrupt and from 0x100 the
+//! gate; page 5, the freeze session; page 6, the pixel layer, the still capture and the C64 text layer. Spec:
+//! docs/specs/S37-trx-pixel-layer.md. The hardware is TRX64-Ultimate's designs/c64_basic/trx_io.v (page 0 below
+//! 0x100), trx_sys.v (page 0 from 0x100, pages 1, 2, 3, 5, 7), freeze_resp.v (the session), pix_layer.v and c64_text.v
+//! (page 6).
 //!
-//! Sixteen 4 KB pages, byte wide. Every other page and every offset not listed reads 0 and ignores writes. Page 6
-//! still capture (`STILL_*`) keeps its registers but captures nothing yet (S37 phase B), so `STILL_STATUS` reads 0.
+//! Sixteen 4 KB pages, byte wide. Pages 1, 2, 3, 4 and 7 and every offset not listed read 0 and ignore writes.
 //!
 //! The layer's settings and a pending flip take effect at the frame start, one per VIC frame. The device sees a VIC
 //! frame through the count [`C64Port`] publishes after each sync, polled every millisecond, so the frame start comes
-//! up to 1 ms after the VIC finished the frame. Without a C64 that counts frames it comes every PAL frame period.
+//! up to 1 ms after the VIC finished the frame. While the machine pause stands the VIC count stands too, and a frame
+//! start comes every frame period instead (the output timing runs on). Without a C64 that counts frames it comes every
+//! PAL frame period.
+//!
+//! The machine pause, the freeze session and the still capture live where the C64 is, in [`C64Port`]; the block and
+//! the port share them through a [`TrxLink`].
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::c64host::{C64Charset, C64Rom};
 use crate::devices::c64::C64Port;
-use crate::host::TrxLayer;
+use crate::devices::trx_session::{Chips, Session, VicView};
+use crate::host::{TrxLayer, TrxText};
 use crate::io::{IoCtx, IoDevice, IoMap};
 use crate::irq::IrqState;
 use crate::machine::{MachineConfig, TrxIo};
@@ -26,18 +33,41 @@ pub const IRQ_HIGH_BIT: u8 = 2;
 
 /// Page 0 (trx_io.v): ID "TRX2" at 000-003, CAPS 004, CAPS2 005, BUILD 008-00B, IRQ_EN 010, IRQ_CAUSE 014.
 const ID: &[u8; 4] = b"TRX2";
-/// CAPS b6 page 6 video, b7 the layer is RGB565. The bitstream reads $FF; UE2 has only these two, so the app leaves
-/// the state bus, the engine, the freeze session and the cartridge alone.
-pub const CAPS: u8 = 0xC0;
-/// The bitstream reads $3F; UE2 has none of its features.
-pub const CAPS2: u8 = 0x00;
+/// CAPS b0 page 0 gate, b5 page 5 session, b6 page 6 video, b7 the layer is RGB565: what the app's freeze menu needs
+/// (trx_video.cc `init`). The bitstream reads $FF; b1-b4 (state bus, engine, debug, cartridge) stay off, and with them
+/// every app path that needs pages 1-4.
+pub const CAPS: u8 = 0xE1;
+/// CAPS2 b3: the session has the commit list, so the app sets PROTO around Gideon's protocol (trx_video.cc
+/// `has_list`). The bitstream reads $3F; the other bits' features are not here.
+pub const CAPS2: u8 = 0x08;
 const CAPS_OFF: u32 = 0x004;
 const CAPS2_OFF: u32 = 0x005;
 pub const IRQ_EN: u32 = 0x010;
 pub const IRQ_CAUSE: u32 = 0x014;
-/// IRQ_CAUSE b6, the frame start; b7, a flip was done. The other causes are pages UE2 does not build, so they stay 0.
+/// IRQ_CAUSE b0, the machine pause came into effect (top.v `stop_tgl`); b6, the frame start; b7, a flip was done. The
+/// other causes are pages UE2 does not build, so they stay 0.
+pub const CAUSE_STOP: u8 = 0x01;
 pub const CAUSE_VSYNC: u8 = 0x40;
 pub const CAUSE_FLIP: u8 = 0x80;
+
+/// trx_sys.v page 0 from 0x100: GATE_CTRL, W b0 FRZ, R b0 FRZ, b8 halted, b9 the gate is shut. 104-FFF read 0 (S38).
+pub const GATE_CTRL: u32 = 0x100;
+pub const GATE_FRZ: u32 = 0x001;
+pub const GATE_HALTED: u32 = 0x100;
+pub const GATE_SHUT: u32 = 0x200;
+/// Page 5, the freeze session (trx_sys.v, freeze_resp.v).
+pub const PAGE5: u32 = 0x5000;
+pub const SH_CTRL: u32 = 0x000;
+pub const SH_STATUS: u32 = 0x004;
+pub const SH_ACCESSES: u32 = 0x008;
+pub const SH_REAL: u32 = 0x00C;
+pub const SH_GCLK: u32 = 0x010;
+pub const SH_UNMAPPED: u32 = 0x014;
+pub const SH_LIST: u32 = 0x018;
+pub const SH_COMMIT: u32 = 0x01C;
+/// The 128 overlay bytes and their valid bits.
+pub const SH_OVERLAY: u32 = 0x080;
+pub const SH_VALID: u32 = 0x100;
 
 /// Page 6, the pixel layer (pix_layer.v): 32-bit registers, little endian. Writing byte 0-2 stages it, writing byte
 /// 3 commits all four; reading byte 0 latches the register for bytes 1-3.
@@ -54,21 +84,115 @@ pub const PX_POS: u32 = 0x098;
 pub const PX_GALPHA: u32 = 0x09C;
 pub const PX_KEY: u32 = 0x0A0;
 pub const PX_STATUS: u32 = 0x0A4;
+/// c64_text.v in page 6: TX_CTRL b0 show, b1 opaque, reads b31:24 = 1; TX_STATUS b0 shown now, b15:8 late lines.
+pub const TX_CTRL: u32 = 0x0C0;
+pub const TX_STATUS: u32 = 0x0C4;
+const TX_THERE: u32 = 0x0100_0000;
 
 /// How often the device looks at the VIC frame count: the C64 port syncs at least this often (c64.rs SYNC_PERIOD).
 const POLL: u64 = CLOCKS_PER_MS;
-/// The frame period without a C64 that counts frames: PAL, 312 lines of 63 cycles at 985,248 Hz.
+/// The frame period without a C64 that says its own: PAL, 312 lines of 63 cycles at 985,248 Hz.
 const PAL_FRAME: u64 = 312 * 63 * CLOCK_HZ / 985_248;
 /// PX_STATUS b1 holds for the first 45 output lines of 1125 (`px_vblank`, cy < 45): 45 × 2688 clocks of the
 /// 151.58 MHz pixel clock (vic_scaler.v), 0.8 ms.
 const VBLANK: u64 = 45 * 2688 * CLOCK_HZ / 151_580_000;
-/// The DDR byte address the layer's fetch takes: bits 26:4 (pix_layer.v `rd_a`), 128 MB.
-const DDR_ADDR_MASK: u32 = 0x07FF_FFFF;
+/// The DDR byte address the layer's fetch and the still capture take: bits 26:0 (pix_layer.v `rd_a`, `st_a`).
+pub const DDR_ADDR_MASK: u32 = 0x07FF_FFFF;
 /// Output frame size the layer is placed in.
 pub const OUT_W: usize = 1920;
 pub const OUT_H: usize = 1080;
 /// Source width limit: the line buffer holds 960 pixels (pix_layer.v `f_w`).
 const MAX_W: u16 = 960;
+
+/// The still capture's window (pix_layer.v `X0S`, `Y0S`, 400 × 270): VIC raster columns 96-495, lines 16-285, two
+/// pixels a byte, the first in the low nibble. Slot n is at `STILL_BASE` + n × 64 KB.
+pub const STILL_W: usize = 400;
+pub const STILL_H: usize = 270;
+pub const STILL_Y0: usize = 16;
+pub const STILL_SLOT: u32 = 0x1_0000;
+
+/// The still capture (pix_layer.v): its settings as the app committed them and the status of the last complete
+/// frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Still {
+    /// STILL_CTRL b0 and STILL_BASE.
+    pub on: bool,
+    pub base: u32,
+    /// STILL_STATUS b0 (a frame completed since power on), b1 (its slot), b31:8 (frames, 24 bits).
+    pub valid: bool,
+    pub slot: u8,
+    pub count: u32,
+    /// The slot the capture last completed (`last_slot`): 1 at power on, so the first frame goes to slot 0.
+    pub last: u8,
+}
+
+impl Still {
+    pub const POWER_ON: Still = Still { on: true, base: 0x0505_0000, valid: false, slot: 0, count: 0, last: 1 };
+
+    pub fn status(&self) -> u32 {
+        (self.count & 0xFF_FFFF) << 8 | u32::from(self.slot) << 1 | u32::from(self.valid)
+    }
+
+    /// `frames` VIC frames ended since the last look; the newest is captured. A complete one goes into the slot the
+    /// device would have used for it and counts them all; an incomplete one (a VIC that never reaches line 285) goes
+    /// into the slot after the last and changes no status. Returns the slot written.
+    pub fn frames(&mut self, frames: u64, complete: bool) -> u8 {
+        if !complete {
+            return self.last ^ 1;
+        }
+        let slot = self.last ^ (frames & 1) as u8;
+        self.last = slot;
+        self.slot = slot;
+        self.valid = true;
+        self.count = self.count.wrapping_add(frames as u32) & 0xFF_FFFF;
+        slot
+    }
+}
+
+/// What the block and the C64 port share (S37 phase B). The port owns the C64: it applies the pause, answers the
+/// session's window accesses and captures the still; the block owns the registers the app reads and writes.
+#[derive(Debug)]
+pub struct TrxLink {
+    /// TRX64's VIC frame count after the last sync, 0 while no C64 counts frames.
+    pub frames: u64,
+    /// One VIC frame in emulator clocks, 0 when the C64 does not say.
+    pub frame_clocks: u64,
+    /// GATE_CTRL b0, and the writes the port has not taken yet: (clock, b0).
+    pub frz: bool,
+    pub frz_writes: Vec<(u64, bool)>,
+    /// The machine pause is in effect (applied by the port), and how often it came into effect.
+    pub paused: bool,
+    pub pause_starts: u64,
+    pub session: Session,
+    pub still: Still,
+}
+
+impl TrxLink {
+    fn power_on(frames: u64, frame_clocks: u64, paused: bool, pause_starts: u64) -> Self {
+        TrxLink {
+            frames,
+            frame_clocks,
+            frz: false,
+            frz_writes: Vec::new(),
+            paused,
+            pause_starts,
+            session: Session::default(),
+            still: Still::POWER_ON,
+        }
+    }
+}
+
+pub type Link = Arc<Mutex<TrxLink>>;
+
+/// A new link at power on.
+pub fn link() -> Link {
+    Arc::new(Mutex::new(TrxLink::power_on(0, 0, false, 0)))
+}
+
+/// The link, also after a panic elsewhere held it.
+pub fn lock(link: &Link) -> MutexGuard<'_, TrxLink> {
+    link.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The layer's settings as the app last committed them (pix_layer.v `r_*`, defaults included).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,52 +255,79 @@ impl Shown {
     }
 }
 
+/// Whether block offset `off` is one of trx_sys.v's pages (trx_io.v `far`): page 0 from 0x100, pages 1, 2, 3, 5, 7.
+fn far(off: u32) -> bool {
+    match off >> 12 {
+        0 => off & 0xF00 != 0,
+        1 | 2 | 3 | 5 | 7 => true,
+        _ => false,
+    }
+}
+
+/// TX_CTRL and TX_STATUS, c64_text.v's two registers (`sel`, 0C0-0C7).
+fn tx_sel(reg: u32) -> bool {
+    reg & !7 == TX_CTRL
+}
+
 pub struct Trx {
     irq_en: u8,
     cause: u8,
-    still_ctrl: bool,
-    still_base: u32,
     set: Settings,
     /// PX_FRONT and PX_BACK; `flip` while a PX_BACK write waits for the frame start.
     front: u32,
     back: u32,
     flip: bool,
-    /// Bytes 0-2 of the next commit, one stage for all registers (pix_layer.v `stg`).
+    /// Bytes 0-2 of the next commit, one stage for all of page 6 (pix_layer.v `stg`).
     stage: u32,
-    /// Bytes 1-3 of the last byte-0 read (pix_layer.v `lat`).
+    /// Bytes 1-3 of the last page 6 byte-0 read (pix_layer.v `lat`).
     latch: u32,
+    /// trx_sys.v's one collect buffer and one latch for all of its pages (`wbuf`, `rlatch`).
+    far_stage: u32,
+    far_latch: u32,
+    /// c64_text.v: TX_CTRL b1:0, its own stage of byte 0 and its own latch.
+    tx_ctrl: u8,
+    tx_stage: u8,
+    tx_latch: u32,
     shown: Shown,
-    /// Frame starts, wrapping (PX_STATUS b31:16).
+    /// Frame starts, wrapping (PX_STATUS b31:16), and all of them.
     frames: u16,
+    starts: u64,
     /// Clock of the last frame start, and the latest clock the device saw.
     frame_at: u64,
     now: u64,
-    /// The VIC frame count from [`C64Port`], and the value of the last frame start; 0 while no C64 counts.
-    vic: Arc<AtomicU64>,
+    /// The VIC frame count of the last frame start, and the pause starts seen.
     vic_seen: u64,
+    pause_seen: u64,
     next_poll: u64,
+    link: Link,
 }
 
 impl Trx {
-    pub fn new(vic: Arc<AtomicU64>) -> Self {
+    pub fn new(link: Link) -> Self {
+        let pause_seen = lock(&link).pause_starts;
         Trx {
             irq_en: 0,
             cause: 0,
-            still_ctrl: true,
-            still_base: 0x0505_0000,
             set: Settings::DEFAULT,
             front: 0,
             back: 0,
             flip: false,
             stage: 0,
             latch: 0,
+            far_stage: 0,
+            far_latch: 0,
+            tx_ctrl: 0,
+            tx_stage: 0,
+            tx_latch: 0,
             shown: Shown::of(&Settings::DEFAULT, 0),
             frames: 0,
+            starts: 0,
             frame_at: 0,
             now: 0,
-            vic,
             vic_seen: 0,
+            pause_seen,
             next_poll: POLL,
+            link,
         }
     }
 
@@ -193,12 +344,28 @@ impl Trx {
         self.shown.on
     }
 
-    /// Page 6 register `off` (its first byte) as a 32-bit read returns it.
+    /// The machine pause is in effect.
+    pub fn paused(&self) -> bool {
+        lock(&self.link).paused
+    }
+
+    /// Frame starts since power on: the output's frames, which go on while the machine pause stands.
+    pub fn frame_starts(&self) -> u64 {
+        self.starts
+    }
+
+    /// TRX64's VIC frame count as the block saw it last.
+    pub fn vic_frames(&self) -> u64 {
+        lock(&self.link).frames
+    }
+
+    /// Page 6 register `off` (its first byte) as a 32-bit read returns it; c64_text.v's two read 0 here.
     pub fn reg(&self, off: u32) -> u32 {
         let s = &self.set;
         match off {
-            STILL_CTRL => u32::from(self.still_ctrl),
-            STILL_BASE => self.still_base,
+            STILL_CTRL => u32::from(lock(&self.link).still.on),
+            STILL_BASE => lock(&self.link).still.base,
+            STILL_STATUS => lock(&self.link).still.status(),
             PX_CTRL => u32::from(s.ctrl),
             PX_FRONT => self.front,
             PX_BACK => self.back,
@@ -212,8 +379,69 @@ impl Trx {
                 let vblank = self.now < self.frame_at + VBLANK;
                 u32::from(self.frames) << 16 | u32::from(vblank) << 1 | u32::from(self.flip)
             }
-            // STILL_STATUS: no capture before phase B.
             _ => 0,
+        }
+    }
+
+    /// c64_text.v's TX_CTRL (`0x0100_0000` | ctrl) or TX_STATUS (b0 shown now; the late lines stay 0).
+    pub fn tx_reg(&self, off: u32) -> u32 {
+        if off & 4 == 0 {
+            TX_THERE | u32::from(self.tx_ctrl)
+        } else {
+            u32::from(self.text().is_some())
+        }
+    }
+
+    /// The text layer's view and its opaque bit while it is shown: TX_CTRL b0, a session runs and the session's VIC
+    /// writes leave standard text mode (c64_text.v:135, :188).
+    pub fn text(&self) -> Option<(VicView, bool)> {
+        if self.tx_ctrl & 1 == 0 {
+            return None;
+        }
+        let l = lock(&self.link);
+        let view = l.session.vic_view();
+        (l.session.active && view.text()).then_some((view, self.tx_ctrl & 2 != 0))
+    }
+
+    /// trx_sys.v register `off` (a block offset, 32-bit aligned) as a read returns it (trx_sys.v:211-245).
+    pub fn sys_reg(&self, off: u32) -> u32 {
+        let l = lock(&self.link);
+        if off == GATE_CTRL {
+            // b9: the state bus shadows follow the machine; UE2 reads the pause for it.
+            let paused = u32::from(l.paused);
+            return paused << 9 | paused << 8 | u32::from(l.frz);
+        }
+        if off & !0xFFF != PAGE5 {
+            return 0;
+        }
+        let s = &l.session;
+        match off & 0xFFF {
+            SH_CTRL => s.ctrl(),
+            SH_STATUS => s.status(),
+            SH_ACCESSES => s.accesses,
+            SH_REAL => s.real,
+            SH_UNMAPPED => s.unmapped,
+            SH_LIST => s.list_reg(),
+            SH_COMMIT => u32::from(s.last_commit),
+            r @ SH_OVERLAY..=0x0FF => {
+                let i = (r - SH_OVERLAY) as usize;
+                u32::from_le_bytes(std::array::from_fn(|b| s.overlay(i + b)))
+            }
+            r @ SH_VALID..=0x10F => s.valid_word(((r - SH_VALID) / 4) as usize),
+            // SH_GCLK, LK_RES and the rest.
+            _ => 0,
+        }
+    }
+
+    /// trx_sys.v's commit of byte 3: GATE_CTRL and SH_CTRL; the rest is S38's.
+    fn sys_commit(&mut self, off: u32, v: u32, now: u64) {
+        let mut l = lock(&self.link);
+        if off == GATE_CTRL {
+            l.frz = v & GATE_FRZ != 0;
+            let frz = l.frz;
+            l.frz_writes.push((now, frz));
+        } else if off == PAGE5 + SH_CTRL {
+            l.session.write_ctrl(v);
         }
     }
 
@@ -256,21 +484,37 @@ impl Trx {
         self.shown = Shown::of(&self.set, self.front);
         self.cause |= CAUSE_VSYNC;
         self.frames = self.frames.wrapping_add(1);
+        self.starts += 1;
         self.frame_at = now;
         self.update_irq(irq);
     }
 
-    /// A frame start for each new VIC frame count, or every PAL frame while no C64 counts frames.
+    /// A frame start for each new VIC frame count; while the pause stands, one every frame period from the last; while
+    /// no C64 counts frames, one every PAL frame. A pause that came into effect raises b0.
     fn poll(&mut self, now: u64, irq: &mut IrqState) {
         self.now = now;
-        let vic = self.vic.load(Ordering::Relaxed);
-        if vic != 0 {
-            if vic != self.vic_seen {
-                self.vic_seen = vic;
-                self.frame_start(now, irq);
-            }
-        } else if now >= self.frame_at + PAL_FRAME {
+        let (vic, paused, period, starts) = {
+            let l = lock(&self.link);
+            (l.frames, l.paused, l.frame_clocks, l.pause_starts)
+        };
+        if starts != self.pause_seen {
+            self.pause_seen = starts;
+            self.cause |= CAUSE_STOP;
+            self.update_irq(irq);
+        }
+        if vic != 0 && vic != self.vic_seen {
+            self.vic_seen = vic;
             self.frame_start(now, irq);
+        } else if vic == 0 || paused {
+            let period = if vic != 0 && period != 0 { period } else { PAL_FRAME };
+            let due = self.frame_at + period;
+            if now >= due {
+                self.frame_start(now, irq);
+                // On the cadence, unless the poll came a whole period late.
+                if now < due + period {
+                    self.frame_at = due;
+                }
+            }
         }
     }
 
@@ -283,8 +527,8 @@ impl Trx {
     fn commit(&mut self, reg: u32, v: u32) {
         let s = &mut self.set;
         match reg {
-            STILL_CTRL => self.still_ctrl = v & 1 != 0,
-            STILL_BASE => self.still_base = v & !0x0F,
+            STILL_CTRL => lock(&self.link).still.on = v & 1 != 0,
+            STILL_BASE => lock(&self.link).still.base = v & !0x0F,
             PX_CTRL => s.ctrl = (v & 0x3F) as u8,
             // Shown from the next frame start, without a flip and without b7 (the fetch takes `c_front` there).
             PX_FRONT => self.front = v & !0x0F,
@@ -309,8 +553,16 @@ impl IoDevice for Trx {
 
     fn read8(&mut self, off: u32, ctx: &mut IoCtx) -> u8 {
         self.poll(ctx.now, ctx.irq);
-        if off & !0xFFF == PAGE6 && off & 3 == 0 {
-            self.latch = self.reg(off & 0xFFF);
+        let reg = off & 0xFFF;
+        if off & 3 == 0 {
+            if far(off) {
+                self.far_latch = self.sys_reg(off);
+            } else if off & !0xFFF == PAGE6 {
+                self.latch = self.reg(reg);
+                if tx_sel(reg) {
+                    self.tx_latch = self.tx_reg(reg);
+                }
+            }
         }
         self.peek8(off)
     }
@@ -318,6 +570,20 @@ impl IoDevice for Trx {
     fn write8(&mut self, off: u32, val: u8, ctx: &mut IoCtx) {
         self.poll(ctx.now, ctx.irq);
         let reg = off & 0xFFF;
+        if far(off) {
+            match off & 3 {
+                // trx_sys.v: a write answers 0, which is what the latch then holds.
+                3 => {
+                    self.sys_commit(off & !3, u32::from(val) << 24 | self.far_stage, ctx.now);
+                    self.far_latch = 0;
+                }
+                b => {
+                    let shift = 8 * b;
+                    self.far_stage = self.far_stage & !(0xFF << shift) | u32::from(val) << shift;
+                }
+            }
+            return;
+        }
         match off & !0xFFF {
             0 => {
                 match reg {
@@ -327,20 +593,36 @@ impl IoDevice for Trx {
                 }
                 self.update_irq(ctx.irq);
             }
-            PAGE6 => match reg & 3 {
-                3 => self.commit(reg & !3, u32::from(val) << 24 | self.stage),
-                b => {
-                    let shift = 8 * b;
-                    self.stage = self.stage & !(0xFF << shift) | u32::from(val) << shift;
+            PAGE6 => {
+                // c64_text.v keeps its own byte 0 and commits on byte 3 of TX_CTRL only.
+                match reg {
+                    TX_CTRL => self.tx_stage = val,
+                    r if r == TX_CTRL + 3 => self.tx_ctrl = self.tx_stage & 3,
+                    _ => {}
                 }
-            },
+                match reg & 3 {
+                    3 => self.commit(reg & !3, u32::from(val) << 24 | self.stage),
+                    b => {
+                        let shift = 8 * b;
+                        self.stage = self.stage & !(0xFF << shift) | u32::from(val) << shift;
+                    }
+                }
+            }
             _ => {}
         }
     }
 
-    /// A read without its side effect: page 6 bytes 1-3 come from the latch of the last byte-0 read.
+    /// A read without its side effect: bytes 1-3 come from the latch of the last byte-0 read (top.v ORs pix_layer's
+    /// and c64_text.v's read data).
     fn peek8(&self, off: u32) -> u8 {
         let reg = off & 0xFFF;
+        let byte = 8 * (off & 3);
+        if far(off) {
+            return match off & 3 {
+                0 => self.sys_reg(off) as u8,
+                _ => (self.far_latch >> byte) as u8,
+            };
+        }
         match off & !0xFFF {
             0 => match reg {
                 0..=3 => ID[reg as usize],
@@ -351,10 +633,13 @@ impl IoDevice for Trx {
                 // BUILD 008-00B: no bitstream, no build stamp.
                 _ => 0,
             },
-            PAGE6 => match reg & 3 {
-                0 => self.reg(reg) as u8,
-                b => (self.latch >> (8 * b)) as u8,
-            },
+            PAGE6 => {
+                let tx = tx_sel(reg);
+                match off & 3 {
+                    0 => (self.reg(reg) | if tx { self.tx_reg(reg) } else { 0 }) as u8,
+                    _ => ((self.latch | if tx { self.tx_latch } else { 0 }) >> byte) as u8,
+                }
+            }
             _ => 0,
         }
     }
@@ -368,25 +653,86 @@ impl IoDevice for Trx {
         self.next_poll = ctx.now + POLL;
     }
 
-    /// The registers' power-on values; the VIC frame count stays connected.
+    /// The registers' power-on values, the shared ones included; the VIC frame count and the pause the port applied
+    /// stay, they are the C64's.
     fn reset(&mut self) {
-        let vic = self.vic.clone();
-        *self = Trx::new(vic);
+        {
+            let mut l = lock(&self.link);
+            let (frames, clocks, paused, starts) = (l.frames, l.frame_clocks, l.paused, l.pause_starts);
+            *l = TrxLink::power_on(frames, clocks, paused, starts);
+        }
+        let link = self.link.clone();
+        *self = Trx::new(link);
     }
 
     crate::impl_as_any!();
 }
 
-/// With `--trx-io` on only (`Machine::new` has resolved auto): the block, with high IRQ 2 and the VIC frame count taken from the C64 port.
+/// With `--trx-io` on only (`Machine::new` has resolved auto): the block, with high IRQ 2, and the link to the C64 port.
 pub fn install(map: &mut IoMap, cfg: &MachineConfig) {
     if cfg.trx_io != TrxIo::On {
         return;
     }
-    let vic = Arc::new(AtomicU64::new(0));
+    let link = link();
     if let Some(port) = map.get_mut::<C64Port>() {
-        port.set_trx_io(vic.clone());
+        port.set_trx_io(link.clone());
     }
-    map.add(BASE, SIZE, Box::new(Trx::new(vic)));
+    map.add(BASE, SIZE, Box::new(Trx::new(link)));
+}
+
+/// The text layer's pixels as c64_text.v fetches them, from the C64's RAM, char ROM and colour RAM with the session's
+/// VIC registers (c64_text.v:106-173): the screen at bank × $4000 + `$D018` b7:4 × $400; the glyphs from the char ROM
+/// at `$D018` b1 × $800 when the bank is 0 or 2 and `$D018` b3:2 = %01, else from RAM at bank × $4000 + `$D018` b3:1 ×
+/// $800.
+pub fn text_layer<C: Chips + ?Sized>(view: VicView, opaque: bool, c: &C) -> TrxText {
+    let bank = u16::from(view.bank) << 14;
+    let d018 = u16::from(view.d018);
+    let screen = bank | d018 >> 4 << 10;
+    let rom = view.bank & 1 == 0 && d018 >> 2 & 3 == 1;
+    let chars = if rom { (d018 >> 1 & 1) << 11 } else { bank | (d018 >> 1 & 7) << 11 };
+    let codes: Vec<u8> = (0..1000u16).map(|i| c.ram_read(screen | i)).collect();
+    let glyphs = (0..200usize)
+        .flat_map(|line| (0..40usize).map(move |col| (line, col)))
+        .map(|(line, col)| {
+            let a = chars | u16::from(codes[line / 8 * 40 + col]) << 3 | (line & 7) as u16;
+            if rom {
+                c.rom_read(C64Rom::Char, a)
+            } else {
+                c.ram_read(a)
+            }
+        })
+        .collect();
+    let colours = (0..1000u16).map(|i| c.io_peek(0xD800 + i) & 0x0F).collect();
+    let charset = match (rom, d018 & 2 != 0) {
+        (false, _) => C64Charset::Ram,
+        (true, false) => C64Charset::Upper,
+        (true, true) => C64Charset::Lower,
+    };
+    TrxText { glyphs, colours, background: view.d021, opaque, screen: codes, charset }
+}
+
+/// The still capture's window of `frame` (pix_layer.v:494-541), mapped onto TRX64's canvas as the composite maps it
+/// (render.rs `draw_c64_trx`): 200 bytes a line, as many lines as the VIC reaches. All 270 lines make a complete
+/// frame; a VIC of fewer than 286 lines never reaches the last (pix_layer.v:505, :535).
+pub fn still_window(frame: &crate::c64host::C64Frame) -> Vec<u8> {
+    if frame.width == 0 || frame.height == 0 {
+        return Vec::new();
+    }
+    let (text_x, first, lines) = match frame.raster_lines {
+        0 => (32, 16, 312),
+        n => (frame.text_x, frame.first_line, n),
+    };
+    let reached = lines.saturating_sub(STILL_Y0).min(STILL_H);
+    let cols: Vec<usize> =
+        (0..STILL_W).map(|x| (crate::render::TRX_X0 + x + text_x).saturating_sub(crate::render::TRX_X_TEXT).min(frame.width - 1)).collect();
+    let mut out = Vec::with_capacity(reached * STILL_W / 2);
+    for y in 0..reached {
+        let line = STILL_Y0 + y;
+        let row = if line < first { line + lines } else { line } - first;
+        let src = &frame.indices[row.min(frame.height - 1) * frame.width..][..frame.width];
+        out.extend(cols.chunks(2).map(|pair| src[pair[0]] & 0x0F | (src[pair[1]] & 0x0F) << 4));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -396,7 +742,7 @@ mod tests {
     /// A block on its own, with DDR and an ITU, driven at clock `now`.
     struct Rig {
         trx: Trx,
-        vic: Arc<AtomicU64>,
+        link: Link,
         ram: Vec<u8>,
         irq: IrqState,
         now: u64,
@@ -404,8 +750,8 @@ mod tests {
 
     impl Rig {
         fn new() -> Self {
-            let vic = Arc::new(AtomicU64::new(0));
-            Rig { trx: Trx::new(vic.clone()), vic, ram: vec![0; 1 << 20], irq: IrqState::new(), now: 0 }
+            let link = link();
+            Rig { trx: Trx::new(link.clone()), link, ram: vec![0; 1 << 20], irq: IrqState::new(), now: 0 }
         }
 
         fn with<R>(&mut self, f: impl FnOnce(&mut Trx, &mut IoCtx) -> R) -> R {
@@ -436,8 +782,13 @@ mod tests {
 
         /// The next VIC frame, seen by the next poll.
         fn frame(&mut self) {
-            self.vic.fetch_add(1, Ordering::Relaxed);
+            lock(&self.link).frames += 1;
             self.now += POLL;
+            self.with(|t, ctx| t.tick(ctx));
+        }
+
+        fn tick_at(&mut self, now: u64) {
+            self.now = now;
             self.with(|t, ctx| t.tick(ctx));
         }
 
@@ -450,10 +801,37 @@ mod tests {
     fn page_0_reads_id_and_caps_and_other_pages_read_0() {
         let mut r = Rig::new();
         assert_eq!([r.r8(0), r.r8(1), r.r8(2), r.r8(3)], *b"TRX2");
-        assert_eq!((r.r8(4), r.r8(5)), (0xC0, 0x00));
+        assert_eq!((r.r8(4), r.r8(5)), (0xE1, 0x08), "gate, session, video, RGB565; the commit list");
         assert_eq!(r.r32(0x008), 0, "BUILD");
-        r.w8(0x1000, 0xFF);
-        assert!((0x1000..0x1010).chain(0xF000..0xF004).chain(0x100..0x104).all(|o| r.r8(o) == 0));
+        r.w8(0x4000, 0xFF);
+        assert!((0x4000..0x4010).chain(0xF000..0xF004).chain(0x1000..0x1004).chain(0x104..0x140).all(|o| r.r8(o) == 0));
+        assert!((0x140..0x1000).step_by(0x3C).all(|o| r.r8(o) == 0), "140-FFF");
+    }
+
+    #[test]
+    fn the_far_pages_share_one_stage_and_one_latch() {
+        let mut r = Rig::new();
+        // SH_CTRL resets to mode 1.
+        assert_eq!(r.r32(PAGE5 + SH_CTRL), 1);
+        // Bytes 0-2 collect in one buffer for every far page: byte 3 of SH_CTRL commits what was written at GATE_CTRL.
+        r.w8(GATE_CTRL, 0x0E);
+        r.w8(PAGE5 + SH_CTRL + 3, 0);
+        assert_eq!(r.r32(PAGE5 + SH_CTRL), 0x0E, "mode 2, SIDEFX, PROTO");
+        assert_eq!(r.r32(GATE_CTRL), 0, "GATE_CTRL never committed");
+        // Byte 0 latches for bytes 1-3, across pages; a commit leaves the latch 0.
+        r.w32(PAGE5 + SH_CTRL, 1);
+        lock(&r.link).session.count = 0x1234;
+        assert_eq!(r.r8(PAGE5 + SH_STATUS), 0);
+        lock(&r.link).session.count = 0x5678;
+        assert_eq!([r.r8(PAGE5 + SH_STATUS + 2), r.r8(GATE_CTRL + 3)], [0x34, 0x12], "the latch of the byte-0 read");
+        r.r8(PAGE5 + SH_STATUS);
+        r.w32(GATE_CTRL, 1);
+        assert_eq!(r.r8(PAGE5 + SH_STATUS + 2), 0, "a commit answers 0");
+        // GATE_CTRL: b0 RW, b8 and b9 the pause.
+        assert_eq!(r.r32(GATE_CTRL), 0x001);
+        assert_eq!(lock(&r.link).frz_writes, [(0, true)], "for the port, at its clock");
+        lock(&r.link).paused = true;
+        assert_eq!(r.r32(GATE_CTRL), 0x301);
     }
 
     #[test]
@@ -487,6 +865,10 @@ mod tests {
         r.w32(PAGE6 + PX_KEY, 0xFFFF_FFFF);
         let got = [PX_FRONT, PX_STRIDE, PX_CTRL, PX_KEY].map(|reg| r.r32(PAGE6 + reg));
         assert_eq!(got, [0x0123_4560, 0xFFF0, 0x3F, 0x1_FFFF]);
+        r.w32(PAGE6 + STILL_BASE, 0x0012_345F);
+        r.w32(PAGE6 + STILL_CTRL, 0);
+        let still = lock(&r.link).still;
+        assert_eq!((still.base, still.on), (0x0012_3450, false), "the port captures with them");
     }
 
     #[test]
@@ -498,6 +880,26 @@ mod tests {
         let late = [1, 2, 3].map(|b| r.r8(PAGE6 + PX_SIZE + b));
         assert_eq!(late, [0x02, 0x11, 0x01], "bytes 1-3 from the latch of the first read");
         assert_eq!(r.r32(PAGE6 + PX_SIZE), 0x0333_0444, "a new byte-0 read takes the new value");
+    }
+
+    #[test]
+    fn tx_ctrl_is_c64_texts_own_register() {
+        let mut r = Rig::new();
+        assert_eq!(r.r32(PAGE6 + TX_CTRL), 0x0100_0000, "b31:24 = 1: the text layer is there");
+        r.w32(PAGE6 + TX_CTRL, 0xFFFF_FF03);
+        assert_eq!(r.r32(PAGE6 + TX_CTRL), 0x0100_0003, "b1:0 only");
+        assert_eq!(r.r32(PAGE6 + TX_STATUS), 0, "no session: not shown");
+        // Its own byte-0 stage: byte 3 of TX_CTRL takes byte 0, whatever the pixel layer's stage holds.
+        r.w8(PAGE6 + TX_CTRL, 0x01);
+        r.w8(PAGE6 + PX_GALPHA, 0x02);
+        r.w8(PAGE6 + TX_CTRL + 3, 0);
+        assert_eq!(r.r32(PAGE6 + TX_CTRL), 0x0100_0001);
+        // Shown with a session in text mode; ECM, BMM or MCM hide it.
+        lock(&r.link).session.active = true;
+        assert_eq!(r.r32(PAGE6 + TX_STATUS), 1);
+        assert!(r.trx.text().is_some());
+        r.w32(PAGE6 + TX_CTRL, 0);
+        assert_eq!((r.r32(PAGE6 + TX_STATUS), r.trx.text()), (0, None), "without show");
     }
 
     #[test]
@@ -535,12 +937,41 @@ mod tests {
         assert_eq!(r.r32(PAGE6 + PX_STATUS) >> 1 & 1, 0, "45 lines later");
         // Without a C64 counting frames: every PAL frame.
         let mut r = Rig::new();
-        r.now = PAL_FRAME - 1;
-        r.with(|t, ctx| t.tick(ctx));
+        r.tick_at(PAL_FRAME - 1);
         assert_eq!(r.trx.frames, 0);
-        r.now = PAL_FRAME;
-        r.with(|t, ctx| t.tick(ctx));
+        r.tick_at(PAL_FRAME);
         assert_eq!(r.trx.frames, 1);
+    }
+
+    #[test]
+    fn frame_starts_go_on_while_paused_one_per_frame_period() {
+        let mut r = Rig::new();
+        let period = 20 * CLOCKS_PER_MS;
+        lock(&r.link).frame_clocks = period;
+        r.frame();
+        let start = r.now;
+        // The pause: the VIC count stands, the frame starts keep the frame period from the last one.
+        {
+            let mut l = lock(&r.link);
+            l.paused = true;
+            l.pause_starts += 1;
+        }
+        r.tick_at(start + 1);
+        assert_eq!((r.trx.frames, r.r8(IRQ_CAUSE) & CAUSE_STOP), (1, CAUSE_STOP), "b0: the pause came into effect");
+        let mut at = start;
+        for n in 2..=11 {
+            at += period;
+            r.tick_at(at - 1);
+            assert_eq!(r.trx.frames, n - 1);
+            r.tick_at(at + POLL / 2);
+            assert_eq!(r.trx.frames, n, "frame {n} on time");
+        }
+        // The release: the VIC frame count moves again and the next frame start is the VIC's.
+        lock(&r.link).paused = false;
+        r.tick_at(at + period + POLL);
+        assert_eq!(r.trx.frames, 11, "running: only the VIC count makes frame starts");
+        r.frame();
+        assert_eq!(r.trx.frames, 12);
     }
 
     #[test]
@@ -607,6 +1038,44 @@ mod tests {
         let s = Shown::of(&Settings { ctrl: 0x03, w: 2000, h: 2000, galpha: 0, ..Settings::DEFAULT }, 0);
         assert_eq!((s.w, s.h, s.scale, s.alpha), (960, 1080, 1, 0), "clamped, scale 0 is 1");
         assert_eq!(Shown::of(&Settings { ctrl: 0x33, ..Settings::DEFAULT }, 0).scale, 3);
+    }
+
+    #[test]
+    fn the_still_fills_slots_0_1_0_and_counts() {
+        let mut s = Still::POWER_ON;
+        assert_eq!(s.status(), 0);
+        assert_eq!(s.frames(1, true), 0, "the first frame goes to slot 0");
+        assert_eq!(s.status(), 1 << 8 | 0 << 1 | 1);
+        assert_eq!(s.frames(1, true), 1);
+        assert_eq!(s.frames(1, true), 0);
+        assert_eq!(s.status(), 3 << 8 | 1);
+        // Three frames in one sync: the newest goes where the device would have put it, all three count.
+        assert_eq!(s.frames(3, true), 1);
+        assert_eq!(s.status(), 6 << 8 | 1 << 1 | 1);
+        // A frame that never completes goes to the slot after the last and changes nothing.
+        let before = s;
+        assert_eq!(s.frames(5, false), 0);
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn the_still_window_packs_two_pixels_a_byte_low_nibble_first() {
+        use crate::c64host::C64Frame;
+        // A PAL canvas of 384 × 272 from raster line 16, text area at column 32: pixel (x, y) of the window is canvas
+        // column 96 + x + 32 − 136 = x − 8, clamped to the canvas.
+        let (w, h) = (384, 272);
+        let indices = (0..w * h).map(|i| ((i % w) as u8 ^ (i / w) as u8) & 0x0F).collect();
+        let frame = C64Frame { width: w, height: h, indices, text_x: 32, first_line: 16, raster_lines: 312, ..C64Frame::default() };
+        let px = |x: usize, y: usize| ((x.saturating_sub(8).min(w - 1) as u8) ^ y as u8) & 0x0F;
+        let still = still_window(&frame);
+        assert_eq!(still.len(), 54_000);
+        let nibble = |k: usize| still[k / 2] >> (4 * (k % 2)) & 0x0F;
+        for k in [0, 1, 399, 400, 107_999] {
+            assert_eq!(nibble(k), px(k % 400, k / 400), "pixel {k}");
+        }
+        // A 263-line VIC never reaches line 285: 247 lines, no complete frame.
+        let ntsc = C64Frame { raster_lines: 263, first_line: 28, height: 235, indices: vec![1; w * 235], ..frame };
+        assert_eq!(still_window(&ntsc).len(), 247 * 200);
     }
 
     #[test]
