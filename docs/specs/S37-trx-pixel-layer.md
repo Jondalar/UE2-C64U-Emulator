@@ -99,9 +99,9 @@ The interrupt is `(IRQ_EN & IRQ_CAUSE) != 0` on **ITU high IRQ 2**.
 - **Buffers:** the layer reads the guest DDR at `PX_FRONT`, the same memory the RISC-V writes. The fetch keeps
   address bits 26:0; a pixel past UE2's 64 MB reads 0 (black, or transparent with key 0 on). There are no
   underruns, so the count stays 0.
-- **Composite:** while the layer is on (`PX_CTRL` b0, format 1, w, h ≠ 0), the window, `png` and screenshots show
-  the 1920 × 1080 composite of §1, scaled to the window as today. While it is off, the picture path is the one we
-  have now, with no extra cost.
+- **Composite:** with the block on, the window, `png` and screenshots always show the 1920 × 1080 composite of §1,
+  scaled to the window as today: the bitstream has no other output, so the picture keeps one shape whether the layer
+  is on or off (with it off: the C64 at 4× between the bars). Without the block the picture path is unchanged.
   - When S = 2, x0 and y0 are even (LVGL's case) and no overlay window is up, the composite is built at
     960 × 540. Each 50 Hz C64 pixel is then exactly 2 × 2. The overlay's text is drawn 1:1 in the output mode, so
     with a window up the composite stays at 1920 × 1080.
