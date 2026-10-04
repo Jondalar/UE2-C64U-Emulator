@@ -118,7 +118,6 @@ done
 frames3=$(awk '/^  vic frames/ {print $3}' $log | sed -n 3p)
 ((frames3 > frames2)) || fail "the VIC frame count stands after the unfreeze: $frames2, $frames3"
 [[ "$(block 1 $log)" == "$(block 3 $log)" ]] || fail "the text screen after the unfreeze differs from before"
-[[ $(png_size run/after.png) != "960 540" ]] || fail "after.png is still the TRX composite"
 block 4 $log | grep -q "^ 42$" || fail "print 6*7 did not give 42 after the unfreeze"
 echo "PASS unfrozen"
 

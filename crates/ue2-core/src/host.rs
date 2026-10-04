@@ -49,8 +49,8 @@ pub struct DisplaySnapshot {
     pub now_ms: u64,
     /// C64 frame under the overlay; None without an attached C64 (docs/specs/S14-c64-trx64.md §9).
     pub c64: Option<C64Frame>,
-    /// S37: the TRX output picture while it differs from the output mode's: the pixel layer is on or the machine
-    /// pause is in effect. None otherwise and without `--trx-io`. Filled by `Machine::display`.
+    /// S37: the TRX output picture (1920 × 1080, the C64 at 4× between bars, the pixel layer and the text layer),
+    /// always with `--trx-io`, as the bitstream has no other output. None without it. Filled by `Machine::display`.
     pub trx: Option<TrxOutput>,
 }
 

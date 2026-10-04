@@ -765,7 +765,8 @@ impl Machine {
             let (layer, paused) = (trx.layer(&self.bus.ram), trx.paused());
             let backend = self.bus.io.get::<C64Port>().and_then(C64Port::backend);
             let text = trx.text().zip(backend).map(|((view, opaque), c64)| devices::trx::text_layer(view, opaque, c64));
-            (layer.is_some() || paused).then_some(TrxOutput { layer, paused, text })
+            // The TRX bitstream always outputs its 1920 × 1080 frame, layer or not, so the picture keeps one shape.
+            Some(TrxOutput { layer, paused, text })
         });
         // The text dump shows what the text layer draws while it is shown, not what the paused VIC points at.
         if let (Some(frame), Some(text)) = (snap.c64.as_mut(), snap.trx.as_ref().and_then(|t| t.text.as_ref())) {
