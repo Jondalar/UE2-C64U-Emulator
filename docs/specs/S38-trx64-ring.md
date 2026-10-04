@@ -1,7 +1,8 @@
 # S38 — TRX64's rings on the C64 (time travel)
 
 **Status:** built (2026-10-04), local branch `s37-trx-pixel-layer`, not pushed. §4.1 (UE2's part around the C64
-rewinds with it) and §4.3 (the picture comes back with the anchor) built the same day. See "As built" at the end.
+rewinds with it), §4.3 (the picture comes back with the anchor) and §7's board files built the same day. See "As
+built" at the end.
 
 **Why:** UE2's C64 is TRX64 (`trx64-core`, tag v0.12.3). TRX64 has its own time travel: a delta ring per
 instruction, a CPU history, and a checkpoint ring with marks. Its daemon runs all three by default. UE2 runs the
@@ -223,7 +224,7 @@ Over the control port (`monitor <line>`) and the MCP tool `emu_monitor`, the sam
 | `mark`, `marks`, `unmark` | ours | TRX64's marks: a name and a pin, at most 32, carried by `ringdump` |
 | `goto <frame\|c<cycle>\|@<cycle>\|mark>`, `frame [-N\|+N]`, `rewind`, `run` | ours | `frame +N` at the head is refused (the firmware runs the C64 there; `c64 step` steps it) |
 | `cadence [frames] [seconds]`, `window [seconds]` | ours | retune the cap and budget together |
-| `ringdump <path>`, `ringload <path>` | ours | TRX64's `.c64rering` |
+| `ringdump <path> [board]`, `ringload <path>` | ours | TRX64's `.c64rering`; `board`: the board's format (§7) |
 | `asm-file <path> [addr]`, `pwd`, `cd`, `ls` | ours | the library's assembler; files under `--monitor-dir` |
 
 - Not here: `play`, `pause` (wall-clock pacing), `rawframe` (UE2 shows the frame that ended at the anchor, §4.3, and
@@ -256,9 +257,17 @@ Over the control port (`monitor <line>`) and the MCP tool `emu_monitor`, the sam
   - UE2 writes TRX64's own: compressed gzip, TRX64's checkpoint nodes, a real `turbo` node (`enable`, `menuIndex`,
     `menuStalls`, `d031`, `d030`, `resetHold`), labels, the delta ring and the CPU history.
   - The board (`trx_c64re.cc`) writes stored-block gzip, at most 64 anchors, no labels, empty delta and CPU rings,
-    `trx64Hw` nodes and a constant `turbo` node. It refuses compressed files, so UE2's files do not load on
+    `trx64Hw` nodes and a constant `turbo` node. It refuses compressed files, so UE2's own files do not load on
     `trx64/main`.
-  - Whether a board file restores in UE2 is untested.
+- **Board files in UE2** (built 2026-10-04, see "As built"):
+  - `ringload` takes a board file. Each anchor gets its RAM under the I/O back from `trx64Hw.ramUnderIo` (the board
+    puts colour nibbles at `$D800` of `ram`). The notes say what the file lacks: no SID, IEC, interrupt-line,
+    keyboard, expansion-port, `ue2Hw` node; the VIC node has registers and colour RAM only (raster compare 0,
+    pipelines cold); TRX64 converts the v2 CIA records; no turbo node (or the board's constant). The picture is
+    drawn from the registers (§4.3).
+  - `ringdump <path> board` writes the board's format, but only for the anchors a board file brought. The board
+    loads nothing without a `trx64Hw` node, and that node is the FPGA's chip block: the CPU's and the CIAs'
+    flip-flops, staged straight into them. UE2 cannot build it from TRX64's state, so UE2's own anchors stay out.
 - **Clients:**
   - To the board: REST `/v1/timewarp:*` and `/v1/machine:readmem?lens=`, plus trxmon's WebSocket JSON-RPC on port
     4312.
@@ -323,6 +332,15 @@ new picture. Two runs each, without the pictures (the commit before) and with th
     cuts after the anchor, keeps the mark, and runs on from the anchor's cycle;
   - the UCI and the turbo enable word stay live; an anchor of another model is refused;
   - `ringdump`/`ringload` round-trip anchors, marks and both rings;
+  - §7: the board's file (fixture `crates/c64-bridge/tests/data/board_2026-10-04.c64rering.gz`, the TRX64-Ultimate
+    test file gzipped, 110 KB) loads: 9 anchors, the current one at READY, the RAM under the I/O, the board's
+    border and background drawn, the notes, the firmware's turbo menu kept; `goto` reaches the others; the ring
+    records past the file's cap of 9 afterwards. With the ROMs the C64 runs a line from the keyboard buffer.
+    `ring_dump_board` writes the board anchors only (marks kept, the transport's anchor as current) and refuses a
+    ring of UE2's own; the file passes `check_board_ring` and loads in UE2 again;
+  - `board.rs`: `check_board_ring` passes the board's own file and refuses what the board's loader refuses
+    (compressed body, no `trx64Hw`, layout, short arrays, snap position, missing current entry); the writer's
+    stored blocks read in TRX64 too; 65 entries are refused, 64 pass;
   - §4.1: going back across a bank switch (Ocean) restores the bank and the C64 reads and runs in the old one; across a
     REU STASH restores the REU's bytes, and forward again redoes them; across an EasyFlash program restores the flash
     byte in DDR; the GeoRAM page and its bytes come back; an idle UCI with two command bytes written comes back, and a
@@ -337,7 +355,7 @@ new picture. Two runs each, without the pictures (the commit before) and with th
     status as they were; a release runs on to the anchor's picture; a `ringload` in the same session shows the
     session's picture of the file's anchor; PackBits round-trips runs, literals and refuses a wrong size.
 - **Monitor tests** (`ue2emu`):
-  - the ring verbs on a booted C64;
+  - the ring verbs on a booted C64; `ringdump … board` refuses UE2's own anchors;
   - files confined to their directory (`..`, `/..`, a symbolic link, a host path);
   - `asm-file` assembles;
   - `ring = false` in TOML;
@@ -348,13 +366,17 @@ new picture. Two runs each, without the pictures (the commit before) and with th
   - `asm-file` assembles `ring.asm`;
   - §4.3: a `png` while `20 goto20` runs (a still screen) at `mark still`; at the end `goto still` gives the same png,
     not the counter's live one.
+- **Smoke** `scripts/smoke-c64-ring-board.ctl` (in `smoke-c64-all.sh`, `--settings smoke-c64-ring-board.cfg`,
+  System Mode PAL): `ringload` of the board's file (unpacked from the fixture), `goto 4`, `ringdump … board` (header
+  and first stored block checked), `run`, then `poke1024,1` typed runs: the keyboard scan works on the board's CIA
+  state.
 - **Smoke** `scripts/smoke-c64-ring-reu.ctl` (in `smoke-c64-all.sh`, `--settings smoke-c64-ring-reu.cfg`, a 128 KB
   REU): a BASIC loop keeps its counter in the REU (fetch, add one, stash). After `goto` a mark it runs on from the
   mark's count, not from the live count it would fetch from an REU that stayed live; no `note: UE2 memories` line.
 
 - `cargo test --workspace --all-features` (585 passed with §4.3; 583 with §4.1; 573 before), `cargo build --release` (only the old
   `transparent` warning), `smoke-all.sh`, `smoke-c64-all.sh` (16 runs, `ring-reu` among them), `smoke-trx.sh` and
-  `smoke-trx-freeze.sh` pass.
+  `smoke-trx-freeze.sh` pass. With §7: 596 tests, `smoke-c64-all.sh` 17 runs (`ring-board` added).
 
 ## 10. TRX64 gaps (met on UE2's side; TRX64 not patched)
 
@@ -385,9 +407,12 @@ new picture. Two runs each, without the pictures (the commit before) and with th
 - REU and cartridge writes in the `.c64rering`: the log is the session's, so a file restores TRX64's state and the
   cartridge registers but not the memories (a note says so). TRX64's `RingBufferDump` has no place for it.
 
-- Exchanging files with the board (being built, Alex 2026-10-04): UE2 loads a board `.c64rering`
-  (test file: TRX64-Ultimate `tests/ringdump/board_2026-10-04.c64rering`, 9 anchors) and writes the board's format
-  (stored-block gzip, at most 64 anchors) so `trx64/main` loads it.
+- UE2's own anchors on the board. The board's loader refuses a payload without `trx64Hw` (§7). Two ways, neither
+  built:
+  - UE2 builds the chip block from TRX64's state: the 6502's 209 flip-flops (`cpu6510.v`/`proc_core.vhd`) and each
+    CIA's 363 (`cia_core.sv`, reDIP-CIA's timer, TOD, serial and interrupt pipelines) at a snap edge, line 0
+    cycle 12 or later. Verifiable only in the RTL bench (`tb_ring`).
+  - The board builds the block from the nodes (T20 §9.4 plans it), which is a board patch.
 
 **Accepted limits** (Alex, 2026-10-04): a UCI command in flight stays live; a serial transfer across a goto (drives
 live, IEC lines from the anchor); the firmware's own writes into DDR are not undone; reSID and sampler voices keep
@@ -395,6 +420,38 @@ their live state; `rstep` undoes C64 RAM only; the REU's shadow registers and `$
 command state.
 
 ## As built
+
+### §7 (board files)
+
+Read from the app's `trx64/main` at 029da8ef, `software/io/c64/trx_c64re.cc` (code, not its comments):
+
+| Rule | Where |
+|---|---|
+| Writer: at most 64 entries | `MAX_RING_ENTRIES`, 576; the loop 591 |
+| Container `C64RERNG` 1, gzip header without flags, stored blocks of 16 KiB, CRC-32 and ISIZE | 644, 180, 144 and 202-215, 327-341 |
+| Entries: `id`, `frame`, `cycles`, `pinned: false`, no `label`; empty delta and CPU rings | 657-674 |
+| Turbo node: a constant | `write_turbo`, 458-461 |
+| Loader: `C64RERNG` 1, at least 27 bytes | 848 |
+| A block with BTYPE other than stored is refused; ISIZE bounds the body | `gunzip_stored`, 723, 737-748 |
+| Only the entry `checkpoint_ring.current_id` names is loaded | 895-915 |
+| Keys are found by name; others are passed over | `key`, 768-779 |
+| Turbo node: read only for a message | 922-927 |
+| `trx64Hw` required, `layout` 1; `ram` 65 536 bytes, `block` 232, `ramUnderIo` and `colorRam` 1024 | 928-943, `tok_ta` 800-827 |
+| `ram[$D800..]` ← `ramUnderIo` | 945 |
+| Snap position `x` 96-504 | 949-951 |
+
+- The block's CPU and CIA words go straight into the flip-flops (`trx_ring.cc` `stage_and_load`, 697; `put_back`,
+  873); `c64_core.v` loads `s_cpuf[208:0]` and `s_cia1f`/`s_cia2f[362:0]` from them.
+- `ue2Hw` and other unknown keys would not hurt the board (`key` by name), but the board needs `trx64Hw` anyway, so
+  the writer only carries board anchors; they have no `ue2Hw`.
+- `board.rs`: `adopt` (ring_load), `notes` (restore_c64), `write_board_ring` (stored gzip, the board's block size),
+  `check_board_ring` (the loader's rules in order, with its messages).
+- `ring_load` raises the file's entry cap to the ring's window and cadence: the board's file says 9.
+- `restore_c64`: an anchor without a turbo node gets `$D030`/`$D031` = `$00` and keeps the firmware's enable word and
+  menu speed (TRX64 would reset them); TRX64's own restore notes (a v2 CIA converted) now reach the monitor.
+- **Smoke** (upstream ELF, PAL): `ringload` 9 anchors with the notes, `goto 4`, `ringdump … board` 9 anchors in
+  874 034 bytes, the header and first stored block as the board's own; after `run`, `poke1024,1` typed reads back
+  `01`.
 
 - `Trx64Backend::set_ring` sizes the rings and `ring_recording` gates them. `run_recording` stops at each frame
   boundary. `ring_goto`, `ring_release`, `ring_dump` and `ring_load` are the transport. `restore_c64` is §4.

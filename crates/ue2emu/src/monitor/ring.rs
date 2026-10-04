@@ -489,15 +489,41 @@ fn window(host: &mut Host, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// `ringdump <path>`: the three rings into a `.c64rering` under the monitor directory.
+/// `ringdump <path>`: the three rings into a `.c64rering` under the monitor directory. `ringdump <path> board`: the
+/// file the TRX64-Ultimate board loads (S38 §7), from the anchors a board file brought.
 fn ringdump(host: &mut Host, args: &[&str]) -> Result<String, String> {
-    let [path] = args else { return Err("ringdump: usage: ringdump <path.c64rering>".into()) };
+    let usage = || "ringdump: usage: ringdump <path.c64rering> [board]".to_string();
+    let path = match args {
+        [path] => *path,
+        [path, "board"] => return ringdump_board(host, path),
+        _ => return Err(usage()),
+    };
     let (bytes, info) = backend(host).ring_dump().map_err(|e| format!("ringdump: {e}"))?;
     host.state.files.write(path, &bytes).map_err(|e| format!("ringdump: {e}"))?;
     Ok(format!(
         "ringdump: {} anchor(s), {} delta entr(ies), {} cpu-history \u{2192} {path}  ({} bytes, cycles {}\u{2013}{})",
         info.anchors, info.delta_entries, info.cpu_history, info.file_bytes, info.cycle_first, info.cycle_last
     ))
+}
+
+fn ringdump_board(host: &mut Host, path: &str) -> Result<String, String> {
+    let (bytes, info) = backend(host).ring_dump_board().map_err(|e| format!("ringdump: {e}"))?;
+    host.state.files.write(path, &bytes).map_err(|e| format!("ringdump: {e}"))?;
+    let mut line = format!(
+        "ringdump: {} board anchor(s), {} marked, current={} \u{2192} {path}  ({} bytes, stored gzip, the board's format)",
+        info.anchors, info.marks, info.current_id, info.file_bytes
+    );
+    if info.not_board > 0 {
+        line.push_str(&format!("\n  note: {} anchor(s) of UE2's own left out: no chip block (trx64Hw)", info.not_board));
+    }
+    if info.over_limit > 0 {
+        line.push_str(&format!(
+            "\n  note: {} older board anchor(s) left out: the board takes at most {}",
+            info.over_limit,
+            c64_bridge::BOARD_MAX_ENTRIES
+        ));
+    }
+    Ok(line)
 }
 
 /// `ringload <path>`: a `.c64rering` back, and the C64 on its current anchor, held there.

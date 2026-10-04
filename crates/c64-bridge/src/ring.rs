@@ -24,8 +24,8 @@ use trx64_core::c64re_snapshot::{
     CaptureOpts,
 };
 use trx64_core::checkpoint_ring::{
-    checkpoint_ring_budget_for, checkpoint_ring_max_entries, RuntimeCheckpointRef, RuntimeCheckpointRing,
-    DEFAULT_CHECKPOINT_RING_SECONDS,
+    checkpoint_ring_budget_for, checkpoint_ring_max_entries, CheckpointAnchorDump, RuntimeCheckpointRef,
+    RuntimeCheckpointRing, DEFAULT_CHECKPOINT_RING_SECONDS,
 };
 use trx64_core::cpu_history::DEFAULT_CAPACITY;
 use trx64_core::delta_ring::{DeltaRing, DEFAULT_REVERSE_SECONDS};
@@ -33,6 +33,7 @@ use trx64_core::render::{render_index_buffer, RenderInput, FB_H, FB_W};
 use trx64_core::ring_dump::{read_ring_dump, write_ring_dump, RingBufferDump, RingDumpInfo};
 use trx64_core::{CpuHistoryRing, Machine, Uci, UciEvents, UciStatus};
 
+use crate::board;
 use crate::cart::CartRegs;
 use crate::clock::Clock;
 use crate::hwlog::{Mark, Poke, Space};
@@ -184,6 +185,20 @@ impl Mode {
     }
 }
 
+/// What [`Trx64Backend::ring_dump_board`] wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoardDumpInfo {
+    pub anchors: usize,
+    /// Of them, marked.
+    pub marks: usize,
+    pub current_id: String,
+    /// Board anchors left out over the board's limit (the oldest unmarked).
+    pub over_limit: usize,
+    /// Anchors left out because they have no chip block (UE2's own).
+    pub not_board: usize,
+    pub file_bytes: usize,
+}
+
 /// The checkpoint ring and the transport over it.
 pub struct Ring {
     pub anchors: RuntimeCheckpointRing,
@@ -206,6 +221,8 @@ pub struct Ring {
     last_uci: Option<(UciPrint, Arc<Uci>)>,
     /// The last picture packed and the buffer it came from: an unchanged picture shares it.
     last_picture: Option<(Box<[u8]>, Arc<Picture>)>,
+    /// The anchors a board file brought (their payload has the board's chip block): the ones the board can load back.
+    board: HashSet<String>,
 }
 
 impl Ring {
@@ -225,6 +242,7 @@ impl Ring {
             since_sweep: 0,
             last_uci: None,
             last_picture: None,
+            board: HashSet::new(),
         }
     }
 
@@ -501,6 +519,7 @@ impl Trx64Backend {
         ring.side.clear();
         ring.last_uci = None;
         ring.last_picture = None;
+        ring.board.clear();
         self.m.delta_ring.clear();
         self.m.cpu_history.clear();
         // UE2's write log describes the same machine: a new one.
@@ -572,13 +591,80 @@ impl Trx64Backend {
         Ok((bytes, info))
     }
 
+    /// The ring as the TRX64-Ultimate board loads it (board.rs): the anchors a board file brought, at most
+    /// [`board::BOARD_MAX_ENTRIES`] of them (the marks, then the newest), with the one the transport stands on as
+    /// current, else the newest; stored-block gzip, empty delta and CPU rings. UE2's own anchors have no chip block
+    /// and stay out; with no board anchor at all it refuses.
+    pub fn ring_dump_board(&self) -> Result<(Vec<u8>, BoardDumpInfo), String> {
+        let ring = self.ring.as_deref().ok_or("the rings are off (--ring=off)")?;
+        let refs = ring.anchors.list();
+        let mut picked: Vec<usize> = (0..refs.len()).filter(|&i| ring.board.contains(&refs[i].id)).collect();
+        let not_board = refs.len() - picked.len();
+        if picked.is_empty() {
+            return Err(format!(
+                "no anchor carries the board's chip block ({}): the board loads only anchors it wrote, and UE2's \
+                 anchors have none (the block is the FPGA's CPU and CIA flip-flops)",
+                board::BOARD_NODE
+            ));
+        }
+        let over_limit = picked.len().saturating_sub(board::BOARD_MAX_ENTRIES);
+        if over_limit > 0 {
+            // The marks first, then the newest.
+            let (marks, rest): (Vec<usize>, Vec<usize>) = picked.iter().partition(|&&i| refs[i].pinned);
+            let room = board::BOARD_MAX_ENTRIES.saturating_sub(marks.len());
+            picked = marks.into_iter().take(board::BOARD_MAX_ENTRIES).chain(rest.iter().rev().take(room).copied()).collect();
+            picked.sort_unstable();
+        }
+        let current = match &ring.cursor {
+            Some(id) if picked.iter().any(|&i| refs[i].id == *id) => id.clone(),
+            _ => refs[*picked.last().expect("not empty")].id.clone(),
+        };
+        let mut entries = Vec::with_capacity(picked.len());
+        for &i in &picked {
+            let r = &refs[i];
+            let payload = ring.anchors.restore_snapshot(&r.id).ok_or_else(|| format!("anchor {} is gone", r.id))?;
+            entries.push(CheckpointAnchorDump {
+                id: r.id.clone(),
+                label: r.label.clone(),
+                frame: r.frame,
+                cycles: r.cycles,
+                pinned: r.pinned,
+                byte_size: r.byte_size,
+                created_at_ms: r.created_at_ms,
+                payload,
+            });
+        }
+        // The ids end in the ring's sequence number (`cp_<frame>_<seq>`).
+        let seq = refs.iter().filter_map(|r| r.id.rsplit('_').next()?.parse::<u64>().ok()).max().unwrap_or(0);
+        let marks = entries.iter().filter(|e| e.pinned).count();
+        let anchors = entries.len();
+        let bytes = board::write_board_ring(entries, current.clone(), seq)?;
+        let info = BoardDumpInfo { anchors, marks, current_id: current, over_limit, not_board, file_bytes: bytes.len() };
+        Ok((bytes, info))
+    }
+
     /// A `.c64rering` back: the three rings from the file, and the C64 on its current anchor, held there.
     pub fn ring_load(&mut self, bytes: &[u8]) -> Result<RingDumpInfo, String> {
         if self.ring.is_none() {
             return Err("the rings are off (--ring=off)".into());
         }
-        let dump = read_ring_dump(bytes)?;
-        let anchors = RuntimeCheckpointRing::from_dump(&dump.checkpoint_ring);
+        let mut dump = read_ring_dump(bytes)?;
+        // A board file's anchors as TRX64 reads them (board.rs).
+        let mut board_ids = HashSet::new();
+        for a in &mut dump.checkpoint_ring.entries {
+            if board::adopt(&mut a.payload) {
+                board_ids.insert(a.id.clone());
+            }
+        }
+        let mut anchors = RuntimeCheckpointRing::from_dump(&dump.checkpoint_ring);
+        // The file's cap is its writer's: the board's is the number of entries it wrote. The ring keeps at least the
+        // window and cadence it had, so it goes on recording as far back after the load.
+        let fps = self.m.timing().nominal_fps;
+        let ring = self.ring.as_deref().expect("checked above");
+        let want = checkpoint_ring_max_entries(ring.window_seconds, ring.cadence_frames, fps);
+        if anchors.max_entries() < want {
+            anchors.set_max_entries(want);
+        }
         let current = dump.checkpoint_ring.current_id.clone().or_else(|| anchors.list().last().map(|r| r.id.clone()));
         // Check the anchor restores before anything is replaced.
         if let Some(id) = &current {
@@ -612,6 +698,7 @@ impl Trx64Backend {
         ring.side = side;
         ring.last_uci = None;
         ring.last_picture = None;
+        ring.board = board_ids;
         self.m.delta_ring = DeltaRing::from_dump(&dump.delta_ring);
         self.m.cpu_history = CpuHistoryRing::from_dump(&dump.cpu_history);
         if let Some(id) = current {
@@ -690,6 +777,8 @@ impl Trx64Backend {
             None,
             CaptureOpts { omit_framebuffer: true, omit_expansion_ram: true },
         );
+        // What the anchor itself lacks, before anything is put into it.
+        let mut lacks = if board::is_board(cp) { board::notes(cp) } else { Vec::new() };
         let tree = cp.as_object_mut().ok_or("the anchor is not a checkpoint")?;
         for key in FIRMWARE_NODES {
             match live.get(key) {
@@ -711,10 +800,23 @@ impl Trx64Backend {
         if kept {
             tree.insert("expansion".into(), live_exp);
         }
-        if let (Some(t), Some(l)) = (tree.get_mut("turbo").and_then(|t| t.as_object_mut()), live.get("turbo")) {
-            for key in ["enable", "menuIndex", "menuStalls"] {
-                if let Some(v) = l.get(key) {
-                    t.insert(key.to_string(), v.clone());
+        if let Some(l) = live.get("turbo").filter(|l| l.is_object()) {
+            // An anchor without a turbo node (a board file, an older TRX64) gets the registers-mode reset state for
+            // `$D030`/`$D031`: TRX64 would also put the enable word and the menu speed to theirs, which are the
+            // firmware's.
+            if !tree.get("turbo").is_some_and(|t| t.is_object()) {
+                tree.insert("turbo".into(), serde_json::json!({ "d031": 0, "d030": 0, "resetHold": 0 }));
+                lacks.push(
+                    "the anchor has no turbo node: $D030/$D031 = $00 (1 MHz with badline stalls), the turbo enable \
+                     and menu speed stay live"
+                        .into(),
+                );
+            }
+            if let Some(t) = tree.get_mut("turbo").and_then(|t| t.as_object_mut()) {
+                for key in ["enable", "menuIndex", "menuStalls"] {
+                    if let Some(v) = l.get(key) {
+                        t.insert(key.to_string(), v.clone());
+                    }
                 }
             }
         }
@@ -760,6 +862,9 @@ impl Trx64Backend {
         // The frame count only goes forward: the S37 still and the display take a larger count as a new picture.
         self.m.vic.frame = frame + 1;
         restored?;
+        // What TRX64's restore converted or could not put back (an older CIA record, say), then what the anchor lacks.
+        notes.extend(self.m.restore_notes.iter().cloned());
+        notes.extend(lacks);
         let clk = self.m.c64_core.clk;
         self.m.clk = clk;
         self.m.drive_c64_ref = clk;

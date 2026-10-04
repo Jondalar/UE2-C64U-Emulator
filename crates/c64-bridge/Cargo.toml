@@ -17,3 +17,6 @@ ue2-core = { path = "../ue2-core" }
 trx64-core = { git = "https://github.com/Jondalar/TRX64", tag = "v0.12.3" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The CRC of the board's stored-block gzip (S38 §7, board.rs); the tests unpack the gzipped board fixture with it.
+# Already in the build through trx64-core.
+flate2 = "1"
