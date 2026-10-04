@@ -78,7 +78,7 @@ block() {
 
 "$bin" run --headless --speed max --board c64u --firmware "$elf" --roms "$roms" --flash run/flash.bin --c64-roms \
     --settings "$repo/scripts/smoke-trx-freeze.cfg" --script "$repo/scripts/smoke-trx-freeze.ctl" \
-    >run/freeze.log 2>run/freeze.err || fail "exit code $?"
+    --audio-wav run/freeze.wav >run/freeze.log 2>run/freeze.err || fail "exit code $?"
 log=run/freeze.log
 
 # Boot.
@@ -120,5 +120,30 @@ frames3=$(awk '/^  vic frames/ {print $3}' $log | sed -n 3p)
 [[ "$(block 1 $log)" == "$(block 3 $log)" ]] || fail "the text screen after the unfreeze differs from before"
 block 4 $log | grep -q "^ 42$" || fail "print 6*7 did not give 42 after the unfreeze"
 echo "PASS unfrozen"
+
+# The sound (top.v:1059): cut to zeros for the freeze, the output going on at its rate, and the tone again after.
+python3 - run/freeze.wav <<'PY' || fail "freeze.wav: no stretch of 2 s of zeros between the tone before and after"
+import struct, sys, wave
+w = wave.open(sys.argv[1])
+rate, ch = w.getframerate(), w.getnchannels()
+pcm = struct.unpack('<%dh' % (w.getnframes() * ch), w.readframes(w.getnframes()))
+peak = [max(abs(s) for s in pcm[i:i + ch]) for i in range(0, len(pcm), ch)]
+# The tone, not a click: a fifth of the quarter second above 5000.
+loud = lambda part: len(part) > 0 and sum(p > 5000 for p in part) * 5 >= len(part)
+# Zero stretches of 2 s or more with the tone right before and right after: the freeze. (The firmware's boot has
+# one too, the C64 held then, with clicks around it.)
+found, i = [], 0
+while i < len(peak):
+    j = i
+    while j < len(peak) and peak[j] == 0:
+        j += 1
+    if j - i >= 2 * rate and loud(peak[max(0, i - rate // 4):i]) and loud(peak[j:j + rate // 4]):
+        found.append((i / rate, (j - i) / rate))
+    i = j + 1
+print("muted with the tone around it: %s" % ", ".join("%.2f s from %.2f s" % (n, t) for t, n in found))
+sys.exit(0 if len(found) == 1 else 1)
+PY
+"$repo/scripts/wav-tone.py" run/freeze.wav --expect 1000 >/dev/null || fail "freeze.wav: no 1000 Hz tone after the unfreeze"
+echo "PASS sound"
 
 echo "TRX freeze smoke passed; pngs in $rundir/run"
