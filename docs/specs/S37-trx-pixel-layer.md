@@ -1,7 +1,7 @@
 # S37 — The TRX64-Ultimate pixel layer (LVGL UI)
 
-**Status:** phase A built (2026-10-04), phases B1 and B2 (the freeze, §5) built (2026-10-04), local branch
-`s37-trx-pixel-layer`, not pushed. B3 not built. See "As built" at the end.
+**Status:** phase A built (2026-10-04), phases B1 and B2 (the freeze, §5) built (2026-10-04), B3 (`overlay.v`'s
+box, §5.10) built (2026-10-04), local branch `s37-trx-pixel-layer`, not pushed. See "As built" at the end.
 
 **Why:** TRX64-Ultimate (Alex's own FPGA for the C64U, `/Users/alex/Development/TRX64-Ultimate`, Gitea
 `TREX/TRX64-Ultimate`) adds an RGB565 pixel layer over the C64 picture. Its app fork (`software/ultimate-app`,
@@ -102,9 +102,9 @@ The interrupt is `(IRQ_EN & IRQ_CAUSE) != 0` on **ITU high IRQ 2**.
 - **Composite:** with the block on, the window, `png` and screenshots always show the 1920 × 1080 composite of §1,
   scaled to the window as today: the bitstream has no other output, so the picture keeps one shape whether the layer
   is on or off (with it off: the C64 at 4× between the bars). Without the block the picture path is unchanged.
-  - When S = 2, x0 and y0 are even (LVGL's case) and no overlay window is up, the composite is built at
-    960 × 540. Each 50 Hz C64 pixel is then exactly 2 × 2. The overlay's text is drawn 1:1 in the output mode, so
-    with a window up the composite stays at 1920 × 1080.
+  - When S = 2, x0 and y0 are even (LVGL's case) and `overlay.v`'s box is off, the composite is built at
+    960 × 540. Each 50 Hz C64 pixel is then exactly 2 × 2. The box's scale is 1 to 4 per axis and its corner is
+    centred to the pixel (§5.10), so with the box on the composite stays at 1920 × 1080.
   - Otherwise it is built at 1920 × 1080.
 - **Not changed:** the UDP video stream (S24) carries the VIC picture, as before.
 - **Monitor:** `monitor trx` shows ID, CAPS, IRQ_EN/CAUSE and the PX_* registers.
@@ -421,17 +421,27 @@ The smoke also writes `frozen.png` for a look by eye against a photo of the devi
 
 ### 5.10 Phase B3: `overlay.v` in TRX mode
 
-Only for "Overlay on HDMI"; the freeze path does not touch it. `overlay.v` differs from Gideon's chargen in three ways,
-UE2's placement in the composite follows it when `--trx-io` is on:
-- **Place:** X_ON/Y_ON are ignored (overlay.v:93); the box is centred in 1920 × 1080: x = (1920 − w·sx) / 2,
-  y = (1080 − h·sy) / 2, 0 when it does not fit (overlay.v:142-143).
-- **Scale:** w = chars per line × char width, h = lines × lines per row (the big font: ch − ch / 4); sx, sy each
-  the largest of 4, 3, 2, 1 with w·sx ≤ 1280 and h·sy ≤ 800 (overlay.v:135-141).
-- **Blend:** a pixel whose colour index is not the transparent one is the overlay palette's colour, opaque; a
-  transparent one inside the box shows the C64 at half brightness, each channel shifted right by 1; outside the box
-  the C64 is unchanged (overlay.v:259-277). UE2's 50 % mix of today (`blend_half`) is Gideon's look, not this one.
-- Registers are taken at the frame start (overlay.v:119-123). The font rules (8-pixel ROM font or the 12 × 24 font,
-  stretch, the 9th line) are Gideon's and stay as UE2 has them.
+Only for "Overlay on HDMI"; the freeze path does not touch it. With `--trx-io` UE2 draws Gideon's chargen as
+`overlay.v` does, between the C64 and the layer (top.v:1383-1388). Without the block nothing changes.
+- **Registers** (overlay.v:84-93, taken at the frame start :119-123): CHAR_WIDTH b3:0, CHAR_HEIGHT b4:0 with the big
+  font b6 and stretch b7, CHARS_PER_LINE, ACTIVE_LINES b5:0, the pointer's low 12 bits, TRANSPARENCY (index b3:0,
+  on b7). X_ON/Y_ON, the line clocks and PERFORM_SYNC are not read.
+- **Scale:** w = cpl · cw, h = nl · lpr with lpr = ch, for the big font ch − ch / 4 (overlay.v:135-137); sx, sy each
+  the largest of 4, 3, 2, 1 with 4·w ≤ 1280 resp. 4·h ≤ 800 and so on (:138-139). The firmware's SD settings,
+  40 × 25 of 8 × 9: 4 × 3, 1280 × 675. 1080p settings, 40 × 25 of 12 × 23 with the big font: 18 lines per row,
+  2 × 1, 960 × 450 (overlay.v:17-18 says 960 × 575; the code gives 450).
+- **Place:** centred in 1920 × 1080: first pixel x = (1920 − w·sx) / 2, first line y = (1080 − h·sy) / 2, rounded
+  down, 0 when it does not fit (:142-143; cx xs_m1 + 1, cx 768 being x 0). SD settings: (320, 202), the box ends at
+  x 1599 and line 876.
+- **Counters** (:153-201): each character line repeats sy times and each pixel sx times; the big font steps from
+  line 4n + 2 to 4n + 4; a row ends at line ch − 1 (5 bits) and moves the pointer on by cpl (12 bits); nl rows.
+  Nothing is drawn while on is 0, cw · cpl is 0 or nl is 0.
+- **Pixel** (:221-263): the glyph rules are Gideon's: the 8-pixel ROM font (`ovl_font8.mem`, the first 1 K of
+  `roms/chars.bin`), stretch, the 9th line blank unless line 7 is 0x18, the 12 × 24 font for the big one, bit 7 of
+  the screen code reverses. The colour index is the colour RAM's low nibble for a set bit, else its high nibble.
+- **Blend** (:255-277): an index other than the transparent one is the overlay palette's colour, opaque; the
+  transparent index inside the box is the C64 at half brightness, each channel shifted right by 1; outside the box
+  the C64 is unchanged. UE2's 50 % mix (`blend_half`) is Gideon's look and stays for the path without the block.
 - With the box on, the composite is built at 1920 × 1080.
 
 ### 5.11 Deferred to S38
@@ -469,8 +479,7 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
   - TRX64's canvas is 384 wide, the window 400: the columns outside it repeat the canvas's edge pixel (the border);
   - the window is mapped through the text area's first pixel (raster x 136, `x_text`) and the canvas's first line;
   - a 60 Hz composite at 960 × 540 takes every second output line of the 5, 4, 5, 4 pattern.
-- **Gideon's overlay** is placed as UE2 places it without the layer (X_ON/Y_ON in the output mode, half strength).
-  `overlay.v` instead centres the box and scales it; not modelled.
+- **Gideon's overlay** follows `overlay.v` since B3 (see "As built (phase B3)").
 - **Drive B:** the firmware probes DRIVETYPE 2 at boot (c1541.cc:119-123). With `--trx-io` the write keeps the
   1541, so the firmware offers drive B as a 1541 only, and the log says so once.
 - **Firmware smoke** (`scripts/smoke-trx.sh`, trx64/main 029da8ef): "LVGL 9.6.0 on the pixel layer" at about
@@ -501,3 +510,21 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
   layer 800 × 540 at (160, 0), the still valid; frozen.png is the menu text over the dimmed still, 960 × 540 with black
   bars, and frozen2.png 1 s later is the same file with the same VIC frame count. After the unfreeze the screen is the
   one before, the list wrote nothing (every listed register was put back by `restore_io()`), and `print 6*7` gives 42.
+
+## As built (phase B3)
+
+- **`render.rs`:** `TrxBox` takes the registers and runs overlay.v's line counters over the 1080 lines;
+  `draw_overlay_trx` runs its pixel counters across the box and replaces the 50 % window in `render_trx`. The path
+  without the block (`blend_overlay`) is unchanged.
+- **The frame start:** UE2 renders from one snapshot of registers, screen and colour RAM and palette. overlay.v takes
+  the registers at the frame start, but reads the RAMs and the palette live (:208-209, :275); a write within a frame
+  shows from the next picture in UE2.
+- **Not modelled:**
+  - the big font: UE2 draws the 8 × 8 font widened to 12 (`Renderer::new`), the RTL its `ovl_font12.mem`. The TRX
+    firmware writes the SD settings (CHAR_WIDTH 8, CHAR_HEIGHT 9, no big font) in the smoke, so it does not show;
+  - the bus side: overlay.v decodes the registers at 0x000-0x00F only (Gideon's every 16 bytes), reads the palette as
+    0, and powers up with the Colodore palette (UE2: 0). The firmware writes its own palette before the menu opens.
+- **Firmware smoke** (`scripts/smoke-trx-overlay.sh`, trx64/main 029da8ef): the TRX app writes 40 × 25 of 8 × 9,
+  pointer 0, TRANSPARENCY 0xC0 (index 0). menu.png is 1920 × 1080 with the box at (320, 202)-(1599, 876): outside it
+  the picture before the menu, inside it the C64 at half brightness wherever the cells are index 0, and the rest in
+  at most 16 opaque colours (6 or 7 per run). After the second `button` the picture is 960 × 540 again.
