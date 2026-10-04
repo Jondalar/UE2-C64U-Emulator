@@ -1,7 +1,7 @@
 # S38 — TRX64's rings on the C64 (time travel)
 
 **Status:** built (2026-10-04), local branch `s37-trx-pixel-layer`, not pushed. §4.1 (UE2's part around the C64
-rewinds with it) built the same day. See "As built" at the end.
+rewinds with it) and §4.3 (the picture comes back with the anchor) built the same day. See "As built" at the end.
 
 **Why:** UE2's C64 is TRX64 (`trx64-core`, tag v0.12.3). TRX64 has its own time travel: a delta ring per
 instruction, a CPU history, and a checkpoint ring with marks. Its daemon runs all three by default. UE2 runs the
@@ -164,8 +164,29 @@ Then the firmware's half holds nothing either, and what comes back is the C64's:
 buffer, the command interrupt enable. Otherwise the live block stays and the restore says why. The copy is the
 session's: a `.c64rering` does not carry it.
 
+### 4.3 The picture
+
+TRX64's anchor carries no picture (`omit_framebuffer`, TRX64 Spec 807). The daemon draws one after a restore: it runs
+one or two frames and restores again (Spec 808, `transport_move_to`). Here such a frame would reach the cartridge, the
+REU, the UCI, the drives and the sampler, which a second restore does not undo. So the bridge keeps the picture itself:
+
+- **At each anchor** it keeps the VIC's `displayed` buffer (520 × 312 colour indices, the last complete frame), packed
+  (PackBits), in the anchor's session entry beside the UCI copy. A picture equal to the one before shares it.
+- **At `goto`, `frame` and `ringload`**, after the restore, it unpacks that picture into `displayed`. Nothing runs. The
+  VIC's accumulator gets the same picture, except the line the VIC draws now, which is the anchor's (TRX64's VIC node
+  carries it). The frame count already went up with the restore (§4), so the window, `png`, the UDP stream and, with
+  `--trx-io`, the composite and the still take the new picture.
+- **What it shows:** the frame that ended at the anchor, as it was on screen then, with every raster split, sprite
+  multiplexer and border trick. The daemon shows the frame after the anchor instead (it draws on from there).
+- **No picture kept** (an anchor from another session's `.c64rering`): TRX64's `render_index_buffer` draws one from the
+  anchor's VIC registers, RAM, colour RAM and character ROM, and a note says so. It is one register state for the
+  whole frame: no raster splits, and the VIC reads RAM where on the machine it may read a cartridge's ROM (Ultimax).
+
+`rewind` prints the pictures held: how many distinct ones and their packed size.
+
 **Notes.** What a restore could not put back is listed under the status line (`note: …`): no `ue2Hw` node, an anchor
-the log no longer reaches, no DDR lent, another cartridge type, another CRT in the port, the UCI kept live.
+the log no longer reaches, no DDR lent, another cartridge type, another CRT in the port, the UCI kept live, a picture
+drawn from the registers (§4.3).
 
 The bridge then re-anchors its clock and the SID stream at the anchor's cycle, as after a reset release. A physical
 cartridge whose node came back has the anchor's epoch; otherwise its flash timers carry the cycles the C64 went back.
@@ -183,9 +204,9 @@ cartridge whose node came back has the anchor's epoch; otherwise its flash timer
 - UE2's reSID engines and the sampler keep their voice state; the SID registers in TRX64 are the anchor's. The sound
   follows once the program writes the SID again.
 - The anchors carry no drive state, as in the daemon (`drive1541` null).
-- The picture is not redrawn while the C64 stands: the window shows the last frame before `goto`. The daemon runs a
-  frame and restores again. Here that frame would reach the drives, the UCI and the sampler, which a second restore
-  does not undo. Screen RAM (`c64screen`, `m`) is right at once.
+- The picture of an anchor from another session's file is drawn from its registers (§4.3): no raster splits.
+- On a wrapped window (NTSC) the frame in progress at the anchor is not kept, only the one shown. The first frame after
+  a release has, from its vsync line down, the lines of the frame before: one frame.
 - `rstep` undoes C64 RAM from TRX64's delta ring, as before; UE2's memories stay where they are.
 - The delta ring and the CPU history are not cut with the anchors (as in the daemon). After a release, `whowrote` can
   name a write of the abandoned future.
@@ -205,8 +226,8 @@ Over the control port (`monitor <line>`) and the MCP tool `emu_monitor`, the sam
 | `ringdump <path>`, `ringload <path>` | ours | TRX64's `.c64rering` |
 | `asm-file <path> [addr]`, `pwd`, `cd`, `ls` | ours | the library's assembler; files under `--monitor-dir` |
 
-- Not here: `play`, `pause`, `rawframe`, `diff`, `cdiff`, thumbnails, `buildtrace`. They need wall-clock pacing,
-  pictures or traces that UE2 does not keep.
+- Not here: `play`, `pause` (wall-clock pacing), `rawframe` (UE2 shows the frame that ended at the anchor, §4.3, and
+  draws no other), `diff`, `cdiff`, thumbnails, `buildtrace`.
 - `on_effect` is implemented, and `files()` gives the library our `Files`. The library calls neither `timeline()`
   nor `files()` in v0.12.3, so the verbs are ours.
 - The VICE binary monitor port has no time-travel commands and is unchanged.
@@ -280,6 +301,18 @@ With a 128 KB REU (`scripts/smoke-c64-ring-reu.cfg`), a BASIC loop stashing 64 K
 - An EasyFlash that writes was not measured with the firmware (no test cartridge writes continuously). Its writes take
   the same tap as cart RAM, GeoRAM and the REU (`CartLogic::ddr_write`), one record each.
 
+The pictures (§4.3), 66 s emulated at `--speed max`, a BASIC loop that counts `$0400`, so nearly every frame is a
+new picture. Two runs each, without the pictures (the commit before) and with them, taken in turn:
+
+| | wall s | max RSS | pictures |
+|---|---|---|---|
+| without | 8.08, 7.86 | 481-483 MiB | |
+| with | 8.49, 8.02 | 508-515 MiB | 2 741 distinct, 17.3 MiB packed |
+
+- About 6.5 KiB a text-screen picture packed; an unchanged picture costs a 162 KB compare and no memory.
+- A full-screen picture that changes every frame (bitmaps, scrollers) packs worse; at most 162 KB a frame plus 1/128,
+  about 470 MiB for 3000 anchors. Not measured with such a program.
+
 ## 9. Checks
 
 - **Bridge unit tests** (`c64-bridge`):
@@ -298,7 +331,11 @@ With a 128 KB REU (`scripts/smoke-c64-ring-reu.cfg`), a BASIC loop stashing 64 K
     `ue2Hw` node is in a `.c64rering`, TRX64's own loader restores an anchor with it, and a load in the same session
     puts the REU back through the log;
   - `hwlog.rs`: undo and redo, pokes for the other spaces, nothing moves without DDR; a cut, the cap and a new log
-    uncover the anchors they leave behind.
+    uncover the anchors they leave behind;
+  - §4.3: `goto` an anchor taken before the border changed shows that anchor's picture; showing it again, kept or
+    drawn from the registers, leaves TRX64's whole checkpoint, the write log, the cartridge registers and the UCI
+    status as they were; a release runs on to the anchor's picture; a `ringload` in the same session shows the
+    session's picture of the file's anchor; PackBits round-trips runs, literals and refuses a wrong size.
 - **Monitor tests** (`ue2emu`):
   - the ring verbs on a booted C64;
   - files confined to their directory (`..`, `/..`, a symbolic link, a host path);
@@ -308,12 +345,14 @@ With a 128 KB REU (`scripts/smoke-c64-ring-reu.cfg`), a BASIC loop stashing 64 K
 - **Smoke** `scripts/smoke-c64-ring.ctl` (in `smoke-c64-all.sh`), with the firmware:
   - a BASIC loop counts `$0400`; `mark`, then `goto` the mark twice gives the same byte, not the live one;
   - `ringdump`/`ringload`;
-  - `asm-file` assembles `ring.asm`.
+  - `asm-file` assembles `ring.asm`;
+  - §4.3: a `png` while `20 goto20` runs (a still screen) at `mark still`; at the end `goto still` gives the same png,
+    not the counter's live one.
 - **Smoke** `scripts/smoke-c64-ring-reu.ctl` (in `smoke-c64-all.sh`, `--settings smoke-c64-ring-reu.cfg`, a 128 KB
   REU): a BASIC loop keeps its counter in the REU (fetch, add one, stash). After `goto` a mark it runs on from the
   mark's count, not from the live count it would fetch from an REU that stayed live; no `note: UE2 memories` line.
 
-- `cargo test --workspace --all-features` (583 passed with §4.1; 573 before), `cargo build --release` (only the old
+- `cargo test --workspace --all-features` (585 passed with §4.3; 583 with §4.1; 573 before), `cargo build --release` (only the old
   `transparent` warning), `smoke-all.sh`, `smoke-c64-all.sh` (16 runs, `ring-reu` among them), `smoke-trx.sh` and
   `smoke-trx-freeze.sh` pass.
 
@@ -346,7 +385,6 @@ With a 128 KB REU (`scripts/smoke-c64-ring-reu.cfg`), a BASIC loop stashing 64 K
 - REU and cartridge writes in the `.c64rering`: the log is the session's, so a file restores TRX64's state and the
   cartridge registers but not the memories (a note says so). TRX64's `RingBufferDump` has no place for it.
 
-- Redraw the picture on `goto` without reaching the firmware's parts (needs gap 1, or a VIC-only re-run).
 - A board `.c64rering` into UE2, and UE2's into the board once its loader takes compressed gzip.
 - Whether `ringdump` should also write the board's subset, so a file from UE2 loads on `trx64/main`.
 
@@ -364,6 +402,16 @@ With a 128 KB REU (`scripts/smoke-c64-ring-reu.cfg`), a BASIC loop stashing 64 K
   - `$0400`: 93 live, 5b after `goto here`, 5b after 500 ms held, 5b after `run` and `goto here` again;
   - `ringdump`: 726 anchors, 3 116 300 delta entries, 262 144 CPU history entries, 35.9 MB;
   - `asm-file`: `a9 01 60` at `$c000`.
+
+### §4.3 (the picture)
+
+- `Ring::picture` packs `vic.displayed` at `ring_frame` (PackBits, `Picture`); the side entry holds it. `ring_goto`
+  calls `show_picture` after `restore_c64`; `ring_load` keeps this session's pictures by anchor id.
+- `show_picture` writes only `vic.displayed` and `vic.dbuf` (minus the draw line the anchor carries). A unit test
+  checks that TRX64's whole checkpoint, the write log, the cartridge registers and the UCI status do not move.
+- **Smoke** (upstream ELF, NTSC): `ring-goto.png` equals `ring-mark.png` byte for byte, and differs from
+  `ring-live.png`. The commit before shows the live frame (`ring-goto.png` equals `ring-live.png`). With the TRX
+  firmware and `--trx-io` (960 × 540 composite) the same holds.
 
 ### §4.1 (UE2's part)
 

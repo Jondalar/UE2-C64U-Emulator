@@ -12,17 +12,24 @@
 //! registers and memories, the REU's memory, the GMOD2 EEPROM, a physical cartridge, the UCI block when no command is
 //! in flight. What the firmware owns stays live: the drives and the IEC devices, the turbo enable word and menu speed,
 //! the model, whether a REU is fitted and its size, the bus sharing, the sampler and the mixer.
+//!
+//! An anchor also keeps the picture the VIC showed when it was taken, so the C64 standing on it shows that picture
+//! at once, without running anything.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use trx64_core::c64re_snapshot::{capture_runtime_checkpoint_with, checkpoint_model, restore_runtime_checkpoint, CaptureOpts};
+use trx64_core::c64re_snapshot::{
+    capture_runtime_checkpoint_with, capture_vic_presentation_opts, checkpoint_model, restore_runtime_checkpoint,
+    CaptureOpts,
+};
 use trx64_core::checkpoint_ring::{
     checkpoint_ring_budget_for, checkpoint_ring_max_entries, RuntimeCheckpointRef, RuntimeCheckpointRing,
     DEFAULT_CHECKPOINT_RING_SECONDS,
 };
 use trx64_core::cpu_history::DEFAULT_CAPACITY;
 use trx64_core::delta_ring::{DeltaRing, DEFAULT_REVERSE_SECONDS};
+use trx64_core::render::{render_index_buffer, RenderInput, FB_H, FB_W};
 use trx64_core::ring_dump::{read_ring_dump, write_ring_dump, RingBufferDump, RingDumpInfo};
 use trx64_core::{CpuHistoryRing, Machine, Uci, UciEvents, UciStatus};
 
@@ -55,12 +62,77 @@ struct Ue2Node {
     physical: Option<PhysNode>,
 }
 
-/// What an anchor holds besides its payload, in this session only: its log position, and the UCI block when it was
-/// enabled. The block is TRX64's and has no serialized form, so it rides no file.
+/// What an anchor holds besides its payload, in this session only: its log position, the UCI block when it was
+/// enabled, and the picture the VIC showed. The block is TRX64's and has no serialized form, so it rides no file; the
+/// picture rides none either, since TRX64's anchor omits the framebuffers.
 struct Side {
     id: String,
     seq: u64,
     uci: Option<Arc<Uci>>,
+    picture: Option<Arc<Picture>>,
+}
+
+/// The VIC's `displayed` buffer (520 × 312 colour indices, the last complete frame) as it stood when an anchor was
+/// taken, PackBits-packed: a header byte `n` below 128 is followed by `n + 1` literal bytes, one from 128 up by one byte
+/// repeated `n - 126` times.
+pub(crate) struct Picture(Box<[u8]>);
+
+/// The size of the VIC's framebuffers.
+const FB_LEN: usize = FB_W * FB_H;
+
+impl Picture {
+    fn pack(src: &[u8]) -> Picture {
+        let mut out = Vec::with_capacity(src.len() / 16);
+        let mut i = 0;
+        while i < src.len() {
+            let b = src[i];
+            let mut run = 1;
+            while run < 129 && i + run < src.len() && src[i + run] == b {
+                run += 1;
+            }
+            if run >= 2 {
+                out.push((run + 126) as u8);
+                out.push(b);
+                i += run;
+                continue;
+            }
+            // Literals up to 128, until two equal bytes start a run.
+            let start = i;
+            i += 1;
+            while i < src.len() && i - start < 128 && !(i + 1 < src.len() && src[i] == src[i + 1]) {
+                i += 1;
+            }
+            out.push((i - start - 1) as u8);
+            out.extend_from_slice(&src[start..i]);
+        }
+        Picture(out.into_boxed_slice())
+    }
+
+    /// Unpack into `dst`; false when the packed bytes do not fill it exactly (`dst` is then left partly written).
+    fn unpack(&self, dst: &mut [u8]) -> bool {
+        let (src, mut at, mut i) = (&self.0, 0, 0);
+        while i < src.len() {
+            let n = usize::from(src[i]);
+            if n < 128 {
+                let Some(lit) = src.get(i + 1..i + 2 + n) else { return false };
+                let Some(out) = dst.get_mut(at..at + n + 1) else { return false };
+                out.copy_from_slice(lit);
+                at += n + 1;
+                i += n + 2;
+            } else {
+                let (Some(&b), Some(out)) = (src.get(i + 1), dst.get_mut(at..at + n - 126)) else { return false };
+                out.fill(b);
+                at += n - 126;
+                i += 2;
+            }
+        }
+        at == dst.len()
+    }
+
+    /// Packed bytes.
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// The UCI block's state as the firmware reads it and its RAM: two captures that agree share one copy.
@@ -132,6 +204,8 @@ pub struct Ring {
     side: VecDeque<Side>,
     since_sweep: u32,
     last_uci: Option<(UciPrint, Arc<Uci>)>,
+    /// The last picture packed and the buffer it came from: an unchanged picture shares it.
+    last_picture: Option<(Box<[u8]>, Arc<Picture>)>,
 }
 
 impl Ring {
@@ -150,7 +224,37 @@ impl Ring {
             side: VecDeque::new(),
             since_sweep: 0,
             last_uci: None,
+            last_picture: None,
         }
+    }
+
+    /// The picture for an anchor taken now from `displayed`: the last one when nothing changed.
+    fn picture(&mut self, displayed: &[u8]) -> Arc<Picture> {
+        match &mut self.last_picture {
+            Some((raw, arc)) if raw[..] == *displayed => arc.clone(),
+            Some((raw, arc)) if raw.len() == displayed.len() => {
+                raw.copy_from_slice(displayed);
+                *arc = Arc::new(Picture::pack(displayed));
+                arc.clone()
+            }
+            _ => {
+                let arc = Arc::new(Picture::pack(displayed));
+                self.last_picture = Some((displayed.into(), arc.clone()));
+                arc
+            }
+        }
+    }
+
+    /// The anchors' pictures: how many distinct ones, and their packed bytes.
+    pub fn pictures(&self) -> (usize, usize) {
+        let mut seen = HashSet::new();
+        let mut bytes = 0;
+        for p in self.side.iter().filter_map(|s| s.picture.as_ref()) {
+            if seen.insert(Arc::as_ptr(p)) {
+                bytes += p.len();
+            }
+        }
+        (seen.len(), bytes)
     }
 
     /// Drop the side entries of anchors that are gone; the oldest log position still wanted, or `None` with no
@@ -352,8 +456,10 @@ impl Trx64Backend {
             }
         });
         let ring = self.ring.as_deref_mut().expect("checked above");
+        // The picture the VIC shows at the anchor: the frame that ended at it, raster effects and all.
+        let picture = Some(ring.picture(&self.m.vic.displayed[..]));
         if let Ok(r) = ring.anchors.capture(payload, frame, clk) {
-            ring.side.push_back(Side { id: r.id, seq, uci });
+            ring.side.push_back(Side { id: r.id, seq, uci, picture });
         }
         ring.since_sweep += 1;
         if ring.since_sweep >= SWEEP_EVERY {
@@ -394,6 +500,7 @@ impl Trx64Backend {
         ring.frames_since = 0;
         ring.side.clear();
         ring.last_uci = None;
+        ring.last_picture = None;
         self.m.delta_ring.clear();
         self.m.cpu_history.clear();
         // UE2's write log describes the same machine: a new one.
@@ -409,20 +516,23 @@ impl Trx64Backend {
         let mut cp =
             ring.anchors.restore_snapshot(&anchor.id).ok_or_else(|| format!("anchor {} is gone (evicted)", anchor.id))?;
         let uci = ring.side(&anchor.id).and_then(|s| s.uci.clone());
+        let picture = ring.side(&anchor.id).and_then(|s| s.picture.clone());
         // Leaving the head: the log takes what a physical cartridge's flash did since the last anchor, then stands.
         if ring.cursor.is_none() {
             self.flush_physical();
         }
         self.hwlog.set_on(false);
         let restored = self.restore_c64(&mut cp, uci.as_deref());
-        let ring = self.ring.as_deref_mut().expect("checked above");
-        ring.notes = match restored {
+        let mut notes = match restored {
             Ok(notes) => notes,
             Err(e) => {
                 self.arm_rings();
                 return Err(e);
             }
         };
+        notes.extend(self.show_picture(picture.as_deref()));
+        let ring = self.ring.as_deref_mut().expect("checked above");
+        ring.notes = notes;
         ring.cursor = Some(anchor.id.clone());
         ring.mode = mode;
         self.arm_rings();
@@ -477,13 +587,21 @@ impl Trx64Backend {
         }
         // The file's anchors reach this session's write log only if they were taken from it (§9).
         let log_id = self.hwlog.mark().id;
+        // So do the pictures this session kept for them.
+        let old = &self.ring.as_deref().expect("checked above").side;
+        let picture = |id: &str| old.iter().rev().find(|s| s.id == id).and_then(|s| s.picture.clone());
         let side: VecDeque<Side> = dump
             .checkpoint_ring
             .entries
             .iter()
             .filter_map(|a| {
                 let node: Ue2Node = serde_json::from_value(a.payload.get(UE2_NODE)?.clone()).ok()?;
-                (node.log.id == log_id).then(|| Side { id: a.id.clone(), seq: node.log.seq, uci: None })
+                (node.log.id == log_id).then(|| Side {
+                    id: a.id.clone(),
+                    seq: node.log.seq,
+                    uci: None,
+                    picture: picture(&a.id),
+                })
             })
             .collect();
         let ring = self.ring.as_deref_mut().expect("checked above");
@@ -493,12 +611,53 @@ impl Trx64Backend {
         ring.frames_since = 0;
         ring.side = side;
         ring.last_uci = None;
+        ring.last_picture = None;
         self.m.delta_ring = DeltaRing::from_dump(&dump.delta_ring);
         self.m.cpu_history = CpuHistoryRing::from_dump(&dump.cpu_history);
         if let Some(id) = current {
             self.ring_goto(&id, Mode::StepBack)?;
         }
         Ok(dump.info(bytes.len() as u64))
+    }
+
+    /// Put the anchor's picture where the display reads it (`vic.displayed`), after a restore: nothing runs, and only the
+    /// VIC's two framebuffers change, which TRX64's anchor does not carry (it carries the line being drawn, which stays).
+    /// The accumulator gets the same picture, so the lines the VIC does not draw again before its next swap (on a
+    /// wrapped window, NTSC) are the anchor's and not the abandoned future's. With no picture kept (another session's file) it is drawn from the anchor's VIC registers
+    /// and memory, one state for the whole frame; the note says so.
+    pub(crate) fn show_picture(&mut self, picture: Option<&Picture>) -> Option<String> {
+        let mut note = None;
+        let unpacked = picture.is_some_and(|p| p.unpack(&mut self.m.vic.displayed[..]));
+        if !unpacked {
+            let mut color_ram = [0u8; 0x400];
+            for (c, s) in color_ram.iter_mut().zip(&self.m.io_shadow[0x800..0xC00]) {
+                *c = s & 0x0F;
+            }
+            let input = RenderInput {
+                regs: &self.m.vic.regs,
+                ram: &self.m.ram,
+                char_rom: &self.m.char_rom,
+                color_ram: &color_ram,
+                bank_base: self.m.vic_bank_base(),
+                model: self.m.model(),
+            };
+            let fb = render_index_buffer(&input);
+            if fb.len() == FB_LEN {
+                self.m.vic.displayed.copy_from_slice(&fb);
+            }
+            note = Some(
+                "picture drawn from the anchor's VIC registers and memory (the session kept none for it): \
+                 no raster splits"
+                    .to_string(),
+            );
+        }
+        // The line the VIC draws now is the anchor's (TRX64's VIC node carries it); the rest of the accumulator is not.
+        let line = usize::try_from(capture_vic_presentation_opts(&self.m, true).lit_last_raster_line).unwrap_or(0);
+        let keep = line.min(FB_H - 1) * FB_W..(line.min(FB_H - 1) + 1) * FB_W;
+        let vic = &mut self.m.vic;
+        vic.dbuf[..keep.start].copy_from_slice(&vic.displayed[..keep.start]);
+        vic.dbuf[keep.end..].copy_from_slice(&vic.displayed[keep.end..]);
+        note
     }
 
     /// The model the checkpoint was taken on must be the one the firmware runs: a restore would otherwise switch the
@@ -684,3 +843,32 @@ impl Trx64Backend {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_picture_packs_and_unpacks_exactly() {
+        let mut src = vec![6u8; FB_LEN];
+        src[..300].fill(14);
+        for (i, b) in src[1000..1500].iter_mut().enumerate() {
+            *b = (i % 16) as u8;
+        }
+        src[FB_LEN - 1] = 1;
+        src[FB_LEN - 3] = 1;
+        let p = Picture::pack(&src);
+        assert!(p.len() < 4000, "{}", p.len());
+        let mut out = vec![0u8; FB_LEN];
+        assert!(p.unpack(&mut out));
+        assert_eq!(out, src);
+        // All literals, and a buffer of the wrong size.
+        let noise: Vec<u8> = (0..1000).map(|i| (i * 7 % 13) as u8).collect();
+        let q = Picture::pack(&noise);
+        assert!(q.len() <= noise.len() + noise.len() / 128 + 1);
+        let mut back = vec![0u8; 1000];
+        assert!(q.unpack(&mut back));
+        assert_eq!(back, noise);
+        assert!(!q.unpack(&mut vec![0u8; 999]) && !q.unpack(&mut vec![0u8; 1001]));
+    }
+}

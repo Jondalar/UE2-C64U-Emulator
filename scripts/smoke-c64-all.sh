@@ -27,7 +27,8 @@
 #   usb         smoke-usb.ctl          --usb run/usb.img --usb-keyboard
 #   joy         smoke-joy.ctl          both control ports in BASIC, port 2 in the menu (S36)
 #   joy-swap    smoke-joy-swap.ctl     --settings smoke-joy-swap.cfg: port 1 in the menu
-#   ring        smoke-c64-ring.ctl     S38: mark, goto twice to the same byte, ringdump/ringload, asm-file
+#   ring        smoke-c64-ring.ctl     S38: mark, goto twice to the same byte, ringdump/ringload, asm-file, the
+#                                      picture after goto is the one at the mark
 #   ring-reu    smoke-c64-ring-reu.ctl --settings smoke-c64-ring-reu.cfg: a counter kept in the REU runs on from the
 #                                      mark's count after goto, so the REU's bytes went back with the C64
 
@@ -177,6 +178,8 @@ counts=($(grep -o '^>R:0400  [0-9a-f][0-9a-f]' run/ring.log | cut -c10-))
 [[ ${counts[1]} == "${counts[2]}" && ${counts[1]} == "${counts[3]}" ]] || fail ring "goto here: ${counts[*]}"
 grep -q "^ringload: restored" run/ring.log || fail ring "no ringload"
 grep -q '^>C:c000  a9 01 60' run/ring.log || fail ring "asm-file did not assemble ring.asm"
+cmp -s run/ring-mark.png run/ring-goto.png || fail ring "goto still: not the picture taken at the mark"
+! cmp -s run/ring-live.png run/ring-goto.png || fail ring "goto still: the picture stayed the live one"
 
 # S38 §4.1: the REU goes back with the C64. Reads: the live count, the mark's count, the count 100 ms on from it.
 cp run/flash.bin run/flash-ring-reu.bin

@@ -343,14 +343,23 @@ fn frame(host: &mut Host, args: &[&str]) -> Result<String, String> {
 /// `rewind`: where the transport stands, the buffer in numbers, and the settings.
 fn rewind(host: &mut Host) -> Result<String, String> {
     let ring = ring_of(host, "rewind")?;
-    let (cap, cadence, window, empty) =
-        (ring.anchors.max_entries(), ring.cadence_frames.max(1), ring.window_seconds, ring.ids().is_empty());
+    let (cap, cadence, window, empty, (pictures, picture_bytes)) = (
+        ring.anchors.max_entries(),
+        ring.cadence_frames.max(1),
+        ring.window_seconds,
+        ring.ids().is_empty(),
+        ring.pictures(),
+    );
     let mut lines = vec![status_line(host), range_line(host)];
     lines.push(format!("  cap {cap} anchors   cadence every {cadence} frame(s)   window {window:.1}s"));
     let (recs, bytes) = backend(host).ue2_log();
     lines.push(format!(
         "  UE2 write log: {recs} write(s), {:.1} MiB (cartridge, REU, GeoRAM, EEPROM)",
         bytes as f64 / (1024.0 * 1024.0)
+    ));
+    lines.push(format!(
+        "  pictures: {pictures} distinct, {:.1} MiB packed",
+        picture_bytes as f64 / (1024.0 * 1024.0)
     ));
     if empty {
         lines.push("  nothing captured yet \u{2014} the ring fills while the C64 runs at 1 MHz".into());
