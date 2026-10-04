@@ -200,8 +200,9 @@ impl Host<'_> {
             "  mark, marks, unmark, goto, frame, rewind, cadence, window   the checkpoint ring: the C64 stands on\n",
             "                    an anchor while the firmware runs on; `run`, `g` or any change lets it go and cuts\n",
             "                    the anchors after it (marks stay)\n",
-            "  ringdump PATH | ringload PATH | asm-file PATH [addr] | pwd | cd [dir] | ls [dir]\n",
-            "                    files under --monitor-dir only\n",
+            "  ringdump PATH [board] | ringload PATH | asm-file PATH [addr] | pwd | cd [dir] | ls [dir]\n",
+            "                    files under --monitor-dir only; `board`: the TRX64-Ultimate board's format, from\n",
+            "                    the anchors a board file brought\n",
         )
         .to_string()
             + devices::HELP
@@ -874,6 +875,8 @@ mod tests {
 
         assert!(run(&mut m, "ringdump dump/r.c64rering").contains("dump/r.c64rering"));
         assert!(dir.path().join("dump/r.c64rering").is_file());
+        let r = exec(&mut m, &mut MonitorSession::new(), &mut State::default(), "ringdump dump/b.c64rering board");
+        assert!(r.as_ref().is_err_and(|e| e.contains("trx64Hw")), "UE2's own anchors only: {r:?}");
         assert!(run(&mut m, "goto here").contains("frame"));
         assert!(run(&mut m, "run").starts_with("RUN"), "the release");
         advance(&mut m, &mut now, 100);

@@ -10,6 +10,7 @@
 //! (Spec 852) the firmware serves at 0x10044000 (docs/specs/S15-uci.md). A held 6510 is TRX64's own `Machine::set_hold`
 //! (Spec 850 D7), and the cartridges' IRQ/NMI sit on its expansion-port source (D6).
 
+mod board;
 mod cart;
 mod cart_eeprom;
 mod clock;
@@ -51,7 +52,8 @@ use keys::Keys;
 use reu::ReuRam;
 use slot::{PhysicalCart, SlotHandle};
 
-pub use ring::{Mode as RingMode, Ring, UE2_NODE};
+pub use board::{check_board_ring, BoardCheck, BOARD_MAX_ENTRIES, BOARD_NODE};
+pub use ring::{BoardDumpInfo, Mode as RingMode, Ring, UE2_NODE};
 pub use slot::FlashDecode;
 use video::Palette;
 
@@ -2885,5 +2887,132 @@ mod tests {
         c64.lend_ddr(None);
         assert!(c64.ring().unwrap().notes.is_empty(), "{:?}", c64.ring().unwrap().notes);
         assert_eq!(ddr[REU_BASE], 0x77, "same session: the log took the REU back");
+    }
+
+    // ---- S38 §7: the board's files ----
+
+    /// A PAL C64 without ROMs (the board file is PAL), the rings on, a loop at $C000 run for 100 ms.
+    fn ringed_pal(ddr: &mut [u8]) -> (Trx64Backend, u64) {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        let mut now = 0;
+        c64.advance_to(now);
+        c64.set_reset(true);
+        c64.core_config_write(CORE_VIDEOFORMAT, 0x00);
+        c64.set_reset(false);
+        c64.m.ram[0xC000..0xC003].copy_from_slice(&[0x4C, 0x00, 0xC0]);
+        c64.m.c64_core.reg_pc = 0xC000;
+        c64.set_ring(true);
+        run_ms_lent(&mut c64, &mut now, 100, ddr);
+        (c64, now)
+    }
+
+    /// `ring_load` with guest DDR lent, as the monitor does it.
+    fn load_lent(c64: &mut Trx64Backend, bytes: &[u8], ddr: &mut [u8]) -> trx64_core::ring_dump::RingDumpInfo {
+        c64.lend_ddr(Some(ddr));
+        let info = c64.ring_load(bytes).unwrap();
+        c64.lend_ddr(None);
+        info
+    }
+
+    /// The board's own file loads: its 9 anchors, the C64 on the current one with the RAM under the I/O from the
+    /// board's node, the picture drawn from its VIC registers, notes for what the file lacks, the firmware's turbo
+    /// settings live; `goto` reaches the others, and after a release the ring records as far back as before.
+    #[test]
+    fn a_board_file_loads_and_goes_to_its_anchors() {
+        let mut ddr = ddr();
+        let (mut c64, mut now) = ringed_pal(&mut ddr);
+        c64.m.write_full(0xD020, 2);
+        c64.m.write_full(0xD021, 0);
+        run_ms_lent(&mut c64, &mut now, 40, &mut ddr);
+        let prefer = c64.m.vic.u64_speed_prefer;
+        let cap = c64.ring().unwrap().anchors.max_entries();
+
+        let info = load_lent(&mut c64, &board::tests::board_file(), &mut ddr);
+        assert_eq!((info.anchors, info.delta_entries, info.cpu_history), (9, 0, 0));
+        assert_eq!(info.current_id.as_deref(), Some("cp_97660_97662"));
+        let ids = c64.ring().unwrap().ids();
+        assert_eq!(ids.len(), 9);
+        assert_eq!((c64.m.c64_core.clk, c64.m.c64_core.reg_pc), (1_919_624_615, 0xE5D4));
+        assert!(screen_has(&c64, "READY."), "the board's screen");
+        assert_ne!(c64.m.ram[0xD800..0xDC00].iter().filter(|b| **b >= 0x10).count(), 0, "RAM under the I/O, not colour");
+        let frame = c64.frame();
+        assert_eq!((frame.indices[4 * 384 + 4], frame.indices[220 * 384 + 340]), (14, 6), "the board's border and background");
+        let notes = c64.ring().unwrap().notes.clone();
+        for want in ["a board anchor (TRX64-Ultimate)", "raster compare", "no ue2Hw node", "picture drawn", "cia1: converted", "no turbo node"] {
+            assert!(notes.iter().any(|n| n.contains(want)), "{want}: {notes:?}");
+        }
+        assert_eq!((c64.m.vic.regs[0x30], c64.m.vic.regs[0x31], c64.m.vic.u64_speed_prefer), (0, 0, prefer));
+        assert!(c64.ring().unwrap().anchors.max_entries() >= cap, "the board's cap of 9 is not the ring's");
+
+        c64.lend_ddr(Some(&mut ddr));
+        c64.ring_goto(&ids[3].0, RingMode::StepBack).unwrap();
+        c64.lend_ddr(None);
+        assert_eq!(c64.m.c64_core.clk, ids[3].2);
+        assert_eq!(c64.m.c64_core.reg_pc, 0xE5D4);
+        c64.ring_release();
+        run_ms_lent(&mut c64, &mut now, 400, &mut ddr);
+        assert!(anchors(&c64) > 9, "records on after the board's anchors: {}", anchors(&c64));
+        assert!(c64.m.c64_core.clk > ids[3].2);
+    }
+
+    /// With the ROMs, the C64 runs on from a board anchor at READY: it takes a line typed after the release.
+    #[test]
+    fn a_board_anchor_runs_on_at_ready() {
+        let Some(roms) = roms() else { return };
+        let mut ddr = ddr();
+        let mut c64 = Trx64Backend::new(&roms);
+        let mut now = 0;
+        c64.advance_to(now);
+        c64.set_reset(true);
+        c64.core_config_write(CORE_VIDEOFORMAT, 0x00);
+        run_ms(&mut c64, &mut now, 20);
+        c64.set_reset(false);
+        run_ms(&mut c64, &mut now, 3000);
+        c64.set_ring(true);
+        load_lent(&mut c64, &board::tests::board_file(), &mut ddr);
+        c64.ring_release();
+        // POKE 1024,1 through the keyboard buffer.
+        let line = b"POKE1024,1\r";
+        c64.m.ram[0x0277..0x0277 + line.len()].copy_from_slice(line);
+        c64.m.ram[0xC6] = line.len() as u8;
+        run_ms_lent(&mut c64, &mut now, 500, &mut ddr);
+        assert_eq!(c64.m.ram[0x0400], 1, "the line ran");
+        assert!(screen_has(&c64, "READY."));
+    }
+
+    /// The board's format back: the anchors the board file brought (not UE2's own), stored-block gzip by the board's
+    /// rules, the anchor the transport stands on as current; UE2 loads that file again. A ring without board anchors
+    /// refuses.
+    #[test]
+    fn ringdump_board_writes_what_the_board_loads() {
+        let mut ddr = ddr();
+        let (mut c64, mut now) = ringed_pal(&mut ddr);
+        assert!(c64.ring_dump_board().unwrap_err().contains("trx64Hw"), "UE2's own anchors only");
+
+        load_lent(&mut c64, &board::tests::board_file(), &mut ddr);
+        let ids = c64.ring().unwrap().ids();
+        c64.ring_mut().unwrap().anchors.set_mark(&ids[1].0, "early").unwrap();
+        c64.lend_ddr(Some(&mut ddr));
+        c64.ring_goto(&ids[5].0, RingMode::StepBack).unwrap();
+        c64.lend_ddr(None);
+        let (bytes, info) = c64.ring_dump_board().unwrap();
+        assert_eq!((info.anchors, info.marks, info.over_limit, info.not_board), (9, 1, 0, 0));
+        assert_eq!(info.current_id, ids[5].0);
+        let check = check_board_ring(&bytes).unwrap();
+        assert_eq!((check.entries, check.current_id.as_str()), (9, ids[5].0.as_str()));
+
+        // Run on from the anchor: UE2's anchors join the ring and stay out of the board's file.
+        c64.ring_release();
+        run_ms_lent(&mut c64, &mut now, 200, &mut ddr);
+        let (_, info) = c64.ring_dump_board().unwrap();
+        assert_eq!((info.anchors, info.marks), (6, 1), "ids 0-5 are left after the cut");
+        assert!(info.not_board > 0);
+        assert_eq!(info.current_id, ids[5].0, "the newest board anchor");
+
+        // And back into UE2.
+        let loaded = load_lent(&mut c64, &bytes, &mut ddr);
+        assert_eq!((loaded.anchors, loaded.current_id.as_deref()), (9, Some(ids[5].0.as_str())));
+        assert_eq!(c64.m.c64_core.clk, ids[5].2);
+        assert_eq!(c64.ring().unwrap().anchors.mark_id("early"), Some(ids[1].0.clone()));
     }
 }

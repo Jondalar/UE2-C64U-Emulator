@@ -31,6 +31,9 @@
 #                                      picture after goto is the one at the mark
 #   ring-reu    smoke-c64-ring-reu.ctl --settings smoke-c64-ring-reu.cfg: a counter kept in the REU runs on from the
 #                                      mark's count after goto, so the REU's bytes went back with the C64
+#   ring-board  smoke-c64-ring-board.ctl --settings smoke-c64-ring-board.cfg (PAL): the board's .c64rering (the
+#                                      c64-bridge fixture) loads, goto reaches an older anchor, `ringdump ... board`
+#                                      writes the board's format, and a typed line runs after `run`
 
 set -euo pipefail
 
@@ -191,6 +194,19 @@ ahead=$(((16#${counts[0]} - 16#${counts[1]} + 256) % 256))
 ran=$(((16#${counts[2]} - 16#${counts[1]} + 256) % 256))
 ((ahead >= 20 && ran < ahead / 2)) || fail ring-reu "live ${counts[0]}, mark ${counts[1]}, on ${counts[2]}"
 ! grep -q "note: UE2 memories" run/ring-reu.log || fail ring-reu "the REU's bytes were not put back"
+
+# S38 §7: a file the TRX64-Ultimate board wrote loads and runs on; the board's format goes back out (stored blocks).
+gunzip -c "$repo/crates/c64-bridge/tests/data/board_2026-10-04.c64rering.gz" >board.c64rering
+cp run/flash.bin run/flash-ring-board.bin
+smoke ring-board "$repo/scripts/smoke-c64-ring-board.ctl" --flash run/flash-ring-board.bin --c64-roms \
+    --settings "$repo/scripts/smoke-c64-ring-board.cfg"
+grep -q "^ringload: restored 9 anchor(s)" run/ring-board.log || fail ring-board "no ringload of the board's anchors"
+grep -q "note: a board anchor" run/ring-board.log || fail ring-board "no note for what the board's file lacks"
+grep -q "^ringdump: 9 board anchor(s), 0 marked, current=cp_97535_97537" run/ring-board.log ||
+    fail ring-board "no ringdump in the board's format"
+head=$(head -c 20 board-out.c64rering | od -An -tx1 | tr -d ' \n')
+[[ $head == 4336345245524e47011f8b080000000000000300 ]] || fail ring-board "not the board's header and stored block: $head"
+grep -q '^>R:0400  01' run/ring-board.log || fail ring-board "the typed line did not run on the board's state"
 
 cp run/flash.bin run/flash-joy.bin
 smoke joy "$repo/scripts/smoke-joy.ctl" --flash run/flash-joy.bin --c64-roms --speed max
