@@ -39,12 +39,16 @@ use std::cell::UnsafeCell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use trx64_core::cart::{self as tcart, BankInfo, CartLines, CartMapper, CartState, MapperType};
-use trx64_core::flash040::{Flash040, Flash040Type, FLASH040B, FLASH040B_XL, FLASH040_160, FLASH040_NORMAL, FLASH800_CB};
+use trx64_core::c64re_snapshot::{capture_cart_state, restore_cart_state, CartStateSnapshot};
+use trx64_core::cart::{self as tcart, BankInfo, CartLines, CartMapper, CartState, FlashCartState, MapperType};
+use trx64_core::flash040::{
+    Flash040, Flash040SnapState, Flash040Type, FLASH040B, FLASH040B_XL, FLASH040_160, FLASH040_NORMAL, FLASH800_CB,
+};
 use trx64_core::m93c86::M93c86;
 use ue2_core::c64host::{CartSlotInfo, CART_DETECT_NONE};
 
-use crate::cart::{CartHandle, CartLogic, Layout, RunHints, RAM_SIZE, ROM_SIZE};
+use crate::cart::{CartHandle, CartLogic, CartRegs, Layout, RunHints, RAM_SIZE, ROM_SIZE};
+use crate::hwlog::{HwLog, Poke, Space};
 
 /// C64_BUS_INTERNAL / C64_BUS_EXTERNAL bits (c64.cc:1539-1592).
 pub const BUS_IO1: u8 = 0x01;
@@ -277,6 +281,37 @@ fn window_offset(addr: u16) -> u32 {
     u32::from(addr & 0x1FFF)
 }
 
+/// S38: a flash chip's command state for an anchor. `Flash040::snapshot_state` needs `&mut` (it catches the erase
+/// alarm up first), and `CartMapper::get_state` is `&self`, so a busy chip is cloned, as TRX64's own mappers do. An idle
+/// chip (READ, no erase pending) is what `snapshot_state` would give without the clone of its array; the anchor's
+/// capture has caught every erase up before (`PhysicalCart::log_image`).
+fn flash_snap(f: &Flash040) -> Flash040SnapState {
+    if f.is_busy() {
+        return f.clone().snapshot_state(0);
+    }
+    Flash040SnapState {
+        state: 0,
+        base_state: 0,
+        program_byte: 0,
+        last_read: 0,
+        dirty: f.is_dirty(),
+        erase_mask: Default::default(),
+        erase_alarm_clk: -1,
+    }
+}
+
+/// The command state of the chips in a `CartState` (S38).
+fn flash_state(lo: &Flash040, hi: Option<&Flash040>, eeprom: Option<&M93c86>, io_ram: &[u8]) -> Option<FlashCartState> {
+    Some(FlashCartState {
+        flash_lo: Some(flash_snap(lo)),
+        flash_hi: hi.map(flash_snap),
+        eeprom: eeprom.map(M93c86::snapshot_state),
+        spi: None,
+        easyflash_jumper: 0,
+        easyflash_ram: io_ram.to_vec(),
+    })
+}
+
 /// EasyFlash memory configuration per mode register bits 2:0 with the boot jumper open (TRX64 cart.rs
 /// `EASYFLASH_MEMCONFIG`, easyflash.c): 0 = 8 K, 1 = 16 K, 2 = off, 3 = ULTIMAX.
 const EASYFLASH_MODES: [u8; 8] = [3, 3, 1, 1, 2, 3, 0, 1];
@@ -378,10 +413,29 @@ impl CartMapper for EasyFlash {
     fn active_bank(&self, _: u16) -> u16 {
         u16::from(self.bank)
     }
+    /// S38: the registers, the I/O RAM and both chips' command state.
     fn get_state(&self) -> CartState {
-        CartState::default()
+        CartState {
+            current_bank: u16::from(self.bank),
+            control_register: Some(self.register02),
+            flash: flash_state(&self.lo, Some(&self.hi), None, &self.io_ram),
+        }
     }
-    fn set_state(&mut self, _: CartState) {}
+    fn set_state(&mut self, st: CartState) {
+        self.bank = st.current_bank as u8 & self.bank_mask;
+        self.register02 = st.control_register.unwrap_or(0) & 0x87;
+        if let Some(f) = st.flash {
+            if f.easyflash_ram.len() == self.io_ram.len() {
+                self.io_ram.copy_from_slice(&f.easyflash_ram);
+            }
+            if let Some(s) = &f.flash_lo {
+                self.lo.restore_state(s);
+            }
+            if let Some(s) = &f.flash_hi {
+                self.hi.restore_state(s);
+            }
+        }
+    }
     fn clone_box(&self) -> Box<dyn CartMapper> {
         Box::new(self.clone())
     }
@@ -397,6 +451,11 @@ impl CartMapper for EasyFlash {
     /// ROML chip then ROMH chip, as TRX64's EasyFlash.
     fn writable_image(&mut self, clk: u64) -> Option<Vec<u8>> {
         Some([self.lo.get_data(clk), self.hi.get_data(clk)].concat())
+    }
+    fn set_writable_image(&mut self, bytes: &[u8]) {
+        let (lo, hi) = bytes.split_at(bytes.len().min(self.lo.data.len()));
+        self.lo.load_data(lo);
+        self.hi.load_data(hi);
     }
 }
 
@@ -481,10 +540,27 @@ impl CartMapper for Gmod2 {
     fn active_bank(&self, _: u16) -> u16 {
         self.bank
     }
+    /// S38: the bank, the mode with the EEPROM's chip select in bit 2, and the chips' state.
     fn get_state(&self) -> CartState {
-        CartState::default()
+        CartState {
+            current_bank: self.bank,
+            control_register: Some(self.mode | (self.cs << 2)),
+            flash: flash_state(&self.flash, None, Some(&self.eeprom), &[]),
+        }
     }
-    fn set_state(&mut self, _: CartState) {}
+    fn set_state(&mut self, st: CartState) {
+        self.bank = st.current_bank & 0x3F;
+        let c = st.control_register.unwrap_or(0);
+        (self.mode, self.cs) = (c & 3, (c >> 2) & 1);
+        if let Some(f) = st.flash {
+            if let Some(s) = &f.flash_lo {
+                self.flash.restore_state(s);
+            }
+            if let Some(s) = &f.eeprom {
+                self.eeprom.restore_state(s);
+            }
+        }
+    }
     fn clone_box(&self) -> Box<dyn CartMapper> {
         Box::new(self.clone())
     }
@@ -500,6 +576,13 @@ impl CartMapper for Gmod2 {
     /// Flash then the 2 K EEPROM, as TRX64's GMod2.
     fn writable_image(&mut self, clk: u64) -> Option<Vec<u8>> {
         Some([self.flash.get_data(clk), self.eeprom.get_data()].concat())
+    }
+    fn set_writable_image(&mut self, bytes: &[u8]) {
+        let (flash, eeprom) = bytes.split_at(bytes.len().min(self.flash.data.len()));
+        self.flash.load_data(flash);
+        if !eeprom.is_empty() {
+            self.eeprom.load_data(eeprom);
+        }
     }
 }
 
@@ -556,10 +639,21 @@ impl CartMapper for MegaByter {
     fn active_bank(&self, _: u16) -> u16 {
         u16::from(self.register00)
     }
+    /// S38: both registers and the chip's command state.
     fn get_state(&self) -> CartState {
-        CartState::default()
+        CartState {
+            current_bank: u16::from(self.register00),
+            control_register: Some(self.register02),
+            flash: flash_state(&self.flash, None, None, &[]),
+        }
     }
-    fn set_state(&mut self, _: CartState) {}
+    fn set_state(&mut self, st: CartState) {
+        self.register00 = st.current_bank as u8 & 0x7F;
+        self.register02 = st.control_register.unwrap_or(0) & 0x83;
+        if let Some(s) = st.flash.as_ref().and_then(|f| f.flash_lo.as_ref()) {
+            self.flash.restore_state(s);
+        }
+    }
     fn clone_box(&self) -> Box<dyn CartMapper> {
         Box::new(self.clone())
     }
@@ -574,6 +668,9 @@ impl CartMapper for MegaByter {
     }
     fn writable_image(&mut self, clk: u64) -> Option<Vec<u8>> {
         Some(self.flash.get_data(clk).to_vec())
+    }
+    fn set_writable_image(&mut self, bytes: &[u8]) {
+        self.flash.load_data(bytes);
     }
 }
 
@@ -642,10 +739,21 @@ impl CartMapper for C64MegaCart {
     fn active_bank(&self, _: u16) -> u16 {
         self.bank & self.bank_mask
     }
+    /// S38: the bank, the mode and the chip's command state.
     fn get_state(&self) -> CartState {
-        CartState::default()
+        CartState {
+            current_bank: self.bank,
+            control_register: Some(self.mode),
+            flash: flash_state(&self.flash, None, None, &[]),
+        }
     }
-    fn set_state(&mut self, _: CartState) {}
+    fn set_state(&mut self, st: CartState) {
+        self.bank = st.current_bank & 0x3FFF;
+        self.mode = st.control_register.unwrap_or(0).min(2);
+        if let Some(s) = st.flash.as_ref().and_then(|f| f.flash_lo.as_ref()) {
+            self.flash.restore_state(s);
+        }
+    }
     fn clone_box(&self) -> Box<dyn CartMapper> {
         Box::new(self.clone())
     }
@@ -660,6 +768,9 @@ impl CartMapper for C64MegaCart {
     }
     fn writable_image(&mut self, clk: u64) -> Option<Vec<u8>> {
         Some(self.flash.get_data(clk).to_vec())
+    }
+    fn set_writable_image(&mut self, bytes: &[u8]) {
+        self.flash.load_data(bytes);
     }
 }
 
@@ -748,6 +859,34 @@ pub struct PhysicalCart {
     epoch: u64,
     /// `--log cart` (S14): trace every access this cartridge sees.
     trace_on: bool,
+    /// S38: which CRT this is (FNV-1a of the file), so an anchor's node is only put back into the cartridge it was
+    /// taken from.
+    print: u64,
+    /// S38: the writable image as the write log last saw it, and the mutation counter it was read at.
+    shadow: Option<Vec<u8>>,
+    shadow_gen: u64,
+    /// S38: images put back by a restore. `generation` counts them, so the write-back of `--cart-slot` sees the change.
+    restores: u64,
+}
+
+/// FNV-1a, 64 bits.
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+}
+
+/// S38: a physical cartridge's node in an anchor's `ue2Hw` (docs/specs/S38-trx64-ring.md §4.1).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PhysNode {
+    /// The CRT's hardware type and print: the node belongs to this cartridge only.
+    hw: u16,
+    print: u64,
+    /// The cartridge's cycle epoch (module doc): the flash's erase alarm is on it.
+    epoch: u64,
+    /// A mapper's continuation (TRX64's `cartState` shape), or the U64 logic's registers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mapper: Option<CartStateSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    logic: Option<CartRegs>,
 }
 
 impl PhysicalCart {
@@ -805,7 +944,89 @@ impl PhysicalCart {
             banks,
             epoch: 0,
             trace_on: false,
+            print: fnv(crt),
+            shadow: None,
+            shadow_gen: 0,
+            restores: 0,
         })
+    }
+
+    /// S38: the U64 logic's writes into the cartridge's own memory go to `log`.
+    pub fn set_log(&mut self, log: &HwLog) {
+        if let Device::Logic(c) = &mut self.device {
+            c.logic.set_log(log.clone(), Space::PhysMem);
+        }
+    }
+
+    /// S38: what changed in the writable image since the last look goes to `log`, byte by byte. TRX64's flash chips
+    /// write their arrays inside the mapper (and an erase completes lazily, `catch_up_erase`), so the bytes are found
+    /// by comparing with the image the log last saw, and only when the mutation counter moved. The first look takes
+    /// the image as it is. `clk` is TRX64's cycle: a due erase completes first.
+    pub fn log_image(&mut self, log: &HwLog, clk: u64) {
+        let Device::Mapper(m) = &mut self.device else { return };
+        let gen = m.writable_generation();
+        if self.shadow.is_some() && gen == self.shadow_gen {
+            return;
+        }
+        let Some(image) = m.writable_image(clk + self.epoch) else { return };
+        self.shadow_gen = m.writable_generation();
+        if let Some(old) = self.shadow.as_ref().filter(|o| o.len() == image.len()) {
+            for (i, (&o, &n)) in old.iter().zip(&image).enumerate() {
+                log.note(Space::PhysImage, i, o, n);
+            }
+        }
+        self.shadow = Some(image);
+    }
+
+    /// S38: the cartridge's node for an anchor.
+    pub fn node(&self) -> PhysNode {
+        let (mapper, logic) = match &self.device {
+            Device::Mapper(m) => (Some(capture_cart_state(m.as_ref())), None),
+            Device::Logic(c) => (None, Some(c.logic.regs())),
+        };
+        PhysNode { hw: self.hw_type, print: self.print, epoch: self.epoch, mapper, logic }
+    }
+
+    /// S38: an anchor's node back, after the write log has put the memories back. Refused, and nothing changes, when
+    /// it was taken from another cartridge.
+    pub fn set_node(&mut self, n: &PhysNode) -> Result<(), String> {
+        if (n.hw, n.print) != (self.hw_type, self.print) {
+            return Err(format!("the anchor's expansion-port cartridge is not {}", self.name));
+        }
+        match (&mut self.device, &n.mapper, &n.logic) {
+            (Device::Mapper(m), Some(snap), _) => restore_cart_state(m, snap),
+            (Device::Logic(c), _, Some(regs)) => c.logic.set_regs(regs)?,
+            _ => return Err("the anchor's expansion-port node does not fit the cartridge".into()),
+        }
+        self.epoch = n.epoch;
+        Ok(())
+    }
+
+    /// S38: bytes the write log puts back, in its order: into the logic's own memory, or into the image, which then
+    /// goes back into the chips in one piece.
+    pub fn poke(&mut self, pokes: &[Poke]) {
+        let mut image = false;
+        for p in pokes {
+            match (p.space, &mut self.device, &mut self.shadow) {
+                (Space::PhysMem, Device::Logic(c), _) => {
+                    if let Some(b) = c.mem.get_mut(p.addr) {
+                        *b = p.value;
+                    }
+                }
+                (Space::PhysImage, Device::Mapper(_), Some(shadow)) => {
+                    if let Some(b) = shadow.get_mut(p.addr) {
+                        *b = p.value;
+                        image = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let (true, Device::Mapper(m), Some(shadow)) = (image, &mut self.device, &self.shadow) {
+            m.set_writable_image(shadow);
+            self.shadow_gen = m.writable_generation();
+            self.restores += 1;
+        }
     }
 
     /// EXROM/GAME as the cartridge drives them, 1 = released.
@@ -913,10 +1134,10 @@ impl PhysicalCart {
         matches!(&self.device, Device::Mapper(m) if m.is_writable_dirty())
     }
 
-    /// Mutation counter of flash and EEPROM.
+    /// Mutation counter of flash and EEPROM, and of the images a restore put back (S38).
     pub fn generation(&self) -> u64 {
         match &self.device {
-            Device::Mapper(m) => m.writable_generation(),
+            Device::Mapper(m) => m.writable_generation() + self.restores,
             Device::Logic(_) => 0,
         }
     }
@@ -1081,8 +1302,7 @@ impl Slot {
         self.physical.as_ref()
     }
 
-    #[cfg(test)]
-    fn physical_mut(&mut self) -> Option<&mut PhysicalCart> {
+    pub fn physical_mut(&mut self) -> Option<&mut PhysicalCart> {
         self.physical.as_mut()
     }
 

@@ -14,6 +14,7 @@ mod cart;
 mod cart_eeprom;
 mod clock;
 mod drive;
+mod hwlog;
 pub mod iec_proc;
 mod keys;
 mod reu;
@@ -45,11 +46,12 @@ use ue2_core::c64host::{C64Backend, C64CartSlot, C64Drive, C64Frame, C64Rom, Car
 
 use cart::{CartHandle, CartLogic, CartProxy, RunHints};
 use clock::Clock;
+use hwlog::HwLog;
 use keys::Keys;
 use reu::ReuRam;
 use slot::{PhysicalCart, SlotHandle};
 
-pub use ring::{Mode as RingMode, Ring};
+pub use ring::{Mode as RingMode, Ring, UE2_NODE};
 pub use slot::FlashDecode;
 use video::Palette;
 
@@ -277,6 +279,9 @@ pub struct Trx64Backend {
     iec: iec_proc::IecHandle,
     /// S38: the checkpoint ring and its transport while TRX64's rings are on (`set_ring`).
     ring: Option<Box<Ring>>,
+    /// S38: UE2's write log of the memories around the C64 (hwlog.rs), shared with the cartridge logic and the REU's
+    /// store. It takes records while the rings are on.
+    hwlog: HwLog,
 }
 
 impl Trx64Backend {
@@ -335,6 +340,10 @@ impl Trx64Backend {
         // S30: the IEC processor is on the bus for the life of the machine, as in the FPGA; RESET_ENABLE decides
         // whether it runs. Slot 4 is TRX64's home for a device with no fixed unit (Spec 874 §4).
         let iec = iec_proc::IecHandle::default();
+        // S38: the cartridge logic's memory writes (cart ROM, cart RAM, GeoRAM, the EEPROM) and the REU's go to one log.
+        let hwlog = HwLog::default();
+        let cart = CartHandle::default();
+        cart.with(|c| c.set_log(hwlog.clone(), hwlog::Space::Ddr));
         let hz = u64::from(m.timing().cpu_hz);
         if let Err(e) = m.attach_iec_device(IEC_SLOT, Box::new(iec_proc::IecBusDevice::new(iec.clone(), hz))) {
             eprintln!("c64: {e}");
@@ -351,7 +360,7 @@ impl Trx64Backend {
             reset_held: false,
             ram_snoop: false,
             ultimax: false,
-            cart: CartHandle::default(),
+            cart,
             slot: SlotHandle::default(),
             unsupported: Vec::new(),
             keys: Keys::default(),
@@ -366,7 +375,7 @@ impl Trx64Backend {
             sid,
             drives,
             drive_sel: 0,
-            reu: ReuRam::default(),
+            reu: ReuRam::with_log(hwlog.clone()),
             reu_size_kb: reu::DEFAULT_SIZE_KB,
             parked_reu: None,
             reu_off_since: None,
@@ -380,6 +389,7 @@ impl Trx64Backend {
             paddles: [0; 6],
             iec,
             ring: None,
+            hwlog,
         }
     }
 
@@ -476,7 +486,10 @@ impl Trx64Backend {
     /// any cartridge there (docs/status/cart-slot.md). The C64 sees it at once; U64_CART_DETECT reports its lines.
     /// `decode` is the flash command decode of a flash cartridge.
     pub fn insert_cart(&mut self, crt: &[u8], decode: FlashDecode) -> Result<CartSlotInfo, String> {
-        let cart = PhysicalCart::from_crt(crt, decode)?;
+        let mut cart = PhysicalCart::from_crt(crt, decode)?;
+        cart.set_log(&self.hwlog);
+        // S38: another cartridge is another machine; the anchors describe the one before (TRX64-Ultimate T20 §4.5).
+        self.ring_discard();
         self.slot.with(|s| s.insert(cart));
         self.install_cart();
         self.apply_interrupts();
@@ -491,6 +504,8 @@ impl Trx64Backend {
     /// CARTSLOT: take the physical cartridge out of the expansion port.
     pub fn eject_cart(&mut self) {
         if self.slot.with(|s| s.eject()).is_some() {
+            // S38: as an insert, an eject replaces the machine.
+            self.ring_discard();
             self.install_cart();
         }
     }
@@ -1109,6 +1124,10 @@ impl C64Backend for Trx64Backend {
             cart::CART_TYPE_NONE
         };
         let (reset, clk) = (self.reset_held, self.m.c64_core.clk);
+        // S38: another cartridge type is another machine; the anchors describe the one before (T20 §4.5).
+        if self.cart.with(|c| c.type_variant()) != type_variant {
+            self.ring_discard();
+        }
         self.cart.with(|c| c.configure(type_variant, reset, clk));
         self.install_cart();
         self.apply_interrupts();
@@ -1211,6 +1230,8 @@ impl C64Backend for Trx64Backend {
         // REU: TRX64 HOLDS the store for the life of the device, while the DDR is only LENT for this access, so the
         // store cannot be the borrow — it is a second view of the very same lease (Spec 854 D3, reu.rs).
         self.reu.set_ddr(ddr.as_mut().map(|d| (d.as_mut_ptr(), d.len())));
+        // S38: the write log puts guest DDR bytes back on the same lease.
+        self.hwlog.set_ddr(ddr.as_mut().map(|d| (d.as_mut_ptr(), d.len())));
         // S16: the voices read the same DDR, on the same lease — but not through the REU's store, which is gated by
         // `C64_REU_SIZE`; a voice plays with no REU fitted at all.
         self.sampler.with(|s| s.ram()).set_ddr(ddr.as_mut().map(|d| (d.as_mut_ptr(), d.len())));
@@ -2511,7 +2532,7 @@ mod tests {
         let ntsc = model::find("c64-ntsc").unwrap();
         cp["vic"]["model"] = serde_json::json!(ntsc.vicii_id);
         let clk = c64.m.c64_core.clk;
-        let err = c64.restore_c64(&mut cp).unwrap_err();
+        let err = c64.restore_c64(&mut cp, None).unwrap_err();
         assert!(err.contains("firmware runs"), "{err}");
         assert_eq!(c64.m.c64_core.clk, clk);
     }
@@ -2540,5 +2561,269 @@ mod tests {
         assert_eq!(c64.m.c64_core.clk, head.2, "on the current anchor");
         assert_eq!(c64.m.ram[0xC000], 0x33);
         assert!(c64.ring_holds());
+    }
+
+    // ---- S38 §4.1: UE2's part around the C64 rewinds with TRX64 ----
+
+    /// A C64 without ROMs running `code` at `at` with cartridge `type_variant`, the rings on and guest DDR lent around
+    /// every slice; `now` after 100 ms.
+    fn ringed_at(type_variant: u8, at: u16, code: &[u8], ddr: &mut [u8]) -> (Trx64Backend, u64) {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        let mut now = 0;
+        c64.advance_to(now);
+        c64.lend_ddr(Some(ddr));
+        c64.set_reset(true);
+        c64.set_cart(type_variant, &[]);
+        c64.set_reset(false);
+        c64.lend_ddr(None);
+        c64.m.ram[usize::from(at)..usize::from(at) + code.len()].copy_from_slice(code);
+        c64.m.c64_core.reg_pc = at;
+        c64.set_ring(true);
+        run_ms_lent(&mut c64, &mut now, 100, ddr);
+        (c64, now)
+    }
+
+    /// The newest anchor's id.
+    fn newest(c64: &Trx64Backend) -> String {
+        c64.ring().unwrap().ids().last().unwrap().0.clone()
+    }
+
+    /// `goto` with guest DDR lent, as the monitor does it; the notes of the restore.
+    fn goto_lent(c64: &mut Trx64Backend, id: &str, ddr: &mut [u8]) -> Vec<String> {
+        c64.lend_ddr(Some(ddr));
+        c64.ring_goto(id, RingMode::StepBack).unwrap();
+        c64.lend_ddr(None);
+        c64.ring().unwrap().notes.clone()
+    }
+
+    /// Going back across a bank switch puts the bank back: the logic's registers come from the anchor, and the C64
+    /// reads the old bank, before and after it runs on.
+    #[test]
+    fn goto_across_a_bank_switch_restores_the_bank() {
+        let mut ddr = ddr();
+        // Ocean 8K: LDA $C100, STA $DE00, LDA $8000, STA $0400, JMP $C000.
+        let code = [0xAD, 0x00, 0xC1, 0x8D, 0x00, 0xDE, 0xAD, 0x00, 0x80, 0x8D, 0x00, 0x04, 0x4C, 0x00, 0xC0];
+        let (mut c64, mut now) = {
+            let mut code = code.to_vec();
+            code.resize(0x101, 0);
+            code[0x100] = 1;
+            ringed_at(0x08, 0xC000, &code, &mut ddr)
+        };
+        assert_eq!(c64.m.ram[0x0400], 0x41, "bank 1");
+        let a = newest(&c64);
+        c64.m.ram[0xC100] = 5;
+        run_ms_lent(&mut c64, &mut now, 100, &mut ddr);
+        assert_eq!(c64.m.ram[0x0400], 0x45, "bank 5");
+
+        let notes = goto_lent(&mut c64, &a, &mut ddr);
+        assert!(notes.is_empty(), "{notes:?}");
+        c64.lend_ddr(Some(&mut ddr));
+        assert_eq!(c64.dma_read(0x8000, false), 0x41, "the C64 reads the anchor's bank");
+        c64.lend_ddr(None);
+        c64.m.ram[0x0400] = 0;
+        c64.ring_release();
+        run_ms_lent(&mut c64, &mut now, 20, &mut ddr);
+        assert_eq!(c64.m.ram[0x0400], 0x41, "and runs on in it");
+    }
+
+    /// Going back across a REU STASH puts the REU's bytes back from the write log, and forward again redoes them.
+    #[test]
+    fn goto_across_a_reu_stash_restores_the_reu_bytes() {
+        let mut ddr = ddr();
+        let (mut c64, mut now) = ringed_at(0x00, 0xC000, &[0x4C, 0x00, 0xC0], &mut ddr);
+        c64.set_reu_size_kb(512);
+        c64.set_reu_enabled(true);
+        let a_bytes: Vec<u8> = (0..16).map(|i| 0xA0 + i).collect();
+        load(&mut c64, 0x0400, &a_bytes);
+        run_program(&mut c64, &mut now, &reu_program(0x90, 0x0400, 0x100, 16), &mut ddr);
+        assert_eq!(&ddr[REU_BASE + 0x100..REU_BASE + 0x110], &a_bytes[..]);
+        let a = newest(&c64);
+        let b_bytes: Vec<u8> = (0..16).map(|i| 0x50 + i).collect();
+        load(&mut c64, 0x0400, &b_bytes);
+        run_program(&mut c64, &mut now, &reu_program(0x90, 0x0400, 0x100, 16), &mut ddr);
+        assert_eq!(&ddr[REU_BASE + 0x100..REU_BASE + 0x110], &b_bytes[..]);
+        let b = newest(&c64);
+        assert!(c64.ue2_log().0 >= 32, "both stashes logged: {:?}", c64.ue2_log());
+
+        let notes = goto_lent(&mut c64, &a, &mut ddr);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(&ddr[REU_BASE + 0x100..REU_BASE + 0x110], &a_bytes[..], "the stash after the anchor is undone");
+        c64.lend_ddr(Some(&mut ddr));
+        assert_eq!(c64.m.reu().map(|r| r.ram_byte(0x100)), Some(0xA0), "and the REU reads it");
+        c64.lend_ddr(None);
+        goto_lent(&mut c64, &b, &mut ddr);
+        assert_eq!(&ddr[REU_BASE + 0x100..REU_BASE + 0x110], &b_bytes[..], "forward redoes it");
+        goto_lent(&mut c64, &a, &mut ddr);
+        c64.ring_release();
+        run_ms_lent(&mut c64, &mut now, 20, &mut ddr);
+        assert_eq!(&ddr[REU_BASE + 0x100..REU_BASE + 0x110], &a_bytes[..], "the program at the anchor stashed A again");
+    }
+
+    /// Going back across an EasyFlash program (EAPI's `$DE09 = $65` in mode 101) puts the cart ROM's byte back in DDR.
+    #[test]
+    fn goto_across_an_easyflash_program_restores_the_flash_byte() {
+        let mut ddr = ddr();
+        // At $0800, visible in ULTIMAX: wait for $02, then mode 101, $DE09 = $65, STA $8000, $02 = 0, loop.
+        let code = [
+            0xA5, 0x02, 0xF0, 0xFC, 0xA9, 0x05, 0x8D, 0x02, 0xDE, 0xA9, 0x65, 0x8D, 0x09, 0xDE, 0xA5, 0x02, 0x8D, 0x00,
+            0x80, 0xA9, 0x00, 0x85, 0x02, 0x4C, 0x00, 0x08,
+        ];
+        let (mut c64, mut now) = ringed_at(0x11, 0x0800, &code, &mut ddr);
+        assert_eq!(ddr[CART_ROM], 0x40);
+        let a = newest(&c64);
+        c64.m.ram[0x02] = 0x5A;
+        run_ms_lent(&mut c64, &mut now, 100, &mut ddr);
+        assert_eq!((ddr[CART_ROM], c64.m.ram[0x02]), (0x5A, 0), "programmed");
+        let notes = goto_lent(&mut c64, &a, &mut ddr);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(ddr[CART_ROM], 0x40, "the flash byte is the anchor's");
+        c64.lend_ddr(Some(&mut ddr));
+        assert_eq!(c64.dma_read(0x8000, false), 0x40, "and the C64 reads it");
+        c64.lend_ddr(None);
+    }
+
+    /// GeoRAM: the page registers come from the anchor, the page's bytes from the write log.
+    #[test]
+    fn goto_restores_the_georam_page_and_its_bytes() {
+        const GEORAM: usize = 0x0100_0000;
+        let mut ddr = ddr();
+        // LDA $C100, STA $DFFE, LDA $C101, STA $DE00, JMP $C000.
+        let mut code = vec![0xAD, 0x00, 0xC1, 0x8D, 0xFE, 0xDF, 0xAD, 0x01, 0xC1, 0x8D, 0x00, 0xDE, 0x4C, 0x00, 0xC0];
+        code.resize(0x102, 0);
+        (code[0x100], code[0x101]) = (1, 0x11);
+        let (mut c64, mut now) = ringed_at(0x1F, 0xC000, &code, &mut ddr);
+        assert_eq!(ddr[GEORAM + 0x100], 0x11, "page 1");
+        let a = newest(&c64);
+        (c64.m.ram[0xC100], c64.m.ram[0xC101]) = (2, 0x22);
+        run_ms_lent(&mut c64, &mut now, 100, &mut ddr);
+        assert_eq!(ddr[GEORAM + 0x200], 0x22, "page 2");
+        let notes = goto_lent(&mut c64, &a, &mut ddr);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(ddr[GEORAM + 0x200], 0, "page 2's byte undone");
+        c64.lend_ddr(Some(&mut ddr));
+        assert_eq!(c64.dma_read(0xDE00, false), 0x11, "the window shows page 1 again");
+        c64.lend_ddr(None);
+    }
+
+    /// The UCI block comes back when neither side has a command in flight: here the C64 had written two command
+    /// bytes at the anchor. With a command in flight it stays live, and the restore says so.
+    #[test]
+    fn goto_restores_an_idle_uci_and_keeps_a_command_in_flight_live() {
+        let mut ddr = ddr();
+        let (mut c64, mut now) = ringed_at(0x00, 0xC000, &[0x4C, 0x00, 0xC0], &mut ddr);
+        c64.uci_write(0, 0x47);
+        c64.uci_write(UCI_SLOT_ENABLE, 1);
+        // The firmware has taken the reset event, as its UCI task does at once.
+        c64.uci_take_events();
+        c64.dma_write(0xDF1D, 0x01, false);
+        c64.dma_write(0xDF1D, 0x02, false);
+        run_ms_lent(&mut c64, &mut now, 60, &mut ddr);
+        let len = |c: &Trx64Backend| c.m.uci().unwrap().status().command_length;
+        assert_eq!(len(&c64), 2);
+        let a = newest(&c64);
+        c64.dma_write(0xDF1D, 0x03, false);
+        run_ms_lent(&mut c64, &mut now, 60, &mut ddr);
+        assert_eq!(len(&c64), 3);
+        let notes = goto_lent(&mut c64, &a, &mut ddr);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(len(&c64), 2, "the anchor's command buffer");
+        c64.ring_release();
+
+        // PUSH_CMD: the command is the firmware's now.
+        c64.dma_write(0xDF1C, 0x01, false);
+        assert!(c64.m.uci().unwrap().status().new_command);
+        run_ms_lent(&mut c64, &mut now, 60, &mut ddr);
+        let notes = goto_lent(&mut c64, &a, &mut ddr);
+        assert!(notes.iter().any(|n| n.contains("UCI kept live")), "{notes:?}");
+        assert!(c64.m.uci().unwrap().status().new_command, "the live block, command and all");
+    }
+
+    /// A physical EasyFlash: a byte programmed and a bank switched after the anchor are both undone, and the
+    /// write-back of `--cart-slot` sees the change.
+    #[test]
+    fn goto_restores_a_physical_easyflash() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        let mut now = 0;
+        c64.advance_to(now);
+        let chips: Vec<_> = (0..4u16)
+            .flat_map(|b| [(b, 0x8000, slot::tests::fill(b, 0x10), 2), (b, 0xA000, slot::tests::fill(b, 0x90), 2)])
+            .collect();
+        c64.insert_cart(&slot::tests::crt(32, 1, 0, &chips), FlashDecode::Both).unwrap();
+        c64.m.ram[0x0800..0x0803].copy_from_slice(&[0x4C, 0x00, 0x08]);
+        c64.m.c64_core.reg_pc = 0x0800;
+        c64.set_ring(true);
+        run_ms(&mut c64, &mut now, 100);
+        let a = newest(&c64);
+        assert_eq!(c64.dma_read(0x8100, false), 0x10);
+        for (addr, val) in [(0x8555, 0xAA), (0x82AA, 0x55), (0x8555, 0xA0), (0x8100, 0x00)] {
+            c64.dma_write(addr, val, false);
+        }
+        c64.dma_write(0xDE00, 2, false);
+        run_ms(&mut c64, &mut now, 100);
+        assert_eq!(c64.dma_read(0x8000, false), 0x12, "bank 2");
+        c64.dma_write(0xDE00, 0, false);
+        assert_eq!(c64.dma_read(0x8100, false), 0x00, "programmed");
+        c64.dma_write(0xDE00, 2, false);
+        let gen = c64.generation();
+
+        let mut ddr = ddr();
+        let notes = goto_lent(&mut c64, &a, &mut ddr);
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(c64.dma_read(0x8000, false), 0x10, "bank 0 again");
+        assert_eq!(c64.dma_read(0x8100, false), 0x10, "the programmed byte is the anchor's");
+        assert!(c64.generation() > gen, "the write-back sees a new image");
+    }
+
+    /// Another cartridge is another machine (TRX64-Ultimate T20 §4.5): a new cartridge type, or a cartridge put into
+    /// or taken out of the expansion port, drops the anchors; the same type again does not.
+    #[test]
+    fn a_new_cartridge_drops_the_anchors() {
+        let mut ddr = ddr();
+        let (mut c64, mut now) = ringed_at(0x08, 0xC000, &[0x4C, 0x00, 0xC0], &mut ddr);
+        assert!(anchors(&c64) > 0);
+        c64.set_cart(0x08, &[]);
+        assert!(anchors(&c64) > 0, "the same type");
+        c64.set_cart(0x09, &[]);
+        assert_eq!(anchors(&c64), 0, "another type");
+        run_ms_lent(&mut c64, &mut now, 60, &mut ddr);
+        assert!(anchors(&c64) > 0);
+        let chips = [(0u16, 0x8000u16, slot::tests::fill(0, 0x10), 0u16)];
+        c64.insert_cart(&slot::tests::crt(0, 0, 1, &chips), FlashDecode::Both).unwrap();
+        assert_eq!(anchors(&c64), 0, "an insert");
+        run_ms_lent(&mut c64, &mut now, 60, &mut ddr);
+        c64.eject_cart();
+        assert_eq!(anchors(&c64), 0, "an eject");
+    }
+
+    /// The UE2 node rides the `.c64rering`: TRX64's own loader reads the file and restores an anchor of it, and a
+    /// load in the same session puts the memories back through the log.
+    #[test]
+    fn ringdump_carries_the_ue2_node_and_trx64_still_loads_it() {
+        use trx64_core::c64re_snapshot::restore_runtime_checkpoint;
+        use trx64_core::checkpoint_ring::RuntimeCheckpointRing;
+        use trx64_core::ring_dump::read_ring_dump;
+        let mut ddr = ddr();
+        let (mut c64, mut now) = ringed_at(0x00, 0xC000, &[0x4C, 0x00, 0xC0], &mut ddr);
+        c64.set_reu_size_kb(512);
+        c64.set_reu_enabled(true);
+        load(&mut c64, 0x0400, &[0x77; 16]);
+        run_program(&mut c64, &mut now, &reu_program(0x90, 0x0400, 0, 16), &mut ddr);
+        let (bytes, _) = c64.ring_dump().unwrap();
+        load(&mut c64, 0x0400, &[0x99; 16]);
+        run_program(&mut c64, &mut now, &reu_program(0x90, 0x0400, 0, 16), &mut ddr);
+
+        let dump = read_ring_dump(&bytes).unwrap();
+        let last = dump.checkpoint_ring.entries.last().unwrap();
+        assert!(last.payload.get(UE2_NODE).is_some_and(|n| n.get("cart").is_some()), "the node is in the file");
+        let ring = RuntimeCheckpointRing::from_dump(&dump.checkpoint_ring);
+        let cp = ring.restore_snapshot(&last.id).unwrap();
+        let mut m = Machine::new();
+        assert!(restore_runtime_checkpoint(&mut m, &cp).is_ok(), "TRX64 restores an anchor with the node");
+
+        c64.lend_ddr(Some(&mut ddr));
+        c64.ring_load(&bytes).unwrap();
+        c64.lend_ddr(None);
+        assert!(c64.ring().unwrap().notes.is_empty(), "{:?}", c64.ring().unwrap().notes);
+        assert_eq!(ddr[REU_BASE], 0x77, "same session: the log took the REU back");
     }
 }

@@ -8,12 +8,15 @@
 //! Faithful to the VHDL where it differs from the real chip: no dummy 0 before read data, and WRALL/ERAL fill from
 //! address 1 (the `fill` state increments the address in the clock that writes).
 
+use crate::hwlog::{HwLog, Space};
+
 /// EEPROM memory size (`g_depth_bits => 11`).
 pub const EEPROM_SIZE: usize = 0x800;
 /// Offsets inside the firmware window: `io_req.address(11)` selects memory, else the dirty-flag register.
 const MEM_BIT: u16 = 0x800;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum State {
     Idle,
     Selected,
@@ -26,6 +29,39 @@ enum State {
     Fill,
     Write2,
     Reading,
+}
+
+impl State {
+    const ALL: [State; 11] = [
+        State::Idle,
+        State::Selected,
+        State::Instruction,
+        State::Decode,
+        State::CollectData,
+        State::WaitDeselect,
+        State::Execute,
+        State::Error,
+        State::Fill,
+        State::Write2,
+        State::Reading,
+    ];
+}
+
+/// S38: the EEPROM's state machine and pins, without its memory, which the write log carries (hwlog.rs), and without
+/// the dirty flag, which is the firmware's cue to save.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EepromRegs {
+    state: u8,
+    count: u8,
+    instr: u16,
+    data_word: u16,
+    write_enable: bool,
+    address: u16,
+    data_out: bool,
+    sel: bool,
+    clk: bool,
+    din: bool,
+    load: bool,
 }
 
 #[derive(Clone)]
@@ -46,6 +82,8 @@ pub struct Eeprom {
     din: bool,
     /// A read was requested (`mem_en` in `decode`/`reading`); its byte loads into `data_word` on the next clock.
     load: bool,
+    /// S38: the write log the microwire side's memory writes go to.
+    log: Option<HwLog>,
 }
 
 impl Default for Eeprom {
@@ -72,6 +110,46 @@ impl Eeprom {
             clk: false,
             din: false,
             load: false,
+            log: None,
+        }
+    }
+
+    /// S38: log the memory writes the C64 makes through the microwire pins. The firmware's own writes
+    /// (`io_write`) are not logged: they come from outside.
+    pub fn set_log(&mut self, log: Option<HwLog>) {
+        self.log = log;
+    }
+
+    /// S38: the state machine and pins, for an anchor.
+    pub fn regs(&self) -> EepromRegs {
+        EepromRegs {
+            state: self.state as u8,
+            count: self.count,
+            instr: self.instr,
+            data_word: self.data_word,
+            write_enable: self.write_enable,
+            address: self.address,
+            data_out: self.data_out,
+            sel: self.sel,
+            clk: self.clk,
+            din: self.din,
+            load: self.load,
+        }
+    }
+
+    pub fn set_regs(&mut self, r: &EepromRegs) {
+        self.state = State::ALL.get(usize::from(r.state)).copied().unwrap_or(State::Idle);
+        (self.count, self.instr, self.data_word, self.write_enable) = (r.count, r.instr, r.data_word, r.write_enable);
+        (self.address, self.data_out, self.sel, self.clk, self.din) = (r.address, r.data_out, r.sel, r.clk, r.din);
+        self.load = r.load;
+    }
+
+    /// S38: a byte the write log puts back. The dirty flag is the firmware's cue to save the memory, so a byte put
+    /// back sets it as a microwire write does.
+    pub fn poke(&mut self, addr: usize, val: u8) {
+        if let Some(b) = self.mem.get_mut(addr) {
+            *b = val;
+            self.dirty = true;
         }
     }
 
@@ -237,7 +315,11 @@ impl Eeprom {
             s => s,
         };
         if let Some(byte) = write.filter(|_| self.write_enable) {
-            self.mem[usize::from(self.address)] = byte;
+            let at = usize::from(self.address);
+            if let Some(log) = &self.log {
+                log.note(Space::Eeprom, at, self.mem[at], byte);
+            }
+            self.mem[at] = byte;
             self.dirty = true;
         }
     }

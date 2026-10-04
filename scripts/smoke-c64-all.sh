@@ -28,6 +28,8 @@
 #   joy         smoke-joy.ctl          both control ports in BASIC, port 2 in the menu (S36)
 #   joy-swap    smoke-joy-swap.ctl     --settings smoke-joy-swap.cfg: port 1 in the menu
 #   ring        smoke-c64-ring.ctl     S38: mark, goto twice to the same byte, ringdump/ringload, asm-file
+#   ring-reu    smoke-c64-ring-reu.ctl --settings smoke-c64-ring-reu.cfg: a counter kept in the REU runs on from the
+#                                      mark's count after goto, so the REU's bytes went back with the C64
 
 set -euo pipefail
 
@@ -175,6 +177,17 @@ counts=($(grep -o '^>R:0400  [0-9a-f][0-9a-f]' run/ring.log | cut -c10-))
 [[ ${counts[1]} == "${counts[2]}" && ${counts[1]} == "${counts[3]}" ]] || fail ring "goto here: ${counts[*]}"
 grep -q "^ringload: restored" run/ring.log || fail ring "no ringload"
 grep -q '^>C:c000  a9 01 60' run/ring.log || fail ring "asm-file did not assemble ring.asm"
+
+# S38 §4.1: the REU goes back with the C64. Reads: the live count, the mark's count, the count 100 ms on from it.
+cp run/flash.bin run/flash-ring-reu.bin
+smoke ring-reu "$repo/scripts/smoke-c64-ring-reu.ctl" --flash run/flash-ring-reu.bin --c64-roms \
+    --settings "$repo/scripts/smoke-c64-ring-reu.cfg"
+counts=($(grep -o '^>R:0400  [0-9a-f][0-9a-f]' run/ring-reu.log | cut -c10-))
+((${#counts[@]} == 3)) || fail ring-reu "expected three reads of \$0400, got ${#counts[@]}"
+ahead=$(((16#${counts[0]} - 16#${counts[1]} + 256) % 256))
+ran=$(((16#${counts[2]} - 16#${counts[1]} + 256) % 256))
+((ahead >= 20 && ran < ahead / 2)) || fail ring-reu "live ${counts[0]}, mark ${counts[1]}, on ${counts[2]}"
+! grep -q "note: UE2 memories" run/ring-reu.log || fail ring-reu "the REU's bytes were not put back"
 
 cp run/flash.bin run/flash-joy.bin
 smoke joy "$repo/scripts/smoke-joy.ctl" --flash run/flash-joy.bin --c64-roms --speed max
