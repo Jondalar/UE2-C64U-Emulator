@@ -40,8 +40,9 @@ const SLICE_INSNS: u64 = 100_000;
 /// Emulated interval between published display snapshots when there is no VIC frame counter to follow (S26 §2).
 const DISPLAY_PERIOD_MS: u64 = 20;
 
-/// Whether a display snapshot is due: at every new VIC picture, or every `DISPLAY_PERIOD_MS` without a counting
-/// C64 (`frame == 0`), so the C64's row sets the rate under PAL and NTSC alike (S26 §2).
+/// Whether a display snapshot is due: at every new picture (`Machine::picture_counter`: the VIC's, or with `--trx-io`
+/// the TRX output's), or every `DISPLAY_PERIOD_MS` without a counter (`frame == 0`), so the C64's row sets the rate
+/// under PAL and NTSC alike (S26 §2).
 fn display_due(frame: u64, shown_frame: u64, now_ms: u64, next_display_ms: u64) -> bool {
     if frame == 0 { now_ms >= next_display_ms } else { frame != shown_frame }
 }
@@ -429,7 +430,7 @@ impl EmuThread {
 
             let now_ms = machine.now_ms();
             cart.poll(&mut machine, now_ms);
-            let frame = machine.frame_counter();
+            let frame = machine.picture_counter();
             if display_due(frame, shown_frame, now_ms, next_display_ms) {
                 *self.display.lock().unwrap_or_else(PoisonError::into_inner) = machine.display();
                 shown_frame = frame;

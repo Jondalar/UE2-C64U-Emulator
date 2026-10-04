@@ -49,9 +49,37 @@ pub struct DisplaySnapshot {
     pub now_ms: u64,
     /// C64 frame under the overlay; None without an attached C64 (docs/specs/S14-c64-trx64.md §9).
     pub c64: Option<C64Frame>,
-    /// S37: the TRX pixel layer as the last frame start set it up, with its pixels read from the front buffer; None
-    /// while it is off or without `--trx-io`. Filled by `devices::trx::Trx::layer`.
-    pub trx: Option<TrxLayer>,
+    /// S37: the TRX output picture while it differs from the output mode's: the pixel layer is on or the machine
+    /// pause is in effect. None otherwise and without `--trx-io`. Filled by `Machine::display`.
+    pub trx: Option<TrxOutput>,
+}
+
+/// S37: what the TRX bitstream puts over and in place of the C64 picture (docs/specs/S37-trx-pixel-layer.md §1,
+/// §5.3, §5.6).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrxOutput {
+    /// The pixel layer, None while it is off.
+    pub layer: Option<TrxLayer>,
+    /// The machine pause is in effect: the C64 window is black (vic_scaler.v `blank`).
+    pub paused: bool,
+    /// The C64 text layer (c64_text.v), None while it is not shown.
+    pub text: Option<TrxText>,
+}
+
+/// S37 phase B: the freeze menu's text as c64_text.v draws it: 40 × 25 cells of 8 × 8, each C64 pixel 4 × 4 output
+/// pixels from output (320, 140), over everything else.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrxText {
+    /// Glyph byte of cell `col` on text line `line` (0-199) at `40 line + col`, bit 7 the leftmost pixel.
+    pub glyphs: Vec<u8>,
+    /// Colour RAM nibble of cell `40 row + col`.
+    pub colours: Vec<u8>,
+    /// `$D021` b3:0, drawn where a glyph bit is clear when `opaque`.
+    pub background: u8,
+    pub opaque: bool,
+    /// The 1000 screen codes and the character set they are drawn with, for the text dump of what is shown.
+    pub screen: Vec<u8>,
+    pub charset: crate::c64host::C64Charset,
 }
 
 /// S37: what the pixel layer shows in one frame (pix_layer.v, the `f_*` values of its frame start).

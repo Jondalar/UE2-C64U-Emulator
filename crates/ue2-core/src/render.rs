@@ -18,7 +18,7 @@ use crate::devices::overlay::{
     REG_ACTIVE_LINES, REG_CHARS_PER_LINE, REG_CHAR_HEIGHT, REG_CHAR_WIDTH, REG_POINTER_HI, REG_POINTER_LO,
     REG_TRANSPARENCY, REG_X_ON_HI, REG_X_ON_LO, REG_Y_ON_HI, REG_Y_ON_LO, TEXT_RAM_SIZE,
 };
-use crate::host::{DisplaySnapshot, TrxLayer};
+use crate::host::{DisplaySnapshot, TrxLayer, TrxOutput, TrxText};
 
 /// Colour of transparent pixels and of the whole image while the overlay is hidden, where no C64 frame shows
 /// through.
@@ -230,19 +230,19 @@ impl Renderer {
     ///
     /// Before that, and without a C64, the canvas covers frame and grid, both centred, as it always did.
     ///
-    /// While the TRX pixel layer is on (`snap.trx`, S37) the image is the TRX output instead: 1920 × 1080 or half
-    /// that ([`trx_canvas`]).
+    /// While the TRX pixel layer is on or the machine pause stands (`snap.trx`, S37) the image is the TRX output
+    /// instead: 1920 × 1080 or half that ([`trx_canvas`]).
     pub fn render(&mut self, snap: &DisplaySnapshot, out: &mut Vec<u32>) -> (usize, usize) {
         let canvas = Self::canvas(snap);
         self.render_scaled(snap, out, canvas);
         canvas
     }
 
-    /// The size of the image [`Renderer::render`] makes for `snap`: the TRX composite while its pixel layer is on
-    /// (S37), else the output mode once the firmware has programmed one, else frame and grid covered.
+    /// The size of the image [`Renderer::render`] makes for `snap`: the TRX composite while its pixel layer is on or
+    /// the pause stands (S37), else the output mode once the firmware has programmed one, else frame and grid covered.
     pub fn canvas(snap: &DisplaySnapshot) -> (usize, usize) {
         match &snap.trx {
-            Some(layer) => trx_canvas(snap, layer),
+            Some(trx) => trx_canvas(snap, trx),
             None => Self::output_canvas(snap),
         }
     }
@@ -263,8 +263,8 @@ impl Renderer {
     /// image instead rounds twice, through the output mode's own non-integer ratios, and the C64 font comes out
     /// uneven. At `size` = [`Renderer::canvas`] it is `render`.
     pub fn render_scaled(&mut self, snap: &DisplaySnapshot, out: &mut Vec<u32>, size: (usize, usize)) {
-        if let Some(layer) = &snap.trx {
-            self.render_trx(snap, layer, out, size);
+        if let Some(trx) = &snap.trx {
+            self.render_trx(snap, trx, out, size);
             return;
         }
         let output = Output::new(&snap.hdmi);
@@ -282,22 +282,28 @@ impl Renderer {
         self.blend_overlay(snap, out, size);
     }
 
-    /// S37: the TRX output picture (docs/specs/S37-trx-pixel-layer.md §1), made at [`trx_canvas`] and resampled to
-    /// `size`: the C64 as vic_scaler.v places it, the overlay window over it as [`Renderer::render_scaled`] puts it,
-    /// and the pixel layer on top.
-    fn render_trx(&mut self, snap: &DisplaySnapshot, layer: &TrxLayer, out: &mut Vec<u32>, size: (usize, usize)) {
-        let canvas = trx_canvas(snap, layer);
+    /// S37: the TRX output picture (docs/specs/S37-trx-pixel-layer.md §1, §5.7), made at [`trx_canvas`] and resampled
+    /// to `size`: the C64 as vic_scaler.v places it (black while paused), the overlay window over it as
+    /// [`Renderer::render_scaled`] puts it, the pixel layer, and the text layer on top (top.v: each takes the one before
+    /// as its picture below).
+    fn render_trx(&mut self, snap: &DisplaySnapshot, trx: &TrxOutput, out: &mut Vec<u32>, size: (usize, usize)) {
+        let canvas = trx_canvas(snap, trx);
         let (cw, ch) = canvas;
         let (tw, th) = size;
         let direct = canvas == size;
         let mut comp = if direct { std::mem::take(out) } else { std::mem::take(&mut self.composite) };
         comp.clear();
         comp.resize(cw * ch, 0);
-        if let Some(frame) = &snap.c64 {
+        if let Some(frame) = snap.c64.as_ref().filter(|_| !trx.paused) {
             draw_c64_trx(frame, &mut comp, canvas);
         }
         self.blend_overlay(snap, &mut comp, canvas);
-        draw_layer(layer, &mut comp, canvas);
+        if let Some(layer) = &trx.layer {
+            draw_layer(layer, &mut comp, canvas);
+        }
+        if let Some(text) = &trx.text {
+            draw_text_trx(text, &mut comp, canvas);
+        }
         if direct {
             *out = comp;
             return;
@@ -474,12 +480,13 @@ fn axis(target: usize, canvas: usize, (off, len, span): (usize, usize, usize), h
 }
 
 /// S37: the size the TRX composite is made at. 960 × 540 when every layer pixel is a 2 × 2 block on even output
-/// coordinates (S = 2, x0 and y0 even, LVGL's case) and no overlay window is up, whose text is drawn 1:1 in the output
-/// mode; 1920 × 1080 otherwise.
-fn trx_canvas(snap: &DisplaySnapshot, layer: &TrxLayer) -> (usize, usize) {
+/// coordinates (S = 2, x0 and y0 even, LVGL's case) or the layer is off, and no overlay window is up, whose text is
+/// drawn 1:1 in the output mode; 1920 × 1080 otherwise. The text layer's 4 × 4 pixels from (320, 140) halve exactly.
+fn trx_canvas(snap: &DisplaySnapshot, trx: &TrxOutput) -> (usize, usize) {
     let geo = Geometry::new(&snap.regs);
     let overlay = geo.visible && geo.cols * geo.char_width != 0 && geo.rows != 0;
-    if layer.scale == 2 && layer.x0 % 2 == 0 && layer.y0 % 2 == 0 && !overlay {
+    let even = trx.layer.as_ref().is_none_or(|l| l.scale == 2 && l.x0 % 2 == 0 && l.y0 % 2 == 0);
+    if even && !overlay {
         (TRX_W / 2, TRX_H / 2)
     } else {
         (TRX_W, TRX_H)
@@ -492,10 +499,10 @@ const TRX_H: usize = 1080;
 /// vic_scaler.v: the C64 window's first raster column and line (50 Hz `X0`, `Y0`; 60 Hz `Y0_60`), the raster column
 /// of the first text-area pixel (its `x_text` calibration, T40: 136 in PAL and NTSC), and where its 1600 output
 /// pixels start (`X_WIN0`).
-const TRX_X0: usize = 96;
+pub(crate) const TRX_X0: usize = 96;
 const TRX_Y0: usize = 16;
 const TRX_Y0_60: usize = 31;
-const TRX_X_TEXT: usize = 136;
+pub(crate) const TRX_X_TEXT: usize = 136;
 const TRX_X_WIN0: usize = 160;
 /// vic_scaler.v: the 400 VIC columns of the window, and the line where a 60 Hz window wraps to line 0.
 const TRX_WIN_W: usize = 400;
@@ -571,6 +578,36 @@ fn draw_layer(layer: &TrxLayer, out: &mut [u32], canvas: (usize, usize)) {
             if layer.key != Some(src[p]) {
                 let px = &mut out[y * cw + x];
                 *px = trx_blend(widen_565(src[p]), *px, layer.alpha);
+            }
+        }
+    }
+}
+
+/// c64_text.v's text area: its top left in the 1920 × 1080 output (`XS`, `YS` less the active area's start, cx 768,
+/// cy 45) and its size, 320 × 200 C64 pixels at 4 × 4.
+const TRX_TEXT_X: usize = 320;
+const TRX_TEXT_Y: usize = 140;
+const TRX_TEXT_W: usize = 1280;
+const TRX_TEXT_H: usize = 800;
+
+/// S37: the C64 text layer over `out`, a `canvas` of the 1920 × 1080 output or of half its size (c64_text.v:281-297): a
+/// set glyph bit is its cell's colour RAM colour, a clear one `$D021` when opaque and the picture below otherwise, in
+/// vic_scaler.v's palette.
+fn draw_text_trx(text: &TrxText, out: &mut [u32], canvas: (usize, usize)) {
+    let (cw, ch) = canvas;
+    let k = TRX_W / cw;
+    for y in TRX_TEXT_Y / k..((TRX_TEXT_Y + TRX_TEXT_H) / k).min(ch) {
+        let line = (y * k - TRX_TEXT_Y) / 4;
+        for x in TRX_TEXT_X / k..((TRX_TEXT_X + TRX_TEXT_W) / k).min(cw) {
+            let p = (x * k - TRX_TEXT_X) / 4;
+            let (col, bit) = (p / 8, p % 8);
+            let glyph = text.glyphs.get(line * 40 + col).copied().unwrap_or(0);
+            let px = &mut out[y * cw + x];
+            if glyph & 0x80 >> bit != 0 {
+                let colour = text.colours.get(line / 8 * 40 + col).copied().unwrap_or(0);
+                *px = TRX_PALETTE[usize::from(colour & 0x0F)];
+            } else if text.opaque {
+                *px = TRX_PALETTE[usize::from(text.background & 0x0F)];
             }
         }
     }
@@ -1071,7 +1108,7 @@ mod tests {
 
     /// A snapshot with the TRX layer `layer` on, no overlay window and no C64.
     fn trx_snap(layer: TrxLayer) -> DisplaySnapshot {
-        DisplaySnapshot { trx: Some(layer), ..DisplaySnapshot::default() }
+        DisplaySnapshot { trx: Some(TrxOutput { layer: Some(layer), ..TrxOutput::default() }), ..DisplaySnapshot::default() }
     }
 
     fn trx_layer(x0: usize, y0: usize, w: usize, h: usize, scale: usize, pixels: Vec<u16>) -> TrxLayer {
@@ -1144,7 +1181,7 @@ mod tests {
         let mut r = Renderer::new(&font());
         let mut out = Vec::new();
         let mut s = trx_snap(trx_layer(0, 0, 1, 1, 1, vec![0]));
-        s.trx.as_mut().unwrap().key = Some(0);
+        s.trx.as_mut().unwrap().layer.as_mut().unwrap().key = Some(0);
         let mut frame = c64_frame(384, 272);
         frame.indices.fill(0);
         (frame.text_x, frame.first_line, frame.raster_lines) = (32, 16, 312);
@@ -1177,5 +1214,51 @@ mod tests {
         assert_eq!(col[5..9], [TRX_PALETTE[2]; 4]);
         assert_eq!((px(320, 1079), px(320, 1076)), (TRX_PALETTE[7], TRX_PALETTE[7]), "the last 4 of 9");
         assert_ne!(px(320, 1075), TRX_PALETTE[7]);
+    }
+
+    /// A text layer of one cell: glyph line `l` of cell (0, 0) is `glyph[l]`, the colour RAM nibble `colour`.
+    fn one_cell(glyph: [u8; 8], colour: u8, opaque: bool) -> TrxText {
+        let mut glyphs = vec![0; 8000];
+        for (l, g) in glyph.into_iter().enumerate() {
+            glyphs[l * 40] = g;
+        }
+        let mut colours = vec![0; 1000];
+        colours[0] = colour;
+        TrxText { glyphs, colours, background: 6, opaque, ..TrxText::default() }
+    }
+
+    #[test]
+    fn paused_the_c64_window_is_black_and_the_text_is_on_top() {
+        let mut r = Renderer::new(&font());
+        let mut out = Vec::new();
+        let mut frame = c64_frame(384, 272);
+        frame.indices.fill(1);
+        (frame.text_x, frame.first_line, frame.raster_lines) = (32, 16, 312);
+        let mut s = DisplaySnapshot { c64: Some(frame), ..DisplaySnapshot::default() };
+        s.trx = Some(TrxOutput { paused: true, ..TrxOutput::default() });
+        assert_eq!(r.render(&s, &mut out), (960, 540), "no layer, no overlay window: half size");
+        assert!(out.iter().all(|&p| p == 0), "the window is black while paused");
+        // The text over the layer: 4 x 4 per C64 pixel from (320, 140), glyph bit 7 leftmost.
+        let layer = trx_layer(160, 0, 1, 1, 2, vec![0x001F]);
+        let mut big = TrxLayer { w: 800, h: 540, pixels: vec![0x001F; 800 * 540], ..layer };
+        big.scale = 2;
+        s.trx = Some(TrxOutput { layer: Some(big), paused: true, text: Some(one_cell([0x81, 0, 0, 0, 0, 0, 0, 0x40], 2, false)) });
+        let mut full = Vec::new();
+        r.render_scaled(&s, &mut full, (1920, 1080));
+        let px = |x: usize, y: usize| full[y * 1920 + x];
+        let red = TRX_PALETTE[2];
+        assert!((320..324).all(|x| (140..144).all(|y| px(x, y) == red)), "bit 7 of line 0");
+        assert!((348..352).all(|x| px(x, 140) == red), "bit 0 of line 0");
+        assert_eq!((px(324, 140), px(347, 140), px(319, 140), px(320, 144)), (BLUE, BLUE, BLUE, BLUE), "clear bits: the layer");
+        assert_eq!((px(324, 168), px(328, 168)), (red, BLUE), "line 7, bit 6");
+        assert_eq!((px(159, 140), px(1760, 140)), (0, 0), "the bars");
+        // Opaque: clear bits are $D021.
+        s.trx.as_mut().unwrap().text.as_mut().unwrap().opaque = true;
+        r.render_scaled(&s, &mut full, (1920, 1080));
+        assert_eq!((full[140 * 1920 + 324], full[940 * 1920 + 320], full[139 * 1920 + 324]), (TRX_PALETTE[6], BLUE, BLUE));
+        // The 960 x 540 build equals the 1920 x 1080 one scaled down.
+        let mut half = Vec::new();
+        assert_eq!(r.render(&s, &mut half), (960, 540));
+        assert!((0..540).all(|y| (0..960).all(|x| half[y * 960 + x] == full[2 * y * 1920 + 2 * x])));
     }
 }

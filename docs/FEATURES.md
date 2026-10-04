@@ -45,7 +45,8 @@ One line per feature, as of 0.5.1 (TRX64 v0.12.3). Details: `docs/status/`, spec
 - U64 turbo up to 64 MHz, timed as measured on a C64 Ultimate.
 - Smooth picture: every VIC frame shown, one-step scaling.
 - Ultimate Command Interface (UCI).
-- TRX64-Ultimate pixel layer (`--trx-io`, auto for TRX firmware): RGB565 layer with flip, key and alpha (S37).
+- TRX64-Ultimate pixel layer (`--trx-io`, auto for TRX firmware): RGB565 layer with flip, key and alpha; the freeze
+  menu with the machine pause, the freeze session and its commit list, the still and the text layer (S37).
 - REU on the firmware's DDR, preload and "Save REU"; GeoRAM.
 
 ## Cartridges
