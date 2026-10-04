@@ -407,8 +407,9 @@ new picture. Two runs each, without the pictures (the commit before) and with th
 - REU and cartridge writes in the `.c64rering`: the log is the session's, so a file restores TRX64's state and the
   cartridge registers but not the memories (a note says so). TRX64's `RingBufferDump` has no place for it.
 
-- UE2's own anchors on the board. The board's loader refuses a payload without `trx64Hw` (§7). Two ways, neither
-  built:
+- UE2's own anchors on the board: **accepted limit for now** (Alex, 2026-10-04). The board's loader refuses a payload
+  without `trx64Hw` (§7), so `ringdump … board` writes only anchors that came from a board file. The two ways, if it
+  is taken up again:
   - UE2 builds the chip block from TRX64's state: the 6502's 209 flip-flops (`cpu6510.v`/`proc_core.vhd`) and each
     CIA's 363 (`cia_core.sv`, reDIP-CIA's timer, TOD, serial and interrupt pipelines) at a snap edge, line 0
     cycle 12 or later. Verifiable only in the RTL bench (`tb_ring`).
