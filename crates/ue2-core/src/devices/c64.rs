@@ -668,6 +668,12 @@ impl C64Port {
                 self.stop = val & 1 != 0;
                 if let Some(b) = &mut self.backend {
                     b.set_stopped(self.stop);
+                    // A stopped C64 is silent on every bitstream (Alex, 2026-10-04); with `--trx-io` `trx_apply`
+                    // does it as top.v:1059 does.
+                    if self.trx.is_none() && self.stop != self.muted {
+                        self.muted = self.stop;
+                        b.set_muted(self.stop);
+                    }
                 }
                 self.trx_update();
             }
@@ -1774,9 +1780,9 @@ mod tests {
     }
 
     /// top.v:1059 `c64_mute <= c64_halted | app_s2[1]`: with `--trx-io` C64_STOP mutes, alone or as the pause, and its
-    /// release unmutes; without it nothing mutes (Gideon's bitstream plays on).
+    /// release unmutes; without it C64_STOP mutes as well (Alex, 2026-10-04: a stopped C64 is silent).
     #[test]
-    fn c64_stop_mutes_only_with_trx_io() {
+    fn c64_stop_mutes() {
         use crate::devices::trx::GATE_CTRL;
         let mut b = Bench::trx();
         b.w8(STOP_ADDR, 1);
@@ -1792,7 +1798,7 @@ mod tests {
         let mut b = Bench::new();
         b.w8(STOP_ADDR, 1);
         b.w8(STOP_ADDR, 0);
-        assert!(b.mock.mutes.borrow().is_empty(), "no --trx-io: no mute");
+        assert_eq!(*b.mock.mutes.borrow(), [true, false], "no --trx-io: C64_STOP mutes too");
     }
 
     #[test]
