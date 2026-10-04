@@ -151,6 +151,7 @@ fn c64_step(host: &mut Host, n: u64) -> Result<String, String> {
     }
     let held = peek8(&host.m.bus, C64_STOP) & HAS_STOPPED != 0;
     set_stop(host, false);
+    arm_rings(host);
     let before = host.machine().c64_core.clk;
     host.machine().run_for_full_capped(n * 64, n, &mut trx64_core::NullSink, |_, _, _, _, _, _, _| {});
     let cycles = host.machine().c64_core.clk - before;
@@ -370,5 +371,13 @@ fn pc_cycle(host: &mut Host) -> (u16, u64) {
 
 /// Run the C64's own core out of band: the firmware's clock does not move.
 fn run_c64(host: &mut Host, cycles: u64, insns: u64) {
+    arm_rings(host);
     host.machine().run_for_full_capped(cycles, insns, &mut trx64_core::NullSink, |_, _, _, _, _, _, _| {});
+}
+
+/// S38: TRX64's per-instruction rings record a step out of band as they record a run, so `rstep` undoes it.
+fn arm_rings(host: &mut Host) {
+    if let Some(b) = super::trx64(host.m) {
+        b.arm_rings_for_step();
+    }
 }

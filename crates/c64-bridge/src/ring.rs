@@ -1,0 +1,417 @@
+//! S38: TRX64's own time-travel machinery on the C64 behind the firmware (docs/specs/S38-trx64-ring.md).
+//!
+//! Three rings, all TRX64's: the delta ring and the CPU history, which `Machine` feeds per retired instruction, and
+//! the checkpoint ring, which the TRX64 daemon owns and feeds once per frame. Here the bridge owns the checkpoint ring
+//! in the daemon's place, because the bridge is what advances the machine.
+//!
+//! The rings record only while the C64 runs at 1 MHz: never while turbo is engaged, while the 6510 is held (C64_STOP,
+//! reset) or the machine pause stands (S37), or while the transport holds the machine on an anchor.
+//!
+//! A restore puts back the C64's own state. What the firmware owns stays live: the cartridge, the REU, the UCI block,
+//! the drives and the IEC devices, the turbo enable word and menu speed, and the model.
+
+use trx64_core::c64re_snapshot::{capture_runtime_checkpoint_with, checkpoint_model, restore_runtime_checkpoint, CaptureOpts};
+use trx64_core::checkpoint_ring::{
+    checkpoint_ring_budget_for, checkpoint_ring_max_entries, RuntimeCheckpointRef, RuntimeCheckpointRing,
+    DEFAULT_CHECKPOINT_RING_SECONDS,
+};
+use trx64_core::cpu_history::DEFAULT_CAPACITY;
+use trx64_core::delta_ring::{DeltaRing, DEFAULT_REVERSE_SECONDS};
+use trx64_core::ring_dump::{read_ring_dump, write_ring_dump, RingBufferDump, RingDumpInfo};
+use trx64_core::{CpuHistoryRing, Machine};
+
+use crate::clock::Clock;
+use crate::Trx64Backend;
+
+/// The daemon's capture cadence: one anchor per frame (TRX64 Spec 808, `checkpoint_capture_every_frames`).
+pub const DEFAULT_CADENCE_FRAMES: u64 = 1;
+
+/// Checkpoint nodes that are the firmware's, not the C64's: taken from the live machine at a restore.
+const FIRMWARE_NODES: [&str; 6] = ["drivePart", "driveB", "iecDevices", "folders", "hostFdc", "expansion"];
+
+/// What the transport is doing, in the daemon's words (trx64-daemon `transport::TransportMode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Live,
+    Cut,
+    StepBack,
+    StepFwd,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Live => "LIVE",
+            Mode::Cut => "CUT",
+            Mode::StepBack => "STEP \u{25c0}",
+            Mode::StepFwd => "STEP \u{25b6}",
+        }
+    }
+
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Mode::Live | Mode::Cut => "\u{25b6}",
+            Mode::StepBack => "\u{25c0}|",
+            Mode::StepFwd => "|\u{25b6}",
+        }
+    }
+}
+
+/// The checkpoint ring and the transport over it.
+pub struct Ring {
+    pub anchors: RuntimeCheckpointRing,
+    /// Frames between two anchors.
+    pub cadence_frames: u64,
+    /// How far back the ring reaches, in seconds; with the cadence it sets the entry cap.
+    pub window_seconds: f64,
+    /// Frame boundaries recorded since the last anchor.
+    frames_since: u64,
+    /// The anchor the machine stands on; `None` is the head (the machine runs).
+    pub cursor: Option<String>,
+    pub mode: Mode,
+    /// Anchors the last cut dropped.
+    pub last_cut: u64,
+}
+
+impl Ring {
+    fn new(nominal_fps: u32) -> Ring {
+        let window_seconds = DEFAULT_CHECKPOINT_RING_SECONDS;
+        let max = checkpoint_ring_max_entries(window_seconds, DEFAULT_CADENCE_FRAMES, nominal_fps);
+        Ring {
+            anchors: RuntimeCheckpointRing::with_budget_and_max_entries(checkpoint_ring_budget_for(max), max),
+            cadence_frames: DEFAULT_CADENCE_FRAMES,
+            window_seconds,
+            frames_since: 0,
+            cursor: None,
+            mode: Mode::Live,
+            last_cut: 0,
+        }
+    }
+
+    /// The anchors, oldest first, as (id, frame, cycles).
+    pub fn ids(&self) -> Vec<(String, u64, u64)> {
+        self.anchors.list().into_iter().map(|r| (r.id, r.frame, r.cycles)).collect()
+    }
+
+    /// Where the cursor is: (index, total), the head when there is no cursor. `None` with no anchors, or when the
+    /// cursor's anchor is gone.
+    pub fn position(&self) -> Option<(usize, usize)> {
+        let ids = self.ids();
+        if ids.is_empty() {
+            return None;
+        }
+        match &self.cursor {
+            None => Some((ids.len() - 1, ids.len())),
+            Some(id) => ids.iter().position(|(i, _, _)| i == id).map(|i| (i, ids.len())),
+        }
+    }
+
+    /// Retune the entry cap for the cadence and window at `nominal_fps`; returns the cap.
+    pub fn retune(&mut self, nominal_fps: u32) -> u64 {
+        let want = checkpoint_ring_max_entries(self.window_seconds, self.cadence_frames, nominal_fps);
+        self.anchors.set_max_entries(want)
+    }
+}
+
+/// The capture the daemon's ring takes (trx64-daemon `capture_recorder_anchor_payload`): no framebuffer, no expansion
+/// RAM. UE2 passes no disk or cartridge blobs: those are the firmware's. Drive B's node is left out of the stored
+/// anchor, since a restore takes it from the live machine; it would otherwise store B's whole disk every frame.
+fn anchor_payload(m: &Machine) -> serde_json::Value {
+    let mut cp = capture_runtime_checkpoint_with(
+        m,
+        "",
+        "",
+        None,
+        None,
+        None,
+        None,
+        CaptureOpts { omit_framebuffer: true, omit_expansion_ram: true },
+    );
+    if let Some(tree) = cp.as_object_mut() {
+        tree.remove("driveB");
+    }
+    cp
+}
+
+impl Trx64Backend {
+    /// S38: TRX64's rings on (`--ring`, the default) or off. On: the delta ring at TRX64's default depth
+    /// (`TRX64_REVERSE_SECONDS`, else 10 s), the CPU history at its default capacity and the checkpoint ring at the
+    /// daemon's defaults (one anchor per frame, 60 s). Off: the rings shrink to one entry and record nothing.
+    pub fn set_ring(&mut self, on: bool) {
+        if on == self.ring.is_some() {
+            return;
+        }
+        if on {
+            let secs = crate::USER_REVERSE_SECONDS
+                .get()
+                .cloned()
+                .flatten()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(DEFAULT_REVERSE_SECONDS)
+                .max(1);
+            let (entries, writes) = DeltaRing::caps_for_seconds(secs);
+            self.m.delta_ring.resize(entries, writes);
+            self.m.cpu_history.resize(DEFAULT_CAPACITY);
+            self.ring = Some(Box::new(Ring::new(self.m.timing().nominal_fps)));
+        } else {
+            self.m.cpu_history = CpuHistoryRing::with_capacity(1);
+            self.m.delta_ring = DeltaRing::with_capacity(1, 1);
+            self.ring = None;
+        }
+        self.arm_rings();
+    }
+
+    /// The checkpoint ring and its transport, when the rings are on.
+    pub fn ring(&self) -> Option<&Ring> {
+        self.ring.as_deref()
+    }
+
+    pub fn ring_mut(&mut self) -> Option<&mut Ring> {
+        self.ring.as_deref_mut()
+    }
+
+    /// Whether the rings record now: on, the 6510 running at 1 MHz, nothing holding the machine.
+    pub fn ring_recording(&self) -> bool {
+        self.ring.as_ref().is_some_and(|r| r.cursor.is_none())
+            && !self.stopped
+            && !self.reset_held
+            && !self.paused
+            && !self.m.turbo_engaged()
+    }
+
+    /// Whether the transport holds the C64 on an anchor: no C64 cycle runs until it lets go.
+    pub fn ring_holds(&self) -> bool {
+        self.ring.as_ref().is_some_and(|r| r.cursor.is_some())
+    }
+
+    /// Switch TRX64's per-instruction rings on or off for what the machine is doing now. With the rings off they are
+    /// left as `new` built them.
+    pub(crate) fn arm_rings(&mut self) {
+        if self.ring.is_none() {
+            return;
+        }
+        let on = self.ring_recording();
+        self.m.delta_ring.set_enabled(on);
+        self.m.cpu_history.set_enabled(on);
+    }
+
+    /// For a run out of band (the monitor's steps): the per-instruction rings record whatever the C64 is held by,
+    /// unless they are off or turbo is engaged. The next slice arms them for the machine again.
+    pub fn arm_rings_for_step(&mut self) {
+        if self.ring.is_none() {
+            return;
+        }
+        let on = !self.m.turbo_engaged();
+        self.m.delta_ring.set_enabled(on);
+        self.m.cpu_history.set_enabled(on);
+    }
+
+    /// Up to cycle `target` while recording, stopping at each frame boundary on the way: the checkpoint ring takes an
+    /// anchor there every `cadence_frames` frames. The daemon's pump hands the machine one frame at a time and captures
+    /// after it (`stream_maybe_autocapture`); here the slices are the firmware's, so the frame is found in them.
+    pub(crate) fn run_recording(&mut self, target: u64) {
+        loop {
+            let clk = self.m.c64_core.clk;
+            let boundary = clk + self.cycles_to_frame_end() + crate::BOUNDARY_SLACK;
+            if boundary > target {
+                break;
+            }
+            self.run_to(boundary);
+            if self.m.c64_core.clk == clk {
+                // The C64 waits for the firmware (UCI): nothing ran, nothing to record.
+                return;
+            }
+            self.ring_frame();
+            if !self.ring_recording() {
+                // Turbo came on in this frame.
+                self.arm_rings();
+                break;
+            }
+        }
+        // The last frame's instruction may have run past the slice's end; `run_to` wants a target ahead.
+        if self.m.c64_core.clk < target {
+            self.run_to(target);
+        }
+    }
+
+    /// A frame boundary while recording: an anchor when the cadence is due. A capture error is a gap in the ring, as
+    /// in the daemon.
+    fn ring_frame(&mut self) {
+        let (frame, clk) = (self.m.vic.frame, self.m.c64_core.clk);
+        let Some(ring) = self.ring.as_deref_mut() else { return };
+        ring.frames_since += 1;
+        if ring.frames_since < ring.cadence_frames.max(1) {
+            return;
+        }
+        ring.frames_since = 0;
+        let _ = ring.anchors.capture(anchor_payload(&self.m), frame, clk);
+        if ring.mode == Mode::Cut {
+            ring.mode = Mode::Live;
+        }
+    }
+
+    /// A C64 reset replaces the machine: the anchors describe one that no longer exists (the daemon's
+    /// `timeline_discard`), and the per-instruction history ends at the reset as TRX64's cold reset ends it.
+    pub(crate) fn ring_discard(&mut self) {
+        let Some(ring) = self.ring.as_deref_mut() else { return };
+        ring.anchors.clear();
+        ring.cursor = None;
+        ring.mode = Mode::Live;
+        ring.frames_since = 0;
+        self.m.delta_ring.clear();
+        self.m.cpu_history.clear();
+    }
+
+    /// Stand the C64 on anchor `id` (an id or a mark name): its own state from the anchor, the firmware's from the
+    /// live machine (§4 of the spec). The transport then holds the machine there until [`Self::ring_release`].
+    pub fn ring_goto(&mut self, id: &str, mode: Mode) -> Result<RuntimeCheckpointRef, String> {
+        let ring = self.ring.as_deref().ok_or("the rings are off (--ring=off)")?;
+        let anchor = ring.anchors.get(id).ok_or_else(|| format!("no anchor {id}"))?;
+        let mut cp =
+            ring.anchors.restore_snapshot(&anchor.id).ok_or_else(|| format!("anchor {} is gone (evicted)", anchor.id))?;
+        self.restore_c64(&mut cp)?;
+        let ring = self.ring.as_deref_mut().expect("checked above");
+        ring.cursor = Some(anchor.id.clone());
+        ring.mode = mode;
+        self.arm_rings();
+        Ok(anchor)
+    }
+
+    /// Let go of the machine where the transport stands. The anchors after it are a future that will not happen now:
+    /// they go, marks excepted (the daemon's `timeline_truncate`). Returns how many went.
+    pub fn ring_release(&mut self) -> u64 {
+        let Some(ring) = self.ring.as_deref_mut() else { return 0 };
+        let Some(id) = ring.cursor.take() else { return 0 };
+        let dropped = ring.anchors.truncate_after(&id, true);
+        ring.mode = Mode::Cut;
+        ring.last_cut = dropped;
+        ring.frames_since = 0;
+        // The C64 stood while the emulator's clock ran on: it continues from here, as after the machine pause.
+        self.clock = Some(Clock::new(self.now, self.m.c64_core.clk, self.cpu_hz()));
+        self.arm_rings();
+        dropped
+    }
+
+    /// The whole reverse-debug buffer as a `.c64rering` (TRX64 `ring_dump`): the checkpoint ring with the newest anchor
+    /// as current (the daemon's `ringbuffer_dump_to_path`, wherever the transport stands), the delta ring and the CPU
+    /// history.
+    pub fn ring_dump(&self) -> Result<(Vec<u8>, RingDumpInfo), String> {
+        let ring = self.ring.as_deref().ok_or("the rings are off (--ring=off)")?;
+        let current = ring.anchors.list().last().map(|r| r.id.clone());
+        let dump = RingBufferDump {
+            checkpoint_ring: ring.anchors.to_dump(current),
+            delta_ring: self.m.delta_ring.to_dump(),
+            cpu_history: self.m.cpu_history.to_dump(),
+        };
+        let bytes = write_ring_dump(&dump);
+        let info = dump.info(bytes.len() as u64);
+        Ok((bytes, info))
+    }
+
+    /// A `.c64rering` back: the three rings from the file, and the C64 on its current anchor, held there.
+    pub fn ring_load(&mut self, bytes: &[u8]) -> Result<RingDumpInfo, String> {
+        if self.ring.is_none() {
+            return Err("the rings are off (--ring=off)".into());
+        }
+        let dump = read_ring_dump(bytes)?;
+        let anchors = RuntimeCheckpointRing::from_dump(&dump.checkpoint_ring);
+        let current = dump.checkpoint_ring.current_id.clone().or_else(|| anchors.list().last().map(|r| r.id.clone()));
+        // Check the anchor restores before anything is replaced.
+        if let Some(id) = &current {
+            let cp = anchors.restore_snapshot(id).ok_or_else(|| format!("the file's current anchor {id} is not in it"))?;
+            self.check_model(&cp)?;
+        }
+        let ring = self.ring.as_deref_mut().expect("checked above");
+        ring.anchors = anchors;
+        ring.cursor = None;
+        ring.mode = Mode::Live;
+        ring.frames_since = 0;
+        self.m.delta_ring = DeltaRing::from_dump(&dump.delta_ring);
+        self.m.cpu_history = CpuHistoryRing::from_dump(&dump.cpu_history);
+        if let Some(id) = current {
+            self.ring_goto(&id, Mode::StepBack)?;
+        }
+        Ok(dump.info(bytes.len() as u64))
+    }
+
+    /// The model the checkpoint was taken on must be the one the firmware runs: a restore would otherwise switch the
+    /// C64 behind the firmware's back (C64_VIDEOFORMAT is the firmware's).
+    fn check_model(&self, cp: &serde_json::Value) -> Result<(), String> {
+        let live = self.m.model();
+        match checkpoint_model(cp)? {
+            Some(model) if !std::ptr::eq(model, live) => {
+                Err(format!("the anchor is a {} and the firmware runs a {}", model.name, live.name))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Restore the C64's own state from `cp` and keep the firmware's live.
+    pub(crate) fn restore_c64(&mut self, cp: &mut serde_json::Value) -> Result<(), String> {
+        self.check_model(cp)?;
+        // The firmware's half, from the live machine: the drives, the IEC devices, the expansion port's device, and
+        // the turbo enable word and menu speed. `$D030`/`$D031` are the C64's and come from the anchor.
+        let live = capture_runtime_checkpoint_with(
+            &self.m,
+            "",
+            "",
+            None,
+            None,
+            None,
+            None,
+            CaptureOpts { omit_framebuffer: true, omit_expansion_ram: true },
+        );
+        let tree = cp.as_object_mut().ok_or("the anchor is not a checkpoint")?;
+        for key in FIRMWARE_NODES {
+            match live.get(key) {
+                Some(v) => tree.insert(key.to_string(), v.clone()),
+                None => tree.remove(key),
+            };
+        }
+        if let (Some(t), Some(l)) = (tree.get_mut("turbo").and_then(|t| t.as_object_mut()), live.get("turbo")) {
+            for key in ["enable", "menuIndex", "menuStalls"] {
+                if let Some(v) = l.get(key) {
+                    t.insert(key.to_string(), v.clone());
+                }
+            }
+        }
+        // TRX64's restore detaches a cartridge the checkpoint does not carry and resets the UCI block to power-on
+        // (c64re_snapshot.rs `restore_runtime_checkpoint`); both are the firmware's here and go back afterwards. So
+        // do the drives, exactly: the injected nodes only keep TRX64's device map right.
+        let live_clk = self.m.c64_core.clk;
+        let frame = self.m.vic.frame;
+        let cart = self.m.cartridge.take();
+        let cart_image = self.m.cartridge_image.take();
+        let uci = self.m.uci().cloned();
+        let (drive_a, drive_b) = (self.m.drive8.clone(), self.m.drive_b.clone());
+        let restored = restore_runtime_checkpoint(&mut self.m, cp);
+        self.m.drive8 = drive_a;
+        self.m.drive_b = drive_b;
+        self.m.cartridge = cart;
+        self.m.cartridge_image = cart_image;
+        if let (Some(live), Some(block)) = (uci, self.m.uci_mut()) {
+            *block = live;
+        }
+        // The frame count only goes forward: the S37 still and the display take a larger count as a new picture.
+        self.m.vic.frame = frame + 1;
+        restored?;
+        let clk = self.m.c64_core.clk;
+        self.m.clk = clk;
+        self.m.drive_c64_ref = clk;
+        // The bridge's own view of the C64's clock and inputs, as after a reset release.
+        self.clock = Some(Clock::new(self.now, clk, self.cpu_hz()));
+        self.sid.reanchor(clk);
+        // The physical cartridge's flash timers run on the emulator's time: carry the cycles the C64 went back.
+        let back = live_clk.saturating_sub(clk);
+        self.slot.with(|s| s.reset_release(back));
+        self.keys.apply(&mut self.m.keyboard);
+        self.apply_joysticks();
+        self.apply_pots();
+        self.nmi_line = self.nmi;
+        self.uci_wait = None;
+        self.checkpoint_hit = None;
+        self.update_pla();
+        self.apply_interrupts();
+        Ok(())
+    }
+}

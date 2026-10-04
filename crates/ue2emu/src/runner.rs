@@ -87,6 +87,10 @@ pub struct RunOptions {
     pub cart_slot: Option<CartSlotSpec>,
     /// `--hold-key`: matrix keys pressed before the first instruction, until a control `release`.
     pub hold_keys: Vec<crate::keymap::MatrixKey>,
+    /// S38 `--ring`: TRX64's time-travel rings on the C64.
+    pub ring: bool,
+    /// S38 `--monitor-dir`: the directory the monitor's file verbs are confined to.
+    pub monitor_dir: PathBuf,
 }
 
 pub enum Command {
@@ -168,9 +172,10 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
         mips: mips.clone(),
         speed_pct: speed_pct.clone(),
         speed: opts.speed,
+        monitor_dir: opts.monitor_dir.clone(),
     };
     let running = RunningFlag(ctl.running.clone());
-    let (net_opts, c64, armsid) = (opts.net.clone(), opts.c64, opts.audio.armsid);
+    let (net_opts, c64, armsid, ring) = (opts.net.clone(), opts.c64, opts.audio.armsid, opts.ring);
     let sid_thread = !opts.audio.no_sid_thread;
     let (usb_dirs, usb_dir_work, cart_slot) = (opts.usb_dirs.clone(), opts.usb_dir_work.clone(), opts.cart_slot.clone());
     let hold = control::key_events(&opts.hold_keys, true);
@@ -180,7 +185,7 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
         .name("emulation".into())
         .spawn(move || {
             let _running = running;
-            match build(cfg, net_opts.as_ref(), c64, sink, armsid, sid_thread, &usb_dirs, &usb_dir_work, cart_slot) {
+            match build(cfg, net_opts.as_ref(), c64, ring, sink, armsid, sid_thread, &usb_dirs, &usb_dir_work, cart_slot) {
                 Ok((mut machine, net, dirs, cart)) => {
                     for (_, ev) in hold {
                         machine.input(ev);
@@ -217,6 +222,7 @@ fn build(
     cfg: MachineConfig,
     net: Option<&NetOptions>,
     c64: bool,
+    ring: bool,
     sink: Option<audio::Sink>,
     armsid: bool,
     sid_thread: bool,
@@ -226,7 +232,7 @@ fn build(
 ) -> Result<(Machine, Option<net::Backend>, UsbDirs, CartSlot)> {
     let mut machine = Machine::new(cfg)?;
     if c64 {
-        attach_trx64_audio(&mut machine, sink, armsid, sid_thread, cart_slot.as_ref())?;
+        attach_trx64_audio(&mut machine, sink, armsid, sid_thread, cart_slot.as_ref(), ring)?;
     }
     let cart = CartSlot::new(cart_slot, &mut machine);
     let net = net.map(|opts| net::attach(&mut machine, opts)).transpose()?;
@@ -239,21 +245,23 @@ fn build(
 /// with `cart_slot`'s cartridge in the expansion port. `c64_selected` in main.rs allows it only with the `trx64`
 /// feature; without it this does nothing.
 pub fn attach_trx64(machine: &mut Machine, cart_slot: Option<&CartSlotSpec>) -> Result<()> {
-    attach_trx64_audio(machine, None, false, false, cart_slot)
+    attach_trx64_audio(machine, None, false, false, cart_slot, false)
 }
 
-/// [`attach_trx64`], with the SID's samples going to `sink` when given and an ARMSID in socket 1 when `armsid`
-/// (S14 §W4-SID).
+/// [`attach_trx64`], with the SID's samples going to `sink` when given, an ARMSID in socket 1 when `armsid` (S14
+/// §W4-SID) and TRX64's rings on when `ring` (S38).
 fn attach_trx64_audio(
     machine: &mut Machine,
     sink: Option<audio::Sink>,
     armsid: bool,
     sid_thread: bool,
     cart_slot: Option<&CartSlotSpec>,
+    ring: bool,
 ) -> Result<()> {
     #[cfg(feature = "trx64")]
     {
         let mut c64 = c64_bridge::Trx64Backend::new(&machine.cfg.rom_dir);
+        c64.set_ring(ring);
         c64.set_sid_socket1(armsid);
         if let Some(sink) = sink {
             // S20: with a device listening the engines, the mixing and the sink move to the SID worker.
@@ -306,7 +314,7 @@ fn attach_trx64_audio(
         }
     }
     #[cfg(not(feature = "trx64"))]
-    let _ = (machine, sink, armsid, sid_thread, cart_slot);
+    let _ = (machine, sink, armsid, sid_thread, cart_slot, ring);
     Ok(())
 }
 
@@ -357,6 +365,9 @@ struct EmuThread {
     mips: Arc<AtomicU64>,
     speed_pct: Arc<AtomicU64>,
     speed: Speed,
+    /// S38 `--monitor-dir`.
+    #[cfg_attr(not(feature = "trx64"), allow(dead_code))]
+    monitor_dir: PathBuf,
 }
 
 impl EmuThread {
@@ -377,6 +388,10 @@ impl EmuThread {
         let mut stdout = std::io::stdout();
         let mut inputs = InputTimeline::default();
         let mut monitor = MonitorState::default();
+        #[cfg(feature = "trx64")]
+        {
+            monitor.ours.files = crate::monitor::ring::MonitorFiles::new(self.monitor_dir.clone());
+        }
         // Emulated ms of the quit request: the machine keeps running while a --usb-dir guest write is recent.
         let mut quit_at: Option<u64> = None;
         loop {

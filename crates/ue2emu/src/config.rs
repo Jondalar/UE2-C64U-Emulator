@@ -254,6 +254,14 @@ mod tests {
         assert_eq!(mode("trx-io = false\n").as_deref(), Some("Off"));
         assert_eq!(mode("trx-io = 'auto'\n").as_deref(), Some("Auto"));
         assert_eq!(mode("").as_deref(), Some("Auto"), "the default");
+        // S38: the rings, on unless switched off.
+        let ring = |file: &str| {
+            let (m, _) = parse(file, &[]).unwrap();
+            m.get_one::<crate::RingArg>("ring").map(|v| format!("{v:?}"))
+        };
+        assert_eq!(ring("ring = false\n").as_deref(), Some("Off"));
+        assert_eq!(ring("ring = true\n").as_deref(), Some("On"));
+        assert_eq!(ring("").as_deref(), Some("On"), "the default");
     }
 
     #[test]

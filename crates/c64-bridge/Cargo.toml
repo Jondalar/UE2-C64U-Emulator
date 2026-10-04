@@ -15,3 +15,4 @@ ue2-core = { path = "../ue2-core" }
 # break the build or change behaviour: re-run the tests and the C64 smokes (docs/status/c64.md) before moving the tag.
 # trx64-core's build.rs compiles vendored reSID C++.
 trx64-core = { git = "https://github.com/Jondalar/TRX64", tag = "v0.12.3" }
+serde_json = "1"

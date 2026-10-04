@@ -27,6 +27,7 @@
 #   usb         smoke-usb.ctl          --usb run/usb.img --usb-keyboard
 #   joy         smoke-joy.ctl          both control ports in BASIC, port 2 in the menu (S36)
 #   joy-swap    smoke-joy-swap.ctl     --settings smoke-joy-swap.cfg: port 1 in the menu
+#   ring        smoke-c64-ring.ctl     S38: mark, goto twice to the same byte, ringdump/ringload, asm-file
 
 set -euo pipefail
 
@@ -164,6 +165,16 @@ echo "PASS soft-iec ($((SECONDS - start)) s wall)"
 
 sd run/usb.img 48
 smoke usb "$repo/scripts/smoke-usb.ctl" --flash run/flash.bin --c64-roms --usb run/usb.img --usb-keyboard
+
+# S38: goto a mark twice lands on the same byte, not on the live one; the ring survives a file; asm-file assembles.
+printf '*= $c000\n lda #$01\n rts\n' >ring.asm
+smoke ring "$repo/scripts/smoke-c64-ring.ctl" --flash run/flash.bin --c64-roms
+counts=($(grep -o '^>R:0400  [0-9a-f][0-9a-f]' run/ring.log | cut -c10-))
+((${#counts[@]} == 4)) || fail ring "expected four reads of \$0400, got ${#counts[@]}"
+[[ ${counts[0]} != "${counts[1]}" ]] || fail ring "goto left \$0400 at the live value ${counts[0]}"
+[[ ${counts[1]} == "${counts[2]}" && ${counts[1]} == "${counts[3]}" ]] || fail ring "goto here: ${counts[*]}"
+grep -q "^ringload: restored" run/ring.log || fail ring "no ringload"
+grep -q '^>C:c000  a9 01 60' run/ring.log || fail ring "asm-file did not assemble ring.asm"
 
 cp run/flash.bin run/flash-joy.bin
 smoke joy "$repo/scripts/smoke-joy.ctl" --flash run/flash-joy.bin --c64-roms --speed max

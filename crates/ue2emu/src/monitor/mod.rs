@@ -9,10 +9,12 @@
 //! Our own verbs are S23 M2 and live below, behind the library's dispatch. [`uci`] is what `config` knocks on when
 //! a verb has to reach the *running* firmware rather than the bytes it left behind.
 //!
-//! Run control for both CPUs (S23 M3) is [`run`].
+//! Run control for both CPUs (S23 M3) is [`run`]; the time-travel verbs on TRX64's rings and the monitor's files
+//! (S38) are [`ring`].
 
 mod config;
 mod devices;
+pub mod ring;
 pub mod run;
 mod uci;
 
@@ -58,6 +60,8 @@ pub struct State {
     staged: Vec<settings::Record>,
     /// Run control (S23 M3): whether the firmware is held, and why.
     pub run: run::State,
+    /// S38: the directory the file verbs are confined to (`--monitor-dir`).
+    pub files: ring::MonitorFiles,
 }
 
 impl State {
@@ -111,6 +115,19 @@ impl MonitorHost for Host<'_> {
     fn step(&mut self, n: u64, over: bool) -> Result<trx64_monitor::StopInfo, String> {
         run::step(self, n, over)
     }
+
+    /// S38: a command that changes the C64 while the transport stands on an anchor cuts the anchors after it
+    /// (TRX64 Spec 808 decision 4). A reset goes through the firmware's reset line, which drops the anchors itself.
+    fn on_effect(&mut self, effect: trx64_monitor::MachineEffect) {
+        if effect == trx64_monitor::MachineEffect::Mutates {
+            ring::release(self);
+        }
+    }
+
+    /// S38: the monitor's files, under `--monitor-dir`.
+    fn files(&mut self) -> Option<&mut dyn trx64_monitor::Files> {
+        Some(&mut self.state.files)
+    }
 }
 
 /// Our own verbs (S23 §5): the Ultimate side, which the library has never seen.
@@ -119,7 +136,13 @@ impl Host<'_> {
     fn ours(&mut self, verb: &str, args: &[&str]) -> Option<Result<String, String>> {
         match verb {
             "fw" => Some(self.verb_fw(args)),
-            "c64" => Some(run::c64(self, args)),
+            "c64" => {
+                // Running or stepping the C64 is an intervention: the transport lets go of its anchor first.
+                if matches!(args.first(), Some(&"go" | &"step")) {
+                    ring::release(self);
+                }
+                Some(run::c64(self, args))
+            }
             "status" => Some(Ok(run::status(self))),
             "clock" => Some(Ok(self.verb_clock())),
             "config" => Some(config::verb(self, args)),
@@ -172,6 +195,13 @@ impl Host<'_> {
             "  config set CAT ITEM VALUE   change it in the running firmware\n",
             "  config write [PATH]         the config pages, or a .cfg inside the machine\n",
             "  config read PATH            hand a .cfg inside the machine to the firmware\n",
+            "\nTRX64's rings on the C64 (S38; --ring, on by default):\n",
+            "  rstep, whowrote, triage, chis, revdepth   as above, while the C64 ran at 1 MHz\n",
+            "  mark, marks, unmark, goto, frame, rewind, cadence, window   the checkpoint ring: the C64 stands on\n",
+            "                    an anchor while the firmware runs on; `run`, `g` or any change lets it go and cuts\n",
+            "                    the anchors after it (marks stay)\n",
+            "  ringdump PATH | ringload PATH | asm-file PATH [addr] | pwd | cd [dir] | ls [dir]\n",
+            "                    files under --monitor-dir only\n",
         )
         .to_string()
             + devices::HELP
@@ -244,6 +274,9 @@ pub fn exec(
 ) -> Result<String, String> {
     let mut host = Host::new(m, state).ok_or("the monitor needs a C64: start with --c64 trx64")?;
     let verb = line.split_whitespace().next().unwrap_or("").to_owned();
+    // S38: what the line does to the C64 decides what happens to the transport, before the verb runs (the daemon's
+    // order: a verb that appends anchors must not have them cut afterwards).
+    host.on_effect(verbs::classify_in(&session.state, line));
     let answer = match verbs::try_exec(session, &mut host, line) {
         // `help` is the port audit's list on both sides, so ours goes after theirs.
         Some(Ok(text)) if verb == "help" => Ok(text + &host.help()),
@@ -251,7 +284,9 @@ pub fn exec(
         None => {
             let args = words(line.trim_start().strip_prefix(&verb).unwrap_or(""));
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            host.ours(&verb, &args).unwrap_or(Err(format!("unknown monitor command '{verb}'")))
+            ring::verb(&mut host, session, &verb, &args)
+                .or_else(|| host.ours(&verb, &args))
+                .unwrap_or(Err(format!("unknown monitor command '{verb}'")))
         }
     }?;
     Ok(addr_spans::plain(&answer))
@@ -480,22 +515,22 @@ mod tests {
         );
     }
 
-    /// The verbs `monitor_help_text()` lists that `verbs::try_exec` does not dispatch at rev 638175d.
+    /// The verbs `monitor_help_text()` lists that `verbs::try_exec` does not dispatch at rev 638175d, and that we do
+    /// not answer either.
     ///
     /// The library carries the DAEMON's help text while Spec 864's extraction is under way, so a second host is
     /// offered a list it cannot honour. That is upstream's to close — either the verbs move into the library or
     /// the help text narrows to what it dispatches — and this array is how we watch it happen: a verb that starts
     /// answering fails the test until it is taken out, and a new one that does not answer fails it too.
     ///
-    /// Most of these are a host's own business (`mount`, `eject`, `savecrt`, `drivepower`, `turbo`, `warp`,
-    /// `window`, `frame`, `play`, `pause`), which is exactly why they cannot live in help as if they were the
-    /// library's. We do not invent our own meanings for them: S23 §5 keeps `reu`, `uci` and `turbo` out on purpose.
-    const STILL_THE_DAEMONS: [&str; 45] = [
-        "bitmap", "bload", "bsave", "cadence", "chis", "diff", "drive", "drivepower", "eject", "frame", "goto",
-        "identify", "load", "log", "map", "mark", "marks", "mkdir", "model", "mount", "pause", "play", "pwd",
-        "rawframe", "recent", "rewind", "ringdump", "ringload", "rstep", "run", "save", "savecrt", "sf",
-        "swapcrt", "swimlane", "taint", "trace", "tracedb", "traceindex", "tracering", "traprules", "turbo",
-        "unmark", "warp", "window",
+    /// Most of these are a host's own business (`mount`, `eject`, `savecrt`, `drivepower`, `turbo`, `warp`, `play`,
+    /// `pause`), which is exactly why they cannot live in help as if they were the library's. We do not invent our
+    /// own meanings for them: S23 §5 keeps `reu`, `uci` and `turbo` out on purpose. S38 answers the daemon's ring
+    /// verbs on our side (`monitor::ring`).
+    const STILL_THE_DAEMONS: [&str; 31] = [
+        "bitmap", "bload", "bsave", "diff", "drive", "drivepower", "eject", "identify", "load", "log", "map",
+        "mkdir", "model", "mount", "pause", "play", "rawframe", "recent", "save", "savecrt", "sf", "swapcrt",
+        "swimlane", "taint", "trace", "tracedb", "traceindex", "tracering", "traprules", "turbo", "warp",
     ];
 
     /// S23 §4: `device fw` is the firmware's core — 32-bit, registers and DDR, no flags, no disassembler.
@@ -770,5 +805,136 @@ mod tests {
         let stop = host.step(2, false).expect("step");
         assert_eq!(stop.reason, "step");
         assert_eq!(stop.steps.len(), 2, "one entry per retired instruction, for the library's flow tracker");
+    }
+
+    // ---- S38: the ring verbs and the monitor's files (docs/specs/S38-trx64-ring.md §7) ----
+
+    /// A machine whose C64 has the firmware's ROMs and TRX64's rings on, booted to READY by the bridge alone: there
+    /// is no firmware here, so the test advances the C64 itself, as `C64Port::tick` would. `None` without the ROMs.
+    fn ringed() -> Option<(Machine, u64)> {
+        let roms = std::env::var_os("UE2_FIRMWARE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../firmware/1541ultimate"))
+            .join("roms");
+        if !roms.join("basic.bin").is_file() {
+            eprintln!("skipping: no {} (set UE2_FIRMWARE)", roms.display());
+            return None;
+        }
+        let mut m = machine();
+        let mut c64 = Trx64Backend::new(&roms);
+        c64.set_ring(true);
+        m.attach_c64(Box::new(c64));
+        let b = trx64(&mut m).unwrap();
+        use ue2_core::c64host::C64Backend;
+        b.advance_to(0);
+        b.set_reset(true);
+        b.set_reset(false);
+        let mut now = 0;
+        advance(&mut m, &mut now, 2500);
+        Some((m, now))
+    }
+
+    fn advance(m: &mut Machine, now: &mut u64, ms: u64) {
+        use ue2_core::c64host::C64Backend;
+        for _ in 0..ms {
+            *now += ue2_core::time::CLOCKS_PER_MS;
+            trx64(m).unwrap().advance_to(*now);
+        }
+    }
+
+    /// mark, goto, marks, frame, run, cadence, window, chis, rstep, ringdump and ringload, as the monitor answers
+    /// them on our host.
+    #[test]
+    fn the_ring_verbs_go_back_and_forth_on_the_c64() {
+        let Some((mut m, mut now)) = ringed() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = MonitorSession::new();
+        let mut st = State { files: ring::MonitorFiles::new(dir.path().to_path_buf()), ..State::default() };
+        let mut run = |m: &mut Machine, line: &str| exec(m, &mut s, &mut st, line).unwrap_or_else(|e| panic!("{line}: {e}"));
+
+        run(&mut m, "wr ram c000 11");
+        advance(&mut m, &mut now, 100);
+        assert!(run(&mut m, "mark here").starts_with("MARK here @ Cycle"));
+        let marked = trx64(&mut m).unwrap().trx64().c64_core.clk;
+        run(&mut m, "wr ram c000 22");
+        advance(&mut m, &mut now, 200);
+        assert!(run(&mut m, "marks").contains("here"));
+
+        let line = run(&mut m, "goto here");
+        assert!(line.starts_with("STEP"), "{line}");
+        assert!(run(&mut m, "m ram c000 c000").contains("11"), "the anchor's RAM");
+        let clk = trx64(&mut m).unwrap().trx64().c64_core.clk;
+        assert!(clk <= marked && marked - clk < 20_000, "the anchor at or before the mark's cycle: {clk} {marked}");
+        advance(&mut m, &mut now, 50);
+        assert_eq!(trx64(&mut m).unwrap().trx64().c64_core.clk, clk, "held on the anchor");
+        assert!(run(&mut m, "frame -2").contains("frame"));
+        assert!(run(&mut m, "frame +1").contains("frame"));
+        assert!(run(&mut m, "rewind").contains("RINGBUFFER SIZE"));
+        assert!(exec(&mut m, &mut MonitorSession::new(), &mut State::default(), "rstep").is_err(), "not on an anchor");
+
+        assert!(run(&mut m, "ringdump dump/r.c64rering").contains("dump/r.c64rering"));
+        assert!(dir.path().join("dump/r.c64rering").is_file());
+        assert!(run(&mut m, "goto here").contains("frame"));
+        assert!(run(&mut m, "run").starts_with("RUN"), "the release");
+        advance(&mut m, &mut now, 100);
+        assert!(trx64(&mut m).unwrap().trx64().c64_core.clk > clk, "runs on from the anchor");
+        assert!(run(&mut m, "goto here").contains("frame"), "the mark survived the cut");
+        run(&mut m, "run");
+
+        assert!(run(&mut m, "chis 200").starts_with("# cpuhistory (live ring)"));
+        let r = run(&mut m, "rstep 3");
+        assert!(r.starts_with("reverse-step: undid 3 instruction(s)"), "{r}");
+        assert!(run(&mut m, "cadence 2 30").contains("every 2 frame(s)"));
+        assert!(run(&mut m, "window 20").contains("window: 20.0s"));
+
+        let r = run(&mut m, "ringload dump/r.c64rering");
+        assert!(r.starts_with("ringload: restored"), "{r}");
+        assert!(run(&mut m, "m ram c000 c000").contains("22"), "the file's current anchor is the newest");
+        assert!(run(&mut m, "goto here").contains("frame"), "the marks ride the file");
+        assert!(run(&mut m, "m ram c000 c000").contains("11"));
+    }
+
+    /// The file verbs see the monitor directory and nothing outside it.
+    #[test]
+    fn the_monitor_files_stay_inside_their_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(outside.path().join("secret"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let mut f = ring::MonitorFiles::new(dir.path().to_path_buf());
+
+        assert_eq!(f.resolve("sub/../a.asm").unwrap(), dir.path().join("a.asm"));
+        assert_eq!(f.resolve("/a.asm").unwrap(), dir.path().join("a.asm"));
+        for bad in ["..", "../x", "/../x", "sub/../../x", "link/secret", "link"] {
+            assert!(f.resolve(bad).is_err(), "{bad} is outside");
+        }
+        use trx64_monitor::Files;
+        assert!(f.read(&outside.path().join("secret").display().to_string()).is_err(), "a host path is under the root");
+        assert_eq!(f.set_cwd("sub").unwrap(), "/sub");
+        assert_eq!(f.resolve("b").unwrap(), dir.path().join("sub/b"));
+        assert_eq!(f.resolve("/b").unwrap(), dir.path().join("b"));
+        assert!(f.set_cwd("..").is_ok() && f.set_cwd("..").is_err(), "cd stops at the root");
+        f.write("new/c.bin", b"c").unwrap();
+        assert_eq!(f.read("new/c.bin").unwrap(), b"c");
+        assert!(f.list(".").unwrap().contains("new/"));
+        assert!(f.mount("x.d64", 8).is_err(), "the drives are the firmware's");
+    }
+
+    /// `asm-file` assembles a file from the monitor directory into the C64 (it used to be an unknown command).
+    #[test]
+    fn asm_file_assembles_from_the_monitor_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.asm"), "*= $c000\nloop: lda #$01\n jmp loop\n").unwrap();
+        std::fs::write(dir.path().join("noorg.asm"), "rts\n").unwrap();
+        let mut m = machine();
+        let mut s = MonitorSession::new();
+        let mut st = State { files: ring::MonitorFiles::new(dir.path().to_path_buf()), ..State::default() };
+        let out = exec(&mut m, &mut s, &mut st, "asm-file t.asm").expect("asm-file");
+        assert!(out.contains("asm-file: $c000-$c004  5 bytes"), "{out}");
+        assert!(exec(&mut m, &mut s, &mut st, "m c000 c004").unwrap().contains("a9 01 4c 00 c0"));
+        assert!(exec(&mut m, &mut s, &mut st, "asm-file noorg.asm c100").unwrap().contains("$c100-$c100"));
+        assert!(exec(&mut m, &mut s, &mut st, "asm-file noorg.asm").unwrap_err().contains("no address"));
+        assert!(exec(&mut m, &mut s, &mut st, "asm-file ../t.asm").unwrap_err().contains("outside"));
     }
 }
