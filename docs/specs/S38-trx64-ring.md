@@ -385,8 +385,14 @@ new picture. Two runs each, without the pictures (the commit before) and with th
 - REU and cartridge writes in the `.c64rering`: the log is the session's, so a file restores TRX64's state and the
   cartridge registers but not the memories (a note says so). TRX64's `RingBufferDump` has no place for it.
 
-- A board `.c64rering` into UE2, and UE2's into the board once its loader takes compressed gzip.
-- Whether `ringdump` should also write the board's subset, so a file from UE2 loads on `trx64/main`.
+- Exchanging files with the board (being built, Alex 2026-10-04): UE2 loads a board `.c64rering`
+  (test file: TRX64-Ultimate `tests/ringdump/board_2026-10-04.c64rering`, 9 anchors) and writes the board's format
+  (stored-block gzip, at most 64 anchors) so `trx64/main` loads it.
+
+**Accepted limits** (Alex, 2026-10-04): a UCI command in flight stays live; a serial transfer across a goto (drives
+live, IEC lines from the anchor); the firmware's own writes into DDR are not undone; reSID and sampler voices keep
+their live state; `rstep` undoes C64 RAM only; the REU's shadow registers and `$FF00` arming; GMod4's serial-flash
+command state.
 
 ## As built
 
