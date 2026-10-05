@@ -10,8 +10,8 @@ Boots the t21-p4-app firmware headless with `--trx-io`, a fresh flash with the C
 - `r`, `z`, `z 5` typed on the screen: the registers are UE2's own (`monitor r`), each step one stop record of REASON 2
   and INSTRS + n;
 - RPC: `selftest`; `read c000 256 cpu` equals `monitor m c000`; `m io dc0d` twice the same (no flag cleared);
-- RPC: `trace status` says the bitstream has no trace former (until S40 phase E) or reports the trace; `rstep` lands
-  on the frame since the selftest's breakpoint;
+- RPC: `trace on`, three steps: `trace status` has records (S40 phase E); `rstep` lands on the frame since the
+  selftest's breakpoint;
 - RPC: `wr d020 05`, then a step: the border colour is 5 (or the refusal of a trxmon older than t21-p4-app 553e2e17
   without the menu's C64_STOP);
 - RPC: `r pc=c000` (the CPU write path's redirect with IPC_SET) and `r a=42` on `STA $0400`, then a step: $0400 = $42
@@ -176,11 +176,16 @@ def smoke(run, client):
         client.selftest(c)
         print('PASS RPC selftest')
         # Right after the selftest's breakpoint: the frame from its snap holds no write from outside.
-        try:
-            tr = c.mon('trace status')
-        except client.TrxmonError as e:
-            tr = str(e)
-        print(f'INFO trace status: {tr.strip()[:160]}')
+        # S40 phase E: the instruction trace (CAPS2 b7, stream 3).
+        print(f"INFO {c.mon('trace on').strip()}")
+        for _ in range(3):
+            c.call('debug/step')
+            c.wait_note('debug/stopped', 2.0)
+        tr = c.mon('trace status')
+        print(f'INFO trace status: {" ".join(tr.split())[:200]}')
+        check('needs the instruction trace' not in tr and re.search(r'ON .* [1-9]\d* of \d+ instructions', tr), f'trace: {tr}')
+        print('PASS trace on: the trace has records')
+        c.mon('trace off')
         rs = c.mon('rstep')
         check('landed' in rs, f'rstep: {rs}')
         print(f'PASS rstep: {rs.splitlines()[0][:100]}')

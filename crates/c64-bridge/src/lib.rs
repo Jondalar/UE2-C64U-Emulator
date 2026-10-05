@@ -669,8 +669,10 @@ impl Trx64Backend {
             if let Some(l) = self.dbg_cycles_left() {
                 b = b.min(l.max(1));
             }
+            // S40 phase E: with the trace on every instruction is taken at its IB, so it runs one at a time.
+            self.trace_boundary();
             // A boundary the debugger looks at is passed with one instruction; the tables apply from the next.
-            let single = self.dbg_single();
+            let single = self.tap.cfg.trace || self.dbg_single();
             let (pc, count) = (self.m.c64_core.reg_pc, self.count_now());
             let mut dobs = dbg_run::DbgObs::new(&mut *obs, &self.dbg, clk, count, pc);
             let stop = self.run_obs_one(b, if single { 1 } else { left }, exec, watch, &mut dobs, !single);

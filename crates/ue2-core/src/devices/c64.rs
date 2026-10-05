@@ -734,7 +734,11 @@ impl C64Port {
         let Some(link) = self.trx.clone() else { return };
         let cfg = {
             let l = trx::lock(&link);
-            EngineCfg { boundaries: l.engine.on || l.sb.cap_every != 0, records: l.engine.on }
+            EngineCfg {
+                boundaries: l.engine.on || l.sb.cap_every != 0,
+                records: l.engine.on,
+                trace: l.engine.on && l.engine.tr_en,
+            }
         };
         if cfg != self.engine_cfg {
             self.engine_cfg = cfg;
@@ -2140,7 +2144,7 @@ mod tests {
         assert_eq!(b.r32(TRX_ADDR + CAP_CTRL), 1, "reads back at once");
         assert!(b.mock.engine.borrow().is_empty(), "the run takes it at the next sync");
         b.tick_at(10);
-        assert_eq!(*b.mock.engine.borrow(), [EngineCfg { boundaries: true, records: false }]);
+        assert_eq!(*b.mock.engine.borrow(), [EngineCfg { boundaries: true, records: false, trace: false }]);
         let mut snap = Snap { cycle: 5, x: 103, line: 0, ..Snap::default() };
         snap.shadow.cpu = [0x0403_0201, 0x0122_E5CF, 0x0037_372F];
         snap.live = [0x0185_E5CF, 0x0403_0201, 0x22];
@@ -2225,7 +2229,7 @@ mod tests {
         assert_eq!(b.r32(p2 + LOG_STAT), 0, "the log goes on at the next sync");
         b.tick_at(10);
         assert_eq!(b.r32(p2 + LOG_STAT), 1);
-        assert_eq!(b.mock.engine.borrow().last(), Some(&EngineCfg { boundaries: true, records: true }));
+        assert_eq!(b.mock.engine.borrow().last(), Some(&EngineCfg { boundaries: true, records: true, trace: false }));
         let ram = |addr: u16, old: u8, new: u8| TapEvent::Ram { addr, old, new, outside: false, cycle: 0 };
         let mut snap = Snap { cycle: 1000, x: 103, line: 0, ..Snap::default() };
         snap.shadow.cpu[1] = 0x0122_E5CF;

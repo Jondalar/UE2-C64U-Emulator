@@ -47,9 +47,9 @@ pub const CAPS: u8 = 0xEF;
 /// CAPS2 b0: the drain writes stream 2's F4 only after a frame's F3 (`trx_ring.cc` `f4_after_blocks`); b2: the CPU
 /// write path (state bus chip 1 w4/w5, the staged words 8-14, `IPC_SET`); b3: the session has the commit list, so the
 /// app sets PROTO around Gideon's protocol (trx_video.cc `has_list`); b4: the lens unit (page 5 `LK_REQ`/`LK_RES`);
-/// b5: the engine applies stream 0 itself (APPLY, `apply_hw`). t21-p4's bitstream reads $BF; b1 (BUILD), b6 (turbo)
-/// and b7 (the instruction trace) are not here.
-pub const CAPS2: u8 = 0x3D;
+/// b5: the engine applies stream 0 itself (APPLY, `apply_hw`). t21-p4's bitstream reads $BF; b1 (BUILD) and b6 (turbo)
+/// are not here; b7: the instruction trace (stream 3, S40 phase E).
+pub const CAPS2: u8 = 0xBD;
 const CAPS_OFF: u32 = 0x004;
 const CAPS2_OFF: u32 = 0x005;
 pub const IRQ_EN: u32 = 0x010;
@@ -1071,7 +1071,7 @@ mod tests {
     fn page_0_reads_id_and_caps_and_other_pages_read_0() {
         let mut r = Rig::new();
         assert_eq!([r.r8(0), r.r8(1), r.r8(2), r.r8(3)], *b"TRX2");
-        assert_eq!((r.r8(4), r.r8(5)), (0xEF, 0x3D), "gate, state bus, engine, debug, session, video, RGB565; F4, CPU write, list, lens, APPLY");
+        assert_eq!((r.r8(4), r.r8(5)), (0xEF, 0xBD), "gate, state bus, engine, debug, session, video, RGB565; F4, CPU write, list, lens, APPLY, trace");
         assert_eq!(r.r32(0x008), 0, "BUILD");
         r.w8(0x4000, 0xFF);
         assert!((0x4000..0x4010).chain(0xF000..0xF004).chain(0x2000..0x2004).chain(0x104..0x140).all(|o| r.r8(o) == 0));

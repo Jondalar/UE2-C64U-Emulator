@@ -40,6 +40,16 @@ pub const AP_CMD: u32 = 0x09C;
 /// `LOG_CTRL` (trx_engine.v:463-471): b0 on, b3:1 taps (b1 outside, b2 cartridge RAM, b3 colour RAM), b8 restart.
 pub const LOG_ON: u32 = 0x001;
 pub const LOG_RESTART: u32 = 0x100;
+/// S40 phase E (t21-p4 trx_engine.v:91-102, :550-553): `LOG_CTRL` b4 the trace on, b9 the pending instruction dropped;
+/// `LOG_CNT[3]` at 0x058, records written; the fixed area at `0x6800000`, 8 MB, 1,048,575 words of 8 bytes (349,525
+/// records of three words, so none straddles the wrap).
+pub const LOG_TRACE: u32 = 0x010;
+pub const LOG_FLUSH: u32 = 0x200;
+pub const LOG_CNT3: u32 = 0x058;
+const BASE3: u32 = 0x68_0000;
+const MASK3: u32 = 0x07_FFFF;
+const WORDS3: u32 = 1_048_575;
+const RECS3_WRAP: u32 = 349_525 * 768;
 const TAP_OUTSIDE: u8 = 0x1;
 const TAP_CART: u8 = 0x2;
 const TAP_COLOUR: u8 = 0x4;
@@ -138,6 +148,24 @@ pub struct Engine {
     pub store: Store,
     /// Bytes the engine wrote below 64 MB, for guest DDR (written when the access hands DDR back).
     pub guest_out: Vec<(u32, u8)>,
+    /// S40 phase E, the trace former: on (`tr_en`), stream 3's word index and records written, and the instruction
+    /// that started at the last IB, waiting for the next one (`N`).
+    pub tr_en: bool,
+    words3: u32,
+    pub cnt3: u32,
+    pending: Option<TraceN>,
+}
+
+/// The trace former's `N` (t21-p4 trx_engine.v:261-277): the instruction that started at the last IB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TraceN {
+    cyc: u32,
+    ws: u32,
+    pc: u16,
+    op: u8,
+    b1: u8,
+    b2: u8,
+    regs: [u8; 5],
 }
 
 impl Default for Engine {
@@ -171,6 +199,10 @@ impl Default for Engine {
             done: 0,
             store: Store::default(),
             guest_out: Vec::new(),
+            tr_en: false,
+            words3: 0,
+            cnt3: 0,
+            pending: None,
         }
     }
 }
@@ -208,6 +240,38 @@ impl Engine {
         self.cnt[s] = (self.cnt[s] + 1) & M28;
     }
 
+    /// One trace word into stream 3 (trx_engine.v:720-723, :838-841): word `words3` at `{0x680000 | (off[26:4] & mask),
+    /// off[3:0]}`, the index wrapping at 1,048,575 words; every third word a record.
+    fn put3(&mut self, w: u64) {
+        let off = self.words3 * 8;
+        let at = ((BASE3 | ((off >> 4) & MASK3)) << 4) | (off & 15);
+        for (i, b) in w.to_le_bytes().into_iter().enumerate() {
+            let a = at + i as u32;
+            self.store.write(a, b);
+            if (a as usize) < crate::bus::RAM_SIZE {
+                self.guest_out.push((a, b));
+            }
+        }
+        self.words3 = if self.words3 + 1 == WORDS3 { 0 } else { self.words3 + 1 };
+    }
+
+    /// An IB with the trace former's feed (trx_engine.v:343-377): the instruction waiting since the last IB goes out
+    /// as three words (`{cycles 24}`, `{write_count 16, pc, 4'd0, write_start 28}`, `{b2, b1, opcode, P, S, Y, X,
+    /// A}`); the new one waits if the trace is on. The write counts are stream 0's records pushed.
+    fn trace(&mut self, cycle: u64, pc: u16, op: u8, b1: u8, b2: u8, regs: [u8; 5]) {
+        if let Some(n) = self.pending.take() {
+            let wc = self.cnt[0].wrapping_sub(n.ws) & 0xFFFF;
+            let [a, x, y, s, p] = n.regs;
+            self.put3(u64::from(n.cyc));
+            self.put3(u64::from(wc) << 48 | u64::from(n.pc) << 32 | u64::from(n.ws & M28));
+            self.put3(u64::from_le_bytes([a, x, y, s, p, n.op, n.b1, n.b2]));
+            self.cnt3 = if self.cnt3 + 1 == RECS3_WRAP { 0 } else { self.cnt3 + 1 };
+        }
+        if self.on && self.tr_en {
+            self.pending = Some(TraceN { cyc: (cycle & 0xFF_FFFF) as u32, ws: self.cnt[0], pc, op, b1, b2, regs });
+        }
+    }
+
     /// A stream 0 record by index, from the store.
     pub fn rec0(&self, n: u32) -> u32 {
         let at = self.place(0, n);
@@ -242,6 +306,7 @@ impl Engine {
                 }
             }
             TapEvent::Reu => self.reu = true,
+            TapEvent::Trace { cycle, pc, op, b1, b2, regs } => self.trace(cycle, pc, op, b1, b2, regs),
             // The debug block's log action takes LOG_PUT's holding register: with the log on, a stream 1 record.
             TapEvent::DbgLog(rec) => {
                 if on {
@@ -301,6 +366,7 @@ impl Engine {
             FRAME => self.frame,
             DROPPED => u32::from(self.dropped),
             o if o >= LOG_CNT && o <= LOG_CNT + 0x20 && (o - LOG_CNT) % 0x10 == 0 => self.cnt[((o - LOG_CNT) / 0x10) as usize],
+            LOG_CNT3 => self.cnt3,
             ENG_CMD => 0,
             AP_CMD => u32::from(!self.ap_jobs.is_empty()),
             _ => 0,
@@ -314,9 +380,14 @@ impl Engine {
             LOG_CTRL => {
                 self.on = v & LOG_ON != 0;
                 self.taps = (v >> 1 & 7) as u8;
+                self.tr_en = v & LOG_TRACE != 0;
+                if v & LOG_FLUSH != 0 {
+                    self.pending = None;
+                }
                 if v & LOG_RESTART != 0 {
                     (self.frame, self.dropped, self.gap, self.ext) = (0, 0, false, false);
                     self.cnt = [0; 3];
+                    (self.words3, self.cnt3, self.pending) = (0, 0, None);
                 }
             }
             o if (LOG_BASE..=LOG_MASK + 0x20).contains(&o) && (o - LOG_BASE) % 0x10 <= 4 => {
@@ -607,6 +678,38 @@ mod tests {
     }
 
     /// Registers: write-only ones read 0, the counts `{4'd0, 28}`.
+    /// S40 phase E (t21-p4 trx_engine.v:91-102, :343-377, :720-723, :838-841): with the trace on, instruction I's record
+    /// goes out at I+1's IB as three words at `0x6800000`: the count after I's fetch, `{write_count, pc, write_start}`
+    /// over stream 0's records, `{b2, b1, opcode, P, S, Y, X, A}`; `LOG_CNT[3]` counts records; b9 drops the waiting
+    /// instruction; the restart zeroes the counts; off, nothing waits.
+    #[test]
+    fn the_instruction_trace() {
+        let mut e = Engine::default();
+        let word = |e: &Engine, w: u32| u64::from_le_bytes(std::array::from_fn(|i| e.store.read(0x680_0000 + 8 * w + i as u32)));
+        let tr = |pc: u16, cycle: u64| TapEvent::Trace { cycle, pc, op: 0x8D, b1: 0x00, b2: 0x04, regs: [1, 2, 3, 0xF3, 0x22] };
+        e.tap(&tr(0xC000, 5));
+        assert_eq!(e.read(LOG_CNT3), 0, "the trace is off: nothing waits");
+        e.write(LOG_CTRL, LOG_ON | LOG_TRACE);
+        e.tap(&tr(0xC000, 100));
+        e.tap(&ram(0x0400, 0, 1, false));
+        e.tap(&ram(0x0401, 0, 2, false));
+        e.tap(&tr(0xC003, 104));
+        assert_eq!(e.read(LOG_CNT3), 1);
+        assert_eq!(word(&e, 0), 100);
+        assert_eq!(word(&e, 1), 2 << 48 | 0xC000 << 32, "two writes from stream 0 record 0");
+        assert_eq!(word(&e, 2), 0x0400_8D22_F303_0201);
+        e.tap(&ram(0x0402, 0, 3, false));
+        e.tap(&tr(0xC006, 108));
+        assert_eq!((word(&e, 4), e.read(LOG_CNT3)), (1 << 48 | 0xC003 << 32 | 2, 2));
+        e.write(LOG_CTRL, LOG_ON | LOG_TRACE | LOG_FLUSH);
+        e.tap(&tr(0xC009, 112));
+        assert_eq!(e.read(LOG_CNT3), 2, "b9 dropped the waiting instruction");
+        e.write(LOG_CTRL, LOG_ON | LOG_RESTART);
+        assert_eq!(e.read(LOG_CNT3), 0);
+        e.tap(&tr(0xC00C, 116));
+        assert_eq!(e.read(LOG_CNT3), 0, "b4 off: no record waits");
+    }
+
     #[test]
     fn register_reads() {
         let mut e = Engine::default();

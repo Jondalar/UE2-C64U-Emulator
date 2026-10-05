@@ -50,7 +50,8 @@ One line per feature, as of 0.5.1 (TRX64 v0.12.5). Details: `docs/status/`, spec
 - TRX64-Ultimate's engine (`--trx-io`): the board's frame ring and Timewarp for the firmware, REST rewind and scrub
   (S40, M1).
 - TRX64-Ultimate's debug block (`--trx-io`): trxmon, the board's monitor app, runs with breakpoints, watch units,
-  steps, the CPU write path, the lens unit and the debugger's session (S39; stops at instruction boundaries).
+  steps, the CPU write path, the lens unit, the debugger's session and the instruction trace (S39, S40 phase E; stops at
+  instruction boundaries).
 - REU on the firmware's DDR, preload and "Save REU"; GeoRAM.
 
 ## Cartridges
