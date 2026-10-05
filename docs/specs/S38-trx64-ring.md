@@ -272,11 +272,10 @@ Over the control port (`monitor <line>`) and the MCP tool `emu_monitor`, the sam
   - To the board: REST `/v1/timewarp:*` and `/v1/machine:readmem?lens=`, plus trxmon's WebSocket JSON-RPC on port
     4312.
   - To UE2: the control port's `monitor` lines or the MCP tool `emu_monitor`, as text.
-  - On UE2 the firmware's own `/v1/timewarp:*` answers 503 "No frame ring in this bitstream": the routes need CAPS
-    b2 (engine), and the lens route needs CAPS b1. UE2's CAPS (`$E1` with `--trx-io`) has neither, and trxmon needs
-    CAPS b3. UE2 does not fake them: the engine is not modelled.
+  - Since S40 UE2 serves the board's engine and state bus (CAPS `$E7` with `--trx-io`): the firmware's own
+    `/v1/timewarp:*` and the lens route answer as on the board. trxmon needs CAPS b3 (S39 phase A2).
 - **The board ring does not pause in turbo or on a reset** (no such code in `trx_ring.cc`). UE2 follows TRX64 and
-  Alex's ruling: it stands in turbo, while held and on a reset.
+  Alex's ruling: it stands in turbo, while held and on a reset. With `--trx-io` there is no turbo (S40 §0).
 
 ## 8. Cost
 
