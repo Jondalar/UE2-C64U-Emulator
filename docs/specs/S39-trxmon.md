@@ -1,0 +1,441 @@
+# S39 — trxmon in UE2: the debug block served from TRX64
+
+**Status:** spec (2026-10-05), local branch `s37-trx-pixel-layer`, not built. Waits for answers in §7.
+
+**Why:** the TRX64-Ultimate firmware session must test trxmon (the T21 monitor app) in UE2 as on the board: the
+monitor screen on the overlay (T21 §8), opened from the task menu or Ctrl-O and reopened by `trx->ui_request` when a
+stop fires, and every verb giving real data. UE2 runs the unmodified firmware and the unmodified `trxmon.u2a`. It
+presents the FPGA's register interface that trxmon uses (pages 0, 1, 3, 5) and serves it from TRX64 (`trx64-core`,
+pinned v0.12.3).
+
+**Reads** (code and RTL are the truth; comments are not evidence):
+- RTL, TRX64-Ultimate branch **`t21-p4`** (fa09f06, **not merged into main**): `designs/c64_basic/trx_sys.v`,
+  `trx_dbg.v`, `drv_dbg.v`, `freeze_resp.v`, `c64_core.v`, `trx_io.v`, `top.v`. Line numbers below are of that branch.
+- App, `software/ultimate-app` branch **`t21-p4-app`** (ec4a7327, **not merged into `trx64/main`**; `t21-p4` pins
+  it): `apps/trxmon/src/{hw_trx.c, hw.h, mach.c, main.c, mon.c, rpc.c, ring.c, trace.c, ui.c}`,
+  `software/io/c64/trx_lens.c`, `software/app_loader/{app_api.h, app_api_net.cc, app_registry.cc}`,
+  `software/io/c64/{trx_io.cc, trx_ui.cc, trx_lens_fw.cc, c64.cc}`.
+- Specs (for intent only): `docs/specs/T21-monitor.md` (t21-p4), `T12-freeze-overlay.md` §14.8,
+  `ARCH-lean-state-access.md`.
+- UE2: S37, S38, `crates/ue2-core/src/devices/{trx.rs, trx_session.rs, c64.rs, drives.rs}`, `crates/c64-bridge/src/lib.rs`,
+  `crates/ue2emu/src/monitor`.
+
+**Owns:**
+- `crates/ue2-core/src/devices/trx.rs`: pages 0 (0x104-0x13F), 1, 3 and page 5's `LK_REQ`/`LK_RES`.
+- `crates/ue2-core/src/devices/trx_dbg.rs` (new): `trx_dbg.v` and `drv_dbg.v` as a model: commands, the stop record,
+  the bitmap, the two watch units, the counters, the drive comparator.
+- `crates/ue2-core/src/devices/c64.rs`: OWNER and the debugger's hold in the gate, the shadows, the capture.
+- `crates/ue2-core/src/devices/trx_session.rs`: the debugger's stop as a second session cause.
+- `crates/c64-bridge`: the stop sources on TRX64's run loop, steps, the CPU write, the drive's comparator and step,
+  the shadow words, the class look.
+- `crates/ue2emu/src/monitor`: `monitor trx` shows pages 1 and 3; run control refused while trxmon owns the C64.
+
+## 1. What trxmon touches
+
+trxmon reaches the block only through `hw_trx.c` and `trx_lens.c`. Every register below is one of theirs; nothing
+else in the app touches pages 0-7. All 32-bit registers follow `trx_sys.v`'s rule (trx_sys.v:281-292): bytes 0-2
+written are collected, byte 3 commits the word; reading byte 0 runs the read and latches the word, bytes 1-3 come
+from the latch. A commit answers 0, which the latch then holds (trx_sys.v:347, :387). Pages 0 (from 0x100), 1, 2,
+3, 5, 7 share one collect buffer and one latch (trx_sys.v:194-195). S37 built this rule; S39 adds registers to it.
+
+### 1.1 Page 0
+
+| Off | Name | trxmon | RTL |
+|---|---|---|---|
+| 004 | `CAPS` | read through `trx->caps` (`hw_init` needs b3) | trx_io.v:231 |
+| 005 | `CAPS2` | b2 (`hw_has_cpu_write`), b3 (`hw_session_read`), b4 (`hw_has_lk`) | trx_io.v:232 |
+| 100 | `GATE_CTRL` | not by trxmon; the firmware's freeze (S37) | trx_sys.v:218, :316 |
+| 118 | `OWNER` | W b0 (`hw_owner`, and `trx->acquire`/`release`) | trx_dbg.v:334; masks C64_STOP: top.v:1072 |
+| 120 | `CYCLES` | R; the byte-0 read latches bits 47:32 into `CYCLES_HI` | trx_dbg.v:296, :331, :393 |
+| 124 | `CYCLES_HI` | R | trx_dbg.v:394 |
+| 128 | `INSTRS` | R: IBs passed | trx_dbg.v:297-298, :395 |
+| 130 | `CYC_CMP` | W: arms, one shot | trx_dbg.v:165, :307, :335 |
+| 134 | `CYC_CMP_EN` | W 0: disarm | trx_dbg.v:336 |
+
+`CYCLES` counts every phi2 falling edge the gate lets through: runs, steps and the window's bus cycles while halted
+(trx_dbg.v:296, edge = `ce && phi2n`). It is not reset by a C64 reset. Write-only registers read 0
+(trx_dbg.v:390-404).
+
+### 1.2 Page 1, the state bus
+
+| Off | Name | trxmon | RTL |
+|---|---|---|---|
+| 000 | `SB_ADDR` | W `{chip b11:7, word b6:0}` | trx_sys.v:319 |
+| 004 | `SB_DATA` | R: the word, then `SB_ADDR` + 1 (a block read of n words). W: staged word, then + 1; only while the gate is shut, else `SB_STATUS` b1 | trx_sys.v:320-326, :361-367 |
+| 008 | `SB_STATUS` | R b1 refused; W clears b1 (`hw_cpu_write`) | trx_sys.v:226, :335 |
+| 00C | `SB_LOAD` | W b1: the CPU's staged words load at the next opening edge. R: still armed (`hw_cpu_write_pending`) | trx_sys.v:224, :327; c64_core.v:402-403 |
+
+The words trxmon and `trx_lens.c` read (c64_core.v:600-629, :742-780):
+
+| Chip.word | Contents | Reader |
+|---|---|---|
+| 0.0 | b0 halted, b1 GAME, b2 EXROM, b3 cartridge present, b4 held, b31:16 capture count | `lens_snapshot` |
+| 1.0 | `{S, Y, X, A}` | `hw_cpu` |
+| 1.1 | `{sync b24, P b23:16, PC}` | `hw_cpu` |
+| 1.2 | `{$01 as read, $01 latch, $00}` | `hw_cpu`, `lens_snapshot` |
+| 1.3 | `{IB b24, opcode at IPC b23:16, IPC}`, live | `hw_cpu` |
+| 1.4, 1.5 | `{S, Y, X, A}`, `{P}` after the CPU's pending update (the settled registers), live | `hw_cpu` with CAPS2 b2, gate shut, at an IB |
+| 1.8-1.14 | the 6502N's 209 flip-flops; trxmon uses A 7:0, X 15:8, Y 23:16, S 31:24, P 39:32, PC 55:40, IR 87:80, proc_control from 102 (+12 `copy_d2p`, +15 `flags_update`, +16 `trigger_upd`, +18 `intg`), `din_r` 137:130 | `hw_cpu_write` (read-modify-write), `hw_cpu_fetch` (ring land only) |
+| 2.0-2.11 | VIC `$D000-$D02F` as a read returns them, without the read's side effect | `lens_snapshot` |
+| 3.0-3.3, 4.0-4.3 | CIA 1, 2 registers 0-15 as a read returns them | `lens_snapshot` |
+| 3.4, 4.4 | `{DDRB, DDRA, PB out, PA out}` | `lens_snapshot` (CIA 2: the VIC bank) |
+| 7.0 | `{reg_1, reg_0}` of icepi's cartridge model (meaning per type, `c64_cartridge.v`) | `bank` verb (`reg_0 & $7F`) |
+
+**When the words move.** Words 0.0 (but b0), 1.0-1.2, 1.8-1.14, 2.x, 3.x, 4.x, 7.0 are shadows: loaded one clock
+after a frame's snap when a capture is due, and on every clock while the gate is shut (c64_core.v:660-664,
+:696-706). While the machine runs without captures they keep the state of the last halt. 0.0 b0, 1.3, 1.4, 1.5 are
+live (c64_core.v:746-749, :774).
+
+### 1.3 Page 3, the debug block
+
+| Off | Name | trxmon | RTL |
+|---|---|---|---|
+| 000 | `CMD` | 1 PAUSE_CB, 2 PAUSE_IB, 3 RUN, 5 STEP_INSTR, 6 STEP_CYCLES, 0x10 DRV_PAUSE (not used), 0x11 DRV_RUN (not used), 0x12 DRV_STEP, 0x20 CLEAR_STOP | trx_dbg.v:340-363; drv_dbg.v:55-61 |
+| 004 | `ARG` | W step count, 0 = 1 (written before CMD) | trx_dbg.v:337, :374; drv_dbg.v:53 |
+| 008 | `STATUS` | R b0 gate shut, b2 at an IB, b3 STOP_NEW, b4 held by DMA, b5 C64_STOP, b6 hold off but still shut, b7 step running or requested, b11:8 REASON, b12 RUN/step requested, b16/b17 units on, b18 bitmap on, b19 CYC_CMP armed, b20 OWNER, b31:24 stops | trx_dbg.v:396-397 |
+| 010 | `STOP0` | `{POS 31:16, DATA, FLAGS 3, UNIT 1, REASON 4}` | trx_dbg.v:319-328, :398 |
+| 014 | `STOP1` | `{ADDR, IPC}` | trx_dbg.v:399 |
+| 018 | `IPC_SET` | W `{IB b24, opcode, IPC}` after a CPU redirect | trx_dbg.v:301-306 |
+| 040 | `BMP_IDX` | W | trx_dbg.v:338 |
+| 044 | `BMP_DATA` | W the word, then `BMP_IDX` + 1 | trx_dbg.v:173-182, :333 |
+| 048 | `DBG_CTRL` | W b0 bitmap on | trx_dbg.v:339 |
+| 080 + 0x20 n | unit n: CTRL, RANGE, DATA, REG, PASS, HITS-clear | `hw_unit`, `hw_unit_off` | trx_dbg.v:195-248 |
+| 0B4 | `HITS` | not used by trxmon | trx_dbg.v:401 |
+| 0C0 | `DRV_CMP` | W `{type b17, enable b16, address}`; trxmon writes exec only | drv_dbg.v:54, :73-74 |
+| 0C4 | `DRV_STAT` | R `{DPC 31:16, b3 comparator on, b2 step, b1 held, b0 halted}` | drv_dbg.v:123 |
+| 0C8 | `DCYCLES` | R | drv_dbg.v:124 |
+
+**Rules that trxmon depends on** (trx_dbg.v):
+- **IB** = the phi2 falling edge that ends an opcode fetch the CPU completes (sync, RDY, CPU on the bus) with no
+  interrupt decided (`intg` 0) (:152). A fetch replaced by an interrupt is no IB; the next IB is the handler's first
+  opcode. IPC, the opcode and the IB flag are taken at every IB (:297-305).
+- **Stops close the gate on the edge they see** (`brk`, :268; c64_core.v:368-369): exact, no stop is late.
+  Sources: watch unit stop actions, bitmap hit at an IB, `CYC_CMP` (the edge that passes while `CYCLES[31:0]`
+  equals it, :165), a step's last counted edge, PAUSE_IB at the next IB, PAUSE_CB at the next edge, the drive
+  comparator (at the next edge).
+- **The stop record** is written only while STOP_NEW is 0 (:285, :319-328). PAUSE_CB on a shut gate sets STOP_NEW
+  and REASON 1 only, and leaves the other fields as they were (:344-345).
+- **RUN, STEP_INSTR, STEP_CYCLES are requests** (t21-p4): STOP_NEW clears at once; the release or the step starts
+  only when `freeze_resp` reports no session and no commit (`sess_busy`, :365-381). Steps need the gate shut and no
+  step running (:355). STEP_INSTR counts IBs, STEP_CYCLES counts edges (:258).
+- **Every stop raises `IRQ_CAUSE` b0** (`ev`, :295; top.v:1328), as the pause does.
+- **Watch unit match** (:229-235): type 1 IB, 2 read (`cyc && !we && !sync`: operand and dummy reads count, opcode
+  fetches do not), 3 write, 4 read or write, 5 every edge; value = address or `{line, cycle}` (b4); range, data mask,
+  register qualifier against the registers of the cycle that ends at the edge (on an IB edge that is before the
+  previous instruction's write-back), PREV_RET (opcode at the last IB was RTS/RTI), PASS against HITS, chain,
+  one-shot (:212). Actions: stop, count, log (engine stream 1).
+- **trxmon's own use** (mach.c): the bitmap for `bk` and exec observers; unit type 2/3 over a range for load/store
+  observers; `until` = unit 0 type IB one-shot; `n` = unit 0 IB at the return address with S >= S0, unit 1 any IB
+  with S >= S0 + 1; `ret` = unit 0 IB, PREV_RET, S >= S0 + 1. No raster, every-edge, count, log, chain, PASS or data
+  mask.
+
+### 1.4 Page 5, the lens unit (`freeze_resp.v`)
+
+| Off | Name | trxmon | RTL |
+|---|---|---|---|
+| 004 | `SH_STATUS` | b0 a session runs (`hw_session_read`); b2 the session is the debugger's stop | trx_sys.v:233 |
+| 020 | `LK_REQ` | W `{REAL b18, class b17:16, address}`, ignored while busy | trx_sys.v:337; freeze_resp.v:581-586 |
+| 024 | `LK_RES` | R `{busy b31, refused b12, real b11, ext b10, hit b9, done b8, data}`; polled until b31 is 0 | freeze_resp.v:234 |
+
+- **Look** (REAL 0): the cartridge model at the address as class 0 ROML, 1 ROMH, 2 IO1, 3 IO2, whatever the PLA maps;
+  no write, no bus cycle, also while running. No hit: data `$FF`. A cartridge on the physical port: `ext`, data `$FF`
+  (freeze_resp.v:750-783).
+- **REAL**: one bus cycle with the select forced, the app's Ultimax off for it, only while halted; else `refused`
+  (freeze_resp.v:599-618, :785-795).
+
+### 1.5 Not on the block
+
+- **RAM**: the DMA window `0x10050000` with `C64_DMA_MEMONLY` (`0x10180003`) set around the access
+  (`memonly_on`). UE2 has both (S14, S28).
+- **ROMs**: the apertures `0x10188000` (BASIC, KERNAL) and `0x1018C000` (char). UE2 has them.
+- **Drive A**: DDR `0x0EE0000`, RAM mirrored below `$1800`, the VIAs `--`. UE2 mirrors the drive's RAM there every
+  1 ms (drives.rs `tick`) and keeps the ROM there; exact while the drive stands.
+- **I/O writes and old-bitstream sidefx reads**: the window without MEMONLY, only when STATUS b0 and b5 (C64_STOP)
+  are set (`bus_ok`). In a session that access is answered by the responder (S37 B2).
+- **Colour RAM**: `hw_session_read` = the window without MEMONLY, with CAPS2 b3, `SH_STATUS` b0 and STATUS b0. It
+  goes through `hw_bus_read`, which also needs b5 (§7 Q5).
+
+## 2. CAPS and CAPS2
+
+**`CAPS` = `$EB`** (S37: `$E1`): b0 gate, **b1 state bus**, **b3 debug**, b5 session, b6 video, b7 RGB565.
+**`CAPS2` = `$1C`** (S37: `$08`): **b2 CPU write path**, b3 session with commit list, **b4 lens unit**.
+
+The board reads `$FF` / `$BF` (trx_io.v:231-232). Each bit UE2 reports turns on firmware and app paths:
+
+| Bit | Turns on | UE2 |
+|---|---|---|
+| CAPS b1 state bus | trx_ui.cc `have_pc`: the splash waits for READY by state-bus PC with `CAP_CTRL` captures (page 0 0x104) instead of 3 s; trx_lens_fw.cc `trx_lens_present`: REST `machine:readmem?lens=` | report; build `CAP_CTRL`/`CAP_STAT` and the snap capture (§3.2) |
+| CAPS b3 debug | `app_trx_table()` non-NULL (the `trx` ABI table, so trxmon starts); `trx_dbg_yield` in `C64::stop`/`hard_stop` reads page 3 and gives OWNER back | report |
+| CAPS2 b2 | trxmon's `r a=…`, `g <addr>`, settled registers (w4/w5) | report |
+| CAPS2 b4 | the `cart` lens and IO1/IO2 through the look (trxmon, REST lens) | report |
+| CAPS b2 engine | `trx_ring_init` (the ring, page 2, DDR streams), `trx->ring` non-NULL, Timewarp UI, `/v1/timewarp` | **off**: S38 decided TRX64's rings, not the engine |
+| CAPS b4 cartridge | trx_cart.cc page 4 write-back and descriptor | off (UE2 runs Gideon's cartridge registers) |
+| CAPS2 b7 trace | `trx_ring_trace_present` needs the ring as well | off |
+| CAPS2 b0, b1, b5, b6 | engine F4 order, BUILD, APPLY, T29 turbo | off |
+
+**Without the engine** (`trx->ring` is NULL, `trx_ring_trace_present()` false) trxmon answers with the board's own
+text, exactly as a bitstream without CAPS b2 would: the ring verbs and `checkpoint/*` "no frame ring (the bitstream
+has no engine, or the firmware no ring table)" (ring.c, rpc.c), the trace verbs (`trace`, `chis`, `whowrote`,
+`triage`, `tracering`, `revdepth`, `runtime/who_wrote`, …) "needs the instruction trace" (trace.c). trxmon never
+touches page 2 itself; with b2 off nothing calls it. So these verbs do not return data in UE2; UE2's own monitor has
+their TRX64 forms (S38 §5). This is the one exception to "every verb" (§7 Q1).
+
+`trx->video` works without the engine (app_api_net.cc `api_video` reads the System Mode). `GET /v1/info` and the
+ident then say `caps "0x000000EB"` and `rpc 4312` while trxmon serves.
+
+S38 §7 ("UE2 does not fake them") changes for b1 and b3: they are served, not faked. b2 stays off.
+
+## 3. How UE2 serves each register
+
+### 3.1 The gate and the debugger's hold
+
+The RTL has one gate (c64_core.v:354): the machine runs when no `halt_req`, no `pos_hold` and no `dbg_hold`.
+`halt_req` = JTAG or `C64_STOP & FRZ & !OWNER` (top.v:1072-1073). The CPU-only pause is `C64_STOP & !FRZ & !OWNER`
+(top.v:1237). The mute stays `halted | C64_STOP` with the raw C64_STOP (top.v:1059; S37 "the mute").
+
+UE2 (`C64Port`):
+- **OWNER** masks C64_STOP for both the pause and `Hold::Cpu`. C64_STOP still reads `req | req<<1` (S14) and still
+  mutes.
+- **The debugger's hold** stands the whole machine with the bridge's pause (S37 `set_paused`), the same mechanism as
+  FRZ: CPU, VIC, CIAs, SID, drive A stand; the DMA window, keys and ROM apertures are served.
+- **halted** (`GATE_CTRL` b8/b9, chip 0 b0, STATUS b0) = the pause or the debugger's hold in effect.
+- **RUN** resumes at once (S37 B1 accepted this for the freeze); STATUS b6 is never seen.
+
+### 3.2 The shadows and the capture
+
+UE2 keeps a shadow set with the RTL's words (chips 0, 1, 2, 3, 4, 7), built from TRX64 at each of these points:
+- whenever the gate is shut: at the stop, after every window access, step, CPU load or session commit while halted;
+- at a capture: with `CAP_CTRL` = n ≠ 0, on every n-th frame at the first instruction boundary on line 0 from cycle 12
+  (S38's frame boundary stop is the same point). `CAP_STAT` low half counts captures and halts (c64_core.v:692), the
+  high half the frames that had no snap. `IRQ_CAUSE` b3 is raised at both (trx_io.v cause b3).
+
+Between those points the shadows hold, as on the board. Built from TRX64:
+
+| Word | From |
+|---|---|
+| 0.0 | `halted` (live), `cart_lines()` (present, EXROM, GAME), held = 0 (§5 T8), capture count |
+| 1.0, 1.4, 1.5 | TRX64's `reg_a/x/y/sp`, `status()`. TRX64 has only the settled registers, so 1.0 = 1.4 (§6) |
+| 1.1 | PC = IPC + 1 at an IB, else TRX64's `reg_pc` (§7 Q4); P; sync = 0 |
+| 1.2 | `$00` DDR, `$01` latch, `$01` as read (pins for the bits not driven) |
+| 1.3 | the model's IPC, opcode, IB flag (§3.3), live |
+| 1.8-1.14 | a synthesized image: A, X, Y, S, P, PC = IPC, IR = opcode at IPC, proc_control state = decode, `intg` 0, `din_r` = opcode; every other bit 0 (§3.4) |
+| 2.0-2.11 | `io_peek($D000+r)` for r < 48: no IRQ latch, collision or ICR cleared |
+| 3.x, 4.x | `cia_regs`, the TOD as a read shows it (latched or running); w4 the CIA's port outputs and DDRs |
+| 7.0 | the cartridge logic's banking registers mapped onto `c64_cartridge.v`'s `reg_0`/`reg_1` per type (§7 Q10). Without a mapping: 0 |
+
+Other chips and words read 0 (c64_core.v:772-781).
+
+### 3.3 The debug model on TRX64
+
+`trx_dbg.rs` holds the registers and the stop logic; the bridge runs TRX64 and reports the events. TRX64 runs whole
+instructions (`run_for_full_capped_dbg`, `execute_one`), so UE2's edges are TRX64's instruction boundaries:
+
+| RTL | UE2 on TRX64 |
+|---|---|
+| IB edge | a TRX64 boundary whose next `execute` takes no interrupt. UE2's IB state = TRX64 before the instruction at `reg_pc`: IPC = `reg_pc`, opcode = the byte there (peek through the PLA), IB flag 1. TRX64's registers are then the settled ones (w4/w5) |
+| `CYCLES` | UE2's own 48-bit counter: + the cycles of each run and step (TRX64 `clk` deltas), + 1 per window bus cycle while halted. At an IB stop it reads like the RTL: the opcode fetch counted (TRX64 `clk` − base + 1). A ring restore (S38 `goto`) does not move it |
+| `INSTRS` | + 1 per retired instruction (`on_instruction`); interrupt sequences do not count |
+| bitmap stop | the `exec_watch` table (TRX64's own break-before-execute), skipped at a boundary that takes an interrupt (the RTL's dummy fetch is no IB) |
+| unit, type 1 IB | evaluated at each UE2 IB against IPC, the opcode (data) and the settled registers; PREV_RET from the last IB's opcode |
+| unit, type 2/3/4 | the `access_watch` table over the range, `on_access` with value and registers; the stop lands at the **next** IB (§5 T1). Record: REASON 5, ADDR and DATA of the access, FLAGS b0 = 1 |
+| unit, type 5, raster source | refused: the unit stays disabled and `monitor trx` says so (§5 T1). trxmon does not use them |
+| unit actions count, log | count: HITS only. log: HITS only (no engine stream) |
+| `CYC_CMP` | the run's cycle budget ends at the first boundary at or after the cycle; the record says REASON 7 and, if that is past the asked cycle, `CYCLES` shows where it stood (§5 T1). trxmon's `session/run` then finds the stop at an IB and needs no extra step |
+| PAUSE_IB | stop at the next IB |
+| PAUSE_CB | the same as PAUSE_IB (§5 T1); REASON 1; on a shut gate only STOP_NEW and REASON 1, as trx_dbg.v:344-345 |
+| STEP_INSTR n | n instructions with the hold kept, stop at the n-th IB after them; REASON 2. An interrupt taken on the way: §5 T2 |
+| STEP_CYCLES n | rounded up to whole instructions; REASON 2 (§5 T1) |
+| RUN | commit the session list (§3.6), clear the hold, run on |
+| `IRQ_CAUSE` b0 | at each stop and each record, as trx_dbg.v:295 |
+| `held` (STATUS b4, FLAGS b2) | 0 (§5 T8) |
+
+**The stop record** is written as trx_dbg.v:319-328: only while STOP_NEW is 0; POS = `{raster line, cycle in the
+line}` at the stop (TRX64's VIC position); ADDR = the access address for unit stops, else IPC; DATA = the opcode at
+an IB, the access's byte for unit stops.
+
+**Ordering.** Commands are applied when their byte 3 is written, at the C64's current cycle (the C64 runs up to the
+access first, as S37 does for `GATE_CTRL`).
+
+### 3.4 The CPU write path
+
+- **Settled words** 1.4/1.5 are TRX64's registers (§3.2).
+- **Staging**: `SB_DATA` writes to chip 1 words 8-14 are kept while `SB_STATUS` b0 (refused otherwise, b1).
+  `SB_LOAD` b1 arms the load; it reads armed until the next opening (RUN or a step), as c64_core.v:402-403.
+- **The load**, at the next opening, before TRX64 runs: A, X, Y, S, P from bits 0-39 into TRX64; if the PC field
+  differs from the served one (IPC), `set_pc(PC field)`: TRX64 fetches the opcode there itself (`din_r` is what the
+  RTL's update takes; trxmon writes the byte at that address, so they agree unless it is I/O, which trxmon refuses).
+  IR, `copy_d2p`, `flags_update`, `trigger_upd` are not used: TRX64 has no pending write-back to take out. Then
+  `sync_after_monitor`.
+- **`IPC_SET`** sets IPC, opcode and the IB flag at once (trx_dbg.v:301-306); STATUS b2 and word 1.3 follow.
+- CIA staging (chips 3, 4) and `SB_LOAD` b3/b4 are only used by the engine's restore: accepted, ignored.
+
+### 3.5 The drive
+
+| RTL (drv_dbg.v) | UE2 |
+|---|---|
+| `DRV_CMP` exec at the drive's IB: hold the drive, stop the C64 at its next edge (REASON 8, FLAGS b1) | the drive's PC per drive instruction (§5 T5); the C64 stops at its next IB |
+| `DRV_CMP` write | refused: disabled, said in `monitor trx` (§5 T5). trxmon does not write it |
+| DRV_STEP n: the drive alone, the C64 stays; record REASON 9 | the drive runs n instructions while the C64 stands (§5 T5) |
+| DRV_PAUSE, DRV_RUN, RUN releases the drive | the drive's own hold beside the machine's |
+| `DRV_STAT` DPC, comparator on, step, held, halted (halted = the machine's pause or the drive's hold) | from TRX64's drive CPU |
+| `DCYCLES` | drive CPU cycles UE2 counts |
+
+### 3.6 The debugger's stop is a session (T12 §14.8)
+
+On t21-p4 a debugger stop starts the freeze session (freeze_resp.v:209-224): cause `dbg_stop` = hold, halted, no
+step; `SH_MODE` 1 or 2, no C64_STOP and no Ultimax needed. It lasts while the hold does and no RUN or step is
+requested. At its end the list is committed as bus cycles before the machine moves. `SH_STATUS` b2 says the session
+is the debugger's. `block` is set at every end of such a session and clears when `dbg_stop` falls (:546, :884).
+
+UE2's `Session` (S37 B2) gets this second cause. The window's non-MEMONLY accesses in the stop are answered as in a
+freeze (VIC, CIA, colour RAM, the cartridge look; SID `$FF`); writes go to the overlay and the list (PROTO is not
+set). RUN and the steps run `end` (the list as TRX64 banked writes, S37) inside the command's access, then release
+or step, so STATUS b12 is never seen. `SIDEFX` (SH_CTRL b2) makes I/O accesses real, as in a freeze.
+
+This is t21-p4 only. On `main` a debugger stop has no session and a window read in the stop is a bus cycle with its
+side effects. UE2 builds t21-p4 (§7 Q2).
+
+### 3.7 The lens unit
+
+- **Look**: a class-aware peek of UE2's cartridge logic and the port's devices (the UCI, the REU, the sampler): ROML
+  or ROMH as the class says at that address whatever the PLA maps, IO1/IO2 as `cart_peek` answers them today.
+  `CartPeek::External` (a physical cartridge in `--cart-slot`) is `ext`. `cart_peek` takes only an address now; the
+  class form is new (§5, UE2 gap U1).
+- **REAL**: only while halted, else `refused`. One access to the physical slot with the select forced, through
+  `C64CartSlot` (its side effects are the cartridge's own).
+- Answers come at once: `busy` never reads 1.
+
+### 3.8 One owner of halt and step
+
+| Who | Mechanism | While trxmon owns (OWNER) |
+|---|---|---|
+| the firmware (menu, DMA load, REST pause) | C64_STOP; `C64::stop`/`hard_stop` call `trx_dbg_yield` first (OWNER 0, RUN) | as on the board |
+| the freeze | FRZ + C64_STOP (S37) | the firmware yields first, so it is the freeze |
+| trxmon | page 3 hold, steps, RUN | owner |
+| UE2's monitor: `c64 halt/go/step`, `g`, `z`, `n`, `until`, `ret` | C64_STOP and out-of-band runs (run.rs) | **refused**: "trxmon owns run control (OWNER); use it, or /quit it". Reading verbs work |
+| S38 transport: `goto`, `frame`, `ringload`, `rstep` | the transport hold | **refused**, same sentence |
+| S38 rings | record while the C64 runs at 1 MHz | runs and steps of trxmon record; stops stand |
+| an OWNER write while the transport holds an anchor | | releases the transport (S38 §4 release: cut after the anchor); the C64 stays where it is, now held by the debugger |
+
+The VICE binary monitor port (S23) follows the same refusal for its run commands.
+
+## 4. The screen and the app around it
+
+Nothing new is needed in UE2 for the screen itself:
+- `screen_open_full` draws on Gideon's overlay; with `--trx-io` UE2 draws it as `overlay.v` does (S37 B3), and the
+  running layout's transparent rows (TRANSPARENCY `$C0`, colour 0) show the C64 at half brightness, as on the board.
+- `trx->ui_request` needs `app_ui_overlay_ready()`: the overlay interface ("Overlay on HDMI"), which UE2 seeds into a
+  blank flash (S37 §5).
+- The app loader runs `.u2a` files from the SD/USB images already (docs/status/cart-slot.md: `trex_crt.u2a`); "Run
+  App" registers trxmon in `/Flash/config/apps.json` and its task under Developer.
+- RPC: the firmware's lwIP on `--net user`, `--hostfwd tcp:127.0.0.1:4312:4312`.
+- The 80-column screen (T21, decision 2026-10-05) needs an `overlay.v` mode and an ABI call that do not exist yet
+  (§7 Q13). UE2 adds them to S37 B3 when the RTL has them.
+
+## 5. TRX64 gaps (and UE2's own)
+
+| # | Gap | Effect in UE2 until it is closed |
+|---|---|---|
+| T1 | **No stop or step at a cycle boundary** on the full machine: `run_for_full_capped_dbg` and `execute_one` run whole instructions; `on_access` halts are honoured at the next boundary. Needed: run to cycle c and stand mid-instruction, resume from there | PAUSE_CB, STEP_CYCLES (`cs`), `CYC_CMP` and load/store stops land at the next IB; `CYCLES` shows the overshoot; "mid-instruction" never appears; raster and every-edge units refused |
+| T2 | **The interrupt sequence and the handler's first instruction are one `execute`** (`c64_6510core_execute`: `do_interrupt`, then the fetch). Needed: return after the sequence (an IB at the handler's first opcode), and a predicate "the next execute takes an interrupt" | a bitmap bit at a handler's first opcode does not stop; `z` across an interrupt runs the handler's first instruction too |
+| T3 | **No pre-write-back registers**: TRX64 has the settled registers only | word 1.0 = 1.4; a unit's A/X/Y/P qualifier at an IB sees the settled value where the RTL sees the old one (§7 Q7) |
+| T4 | **`on_access` coverage**: the RTL's read type counts operand fetches and dummy reads, not opcode fetches. To confirm in TRX64 that `on_access` sees every CPU read and write cycle | a load observer may miss a dummy read |
+| T5 | **The drive alone**: no drive hold of its own beside the C64, no drive-only run of n instructions with the C64 standing (`catch_up_to` pairs the clocks), no per-instruction drive hook (`sample_pc_change` samples), no drive write hook | `bk` under `device drive8` stops one drive instruction late at worst; `z` under `drive8` needs the pair to absorb the drive's lead; the write comparator refused |
+| T6 | **No 6502N flip-flop image** (by design: another CPU) | words 1.8-1.14 synthesized (§3.2); `hw_cpu_fetch` (ring land) not reached |
+| T7 | **Whole-machine hold** (S37, S38 gap 6) | the bridge's pause, as in S37 |
+| T8 | **No RDY park by bus DMA** (`held`) | STATUS b4, FLAGS b2, chip 0 b4 read 0 |
+| U1 | UE2: `cart_peek` has no class (ROML/ROMH forced) | to add with §3.7 |
+| U2 | UE2: no mapping of its cartridge registers onto `c64_cartridge.v`'s `reg_0`/`reg_1` | word 7.0 reads 0 for types without one (§7 Q10) |
+
+T1 and T2 decide whether trxmon's stops are exact in UE2. Everything else is exact or a documented approximation.
+
+## 6. Differences from the board that stay
+
+- RUN resumes at once, no frame alignment (S37).
+- Word 1.0 is the settled registers (T3).
+- `CYCLES` counts what TRX64 ran; the board's window bus cycles while halted are counted the same way, the frame
+  alignment's left-out edges are not counted on either.
+- Answers of LK and of commands are immediate (no busy, no request bit).
+- The drive image at `0x0EE0000` follows the drive within 1 ms while it runs.
+
+## 7. Questions for the FPGA session
+
+1. Without the engine trxmon's ring and trace verbs answer "no frame ring" / "needs the instruction trace" in UE2: accepted, or must UE2 report CAPS b2 and model the engine (S38 decided against)?
+2. Is t21-p4 (debugger stop = session, RUN/steps as requests, `SH_STATUS` b2) the register API UE2 must match, and will it merge unchanged?
+3. CAPS2 is a constant per build (`$BF` on t21-p4): is UE2 reporting `$1C` (b2, b3, b4 only) a valid build for the app?
+4. Word 1.1 PC and the PC field of words 8-14 at an IB stop: IPC or IPC + 1?
+5. `hw_session_read` calls `hw_bus_read`, which needs STATUS b5 (C64_STOP): in a stop opened by `ui_request` (no C64_STOP) the colour RAM reads `$FF`. Intended?
+6. `mach_write` refuses I/O writes without STATUS b5, although in a debugger session the window would list them (T12 §14.8 board test 4, `wr d020 05`): should it check `SH_STATUS` b0 instead?
+7. Does trxmon rely on the A/X/Y/P qualifier lag at an IB, or may UE2 compare against the settled registers?
+8. Confirm: a bitmap bit at the interrupted PC does not fire on the replaced fetch, and fires when the handler returns there.
+9. Confirm: STEP_INSTR across an interrupt stops at the handler's first opcode, before it runs.
+10. Word 7.0: is `c64_cartridge.v`'s per-type `reg_0`/`reg_1` the contract for `bank`, and which types does trxmon interpret?
+11. With CAPS b1 the splash writes `CAP_CTRL` and waits for READY by captured PC: is that the only firmware use of `CAP_CTRL`/`CAP_STAT`/`IRQ_CAUSE` b3 without the engine?
+12. The far pages share one collect buffer and latch: trxmon's detached task and firmware tasks (REST lens, trx_ui, trx_video) can interleave bytes. Is there a lock, or is it a known race?
+13. The 80-column monitor screen: the `overlay.v` mode registers and the ABI call (name, arguments, restore on close)?
+14. `IRQ_CAUSE` b0 on every debugger stop: does any firmware handler act on it while trxmon owns the machine?
+15. LK REAL during a debugger session (halted, no C64_STOP): allowed as built?
+
+## 8. Phases
+
+| Phase | Content |
+|---|---|
+| A | Page 0 0x118-0x134, page 3 registers and `trx_dbg.rs` without a CPU (pure register model); page 1 with the shadows; CAPS `$EB`, CAPS2 `$1C`; `CAP_CTRL`/`CAP_STAT` and the capture; OWNER and the hold in `C64Port`; `monitor trx` |
+| B | Stop sources and steps on TRX64 (§3.3): IB, bitmap, units (IB, read, write), CYC_CMP, pauses, steps, RUN; the stop record; `IRQ_CAUSE` b0; the CPU write path (§3.4) |
+| C | The debugger's session (§3.6); the lens unit (§3.7, U1); word 7.0 (U2) |
+| D | The drive (§3.5) |
+| E | Ownership with UE2's monitor and S38 (§3.8) |
+| F | TRX64's T1/T2 when they land: exact cycle stops, `cs`, raster units; the interrupt boundary |
+
+## 9. Checks
+
+**Unit** (`trx.rs`, `trx_dbg.rs`, `c64.rs`, `c64-bridge`), one test per register at least:
+- Byte rule on every new register: bytes 0-2 collect, byte 3 commits, byte-0 read latches, a commit reads 0;
+  `SB_DATA` read moves `SB_ADDR`, a block of 7; `BMP_DATA` write moves `BMP_IDX`; `CYCLES` read latches `CYCLES_HI`.
+- OWNER: C64_STOP neither pauses nor holds the CPU, still reads 3, still mutes; OWNER 0 gives it back.
+- PAUSE_IB then STATUS b0, b2, b3, REASON 1, IPC = PC, `IRQ_CAUSE` b0; PAUSE_CB on a shut gate keeps the old fields.
+- STEP_INSTR 1/5: INSTRS + n, REASON 2, the PC the same n instructions reach in a reference run; ARG 0 = 1; a step on
+  a running gate is ignored; RUN and steps clear STOP_NEW.
+- Bitmap: a bit at `$C000` stops at IPC `$C000` with REASON 3 before it runs; RUN goes on and does not stop there again
+  until it is reached again; an interrupt at that boundary does not fire it.
+- Units: `until` (IB one-shot) stops once and disables itself; `n` over a JSR stops at the return with S >= S0;
+  `ret` with PREV_RET; a store observer over `$0400-$07E7` stops with ADDR, DATA and REASON 5; HITS counts.
+- CYC_CMP: armed, stop REASON 7, disarmed after; STATUS b19.
+- State bus: words 0.0-7.0 against TRX64 at a stop; shadows hold while running, follow while halted, capture with
+  `CAP_CTRL`; 1.4/1.5 = TRX64's registers; `SB_DATA` write refused while running (`SB_STATUS` b1).
+- CPU write: `r a=77 x=05` staged, `SB_LOAD` b1 armed until the step, then `STA $0400` stores `$77` in 4 cycles;
+  `pc=` redirect with `IPC_SET`: IPC and the IB flag at once, no cycle.
+- Session: a debugger stop starts one (`SH_STATUS` `b0 | b2`, count + 1); `$DC0D` and `$D019` read twice keep their
+  flags; `wr d020` is read back, not in the chip, committed by the step before it runs; SH_MODE 0: no session.
+- LK: look of ROML/ROMH/IO1/IO2 for an EasyFlash bank 2 equals the bytes; ROMH asked at `$A000` equals `$E000`;
+  physical slot `ext`, REAL while halted equals the cartridge, refused while running.
+- Drive: `DRV_CMP` exec stops the C64 with REASON 8; DRV_STEP 1 moves DPC, the C64 cycle count stands.
+- Ownership: UE2's `c64 halt` and `goto` refused while OWNER; an OWNER write on an anchor releases it.
+
+**Firmware smoke** (`scripts/smoke-trxmon.sh`): the `t21-p4-app` ELF and `trxmon.u2a` (both built in the U64 build
+container, `apps/trxmon/build.sh`), `--board c64u --trx-io`, a fresh flash with the ROMs, `--sd` an image with
+`trxmon.u2a`, `--net user --hostfwd tcp:127.0.0.1:4312:4312`, System Mode PAL, the overlay interface:
+
+| Step | Expected |
+|---|---|
+| boot | console `[TRX] IO block present, CAPS eb`; READY |
+| `button`, browse to `trxmon.u2a`, Run App | the monitor screen (40 x 23 from row 2), `PAUSED IB $xxxx`; console `trxmon: serving the TRX64 runtime contract on TCP 4312` |
+| type `r`, `m c000`, `d e5cd`, `io d000` | registers equal UE2's `monitor r`; `m`/`d` equal `monitor m`; VIC registers equal TRX64's `peek_lens(…, "io")` |
+| `z`, `z 5` | the PC equals UE2's own trace of the same steps; cycles + the instructions' cycles |
+| `bk e5cd`, `x` (leave with a stop armed) | the overlay closes, the C64 runs; on the next keyboard wait the screen comes back by itself with `breakpoint 1 hit at .C:e5cd` |
+| `m io dc0d` twice | the same value (no flag cleared) |
+| `wr d020 05`, `z` | the border colour changes after the step (§7 Q6 decides whether trxmon allows the write) |
+| `r a=42`, `z` over `STA $0400` (a program put in with `a c000`) | `$0400` = `$42` |
+| `m cart 8000` with an EasyFlash in `--cart` | the bank's bytes |
+| `trace status`, `rstep` | the board's "needs the instruction trace" and "no frame ring" text |
+| RPC: `tests/trxmon_client.py 127.0.0.1 selftest` | passes |
+| RPC: `read c000 256 cpu` against `monitor m c000` | equal |
+| `/quit` | trxmon ends, OWNER 0, the C64 runs; `print 6*7` gives 42 |
+
+**Not checked by the smoke:** cycle-exact stops (T1), interrupt boundaries (T2), the 80-column screen.
+
+## 10. Size
+
+About 3,000 lines with tests: `trx_dbg.rs` and the page 1/3 registers 700, the bridge (stop sources, steps, CPU
+write, shadows, drive) 900, session and lens 250, ownership and `monitor trx` 150, unit tests 900, smoke script 100.
+Phases A-E without TRX64 changes; F waits for TRX64.
