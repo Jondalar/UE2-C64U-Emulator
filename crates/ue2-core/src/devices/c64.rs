@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use crate::c64host::{C64Backend, C64CartSlot, C64Frame, C64Rom, CartRom};
+use crate::c64host::{C64Backend, C64CartSlot, C64Frame, C64Rom, CartRom, EngineCfg, TapEvent};
 use crate::devices::board::{add_table, at, span, Reg, RegTable, Span, RAM, RAM_PAGE};
 use crate::devices::drives::DriveRegs;
 use crate::devices::trx::{self, Link};
@@ -344,6 +344,8 @@ pub struct C64Port {
     muted: bool,
     /// S37: a still frame for guest DDR (address, bytes), written when the access hands DDR back.
     still_out: Option<(u32, Vec<u8>)>,
+    /// S40: what the engine last asked of the backend's run.
+    engine_cfg: EngineCfg,
 }
 
 impl Default for C64Port {
@@ -380,6 +382,7 @@ impl C64Port {
             paused: false,
             muted: false,
             still_out: None,
+            engine_cfg: EngineCfg::default(),
         }
     }
 
@@ -516,29 +519,29 @@ impl C64Port {
         }
     }
 
-    /// S37 phase B: [`Self::sync`] with `--trx-io`. A GATE_CTRL write since the last sync takes effect at its clock;
-    /// the pause and the session follow the lines; after the run the VIC frame count goes to the block, and when
-    /// frames ended the newest is captured into the still (§5.5).
+    /// S37 phase B: [`Self::sync`] with `--trx-io`. The block's writes to registers of the C64's clock (GATE_CTRL,
+    /// CAP_CTRL, STOP_POS, SB_LOAD, page 2) take effect at their clocks, in order (S40 §3); the pause and the session
+    /// follow the lines; after the run the VIC frame count goes to the block, and when frames ended the newest is
+    /// captured into the still (§5.5).
     fn trx_sync(&mut self, now: u64) {
         let Some(link) = self.trx.clone() else { return };
         if self.backend.is_none() {
             return;
         }
-        let writes = std::mem::take(&mut trx::lock(&link).frz_writes);
-        for (at, frz) in writes {
-            if let Some(b) = self.backend.as_deref_mut().filter(|_| at > self.synced && at < now) {
-                b.advance_to(at);
-                self.synced = at;
+        let ops = std::mem::take(&mut trx::lock(&link).ops);
+        for op in ops {
+            if op.at > self.synced && op.at < now {
+                self.trx_advance(op.at);
             }
-            self.trx_apply(frz);
+            self.trx_op(op);
         }
         self.trx_update();
-        let Some(b) = self.backend.as_deref_mut() else { return };
         if now <= self.synced {
+            self.trx_live();
             return;
         }
-        b.advance_to(now);
-        self.synced = now;
+        self.trx_advance(now);
+        let Some(b) = self.backend.as_deref_mut() else { return };
         let frames = b.frame_counter();
         let mut l = trx::lock(&link);
         if frames > l.frames && l.frames != 0 && l.still.on {
@@ -554,6 +557,151 @@ impl C64Port {
         }
         l.frames = frames;
         l.frame_clocks = b.frame_clocks();
+        drop(l);
+        self.trx_live();
+    }
+
+    /// Run the C64 up to `to`. A load `SB_LOAD` armed is taken first if the machine is not halted: this run's first
+    /// edge opens the gate (c64_core.v:385-386). The engine's events of the run go to the model after it.
+    fn trx_advance(&mut self, to: u64) {
+        let Some(link) = self.trx.clone() else { return };
+        {
+            let mut l = trx::lock(&link);
+            if l.sb.ldarm != 0 && !l.sb.halted {
+                self.trx_load(&mut l);
+            }
+        }
+        let Some(b) = self.backend.as_deref_mut() else { return };
+        if to > self.synced {
+            b.advance_to(to);
+            self.synced = to;
+        }
+        self.trx_events();
+    }
+
+    /// The staged words load into the chips, and `SB_LOAD` reads 0 again.
+    fn trx_load(&mut self, l: &mut trx::TrxLink) {
+        let words = l.sb.load_words(l.sb.ldarm);
+        l.sb.ldarm = 0;
+        if let Some(b) = self.backend.as_deref_mut().filter(|_| !words.is_empty()) {
+            b.sb_load(&words);
+        }
+    }
+
+    /// A write of the C64's clock at its turn (trx_sys.v:310-346).
+    fn trx_op(&mut self, op: trx::SysWrite) {
+        let Some(link) = self.trx.clone() else { return };
+        match op.off {
+            trx::GATE_CTRL => self.trx_apply(op.v & trx::GATE_FRZ != 0),
+            trx::CAP_CTRL => {
+                trx::lock(&link).sb.cap_every = op.v as u8;
+                self.trx_engine_cfg();
+            }
+            trx::STOP_POS => {
+                let (arm, cycle, release) = (op.v & trx::POS_ARM != 0, (op.v & 0x3F) as u8, op.v & trx::POS_RELEASE != 0);
+                {
+                    let mut l = trx::lock(&link);
+                    (l.sb.pos_arm, l.sb.pos_cyc) = (arm, cycle);
+                    if release {
+                        l.sb.pos_hold = false;
+                    }
+                }
+                if let Some(b) = self.backend.as_deref_mut() {
+                    b.set_stop_pos(arm.then_some(cycle));
+                    if release {
+                        b.release_pos();
+                    }
+                }
+                self.trx_update();
+            }
+            o if o == trx::PAGE1 + trx::SB_LOAD => trx::lock(&link).sb.ldarm = (op.v & 0x1F) as u8,
+            _ => {}
+        }
+    }
+
+    /// What the engine wants of the C64's run now: the boundaries while the capture cadence is on.
+    fn trx_engine_cfg(&mut self) {
+        let Some(link) = self.trx.clone() else { return };
+        let cfg = {
+            let l = trx::lock(&link);
+            EngineCfg { boundaries: l.sb.cap_every != 0, records: false }
+        };
+        if cfg != self.engine_cfg {
+            self.engine_cfg = cfg;
+            if let Some(b) = self.backend.as_deref_mut() {
+                b.set_engine(cfg);
+            }
+        }
+    }
+
+    /// The engine's events since the last look: the boundaries go to the capture model; a position hit halts.
+    fn trx_events(&mut self) {
+        let Some(link) = self.trx.clone() else { return };
+        let Some(b) = self.backend.as_deref_mut() else { return };
+        let events = b.take_tap();
+        if events.is_empty() {
+            return;
+        }
+        let mut hit = false;
+        {
+            let mut l = trx::lock(&link);
+            for ev in events {
+                match ev {
+                    TapEvent::Snap(snap) => {
+                        l.sb.snap(&snap);
+                    }
+                    TapEvent::Line16 { .. } => {
+                        l.sb.line16(false);
+                    }
+                    TapEvent::PosHit => {
+                        l.sb.pos_hit();
+                        hit = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if hit {
+            self.trx_update();
+        }
+    }
+
+    /// The live words 1.3-1.5, and while the machine is halted the shadows: they follow it (c64_core.v:647).
+    fn trx_live(&mut self) {
+        let (Some(link), Some(b)) = (self.trx.clone(), self.backend.as_deref()) else { return };
+        let mut l = trx::lock(&link);
+        l.sb.live = b.sb_live();
+    }
+
+    /// While the machine is halted the shadows follow it: after an access that may have changed a chip.
+    fn trx_follow(&mut self) {
+        let (Some(link), Some(b)) = (self.trx.clone(), self.backend.as_deref()) else { return };
+        let mut l = trx::lock(&link);
+        if l.sb.halted {
+            l.sb.shadow = b.sb_shadow();
+            l.sb.live = b.sb_live();
+        }
+    }
+
+    /// A window access that is a bus cycle (no MEMONLY, no session): while the machine is halted it is the edge that
+    /// opens the gate for one cycle, which takes a load `SB_LOAD` armed (c64_core.v:356-357, :385).
+    fn trx_bus_cycle(&mut self, mem_only: bool) {
+        let Some(link) = self.trx.clone().filter(|_| !mem_only) else { return };
+        let mut l = trx::lock(&link);
+        if l.sb.ldarm != 0 && l.sb.halted {
+            self.trx_load(&mut l);
+        }
+    }
+
+    /// After a window access: its engine events, and the shadows when it may have changed a chip.
+    fn trx_after_window(&mut self, mem_only: bool) {
+        if self.trx.is_none() {
+            return;
+        }
+        self.trx_events();
+        if !mem_only {
+            self.trx_follow();
+        }
     }
 
     /// S37 phase B: the lines as the session sees them.
@@ -570,7 +718,9 @@ impl C64Port {
         }
     }
 
-    /// [`Self::trx_update`] with FRZ as `frz`.
+    /// [`Self::trx_update`] with FRZ as `frz`. The machine is halted by the pause or the position hold
+    /// (`c64_halted`): a halt start raises `IRQ_CAUSE` b0 and b3 and loads the shadows (c64_core.v:675-688,
+    /// top.v:1317).
     fn trx_apply(&mut self, frz: bool) {
         let Some(link) = self.trx.clone() else { return };
         let mut l = trx::lock(&link);
@@ -579,13 +729,20 @@ impl C64Port {
         if lines.paused() != self.paused {
             self.paused = lines.paused();
             b.set_paused(self.paused);
-            if self.paused {
+        }
+        let halted = self.paused || l.sb.pos_hold;
+        if halted != l.paused {
+            l.paused = halted;
+            if halted {
                 l.pause_starts += 1;
             }
         }
-        l.paused = self.paused;
-        // top.v:1059 `c64_mute <= c64_halted | app_s2[1]`: the pause, or C64_STOP alone.
-        let muted = self.paused || lines.stop;
+        if l.sb.set_halted(halted) {
+            l.sb.shadow = b.sb_shadow();
+            l.sb.live = b.sb_live();
+        }
+        // top.v:1059 `c64_mute <= c64_halted | app_s2[1]`: the halt, or C64_STOP alone.
+        let muted = halted || lines.stop;
         if muted != self.muted {
             self.muted = muted;
             b.set_muted(muted);
@@ -887,11 +1044,15 @@ impl IoDevice for C64Port {
                 let (addr, mem_only) = ((off - DMA) as u16, self.mem_only());
                 let val = match self.session_access(addr, None, mem_only) {
                     Some(val) => val,
-                    None => match &mut self.backend {
-                        Some(b) => b.dma_read(addr, mem_only),
-                        None => self.dma.read(addr),
-                    },
+                    None => {
+                        self.trx_bus_cycle(mem_only);
+                        match &mut self.backend {
+                            Some(b) => b.dma_read(addr, mem_only),
+                            None => self.dma.read(addr),
+                        }
+                    }
                 };
+                self.trx_after_window(mem_only);
                 self.return_ddr(ctx.ram);
                 ctx.stall += time::DMA_BYTE_CLOCKS;
                 self.update_uci(ctx);
@@ -955,11 +1116,13 @@ impl IoDevice for C64Port {
                 self.sync(ctx.now);
                 let (addr, mem_only) = ((off - DMA) as u16, self.mem_only());
                 if self.session_access(addr, Some(val), mem_only).is_none() {
+                    self.trx_bus_cycle(mem_only);
                     match &mut self.backend {
                         Some(b) => b.dma_write(addr, val, mem_only),
                         None => self.dma.mem[usize::from(addr)] = val,
                     }
                 }
+                self.trx_after_window(mem_only);
                 self.return_ddr(ctx.ram);
                 // UCI: `unlock_irq` acks high IRQ 6 with `C64_POKE(0xD038, 0)`; the ITU has no ack register of its
                 // own, so this write is the only thing that drops the source (u64_config.cc:1012-1014, 02 H8).
@@ -1117,6 +1280,12 @@ impl IoDevice for C64Port {
         // The backend keeps a pause until the next sync takes it away (C64_STOP is 0 now).
         self.paused = paused;
         if let Some(link) = link {
+            // S40: the position hold and the engine's wishes are the block's, which resets with it.
+            if let Some(b) = &mut self.backend {
+                b.set_stop_pos(None);
+                b.release_pos();
+                b.set_engine(EngineCfg::default());
+            }
             self.set_trx_io(link);
         }
     }
@@ -1780,6 +1949,82 @@ mod tests {
         fn link(&mut self) -> Link {
             self.port().trx.clone().expect("linked")
         }
+    }
+
+    /// S39 phase A1: CAP_CTRL reads back at once and reaches the run at its clock; a capture at the snap loads the
+    /// shadows the state bus reads, counts in CAP_STAT and raises IRQ_CAUSE b3; SB_DATA reads move SB_ADDR on.
+    #[test]
+    fn captures_load_the_state_bus() {
+        use crate::c64host::{EngineCfg, Snap, TapEvent};
+        use crate::devices::trx::{CAP_CTRL, CAP_STAT, IRQ_CAUSE, PAGE1, SB_ADDR, SB_DATA};
+        let mut b = Bench::trx();
+        b.w32(TRX_ADDR + CAP_CTRL, 1);
+        assert_eq!(b.r32(TRX_ADDR + CAP_CTRL), 1, "reads back at once");
+        assert!(b.mock.engine.borrow().is_empty(), "the run takes it at the next sync");
+        b.tick_at(10);
+        assert_eq!(*b.mock.engine.borrow(), [EngineCfg { boundaries: true, records: false }]);
+        let mut snap = Snap { cycle: 5, x: 103, line: 0, ..Snap::default() };
+        snap.shadow.cpu = [0x0403_0201, 0x0122_E5CF, 0x0037_372F];
+        snap.live = [0x0185_E5CF, 0x0403_0201, 0x22];
+        b.mock.tap.borrow_mut().extend([TapEvent::Line16 { cycle: 1, x: 7 }, TapEvent::Snap(Box::new(snap))]);
+        b.tick_at(20);
+        assert_eq!(b.r32(TRX_ADDR + CAP_STAT), 1, "CAP_GEN 1, no frame without its snap");
+        assert_eq!(b.r8(TRX_ADDR + IRQ_CAUSE) & 0x08, 0x08, "b3");
+        b.w32(TRX_ADDR + PAGE1 + SB_ADDR, 1 << 7);
+        let words: Vec<u32> = (0..6).map(|_| b.r32(TRX_ADDR + PAGE1 + SB_DATA)).collect();
+        assert_eq!(words, [0x0403_0201, 0x0122_E5CF, 0x0037_372F, 0, 0, 0], "words 1.3-1.5 are the machine's now");
+        assert_eq!(b.r32(TRX_ADDR + PAGE1 + SB_ADDR), 1 << 7 | 6, "a block read moved SB_ADDR on");
+        b.w32(TRX_ADDR + CAP_CTRL, 0);
+        b.tick_at(30);
+        assert_eq!(b.mock.engine.borrow().last(), Some(&EngineCfg::default()), "no cadence: no boundaries");
+    }
+
+    /// S40 §6.3: STOP_POS arms the run; the hit holds the machine (GATE_CTRL b8/b9, IRQ_CAUSE b0, b3, the shadows
+    /// follow it); staging is taken while it stands; SB_LOAD loads at the release; staging refused while running.
+    #[test]
+    fn the_stop_position_holds_and_the_load_comes_at_the_release() {
+        use crate::c64host::TapEvent;
+        use crate::devices::trx::{
+            CAUSE_CAPTURE, CAUSE_STOP, GATE_CTRL, IRQ_CAUSE, PAGE1, POS_ARM, POS_RELEASE, SB_ADDR, SB_DATA, SB_LOAD,
+            SB_STATUS, STOP_POS,
+        };
+        let mut b = Bench::trx();
+        b.w32(TRX_ADDR + PAGE1 + SB_ADDR, 1 << 7 | 8);
+        b.w32(TRX_ADDR + PAGE1 + SB_DATA, 0x11);
+        assert_eq!(b.r32(TRX_ADDR + PAGE1 + SB_STATUS), 2, "refused while the machine runs");
+        b.w32(TRX_ADDR + PAGE1 + SB_STATUS, 0);
+        assert_eq!(b.r32(TRX_ADDR + PAGE1 + SB_STATUS), 0);
+        b.w32(TRX_ADDR + STOP_POS, POS_ARM | 12);
+        b.tick_at(10);
+        assert_eq!(*b.mock.pos.borrow(), [Ok(Some(12))]);
+        assert_eq!(b.r32(TRX_ADDR + STOP_POS), 0x10C, "armed at cycle 12");
+        b.mock.shadow.borrow_mut().cpu[1] = 0x0122_E5D1;
+        b.mock.tap.borrow_mut().push(TapEvent::PosHit);
+        b.tick_at(20);
+        assert_eq!(b.r32(TRX_ADDR + STOP_POS), 0x1_000C, "holding, the arm gone");
+        assert_eq!(b.r32(TRX_ADDR + GATE_CTRL), 0x300, "halted, the gate shut");
+        assert_eq!(b.r8(TRX_ADDR + IRQ_CAUSE) & (CAUSE_STOP | CAUSE_CAPTURE), CAUSE_STOP | CAUSE_CAPTURE);
+        assert_eq!(b.mock.mutes.borrow().last(), Some(&true), "the halt mutes (top.v:1059)");
+        b.w32(TRX_ADDR + PAGE1 + SB_ADDR, 1 << 7 | 1);
+        assert_eq!(b.r32(TRX_ADDR + PAGE1 + SB_DATA), 0x0122_E5D1, "the shadows follow the halt");
+        b.w32(TRX_ADDR + PAGE1 + SB_ADDR, 1 << 7 | 8);
+        for k in 0..7 {
+            b.w32(TRX_ADDR + PAGE1 + SB_DATA, 0x100 + k);
+        }
+        assert_eq!(b.r32(TRX_ADDR + PAGE1 + SB_STATUS), 1, "taken: frozen, no error");
+        b.w32(TRX_ADDR + PAGE1 + SB_LOAD, 0x1A);
+        b.tick_at(30);
+        assert_eq!(b.r32(TRX_ADDR + PAGE1 + SB_LOAD), 0x1A, "armed until the gate opens");
+        assert!(b.mock.loads.borrow().is_empty());
+        b.w32(TRX_ADDR + STOP_POS, POS_RELEASE);
+        b.tick_at(40);
+        assert_eq!(b.mock.pos.borrow().last(), Some(&Err(())), "released");
+        assert_eq!(b.r32(TRX_ADDR + GATE_CTRL), 0);
+        assert_eq!(b.r32(TRX_ADDR + PAGE1 + SB_LOAD), 0, "the load is taken");
+        let loads = b.mock.loads.borrow();
+        assert_eq!(loads.len(), 1);
+        assert_eq!(loads[0].cpu, Some([0x100, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106]));
+        assert_eq!(loads[0].cia, [Some([0; 12]), Some([0; 12])]);
     }
 
     /// S40 §0: a C64 on TRX64-Ultimate's bitstream is told so on attach; without `--trx-io` it is not.

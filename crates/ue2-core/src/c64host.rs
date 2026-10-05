@@ -263,6 +263,37 @@ pub trait C64Backend {
     /// chips are not touched: under C64_STOP alone they run on beneath the cut. Gideon's bitstream has no such cut,
     /// so only `--trx-io` calls it. Ignored by default.
     fn set_muted(&mut self, _muted: bool) {}
+    // ---- S39 phase A1 / S40: the board's state bus and engine (docs/specs/S40-trx-engine.md) ----
+
+    /// The state bus's shadow words as the machine stands now (a capture while halted). Default: all 0.
+    fn sb_shadow(&self) -> SbShadow {
+        SbShadow::default()
+    }
+    /// Words 1.3-1.5 now: `{IB, opcode at IPC, IPC}`, `{S, Y, X, A}`, `{P}` of the settled registers.
+    fn sb_live(&self) -> [u32; 3] {
+        [0; 3]
+    }
+    /// What the engine wants recorded and stopped at from now on. Ignored by default.
+    fn set_engine(&mut self, _cfg: EngineCfg) {}
+    /// The engine's events since the last call, in order.
+    fn take_tap(&mut self) -> Vec<TapEvent> {
+        Vec::new()
+    }
+    /// `STOP_POS`: stop on line 0 at raster cycle `Some(c)` and hold the whole machine there; `None` disarms.
+    fn set_stop_pos(&mut self, _cycle: Option<u8>) {}
+    /// `STOP_POS` b9: let go of the position hold.
+    fn release_pos(&mut self) {}
+    /// `SB_LOAD`: the staged hidden-state words load into the chips now, before the machine moves on.
+    fn sb_load(&mut self, _load: &crate::devices::trx_sb::SbLoad) {}
+    /// APPLY: a byte into C64 RAM through the RAM's second port, logged by nothing.
+    fn apply_ram(&mut self, addr: u16, val: u8) {
+        self.dma_write(addr, val, true);
+    }
+    /// The engine's cycle counter (phi2 edges the C64 ran).
+    fn engine_cycles(&self) -> u64 {
+        0
+    }
+
     /// S40 §0: the C64 sits on TRX64-Ultimate's bitstream (`--trx-io`), whose `main` RTL has no turbo: the CPU runs at
     /// 1 MHz whatever the firmware's menu sets, and `$D030`/`$D031` are the VIC's unused registers (read `$FF`, take no
     /// write). Ignored by default.
@@ -312,6 +343,69 @@ pub trait C64Backend {
             self.dma_write(addr, val, false);
         }
     }
+}
+
+/// S39/S40: the C64's state as the board's state bus shows it at a capture (`c64_core.v:575-612`): the shadow words.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SbShadow {
+    /// Chip 0 b3:1: the cartridge's own lines `{present, EXROM, GAME}`, 1 = high.
+    pub cart: u8,
+    /// Chip 1 w0 `{S, Y, X, A}`, w1 `{sync, P, PC}`, w2 `{$01 as read, $01 latch, $00}`.
+    pub cpu: [u32; 3],
+    /// Chip 2 w0-w11: `$D000-$D02F` as a read returns them.
+    pub vic: [u32; 12],
+    /// Chips 3, 4 w0-w3: registers 0-15 as read; w4 `{DDRB, DDRA, PRB, PRA}`.
+    pub cia: [[u32; 5]; 2],
+    /// Chip 7 w0 `{reg_1, reg_0}` of icepi's cartridge model.
+    pub bank: u32,
+    /// Chip 1 w8-w14: the 6502N's 209 flip-flops.
+    pub cpuf: [u32; 7],
+    /// Chips 3, 4 w8-w19: each reDIP-CIA's 363 flip-flops.
+    pub ciaf: [[u32; 12]; 2],
+}
+
+/// S39/S40: a snap candidate the C64 stood on (`c64_core.v:643-644`): the first instruction boundary on line 0 from
+/// cycle 12 where the conditions hold, with the machine running.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Snap {
+    /// The engine's cycle counter at the boundary, before the opcode fetch the board's snap edge ends.
+    pub cycle: u64,
+    /// F3: the VIC's x (8 × cycle + 7) and line.
+    pub x: u16,
+    pub line: u16,
+    /// The next instruction is an interrupt's: the fetch is dropped (`mk_intg`).
+    pub intg: bool,
+    pub shadow: SbShadow,
+    /// Words 1.3-1.5 at the snap.
+    pub live: [u32; 3],
+}
+
+/// S40: what the C64 did that the board's engine taps see, in order (docs/specs/S40-trx-engine.md §4, §10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TapEvent {
+    /// A write that landed in the 64 KB RAM, with the RAM's own old byte: the machine's port A, or `outside` (the
+    /// RAM's second port: MEMONLY, the session, a restore behind the firmware).
+    Ram { addr: u16, old: u8, new: u8, outside: bool, cycle: u64 },
+    /// A write into colour RAM (`$D800-$DBFF` with I/O visible), nibbles; `outside`: the second port.
+    Colour { addr: u16, old: u8, new: u8, outside: bool, cycle: u64 },
+    /// The cartridge logic wrote its RAM at `0xEF0000 + off`.
+    CartRam { off: u16, old: u8, new: u8, cycle: u64 },
+    /// The REU moved data.
+    Reu,
+    Snap(Box<Snap>),
+    /// The VIC reached line 16 (`l16`): the boundary of a frame that had no snap.
+    Line16 { cycle: u64, x: u16 },
+    /// The machine stood at the stop position (`pos_hit`) and holds.
+    PosHit,
+}
+
+/// S40: what the board's engine wants of the C64's run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngineCfg {
+    /// Snap candidates and line 16: the log or the capture cadence is on.
+    pub boundaries: bool,
+    /// Memory writes: the log is on.
+    pub records: bool,
 }
 
 /// S37: what the cartridge answers to a read without its side effects (freeze_resp.v `pk_*`).
@@ -578,6 +672,14 @@ pub(crate) mod mock {
         pub(crate) mutes: Rc<RefCell<Vec<bool>>>,
         /// S40: the last `set_trx_bitstream`.
         pub(crate) trx_bitstream: Rc<RefCell<bool>>,
+        /// S40: the events `take_tap` hands out next, and what the engine asked for, kept apart from `calls`.
+        pub(crate) tap: Rc<RefCell<Vec<super::TapEvent>>>,
+        pub(crate) engine: Rc<RefCell<Vec<super::EngineCfg>>>,
+        /// S40: `set_stop_pos` (Some(cycle) or None) and `release_pos` (as Err(())) in order.
+        pub(crate) pos: Rc<RefCell<Vec<Result<Option<u8>, ()>>>>,
+        /// S40: the loads `sb_load` got, and what `sb_shadow` returns.
+        pub(crate) loads: Rc<RefCell<Vec<crate::devices::trx_sb::SbLoad>>>,
+        pub(crate) shadow: Rc<RefCell<super::SbShadow>>,
     }
 
     impl Mock {
@@ -757,6 +859,24 @@ pub(crate) mod mock {
         }
         fn set_trx_bitstream(&mut self, on: bool) {
             *self.trx_bitstream.borrow_mut() = on;
+        }
+        fn sb_shadow(&self) -> super::SbShadow {
+            self.shadow.borrow().clone()
+        }
+        fn set_engine(&mut self, cfg: super::EngineCfg) {
+            self.engine.borrow_mut().push(cfg);
+        }
+        fn take_tap(&mut self) -> Vec<super::TapEvent> {
+            std::mem::take(&mut self.tap.borrow_mut())
+        }
+        fn set_stop_pos(&mut self, cycle: Option<u8>) {
+            self.pos.borrow_mut().push(Ok(cycle));
+        }
+        fn release_pos(&mut self) {
+            self.pos.borrow_mut().push(Err(()));
+        }
+        fn sb_load(&mut self, load: &crate::devices::trx_sb::SbLoad) {
+            self.loads.borrow_mut().push(*load);
         }
     }
 }

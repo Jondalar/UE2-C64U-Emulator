@@ -383,6 +383,7 @@ impl Trx64Backend {
             && !self.stopped
             && !self.reset_held
             && !self.paused
+            && !self.tap.pos_hold
             && !self.m.turbo_engaged()
     }
 
@@ -428,8 +429,8 @@ impl Trx64Backend {
                 break;
             }
             self.run_to(boundary);
-            if self.m.c64_core.clk == clk {
-                // The C64 waits for the firmware (UCI): nothing ran, nothing to record.
+            if self.m.c64_core.clk == clk || self.tap.pos_hold {
+                // The C64 waits for the firmware (UCI), or stopped at the board's stop position (S40): no frame end.
                 return;
             }
             self.ring_frame();
@@ -440,7 +441,7 @@ impl Trx64Backend {
             }
         }
         // The last frame's instruction may have run past the slice's end; `run_to` wants a target ahead.
-        if self.m.c64_core.clk < target {
+        if self.m.c64_core.clk < target && !self.tap.pos_hold {
             self.run_to(target);
         }
     }
