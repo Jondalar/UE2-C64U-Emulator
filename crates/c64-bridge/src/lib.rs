@@ -15,6 +15,7 @@ mod cart;
 mod cart_eeprom;
 mod clock;
 mod drive;
+mod engine_tap;
 mod hwlog;
 pub mod iec_proc;
 mod keys;
@@ -23,6 +24,7 @@ mod ring;
 mod sampler;
 mod sid;
 mod slot;
+mod trx_ff;
 mod video;
 pub mod wd177x;
 
@@ -33,6 +35,7 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 
 use trx64_core::c64_6510core::{IK_NMI, INTERRUPT_DELAY, INT_SRC_RESTORE};
+use ue2_core::c64host::{EngineCfg, SbShadow, TapEvent};
 use trx64_core::cart::CartMapper;
 use trx64_core::expansion::Hold;
 use trx64_core::RunStop;
@@ -286,6 +289,8 @@ pub struct Trx64Backend {
     /// S38: UE2's write log of the memories around the C64 (hwlog.rs), shared with the cartridge logic and the REU's
     /// store. It takes records while the rings are on.
     hwlog: HwLog,
+    /// S39/S40: the board's engine on the run (engine_tap.rs).
+    tap: engine_tap::Tap,
 }
 
 impl Trx64Backend {
@@ -395,6 +400,7 @@ impl Trx64Backend {
             iec,
             ring: None,
             hwlog,
+            tap: engine_tap::Tap::default(),
         }
     }
 
@@ -657,9 +663,20 @@ impl Trx64Backend {
         }
     }
 
-    /// Up to cycle `target`: the chips alone while the 6510 is held, else whole instructions, unless it waits for the
-    /// firmware (UCI).
+    /// Up to cycle `target`, stopping where the board's engine wants a look (S40, engine_tap.rs); the position hold
+    /// ends it early.
     fn run_to(&mut self, target: u64) {
+        if self.tap.stops() {
+            self.run_tapped(target);
+        } else {
+            self.run_to_plain(target);
+        }
+    }
+
+    /// Up to cycle `target`: the chips alone while the 6510 is held, else whole instructions, unless it waits for the
+    /// firmware (UCI). The cycles run count on the engine's counter.
+    fn run_to_plain(&mut self, target: u64) {
+        let start = self.m.c64_core.clk;
         if self.stopped || self.reset_held {
             self.run_held(target);
         } else if self.uci_wait.is_none() {
@@ -669,6 +686,12 @@ impl Trx64Backend {
                 d.after_run(&mut self.m);
             }
         }
+        self.tap.cycles += self.m.c64_core.clk.saturating_sub(start);
+    }
+
+    /// The C64 stood while the emulator's clock ran on: it continues from its cycle now.
+    fn reanchor(&mut self) {
+        self.clock = Some(Clock::new(self.now, self.m.c64_core.clk, self.cpu_hz()));
     }
 
     /// The C64's clock in Hz, as its row has it.
@@ -951,7 +974,7 @@ impl C64Backend for Trx64Backend {
         // S37: while the machine pause stands no C64 cycle runs, so the CPU, VIC, CIAs, SID and drives stand and the
         // SID makes no sample of its own. The sampler is the FPGA's and runs on. S38: the same while the transport
         // holds the C64 on an anchor.
-        if self.paused || self.ring_holds() {
+        if self.paused || self.ring_holds() || self.tap.pos_hold {
             self.sampler.with(|s| s.advance_to(now));
             // The pause mutes (top.v:1059), and the output goes on at its rate: the stretch is zeros, not missing.
             if self.paused {
@@ -1427,13 +1450,41 @@ impl C64Backend for Trx64Backend {
             return;
         }
         self.paused = paused;
-        if !paused {
-            self.clock = Some(Clock::new(self.now, self.m.c64_core.clk, self.cpu_hz()));
+        if !paused && !self.tap.pos_hold {
+            self.reanchor();
         }
     }
 
     fn set_muted(&mut self, muted: bool) {
         self.sid.set_mute(muted, self.m.c64_core.clk);
+    }
+
+    fn sb_shadow(&self) -> SbShadow {
+        self.shadow_now()
+    }
+
+    fn sb_live(&self) -> [u32; 3] {
+        self.live_now()
+    }
+
+    fn set_engine(&mut self, cfg: EngineCfg) {
+        self.tap_set_engine(cfg);
+    }
+
+    fn take_tap(&mut self) -> Vec<TapEvent> {
+        std::mem::take(&mut self.tap.events)
+    }
+
+    fn set_stop_pos(&mut self, cycle: Option<u8>) {
+        self.tap_set_pos(cycle);
+    }
+
+    fn release_pos(&mut self) {
+        self.tap_release_pos();
+    }
+
+    fn engine_cycles(&self) -> u64 {
+        self.tap.cycles
     }
 
     /// TRX64's U64 profile with the enable word 0 and the menu speed 1 MHz with badline stalls: `$D030`/`$D031` (and
@@ -1559,7 +1610,7 @@ impl C64CartSlot for Trx64Backend {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::cell::RefCell;
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -1592,7 +1643,7 @@ mod tests {
     }
 
     /// Advance `ms` emulated milliseconds in 1 ms steps, as `C64Port::tick` does.
-    fn run_ms(c64: &mut Trx64Backend, now: &mut u64, ms: u64) {
+    pub(crate) fn run_ms(c64: &mut Trx64Backend, now: &mut u64, ms: u64) {
         for _ in 0..ms {
             *now += CLOCKS_PER_MS;
             c64.advance_to(*now);
@@ -1600,7 +1651,7 @@ mod tests {
     }
 
     /// Reset released at 0, run until `READY.` (at most 3 s emulated).
-    fn booted() -> Option<(Trx64Backend, u64)> {
+    pub(crate) fn booted() -> Option<(Trx64Backend, u64)> {
         let mut c64 = Trx64Backend::new(&roms()?);
         let mut now = 0;
         c64.advance_to(now);

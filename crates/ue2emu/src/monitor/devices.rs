@@ -164,6 +164,31 @@ fn trx(host: &mut Host) -> Result<String, String> {
         on(gate & trx::GATE_FRZ != 0),
         yes(gate & trx::GATE_HALTED != 0),
     ));
+    let (cap, pos) = (t.sys_reg(trx::CAP_STAT), t.sys_reg(trx::STOP_POS));
+    out.push_str(&format!(
+        "  cap_ctrl      every {}  cap_stat gen {}, cadence frames without a snap {}\n",
+        t.sys_reg(trx::CAP_CTRL),
+        cap & 0xFFFF,
+        cap >> 16,
+    ));
+    out.push_str(&format!(
+        "  stop_pos      {pos:#010x}  armed {}, cycle {}, holding: {}\n",
+        yes(pos & trx::POS_ARM != 0),
+        pos & 0x3F,
+        yes(pos & trx::POS_HOLDING != 0),
+    ));
+    let (sb, load) = (t.state_bus(), t.sys_reg(trx::PAGE1 + trx::SB_LOAD));
+    let (w0, w1, w2) = (sb.word(1 << 7), sb.word(1 << 7 | 1), sb.word(1 << 7 | 2));
+    out.push_str(&format!(
+        "  state bus     pc ${:04x}  a {:02x} x {:02x} y {:02x} s {:02x} p {:02x}  $01 {:02x}  sb_load {load:#04x}\n",
+        w1 & 0xFFFF,
+        w0 & 0xFF,
+        w0 >> 8 & 0xFF,
+        w0 >> 16 & 0xFF,
+        w0 >> 24,
+        w1 >> 16 & 0xFF,
+        w2 >> 16 & 0xFF,
+    ));
     let (ctrl, status) = (t.sys_reg(trx::PAGE5 + trx::SH_CTRL), t.sys_reg(trx::PAGE5 + trx::SH_STATUS));
     out.push_str(&format!(
         "  sh_ctrl       {ctrl:#010x}  mode {}, sidefx {}, proto {}\n",

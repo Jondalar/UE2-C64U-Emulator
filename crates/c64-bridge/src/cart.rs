@@ -330,6 +330,26 @@ impl CartLogic {
         self.eeprom.poke(addr, val);
     }
 
+    /// S39/S40: the state bus's word 7.0, `{reg_1, reg_0}` of icepi's cartridge model (`c64_cartridge.v:171-211`): the
+    /// bytes the program wrote to the type's registers, for the types the app's restore writes back (`replay_cart`,
+    /// trx_ring.cc:664): EasyFlash and MegaByter `{$DE02, $DE00}`, Ocean / Magic Desk / Magic Desk 16 / Ocean 16K
+    /// `$DE00`. The rest have no such mapping here: 0.
+    pub fn state_bus_bank(&self) -> u16 {
+        let bank = (self.bank >> 14) as u8;
+        match self.logic {
+            EASY_FLASH => u16::from(self.mode) << 8 | u16::from(bank),
+            MEGABYTER => u16::from(self.mode & 3) << 8 | u16::from(bank),
+            OCEAN_8K => match self.variant & 3 {
+                0 => u16::from(bank & 0x3F),
+                // Magic Desk: $DE00 b7 switches the cartridge off (`mode` b0).
+                1 => u16::from(bank & 0x3F | (self.mode & 1) << 7),
+                _ => 0,
+            },
+            OCEAN_16K => u16::from(bank),
+            _ => 0,
+        }
+    }
+
     /// The type and variant as C64_CARTRIDGE_TYPE writes them.
     pub fn type_variant(&self) -> u8 {
         self.logic | (self.variant << 5)

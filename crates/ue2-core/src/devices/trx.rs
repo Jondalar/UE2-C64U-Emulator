@@ -4,7 +4,9 @@
 //! 0x100), trx_sys.v (page 0 from 0x100, pages 1, 2, 3, 5, 7), freeze_resp.v (the session), pix_layer.v and c64_text.v
 //! (page 6).
 //!
-//! Sixteen 4 KB pages, byte wide. Pages 1, 2, 3, 4 and 7 and every offset not listed read 0 and ignore writes.
+//! Sixteen 4 KB pages, byte wide. Page 0 from 0x104 holds the gate's capture control and page 1 the state bus (S39
+//! phase A1, docs/specs/S39-trxmon.md; the model is `trx_sb.rs`). Pages 2, 3, 4 and 7 and every offset not listed
+//! read 0 and ignore writes.
 //!
 //! The layer's settings and a pending flip take effect at the frame start, one per VIC frame. The device sees a VIC
 //! frame through the count [`C64Port`] publishes after each sync, polled every millisecond, so the frame start comes
@@ -19,6 +21,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::c64host::{C64Charset, C64Rom};
 use crate::devices::c64::C64Port;
+use crate::devices::trx_sb::StateBus;
 use crate::devices::trx_session::{Chips, Session, VicView};
 use crate::host::{TrxLayer, TrxText};
 use crate::io::{IoCtx, IoDevice, IoMap};
@@ -33,10 +36,10 @@ pub const IRQ_HIGH_BIT: u8 = 2;
 
 /// Page 0 (trx_io.v): ID "TRX2" at 000-003, CAPS 004, CAPS2 005, BUILD 008-00B, IRQ_EN 010, IRQ_CAUSE 014.
 const ID: &[u8; 4] = b"TRX2";
-/// CAPS b0 page 0 gate, b5 page 5 session, b6 page 6 video, b7 the layer is RGB565: what the app's freeze menu needs
-/// (trx_video.cc `init`). The bitstream reads $FF; b1-b4 (state bus, engine, debug, cartridge) stay off, and with them
-/// every app path that needs pages 1-4.
-pub const CAPS: u8 = 0xE1;
+/// CAPS b0 page 0 gate, b1 page 1 state bus, b5 page 5 session, b6 page 6 video, b7 the layer is RGB565. The
+/// bitstream reads $FF; b2-b4 (engine, debug, cartridge) stay off, and with them every app path that needs pages 2-4.
+/// A bit is reported only when its pages are built (S39 §2).
+pub const CAPS: u8 = 0xE3;
 /// CAPS2 b3: the session has the commit list, so the app sets PROTO around Gideon's protocol (trx_video.cc
 /// `has_list`). The bitstream reads $3F; the other bits' features are not here.
 pub const CAPS2: u8 = 0x08;
@@ -44,17 +47,35 @@ const CAPS_OFF: u32 = 0x004;
 const CAPS2_OFF: u32 = 0x005;
 pub const IRQ_EN: u32 = 0x010;
 pub const IRQ_CAUSE: u32 = 0x014;
-/// IRQ_CAUSE b0, the machine pause came into effect (top.v `stop_tgl`); b6, the frame start; b7, a flip was done. The
-/// other causes are pages UE2 does not build, so they stay 0.
+/// IRQ_CAUSE b0, the machine halted (top.v `stop_tgl`: the pause or the position hold); b3, a capture or a halt
+/// (`cap_tgl`); b6, the frame start; b7, a flip was done. The other causes are pages UE2 does not build, so they stay
+/// 0.
 pub const CAUSE_STOP: u8 = 0x01;
+pub const CAUSE_CAPTURE: u8 = 0x08;
 pub const CAUSE_VSYNC: u8 = 0x40;
 pub const CAUSE_FLIP: u8 = 0x80;
 
-/// trx_sys.v page 0 from 0x100: GATE_CTRL, W b0 FRZ, R b0 FRZ, b8 halted, b9 the gate is shut. 104-FFF read 0 (S38).
+/// trx_sys.v page 0 from 0x100: GATE_CTRL, W b0 FRZ, R b0 FRZ, b8 halted, b9 the gate is shut.
 pub const GATE_CTRL: u32 = 0x100;
 pub const GATE_FRZ: u32 = 0x001;
 pub const GATE_HALTED: u32 = 0x100;
 pub const GATE_SHUT: u32 = 0x200;
+/// trx_sys.v:24-34: CAP_CTRL RW b7:0, CAP_STAT R `{frames without their snap, CAP_GEN}`, JTAG_PAGE RW b3:0,
+/// RESUME_PHASE, STOP_POS `{R b16 holding, b9 W release, b8 arm, b5:0 cycle}`. 118-13F (debug) and the rest read 0.
+pub const CAP_CTRL: u32 = 0x104;
+pub const CAP_STAT: u32 = 0x108;
+pub const JTAG_PAGE: u32 = 0x10C;
+pub const RESUME_PHASE: u32 = 0x110;
+pub const STOP_POS: u32 = 0x114;
+pub const POS_ARM: u32 = 0x100;
+pub const POS_RELEASE: u32 = 0x200;
+pub const POS_HOLDING: u32 = 0x1_0000;
+/// Page 1, the state bus (trx_sys.v:38-48).
+pub const PAGE1: u32 = 0x1000;
+pub const SB_ADDR: u32 = 0x000;
+pub const SB_DATA: u32 = 0x004;
+pub const SB_STATUS: u32 = 0x008;
+pub const SB_LOAD: u32 = 0x00C;
 /// Page 5, the freeze session (trx_sys.v, freeze_resp.v).
 pub const PAGE5: u32 = 0x5000;
 pub const SH_CTRL: u32 = 0x000;
@@ -174,6 +195,16 @@ impl Still {
     }
 }
 
+/// A write to a register of the C64's clock (page 0 from 0x100, page 1, page 2) that acts on the machine: the port
+/// takes it at its clock, in order, as it runs the C64 up (S40 §3 "Ordering").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SysWrite {
+    pub at: u64,
+    /// The block offset of the register's byte 0.
+    pub off: u32,
+    pub v: u32,
+}
+
 /// What the block and the C64 port share (S37 phase B). The port owns the C64: it applies the pause, answers the
 /// session's window accesses and captures the still; the block owns the registers the app reads and writes.
 #[derive(Debug)]
@@ -182,14 +213,20 @@ pub struct TrxLink {
     pub frames: u64,
     /// One VIC frame in emulator clocks, 0 when the C64 does not say.
     pub frame_clocks: u64,
-    /// GATE_CTRL b0, and the writes the port has not taken yet: (clock, b0).
+    /// GATE_CTRL b0 as written.
     pub frz: bool,
-    pub frz_writes: Vec<(u64, bool)>,
-    /// The machine pause is in effect (applied by the port), and how often it came into effect.
+    /// The writes the port has not taken yet (GATE_CTRL, CAP_CTRL, STOP_POS, SB_LOAD).
+    pub ops: Vec<SysWrite>,
+    /// The machine is halted (the pause or the position hold, applied by the port), and how often it came to a halt.
     pub paused: bool,
     pub pause_starts: u64,
     pub session: Session,
     pub still: Still,
+    /// S39 phase A1: the state bus and the capture control, as the port keeps them.
+    pub sb: StateBus,
+    /// CAP_CTRL and JTAG_PAGE as last written (they read back at once, trx_sys.v:216-218).
+    pub cap_ctrl: u8,
+    pub jtag_page: u8,
 }
 
 impl TrxLink {
@@ -198,11 +235,14 @@ impl TrxLink {
             frames,
             frame_clocks,
             frz: false,
-            frz_writes: Vec::new(),
+            ops: Vec::new(),
             paused,
             pause_starts,
             session: Session::default(),
             still: Still::POWER_ON,
+            sb: StateBus { halted: paused, ..StateBus::default() },
+            cap_ctrl: 0,
+            jtag_page: 0,
         }
     }
 }
@@ -309,6 +349,10 @@ pub struct Trx {
     /// trx_sys.v's one collect buffer and one latch for all of its pages (`wbuf`, `rlatch`).
     far_stage: u32,
     far_latch: u32,
+    /// SB_ADDR (trx_sys.v `sb_a`): `{chip, word}`, moved on by every SB_DATA read and write.
+    sb_a: u16,
+    /// The capture events (`cap_tgl`) seen.
+    cap_seen: u64,
     /// c64_text.v: TX_CTRL b1:0, its own stage of byte 0 and its own latch.
     tx_ctrl: u8,
     tx_stage: u8,
@@ -329,7 +373,10 @@ pub struct Trx {
 
 impl Trx {
     pub fn new(link: Link) -> Self {
-        let pause_seen = lock(&link).pause_starts;
+        let (pause_seen, cap_seen) = {
+            let l = lock(&link);
+            (l.pause_starts, l.sb.cap_events)
+        };
         Trx {
             irq_en: 0,
             cause: 0,
@@ -341,6 +388,8 @@ impl Trx {
             latch: 0,
             far_stage: 0,
             far_latch: 0,
+            sb_a: 0,
+            cap_seen,
             tx_ctrl: 0,
             tx_stage: 0,
             tx_latch: 0,
@@ -367,6 +416,11 @@ impl Trx {
     /// Whether the last frame start turned the layer on.
     pub fn shown(&self) -> bool {
         self.shown.on
+    }
+
+    /// The state bus and the capture control as the port keeps them (a copy).
+    pub fn state_bus(&self) -> StateBus {
+        lock(&self.link).sb.clone()
     }
 
     /// The machine pause is in effect.
@@ -428,13 +482,35 @@ impl Trx {
         (l.session.active && view.text()).then_some((view, self.tx_ctrl & 2 != 0))
     }
 
-    /// trx_sys.v register `off` (a block offset, 32-bit aligned) as a read returns it (trx_sys.v:211-245).
+    /// trx_sys.v register `off` (a block offset, 32-bit aligned) as a read returns it (trx_sys.v:211-245), without
+    /// the side effect of an SB_DATA read.
     pub fn sys_reg(&self, off: u32) -> u32 {
         let l = lock(&self.link);
-        if off == GATE_CTRL {
-            // b9: the state bus shadows follow the machine; UE2 reads the pause for it.
-            let paused = u32::from(l.paused);
-            return paused << 9 | paused << 8 | u32::from(l.frz);
+        let sb = &l.sb;
+        match off {
+            // b9: the shadows follow the machine (`sb_frozen`), b8 halted: both the halt here.
+            GATE_CTRL => {
+                let halted = u32::from(l.paused);
+                return halted << 9 | halted << 8 | u32::from(l.frz);
+            }
+            CAP_CTRL => return u32::from(l.cap_ctrl),
+            CAP_STAT => return u32::from(sb.cap_nosnap) << 16 | u32::from(sb.cap_gen),
+            JTAG_PAGE => return u32::from(l.jtag_page),
+            // Accepted and used by nothing: never pending (S40 §6.3).
+            RESUME_PHASE => return 0,
+            STOP_POS => {
+                return u32::from(sb.pos_hold) << 16 | u32::from(sb.pos_arm) << 8 | u32::from(sb.pos_cyc);
+            }
+            _ => {}
+        }
+        if off & !0xFFF == PAGE1 {
+            return match off & 0xFFF {
+                SB_ADDR => u32::from(self.sb_a),
+                SB_DATA => sb.word(self.sb_a),
+                SB_STATUS => u32::from(sb.err) << 1 | u32::from(sb.frozen()),
+                SB_LOAD => u32::from(sb.ldarm),
+                _ => 0,
+            };
         }
         if off & !0xFFF != PAGE5 {
             return 0;
@@ -458,15 +534,32 @@ impl Trx {
         }
     }
 
-    /// trx_sys.v's commit of byte 3: GATE_CTRL and SH_CTRL; the rest is S38's.
+    /// trx_sys.v's commit of byte 3 (trx_sys.v:310-346). What acts on the machine goes to the port, at this clock.
     fn sys_commit(&mut self, off: u32, v: u32, now: u64) {
         let mut l = lock(&self.link);
-        if off == GATE_CTRL {
-            l.frz = v & GATE_FRZ != 0;
-            let frz = l.frz;
-            l.frz_writes.push((now, frz));
-        } else if off == PAGE5 + SH_CTRL {
-            l.session.write_ctrl(v);
+        let op = SysWrite { at: now, off, v };
+        match off {
+            GATE_CTRL => {
+                l.frz = v & GATE_FRZ != 0;
+                l.ops.push(op);
+            }
+            CAP_CTRL => {
+                l.cap_ctrl = v as u8;
+                l.ops.push(op);
+            }
+            JTAG_PAGE => l.jtag_page = (v & 0x0F) as u8,
+            STOP_POS => l.ops.push(op),
+            o if o == PAGE1 + SB_ADDR => self.sb_a = (v & 0xFFF) as u16,
+            o if o == PAGE1 + SB_DATA => {
+                l.sb.stage(self.sb_a, v);
+                if l.sb.frozen() {
+                    self.sb_a = (self.sb_a + 1) & 0xFFF;
+                }
+            }
+            o if o == PAGE1 + SB_STATUS => l.sb.err = false,
+            o if o == PAGE1 + SB_LOAD => l.ops.push(op),
+            o if o == PAGE5 + SH_CTRL => l.session.write_ctrl(v),
+            _ => {}
         }
     }
 
@@ -518,13 +611,18 @@ impl Trx {
     /// no C64 counts frames, one every PAL frame. A pause that came into effect raises b0.
     fn poll(&mut self, now: u64, irq: &mut IrqState) {
         self.now = now;
-        let (vic, paused, period, starts) = {
+        let (vic, paused, period, starts, caps) = {
             let l = lock(&self.link);
-            (l.frames, l.paused, l.frame_clocks, l.pause_starts)
+            (l.frames, l.paused, l.frame_clocks, l.pause_starts, l.sb.cap_events)
         };
         if starts != self.pause_seen {
             self.pause_seen = starts;
             self.cause |= CAUSE_STOP;
+            self.update_irq(irq);
+        }
+        if caps != self.cap_seen {
+            self.cap_seen = caps;
+            self.cause |= CAUSE_CAPTURE;
             self.update_irq(irq);
         }
         if vic != 0 && vic != self.vic_seen {
@@ -582,6 +680,11 @@ impl IoDevice for Trx {
         if off & 3 == 0 {
             if far(off) {
                 self.far_latch = self.sys_reg(off);
+                // trx_sys.v:358-364: an SB_DATA read moves SB_ADDR on, after it latched the word.
+                if off == PAGE1 + SB_DATA {
+                    self.sb_a = (self.sb_a + 1) & 0xFFF;
+                }
+                return self.far_latch as u8;
             } else if off & !0xFFF == PAGE6 {
                 self.latch = self.reg(reg);
                 if tx_sel(reg) {
@@ -834,10 +937,10 @@ mod tests {
     fn page_0_reads_id_and_caps_and_other_pages_read_0() {
         let mut r = Rig::new();
         assert_eq!([r.r8(0), r.r8(1), r.r8(2), r.r8(3)], *b"TRX2");
-        assert_eq!((r.r8(4), r.r8(5)), (0xE1, 0x08), "gate, session, video, RGB565; the commit list");
+        assert_eq!((r.r8(4), r.r8(5)), (0xE3, 0x08), "gate, state bus, session, video, RGB565; the commit list");
         assert_eq!(r.r32(0x008), 0, "BUILD");
         r.w8(0x4000, 0xFF);
-        assert!((0x4000..0x4010).chain(0xF000..0xF004).chain(0x1000..0x1004).chain(0x104..0x140).all(|o| r.r8(o) == 0));
+        assert!((0x4000..0x4010).chain(0xF000..0xF004).chain(0x2000..0x2004).chain(0x104..0x140).all(|o| r.r8(o) == 0));
         assert!((0x140..0x1000).step_by(0x3C).all(|o| r.r8(o) == 0), "140-FFF");
     }
 
@@ -862,7 +965,7 @@ mod tests {
         assert_eq!(r.r8(PAGE5 + SH_STATUS + 2), 0, "a commit answers 0");
         // GATE_CTRL: b0 RW, b8 and b9 the pause.
         assert_eq!(r.r32(GATE_CTRL), 0x001);
-        assert_eq!(lock(&r.link).frz_writes, [(0, true)], "for the port, at its clock");
+        assert_eq!(lock(&r.link).ops, [SysWrite { at: 0, off: GATE_CTRL, v: 1 }], "for the port, at its clock");
         lock(&r.link).paused = true;
         assert_eq!(r.r32(GATE_CTRL), 0x301);
     }

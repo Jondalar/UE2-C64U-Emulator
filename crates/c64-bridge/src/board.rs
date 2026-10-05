@@ -253,6 +253,20 @@ pub(crate) mod tests {
         bytes
     }
 
+    /// S40: each entry's 58-word chip block (`trx64Hw.block`, little endian) and its payload, oldest first.
+    pub(crate) fn fixture_blocks() -> Option<Vec<(Vec<u32>, Value)>> {
+        let dump = read_ring_dump(&board_file()).ok()?;
+        dump.checkpoint_ring
+            .entries
+            .into_iter()
+            .map(|e| {
+                let bytes = ta_u8_decode(&e.payload[BOARD_NODE]["block"])?;
+                let words = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                Some((words, e.payload))
+            })
+            .collect()
+    }
+
     /// The check passes the board's own file and finds what the board wrote.
     #[test]
     fn the_board_file_passes_the_board_rules() {
