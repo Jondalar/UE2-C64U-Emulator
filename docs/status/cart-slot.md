@@ -66,9 +66,10 @@ Test tools:
 | 5 | Ocean type 1 (512 K: 8 K mode, else 16 K) | `trx64` |
 | 19, 85 | Magic Desk, Magic Desk 16 | `trx64` |
 | 87 | GMod4 (TRX64's numbering) | `trx64` |
+| 90 | EasyFlash 3 (MX29LV640EB, eight slots of 64 banks, the `$DE0F` mode register and the reset it pulls; TRX64 `ef3.rs`) | `trx64` |
 | 32, 232 | EasyFlash (2 × AM29F040B), EasyFlash XL (TRX64 development type) | `trx64-flash` |
 | 60 | GMod2 (AM29F040 + M93C86 EEPROM from the CRT's EEPROM chip) | `trx64-flash` |
-| 61 | C64MegaCart (M29F160FT, 14-bit bank register, TRX64's numbering) | `trx64-flash` |
+| 88 | C64MegaCart (M29F160FT, 14-bit bank register; the id TRX64, TRX_CRT_cli and C64RE share since TRX64 0.12.4, was 61) | `trx64-flash` |
 | 86 | MegaByter (MX29F800CB, byte mode) | `trx64-flash` |
 | 1-4, 8-11, 13, 15, 18, 20, 21, 36, 53, 54, 64-66, 71 | Action Replay, KCS, FC III, Simons, Super Games, Atomic Power, Epyx, Westermann, FC I, C64 Game System, Zaxxon, SS5, COMAL 80, Retro Replay, Pagefox, Business Basic, Blackbox V3/V4/V8/V9 | `u64-logic` (`cart::CartLogic`, all_carts_v5.vhd) with the cartridge's own 4 MB ROM and 64 K RAM, laid out as `C64_CRT::read_crt` does (c64_crt.cc:291-358, `configure_cart` 466-651) |
 

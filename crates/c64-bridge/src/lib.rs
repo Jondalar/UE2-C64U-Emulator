@@ -53,7 +53,7 @@ use clock::Clock;
 use hwlog::HwLog;
 use keys::Keys;
 use reu::ReuRam;
-use slot::{PhysicalCart, SlotHandle};
+use slot::{PhysicalCart, Slot, SlotHandle};
 
 pub use board::{check_board_ring, BoardCheck, BOARD_MAX_ENTRIES, BOARD_NODE};
 pub use ring::{BoardDumpInfo, Mode as RingMode, Ring, UE2_NODE};
@@ -588,7 +588,7 @@ impl Trx64Backend {
         }
         loop {
             let clk = self.m.c64_core.clk;
-            if clk >= target || self.uci_wait.is_some() {
+            if clk >= target || self.uci_wait.is_some() || self.slot.view().cart_reset_pending() {
                 break;
             }
             let events = self.uci_events();
@@ -740,7 +740,7 @@ impl Trx64Backend {
         (self.tap.run_clk, self.tap.run_cycles) = (start, self.tap.cycles);
         if self.stopped || self.reset_held {
             self.run_held(target);
-        } else if self.uci_wait.is_none() {
+        } else if self.uci_wait.is_none() && !self.slot.view().cart_reset_pending() {
             self.run_cpu(target);
             // W4-DRIVE: note what drive A wrote.
             for d in &mut self.drives {
@@ -748,6 +748,39 @@ impl Trx64Backend {
             }
         }
         self.tap.cycles += self.m.c64_core.clk.saturating_sub(start);
+    }
+
+    /// The physical cartridge pulled the expansion port's RESET line (EasyFlash 3, `$DE0F`): TRX64 holds the C64 in
+    /// reset for 8 cycles and warm-resets it with the cartridge told the reset is its own (`cart_generated_reset`), so
+    /// it keeps its mode, slot and bank. The firmware is not involved, as on the board. The rest of the slice is not
+    /// run; the clock re-anchors as at a release ([`C64Backend::set_reset`]).
+    fn cart_generated_reset(&mut self) {
+        self.ring_discard();
+        self.sid.reset();
+        self.sampler.with(|s| s.c64_reset());
+        for d in &mut self.drives {
+            d.update(&mut self.m, self.stopped, true);
+        }
+        let clk = self.m.c64_core.clk.max(self.m.clk);
+        // The 8 cycles of the reset pulse count on the engine's counter (phi2 edges).
+        self.tap.cycles += 8;
+        self.slot.with(|s| s.reset_release(clk + 8));
+        self.m.cart_generated_reset();
+        if let Some(reu) = self.parked_reu.as_mut() {
+            reu.reset();
+        }
+        self.m.clk = self.m.c64_core.clk;
+        self.sid.reanchor(self.m.c64_core.clk);
+        for d in &mut self.drives {
+            d.update(&mut self.m, self.stopped, false);
+        }
+        self.update_pla();
+        self.reanchor();
+        self.keys.cleared();
+        self.keys.apply(&mut self.m.keyboard);
+        self.apply_joysticks();
+        self.nmi_line = self.nmi;
+        self.apply_interrupts();
     }
 
     /// The C64 stood while the emulator's clock ran on: it continues from its cycle now.
@@ -994,7 +1027,7 @@ impl Observer for CartObserver {
         }
         let (cart, forced) = (&self.cart, self.forced_ultimax);
         let lines = self.slot.with(|s| s.lines_changed(cart, forced));
-        lines || (kind == BusKind::Write && is_uci_control(addr))
+        lines || (kind == BusKind::Write && is_uci_control(addr)) || self.slot.view().cart_reset_pending()
     }
 }
 
@@ -1063,6 +1096,9 @@ impl C64Backend for Trx64Backend {
         // S40: what no tap saw since (the REU's DMA) goes to the engine at the end of the slice.
         self.tap_compare(false);
         self.sid.advance(self.m.c64_core.clk);
+        if self.slot.with(Slot::take_cart_reset) {
+            self.cart_generated_reset();
+        }
         // S16: the voices are FPGA-clocked, so they follow the emulator's clock rather than the C64's — and they run
         // whether or not anyone is listening, because a finished voice sets the status bit `audio_detect()` polls.
         self.sampler.with(|s| s.advance_to(now));
@@ -2312,6 +2348,42 @@ pub(crate) mod tests {
     /// CARTSLOT: a physical EasyFlash reached through DMA as the fork's dumper reaches it: its bus setup
     /// (app_api_impl.cc `api_c64_cart_setup_bus`), U64_CART_DETECT, the sharing registers, MEMONLY past the cartridge,
     /// the forced ULTIMAX lens, and a sector erase issued over DMA that completes while the 6510 is stopped.
+    /// TRX64 0.12.4: an EasyFlash 3 (CRT type 90) in the expansion port boots Ultimax from slot 0, and a `$DE0F` = 0
+    /// write pulls RESET: the C64 resets with RAM kept and boots through the cartridge again.
+    #[test]
+    fn physical_easyflash3_boots_and_its_own_reset_reboots_the_c64() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        let mut now = 0;
+        c64.advance_to(now);
+        let code = [
+            0xEE, 0x00, 0x04, // INC $0400
+            0xAD, 0x00, 0x04, // LDA $0400
+            0xC9, 0x02, // CMP #2
+            0xB0, 0x05, // BCS done
+            0xA9, 0x00, // LDA #0
+            0x8D, 0x0F, 0xDE, // STA $DE0F: EasyFlash mode and reset
+            0x4C, 0x0F, 0xE0, // done: JMP done
+        ];
+        let mut romh = vec![0xEA; 0x2000];
+        romh[..code.len()].copy_from_slice(&code);
+        romh[0x1FFC..0x1FFE].copy_from_slice(&[0x00, 0xE0]);
+        let crt = slot::tests::crt(90, 1, 0, &[(0, 0x8000, vec![0x11; 0x2000], 2), (0, 0xE000, romh, 2)]);
+        let info = c64.insert_cart(&crt, FlashDecode::Both).unwrap();
+        assert_eq!((info.family.as_str(), info.model.as_str(), info.banks), ("EasyFlash 3", "trx64", 512));
+        assert_eq!(c64.cart_detect(), 0x02, "boots ULTIMAX: GAME low");
+        c64.set_reset(true);
+        run_ms(&mut c64, &mut now, 2);
+        c64.m.ram[0x0400] = 0;
+        c64.set_reset(false);
+        run_ms(&mut c64, &mut now, 20);
+        assert_eq!(c64.m.ram[0x0400], 2, "booted twice: once at the release, once at the cartridge's reset");
+        assert_eq!(c64.m.c64_core.reg_pc, 0xE00F);
+        assert!(c64.m.c64_core.clk < 20 * 1000, "the cycle counter restarted at the cartridge's reset");
+        let image = c64.crt_image().unwrap();
+        assert_eq!(&image[..0x40], &crt[..0x40], "TRX64 re-packs the type-90 CRT with its header");
+        assert!(PhysicalCart::from_crt(&image, FlashDecode::Both).is_ok());
+    }
+
     #[test]
     fn physical_easyflash_over_dma_while_stopped() {
         let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));

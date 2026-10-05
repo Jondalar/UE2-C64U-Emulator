@@ -8,7 +8,7 @@ are built (as built: §10).
 **Why:** Alex decided (2026-10-05) that UE2 behaves like the TRX64-Ultimate board for the firmware, so its UI and UX
 can be tested without the board. On the board the app's frame ring, Timewarp (freeze menu and REST) and trxmon's
 ring verbs run on the FPGA engine: CAPS b2, page 2, `trx_engine.v`. UE2 presents that register interface and writes
-the streams exactly in the app's format, fed from the embedded TRX64 core (`trx64-core`, pinned v0.12.3). The app is
+the streams exactly in the app's format, fed from the embedded TRX64 core (`trx64-core`, pinned v0.12.5). The app is
 unmodified.
 
 S38 (TRX64's own rings for UE2's monitor) stays as it is. S40 adds the board's engine next to it.

@@ -181,15 +181,16 @@ fn parse(crt: &[u8]) -> Result<Crt, String> {
     Ok(Crt { hw_type: be16(crt, 0x16), name, chips })
 }
 
-/// CRT hardware types TRX64 builds a ROM mapper for (TRX64 cart.rs `infer_mapper_type`). TRX64's numbering is used as
-/// it is: 87 is GMod4 there, where the firmware has TwoMegabyter.
+/// CRT hardware types TRX64's own mappers serve (TRX64 cart.rs `infer_mapper_type`). TRX64's numbering is used as it
+/// is: 87 is GMod4 there, where the firmware has TwoMegabyter; 90 is EasyFlash 3 (TRX64 ef3.rs, its flash in the
+/// chip's own layout).
 fn trx64_rom_type(hw: u16) -> bool {
-    matches!(hw, 0 | 5 | 19 | 85 | 87)
+    matches!(hw, 0 | 5 | 19 | 85 | 87 | 90)
 }
 
-/// The flash families served by the boards below (TRX64's numbering: 61 is C64MegaCart, 232 EasyFlash XL).
+/// The flash families served by the boards below (TRX64's numbering: 88 is C64MegaCart, 232 EasyFlash XL).
 fn flash_type(hw: u16) -> bool {
-    matches!(hw, 32 | 60 | 61 | 86 | 232)
+    matches!(hw, 32 | 60 | 86 | 88 | 232)
 }
 
 /// C64_CARTRIDGE_TYPE and name for the CRT types the U64 cartridge logic serves and TRX64 does not, as
@@ -235,6 +236,7 @@ fn family(t: MapperType) -> &'static str {
         MapperType::MegaByter => "MegaByter",
         MapperType::C64MegaCart => "C64MegaCart",
         MapperType::Gmod4 => "GMod4",
+        MapperType::EasyFlash3 => "EasyFlash 3",
         MapperType::SelfConfig | MapperType::Unsupported => "unsupported",
     }
 }
@@ -281,23 +283,10 @@ fn window_offset(addr: u16) -> u32 {
     u32::from(addr & 0x1FFF)
 }
 
-/// S38: a flash chip's command state for an anchor. `Flash040::snapshot_state` needs `&mut` (it catches the erase
-/// alarm up first), and `CartMapper::get_state` is `&self`, so a busy chip is cloned, as TRX64's own mappers do. An idle
-/// chip (READ, no erase pending) is what `snapshot_state` would give without the clone of its array; the anchor's
-/// capture has caught every erase up before (`PhysicalCart::log_image`).
+/// S38: a flash chip's command state for an anchor, without catching the erase alarm up (`CartMapper::get_state` is
+/// `&self`); the anchor's capture has caught every erase up before (`PhysicalCart::log_image`).
 fn flash_snap(f: &Flash040) -> Flash040SnapState {
-    if f.is_busy() {
-        return f.clone().snapshot_state(0);
-    }
-    Flash040SnapState {
-        state: 0,
-        base_state: 0,
-        program_byte: 0,
-        last_read: 0,
-        dirty: f.is_dirty(),
-        erase_mask: Default::default(),
-        erase_alarm_clk: -1,
-    }
+    f.snapshot_state_ro()
 }
 
 /// The command state of the chips in a `CartState` (S38).
@@ -309,6 +298,7 @@ fn flash_state(lo: &Flash040, hi: Option<&Flash040>, eeprom: Option<&M93c86>, io
         spi: None,
         easyflash_jumper: 0,
         easyflash_ram: io_ram.to_vec(),
+        ef3: None,
     })
 }
 
@@ -917,14 +907,18 @@ impl PhysicalCart {
                 let (_, mapper) =
                     tcart::load_cartridge_from_bytes(crt, &parsed.name, None).map_err(|e| format!("TRX64: {e}"))?;
                 let kind = mapper.mapper_type();
-                let banks = if kind == MapperType::Gmod4 { 1024 } else { highest.map_or(0, |b| b + 1) };
+                let banks = match kind {
+                    MapperType::Gmod4 => 1024,
+                    MapperType::EasyFlash3 => usize::from(trx64_core::ef3::EF3_BANKS),
+                    _ => highest.map_or(0, |b| b + 1),
+                };
                 (Device::Mapper(mapper), family(kind).to_string(), "trx64", banks, None)
             } else {
                 let rom_bytes: usize = chips.iter().filter(|c| c.is_rom()).map(|c| c.size).sum();
                 let Some((type_variant, name)) = logic_type(hw, rom_bytes) else {
                     return Err(format!(
-                        "CRT hardware type {hw} has no physical cartridge model: TRX64 serves 0, 5, 19, 85 and 87, \
-                         the flash boards 32, 60, 61, 86 and 232, the U64 cartridge logic 1-4, 8-11, 13, 15, 18, 20, \
+                        "CRT hardware type {hw} has no physical cartridge model: TRX64 serves 0, 5, 19, 85, 87 and 90, \
+                         the flash boards 32, 60, 86, 88 and 232, the U64 cartridge logic 1-4, 8-11, 13, 15, 18, 20, \
                          21, 36, 53, 54, 64-66 and 71"
                     ));
                 };
@@ -1109,11 +1103,36 @@ impl PhysicalCart {
 
     fn run_hints(&mut self, clk: u64) -> RunHints {
         match &mut self.device {
+            // EasyFlash 3 pulls RESET itself after a `$DE0F` write: its I/O accesses end the run (`Slot::cart_reset`).
+            Device::Mapper(m) if m.mapper_type() == MapperType::EasyFlash3 => RunHints { watch_io: true, ..RunHints::default() },
             Device::Mapper(_) => RunHints::default(),
             Device::Logic(c) => {
                 c.logic.set_clk(clk);
                 c.logic.run_hints()
             }
+        }
+    }
+
+    /// A reset this cartridge asked for (EasyFlash 3: `$DE0F` = 0 or 7, TRX64 ef3.rs), taken once.
+    fn take_reset_request(&mut self) -> bool {
+        match &mut self.device {
+            Device::Mapper(m) => m.take_reset_request(),
+            Device::Logic(_) => false,
+        }
+    }
+
+    /// The RESET line pulled by the cartridge itself: EasyFlash 3 keeps its mode, slot and bank (TRX64
+    /// `CartMapper::reset_generated`).
+    fn reset_generated(&mut self) {
+        match &mut self.device {
+            Device::Mapper(m) => m.reset_generated(),
+            Device::Logic(c) => c.logic.reset_line(),
+        }
+    }
+
+    fn reset_vector_fetched(&mut self) {
+        if let Device::Mapper(m) = &mut self.device {
+            m.reset_vector_fetched();
         }
     }
 
@@ -1181,6 +1200,10 @@ impl PhysicalCart {
             return out; // the logic's ROM is read-only
         };
         let kind = m.mapper_type();
+        if kind == MapperType::EasyFlash3 {
+            // TRX64 re-packs the chip itself: a bank's ROML and ROMH halves lie 64 KB apart in it (ef3.rs).
+            return m.crt_image(clk + self.epoch).unwrap_or(out);
+        }
         let Some(image) = m.writable_image(clk + self.epoch) else {
             return out;
         };
@@ -1274,11 +1297,13 @@ pub struct Slot {
     bus_bridge: u8,
     /// EXROM/GAME as TRX64's PLA last took them.
     shown: (u8, u8),
+    /// The physical cartridge pulled the RESET line (EasyFlash 3): the bridge resets the C64 after the run.
+    cart_reset: bool,
 }
 
 impl Default for Slot {
     fn default() -> Self {
-        Slot { physical: None, bus_internal: BUS_ALL, bus_external: BUS_ALL, bus_bridge: 0, shown: (1, 1) }
+        Slot { physical: None, bus_internal: BUS_ALL, bus_external: BUS_ALL, bus_bridge: 0, shown: (1, 1), cart_reset: false }
     }
 }
 
@@ -1388,7 +1413,11 @@ impl Slot {
         let internal = serves(self.bus_internal, addr) && cart.with(|c| c.bus_write(addr, val, clk, forced_ultimax));
         let mirrored = io && self.bus_bridge & BRIDGE_WRITES != 0;
         let external = match self.physical.as_mut() {
-            Some(p) if serves(self.bus_external, addr) || mirrored => p.write(addr, val, info, clk),
+            Some(p) if serves(self.bus_external, addr) || mirrored => {
+                let taken = p.write(addr, val, info, clk);
+                self.cart_reset |= p.take_reset_request();
+                taken
+            }
             _ => false,
         };
         if io {
@@ -1420,6 +1449,31 @@ impl Slot {
     pub fn reset(&mut self, cart: &CartHandle) {
         cart.with(CartLogic::reset_line);
         self.reset_physical();
+    }
+
+    /// The physical cartridge pulled the RESET line since the last call (EasyFlash 3).
+    pub fn cart_reset_pending(&self) -> bool {
+        self.cart_reset
+    }
+
+    pub fn take_cart_reset(&mut self) -> bool {
+        std::mem::take(&mut self.cart_reset)
+    }
+
+    /// The RESET line pulled by the physical cartridge: the internal cartridge sees the line, the physical one knows
+    /// it pulled it.
+    pub fn reset_generated(&mut self, cart: &CartHandle) {
+        cart.with(CartLogic::reset_line);
+        if let Some(p) = &mut self.physical {
+            p.reset_generated();
+        }
+    }
+
+    /// TRX64 fetched the reset vector through an Ultimax ROMH (EasyFlash 3 lets GAME go here).
+    pub fn reset_vector_fetched(&mut self) {
+        if let Some(p) = &mut self.physical {
+            p.reset_vector_fetched();
+        }
     }
 
     /// The RESET line asserted: the physical cartridge resets while it is held.
@@ -1787,7 +1841,7 @@ pub(crate) mod tests {
         let romh: Vec<u8> = (0xA000..0xC000u16).map(|a| slot.read(&cart, a, &bi, 0).unwrap()).collect();
         assert_eq!(romh, romh0, "the CRT's own EAPI block, not TRX64's");
 
-        let mc = crt(61, 0, 1, &[(0, 0x8000, fill(0, 0x50), 2), (255, 0x8000, fill(255, 0x50), 2)]);
+        let mc = crt(88, 0, 1, &[(0, 0x8000, fill(0, 0x50), 2), (255, 0x8000, fill(255, 0x50), 2)]);
         let mut slot = slot_with(&mc, FlashDecode::Both);
         // fill(255, 0x50) starts with 0x50 + 255, wrapped: 0x4F.
         for (high, low, want) in [(0u8, 255u8, 0x4Fu8), (1, 0, 0x50), (3, 255, 0x4F)] {
