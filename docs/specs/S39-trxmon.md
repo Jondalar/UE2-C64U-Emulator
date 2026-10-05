@@ -1,7 +1,7 @@
 # S39 — trxmon in UE2: the debug block served from TRX64
 
 **Status:** built (2026-10-05), local branch `s37-trx-pixel-layer`: phases A1-E against t21-p4 a85f741 (with the D-page
-fix df6d71c) and t21-p4-app, smoke-tested with the app build 553e2e17 (the D-page change); as built: §11. Phase F waits for TRX64 (§5 T1, T2). Updated the same day from the FPGA
+fix df6d71c, the OWNER block rule 3302c85) and t21-p4-app, smoke-tested with the app build 165c22fe; as built: §11. Phase F waits for TRX64 (§5 T1, T2). Updated the same day from the FPGA
 session's answers (`run/trx/s39-answers.md`, t21-p4 RTL and app; they override this text where they differ) and S40.
 
 **Why:** the TRX64-Ultimate firmware session must test trxmon (the T21 monitor app) in UE2 as on the board: the
@@ -291,7 +291,10 @@ access first, as S37 does for `GATE_CTRL`).
 On t21-p4 a debugger stop starts the freeze session (freeze_resp.v:209-224): cause `dbg_stop` = hold, halted, no
 step; `SH_MODE` 1 or 2, no C64_STOP and no Ultimax needed. It lasts while the hold does and no RUN or step is
 requested. At its end the list is committed as bus cycles before the machine moves. `SH_STATUS` b2 says the session
-is the debugger's. `block` is set at every end of such a session and clears when `dbg_stop` falls (:546, :884).
+is the debugger's. `block` is set at every end of such a session (:888) and clears when `dbg_stop`, `halt_req` and a
+commit are gone and C64_STOP is off or OWNER is set (:550, 3302c85, T12 §14.8 point 10): while the debugger owns the
+machine a foreground app's C64_STOP, held for the whole run, does not take the next stop's session. `cond` and
+`keep_app` still take the raw C64_STOP, so an app's Ultimax freeze while OWNER is set stays the app's session.
 
 UE2's `Session` (S37 B2) gets this second cause. The window's non-MEMONLY accesses in the stop are answered as in a
 freeze (VIC, CIA, colour RAM, the cartridge look; SID `$FF`); writes go to the overlay and the list (PROTO is not
@@ -416,7 +419,9 @@ T1 and T2 decide whether trxmon's stops are exact in UE2. Everything else is exa
 - CPU write: `r a=77 x=05` staged, `SB_LOAD` b1 armed until the step, then `STA $0400` stores `$77` in 4 cycles;
   `pc=` redirect with `IPC_SET`: IPC and the IB flag at once, no cycle.
 - Session: a debugger stop starts one (`SH_STATUS` `b0 | b2`, count + 1); `$DC0D` and `$D019` read twice keep their
-  flags; `wr d020` is read back, not in the chip, committed by the step before it runs; SH_MODE 0: no session.
+  flags; `wr d020` is read back, not in the chip, committed by the step before it runs; SH_MODE 0: no session. With
+  OWNER and C64_STOP held every debugger stop (six, and a step) has its session; without OWNER C64_STOP keeps the
+  block; an app's Ultimax freeze with OWNER is the app's session, ended when C64_STOP falls.
 - LK: look of ROML/ROMH/IO1/IO2 for an EasyFlash bank 2 equals the bytes; ROMH asked at `$A000` equals `$E000`;
   physical slot `ext`, REAL while halted equals the cartridge, refused while running.
 - Drive: `DRV_CMP` exec stops the C64 with REASON 8; DRV_STEP 1 moves DPC, the C64 cycle count stands.
@@ -432,11 +437,11 @@ container, `apps/trxmon/build.sh`), `--board c64u --trx-io`, a fresh flash with 
 | `button`, browse to `trxmon.u2a`, Run App | the monitor screen (40 x 23 from row 2), `PAUSED IB $xxxx`; console `trxmon: serving the TRX64 runtime contract on TCP 4312` |
 | type `r`, `m c000`, `d e5cd`, `io d000` | registers equal UE2's `monitor r`; `m`/`d` equal `monitor m`; VIC registers equal TRX64's `peek_lens(…, "io")` |
 | `z`, `z 5` | the PC equals UE2's own trace of the same steps; cycles + the instructions' cycles |
-| `bk e5cd`, `x` (leave with a stop armed) | the C64 runs (the loader leaves the browser up); when the menu is closed the screen comes back with `breakpoint 1 hit at .C:e5cd` (§11: not with 553e2e17) |
+| `bk e5cd`, `x` (leave with a stop armed) | the menu closes (`ui->close_menu`), the C64 runs; the break opens the monitor screen by itself with `breakpoint 1 hit at .C:e5cd` |
 | `m io dc0d` twice | the same value (no flag cleared) |
 | `wr d020 05`, `z` | the border colour changes after the step |
 | `wr d020 03` in a debugger stop with a session, RUN | on the commit list (the chip keeps its colour), written at RUN |
-| `m io d800` in a debugger stop with a session | UE2's colour RAM |
+| `m io d800` in every debugger stop (foreground with C64_STOP held, and background) | UE2's colour RAM (not while `rstep` keeps the machine landed: §11) |
 | `r a=42`, `z` over `STA $0400` (a program put in with `a c000`) | `$0400` = `$42` |
 | `m cart 8000` with an EasyFlash in `--cart` | the bank's bytes |
 | `trace status`, `rstep` | the board's "needs the instruction trace" and "no frame ring" text |
@@ -454,7 +459,19 @@ Phases A-E without TRX64 changes; F waits for TRX64.
 
 ## 11. As built (2026-10-05)
 
-Against t21-p4 a85f741 (the D-page fix df6d71c: STATUS b1, `ultimate_sys` opens the window's D page for a debugger
+**Update (t21-p4 3302c85, t21-p4-app 165c22fe):** UE2's session takes the new block rule (`trx_session.rs` `step`:
+the block clears with C64_STOP off or OWNER set). The app's `api_delay_ms` sleeps `ceil(ms/tick) + 1` ticks, trxmon
+waits for its serve loop with `plat_wait_flag`, and `x` calls the new `ui->close_menu` (`run_app` returns `MENU_HIDE`;
+Ctrl-O too; not after `/quit`). Builds kept as `run/trx/ultimate-165c22fe.elf` and `run/trx/trxmon-165c22fe.u2a`;
+`scripts/smoke-trxmon.sh --elf $PWD/run/trx/ultimate-165c22fe.elf --u2a $PWD/run/trx/trxmon-165c22fe.u2a` passes with
+both former findings below turned into PASS checks: after `bk e5cd` and `x` the menu closes and the break opens the
+monitor screen by itself; after the selftest and each step in the foreground (C64_STOP held) the stop has its session
+and the colour RAM reads UE2's values. One stop in the foreground still has none: after `rstep` the machine is landed,
+and the ring's land turns sessions off (trx_ring.cc `land_locked` -> `scrub_begin_locked` -> `stop_machine`: `SH_CTRL`
+0) until its commit puts `SH_CTRL` back (`commit_locked`); `m io d800` reads `--` there (INFO). That is the firmware's
+design of a land, not the block.
+
+The first build, against t21-p4 a85f741 (the D-page fix df6d71c: STATUS b1, `ultimate_sys` opens the window's D page for a debugger
 stop) and t21-p4-app 553e2e17 (trxmon: a debugger stop holds the window like C64_STOP), built by the FPGA session and
 kept as `run/trx/ultimate-553e2e17.elf` and `run/trx/trxmon-553e2e17.u2a`:
 `scripts/smoke-trxmon.sh --elf $PWD/run/trx/ultimate-553e2e17.elf --u2a $PWD/run/trx/trxmon-553e2e17.u2a` (absolute
@@ -514,7 +531,7 @@ and `x`: trxmon serves in the background and the breakpoint fires (REASON 3 at `
 `wr d020 03` is on the commit list with the chip unchanged, RUN writes it.
 
 **Deviations and findings (for Alex):**
-- **`bk` then `x`: the screen does not come back. The cause is in the app (trxmon 553e2e17), not in UE2.** Traced with
+- **(Fixed in 165c22fe.) `bk` then `x`: the screen does not come back. The cause is in the app (trxmon 553e2e17), not in UE2.** Traced with
   `--gdb` on the 553e2e17 ELF:
   1. After `x` the request is queued: `s_uireq_fn` = trxmon's `ui_callback` (app_api_net.cc:446-457). The loader leaves
      the browser up after the app returns (app_loader.cc:470 `appear()`, :473 `MENU_C64_RESUME`), so the request waits
@@ -533,7 +550,7 @@ and `x`: trxmon serves in the background and the breakpoint fires (REASON 3 at `
      tick, or the serve task at the same priority); the board behaves the same (same FreeRTOS, same priorities).
   The smoke checks UE2's part (the breakpoint after `x`, trxmon alive) and reports the reopen as KNOWN; it turns into
   a PASS when a fixed app brings the screen back.
-- **The colour RAM in a debugger stop needs a session, and the RTL's block keeps it off while C64_STOP stands.**
+- **(Fixed in 3302c85.) The colour RAM in a debugger stop needs a session, and the RTL's block keeps it off while C64_STOP stands.**
   `hw_session_read` needs `SH_STATUS` b0. freeze_resp.v:546 clears `block` only when the raw `app_stop` (top.v:1149,
   C64_STOP not masked by OWNER), `halt_req` and `dbg_stop` are all low; a debugger session's end sets it (:884). The
   loader holds C64_STOP for a foreground app (app_loader.cc:334 `MENU_C64_PAUSE`), so only the acquire's first stop
