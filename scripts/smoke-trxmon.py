@@ -13,9 +13,11 @@ RPC port forwarded, and drives it over the control port and trxmon's RPC (TRX64-
 - RPC: after the selftest and each step a debugger stop with a session though the loader's C64_STOP stands (OWNER,
   t21-p4 3302c85): the colour RAM reads UE2's values;
 - RPC: `trace on`, three steps: `trace status` has records (S40 phase E); `rstep` lands on the frame since the
-  selftest's breakpoint (the land turns sessions off until its commit: INFO);
+  selftest's breakpoint: the landed stop has its session, `m io d800` is UE2's colour RAM (t21-p4-app f2a26eae);
 - RPC: `wr d020 05`, then a step: the border colour is 5 (in the foreground the loader's C64_STOP holds the window,
   so the write is a bus cycle);
+- RPC: `g c000` with a program counting frames into $d800, pause; `frame -2` twice, `goto N`, `goto` forward, `rewind`:
+  each landed stop has its session, `m io d800` reads UE2's colour RAM, $d800 moves one a frame;
 - typed: `r pc=c000` (the CPU write path's redirect with IPC_SET), `r a=42` on `STA $0400`, `z`: $0400 = $42 (a
   redirect and a bus cycle while halted are no part of a frame's replay, so `rstep` comes before them);
 - `/quit` on the screen: OWNER 0, the C64 runs again; `print 6*7` gives 42;
@@ -170,6 +172,72 @@ def colour_ram(run, c, put=True):
     return got
 
 
+def landed_d800(run, c, what):
+    """`m io d800 d80f` through trxmon in a landed stop: real values (no `--`, the stop is a session) and UE2's colour
+    RAM, which the land put back (the restored frame's)."""
+    session(run, what)
+    t = c.mon('m io d800 d80f')
+    m = re.search(r'd800\s+((?:[0-9a-f]{2}\s+){15}[0-9a-f]{2})', t, re.I)
+    check('--' not in t and m, f'{what}: m io d800 d80f: {t!r}')
+    got = bytes(int(b, 16) for b in m.group(1).split())
+    want = run.mem_io(0xD800, 16)
+    check(bytes(b & 0x0F for b in got) == bytes(b & 0x0F for b in want),
+          f'{what}: m io d800 trxmon {got.hex()} vs UE2 {want.hex()}')
+    return got
+
+
+# The C64 counts frames into $d800: once a frame, at raster $80, INC $d800 (PAL: line 128 is the only one with $80).
+FRAMES_PRG = bytes.fromhex('ad12d0c980d0f9ee00d8ad12d0c980f0f94c00c0')
+
+
+def ring_lands(run, c):
+    """Frames with a colour RAM that changes once a frame, then lands on them: `frame -2`, `goto N`, `rewind` (a
+    status, the machine stays landed); in each the trxmon read is UE2's colour RAM and $d800 moves with the frames."""
+    pc0, a0, x0, y0, sp0 = run.regs()
+    text = '\n'.join(run.cmd('monitor r'))
+    fl = re.search(r';[0-9a-fA-F]{4}(?: [0-9a-fA-F]{2}){4} ([nN][vV]-[bB][dD][iI][zZ][cC])', text)
+    check(fl, f'monitor r: {text}')
+    p0 = 0x20 | sum(1 << (7 - i) for i, ch in enumerate(fl.group(1)) if ch.isupper())
+    run.cmd('monitor wr ram c000 ' + FRAMES_PRG.hex(' '))
+    g = c.mon('g c000')
+    run.cmd('wait 1500')
+    c.call('debug/pause', {'source': 'llm'})
+    live = run.mem_io(0xD800, 1)[0] & 0x0F
+    st = c.mon('frame')
+    m = re.search(r'frame (\d+)/(\d+)', st)
+    check(m and int(m.group(2)) >= 20, f'g c000 ({g.strip()}), 1.5 s, pause: the ring: {st!r}')
+    head = int(m.group(2))
+
+    def at(cmd, frame):
+        o = c.mon(cmd)
+        m = re.search(r'frame (\d+)/', o)
+        check(m and int(m.group(1)) == frame, f'{cmd}: frame {frame} wanted: {o!r}')
+        return landed_d800(run, c, cmd)[0] & 0x0F
+
+    v1 = at('frame -2', head - 2)
+    # the head frame's start lies before the stop: $80 of the frame the machine stands in may have come or not
+    check((live - v1) % 16 in (2, 3), f'frame -2: $d800 {v1:x}, live {live:x}')
+    v2 = at('frame -2', head - 4)
+    check((v1 - v2) % 16 == 2, f'frame -2 twice: $d800 {v1:x} -> {v2:x}')
+    n = head - 10
+    v3 = at(f'goto {n}', n)
+    check((v2 - v3) % 16 == 6, f'goto {n}: $d800 {v3:x}, frame {head - 4}: {v2:x}')
+    v4 = at(f'goto {head - 2}', head - 2)
+    check(v4 == v1, f'goto {head - 2}: $d800 {v4:x}, frame -2 landed {v1:x} there')
+    rw = c.mon('rewind')
+    check('RINGBUFFER' in rw, f'rewind: {rw!r}')
+    v5 = landed_d800(run, c, 'rewind')[0] & 0x0F
+    check(v5 == v4, f'rewind: $d800 {v5:x}, the land {v4:x}')
+    print(f'PASS frame -2, frame -2, goto {n}, goto {head - 2}, rewind: m io d800 is UE2\'s colour RAM, $d800 '
+          f'{live:x} live -> {v1:x} {v2:x} {v3:x} {v4:x} {v5:x} (one a frame)')
+    # Back to the KERNAL's keyboard wait: the redirect (IPC_SET) and the registers, taken by a step.
+    r = c.mon(f'r pc={pc0:04x} a={a0:02x} x={x0:02x} y={y0:02x} sp={sp0:02x} p={p0:02x}')
+    c.call('debug/step')
+    c.wait_note('debug/stopped', 2.0)
+    pc, _, x, y, sp = run.regs()
+    check(0xE5CD <= pc <= 0xE5D6 and (x, y, sp) == (x0, y0, sp0), f'{r.strip()}, a step: {run.regs()}')
+
+
 def session(run, what):
     sh = next(l for l in run.trx().splitlines() if 'sh_status' in l)
     check('session: yes' in sh, f'{what}: the debugger stop has no session: {" ".join(sh.split())}')
@@ -234,6 +302,10 @@ def smoke(run, client):
         rs = c.mon('rstep')
         check('landed' in rs, f'rstep: {rs}')
         print(f'PASS rstep: {rs.splitlines()[0][:100]}')
+        # trxmon f2a26eae: a land ends in a debugger session (land_locked writes the stop's SH_CTRL mode back on the
+        # load edge), so the landed stop reads the restored colour RAM.
+        got = landed_d800(run, c, 'rstep')
+        print(f'PASS m io d800 after rstep (landed): {got[:8].hex(" ")}')
         c.call('debug/pause', {'source': 'llm'})
         check(c.read(0xC000, 256, 'cpu') == run.mem(0xC000, 256), 'read c000 256 cpu differs from monitor m c000')
         print('PASS RPC read c000 256 cpu equals monitor m c000')
@@ -248,10 +320,7 @@ def smoke(run, client):
         border = c.read(0xD020, 1, 'io')[0] & 0x0F
         check(border == 5, f'wr d020 05 ({w.strip()}), then a step: the border is {border}')
         print(f'PASS wr d020 05 ({w.strip()}), a step: the border is 5')
-        # After `rstep` the machine is landed: the ring's land turned sessions off (trx_ring.cc land_locked ->
-        # scrub_begin_locked -> stop_machine: SH_CTRL 0) until its commit puts SH_CTRL back (commit_locked).
-        sh = next(l for l in run.trx().splitlines() if 'sh_ctrl' in l)
-        print(f'INFO colour RAM after rstep (landed): {" ".join(c.mon("m io d800 d807").split()[1:9])}  ({" ".join(sh.split())})')
+        ring_lands(run, c)
     finally:
         c.close()
 

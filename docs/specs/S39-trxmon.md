@@ -441,7 +441,8 @@ container, `apps/trxmon/build.sh`), `--board c64u --trx-io`, a fresh flash with 
 | `m io dc0d` twice | the same value (no flag cleared) |
 | `wr d020 05`, `z` | the border colour changes after the step |
 | `wr d020 03` in a debugger stop with a session, RUN | on the commit list (the chip keeps its colour), written at RUN |
-| `m io d800` in every debugger stop (foreground with C64_STOP held, and background) | UE2's colour RAM (not while `rstep` keeps the machine landed: §11) |
+| `m io d800` in every debugger stop (foreground with C64_STOP held, and background) | UE2's colour RAM |
+| `rstep`, `frame -2` twice, `goto N`, `goto` forward, `rewind` (a C64 program counting frames into `$d800`) | each landed stop has its session; `m io d800` reads real values, UE2's colour RAM the land put back, `$d800` one a frame |
 | `r a=42`, `z` over `STA $0400` (a program put in with `a c000`) | `$0400` = `$42` |
 | `m cart 8000` with an EasyFlash in `--cart` | the bank's bytes |
 | `trace status`, `rstep` | the board's "needs the instruction trace" and "no frame ring" text |
@@ -466,10 +467,31 @@ Ctrl-O too; not after `/quit`). Builds kept as `run/trx/ultimate-165c22fe.elf` a
 `scripts/smoke-trxmon.sh --elf $PWD/run/trx/ultimate-165c22fe.elf --u2a $PWD/run/trx/trxmon-165c22fe.u2a` passes with
 both former findings below turned into PASS checks: after `bk e5cd` and `x` the menu closes and the break opens the
 monitor screen by itself; after the selftest and each step in the foreground (C64_STOP held) the stop has its session
-and the colour RAM reads UE2's values. One stop in the foreground still has none: after `rstep` the machine is landed,
-and the ring's land turns sessions off (trx_ring.cc `land_locked` -> `scrub_begin_locked` -> `stop_machine`: `SH_CTRL`
-0) until its commit puts `SH_CTRL` back (`commit_locked`); `m io d800` reads `--` there (INFO). That is the firmware's
-design of a land, not the block.
+and the colour RAM reads UE2's values. One stop in the foreground still had none: after `rstep` the machine is landed,
+and the ring's land turned sessions off (trx_ring.cc `land_locked` -> `scrub_begin_locked` -> `stop_machine`: `SH_CTRL`
+0) until its commit put `SH_CTRL` back (`commit_locked`); `m io d800` read `--` there.
+
+**Update (t21-p4-app f2a26eae, TRX64 eec9941):** `land_locked` saves the stop's `SH_CTRL` mode and writes it back once
+the machine stands on the load edge held by the debugger (after `DBG_ST_NEW`); the error path restores it; a land from
+a land writes `SH_CTRL` 0 before its put-back. Builds kept as `run/trx/ultimate-f2a26eae.elf` and
+`run/trx/trxmon-f2a26eae.u2a`. The smoke now runs a C64 program that counts frames into `$d800` (`INC $d800` at raster
+`$80`), pauses and lands: `frame -2`, `frame -2`, `goto head-10`, `goto head-2`, `rewind`; after `rstep` and in each of
+these stops trxmon's `m io d800 d80f` reads real values equal to UE2's colour RAM, and `$d800` moves one a frame
+(PASS with `--elf $PWD/run/trx/ultimate-f2a26eae.elf --u2a $PWD/run/trx/trxmon-f2a26eae.u2a`; the INFO line is gone;
+with 165c22fe the check after `rstep` fails, as that build lands without a session). Two UE2 fixes came out of it:
+- **CYCLES read a stale count after a bus cycle while the machine stands** (`c64-bridge` `window_cycle` counted the
+  edge but published it only at the next run or stop). A land from a land stops on a position a few cycles away, so
+  `clear_vic_latches` still makes bus cycles there (`$d012`, `$d011`, `$d019`, `$d01e`, `$d01f` in one pass: up to 5
+  edges after the hold, as on the board: trx_dbg.v:296-297 counts DMA cycles, a read shows the live counter). The land
+  armed CYC_CMP with the stale CYCLES, the comparator lay behind the count and never fired, the machine ran on:
+  "the machine did not reach the frame's snap position" (`goto` forward and the second `frame -2`). `window_cycle` now
+  publishes the count; unit test `cycles_reads_the_window_cycles_and_cyc_cmp_from_it_stops`.
+- **`SH_CTRL` 0 ending the debugger's session now blocks** (freeze_resp.v:888 `if (sh_abort || sess_dbg) block <= 1`;
+  UE2 blocked only on an abort). The block clears in the land's release (C64_STOP off, no debugger stop) and the stop
+  on the load edge gets its session, as the smoke shows.
+UE2 starts the debugger's session as the RTL does at the load edge: `dbg_stop` with `SH_MODE` != 0 and no block
+(freeze_resp.v:217-221 `cond_dbg`, `start`). One difference stays: a session that `SH_CTRL` written while the stop stands
+allows starts at UE2's next look at the lines (`trx_update`, any window access), not on the next clock.
 
 The first build, against t21-p4 a85f741 (the D-page fix df6d71c: STATUS b1, `ultimate_sys` opens the window's D page for a debugger
 stop) and t21-p4-app 553e2e17 (trxmon: a debugger stop holds the window like C64_STOP), built by the FPGA session and
