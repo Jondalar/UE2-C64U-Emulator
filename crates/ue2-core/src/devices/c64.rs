@@ -388,11 +388,15 @@ impl C64Port {
     pub fn set_trx_io(&mut self, link: Link) {
         self.drives[1].refuse_1581();
         self.trx = Some(link);
+        if let Some(b) = &mut self.backend {
+            b.set_trx_bitstream(true);
+        }
     }
 
     /// Attach the C64 at clock `now`, which anchors its clock (S14 §3).
     pub fn attach(&mut self, mut backend: Box<dyn C64Backend>, now: u64) {
         backend.set_cart_rom(self.cart_rom);
+        backend.set_trx_bitstream(self.trx.is_some());
         backend.advance_to(now);
         self.synced = now;
         self.backend = Some(backend);
@@ -1776,6 +1780,19 @@ mod tests {
         fn link(&mut self) -> Link {
             self.port().trx.clone().expect("linked")
         }
+    }
+
+    /// S40 §0: a C64 on TRX64-Ultimate's bitstream is told so on attach; without `--trx-io` it is not.
+    #[test]
+    fn the_trx_bitstream_reaches_the_backend() {
+        let b = Bench::trx();
+        assert!(*b.mock.trx_bitstream.borrow(), "--trx-io: no turbo");
+        let plain = Bench::new();
+        assert!(!*plain.mock.trx_bitstream.borrow());
+        // A link given after the attach reaches the backend too.
+        let mut late = Bench::new();
+        late.port().set_trx_io(crate::devices::trx::link());
+        assert!(*late.mock.trx_bitstream.borrow());
     }
 
     /// top.v:1059 `c64_mute <= c64_halted | app_s2[1]`: with `--trx-io` C64_STOP mutes, alone or as the pause, and its
