@@ -10,16 +10,17 @@ RPC port forwarded, and drives it over the control port and trxmon's RPC (TRX64-
 - `r`, `z`, `z 5`, `d e5cd` typed on the screen: the registers are UE2's own (`monitor r`), each step one stop record
   of REASON 2 and INSTRS + n; the listing is UE2's bytes;
 - RPC: `selftest`; `read c000 256 cpu` equals `monitor m c000`; `m io dc0d` twice the same (no flag cleared);
+- RPC: after the selftest and each step a debugger stop with a session though the loader's C64_STOP stands (OWNER,
+  t21-p4 3302c85): the colour RAM reads UE2's values;
 - RPC: `trace on`, three steps: `trace status` has records (S40 phase E); `rstep` lands on the frame since the
-  selftest's breakpoint;
+  selftest's breakpoint (the land turns sessions off until its commit: INFO);
 - RPC: `wr d020 05`, then a step: the border colour is 5 (in the foreground the loader's C64_STOP holds the window,
   so the write is a bus cycle);
 - typed: `r pc=c000` (the CPU write path's redirect with IPC_SET), `r a=42` on `STA $0400`, `z`: $0400 = $42 (a
   redirect and a bus cycle while halted are no part of a frame's replay, so `rstep` comes before them);
 - `/quit` on the screen: OWNER 0, the C64 runs again; `print 6*7` gives 42;
-- Run App again, `bk e5cd`, `x`: trxmon goes on in the background, the breakpoint fires (REASON 3 at $e5cd); the
-  menu button closes the browser and the monitor screen should come back (trx->ui_request). trxmon 553e2e17 does not
-  bring it back (S39 §11: its ui_callback spins in a task above the serve loop's), so that step reports KNOWN;
+- Run App again, `bk e5cd`, `x`: trxmon goes on in the background and closes the menu (ui->close_menu), the
+  breakpoint fires (REASON 3 at $e5cd) and opens the monitor screen by itself ("breakpoint 1 hit at .C:e5cd");
 - RPC, C64_STOP off: continue and pause, a debugger stop with a session (SH_STATUS b0 | b2): the colour RAM reads
   UE2's values; `wr d020 03` goes to the commit list (SH_COUNTS; the chip keeps its value) and RUN writes it.
 
@@ -157,14 +158,21 @@ def run_app(run):
     check(re.search(r'PAUSED IB \$[0-9a-f]{4}', s), f'the monitor screen: {s}')
 
 
-def colour_ram(run, c):
-    """A pattern UE2 puts in the colour RAM, read back through trxmon's lens (the window's D page in a session)."""
-    run.cmd('monitor wr io d800 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 00')
+def colour_ram(run, c, put=True):
+    """The colour RAM read through trxmon's lens (the window's D page in a session) equals UE2's; with `put` a pattern
+    UE2 puts there first (not in the foreground before `rstep`: the frame's replay holds no write from outside)."""
+    if put:
+        run.cmd('monitor wr io d800 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 00')
     want = run.mem_io(0xD800, 16)
     got = c.read(0xD800, 16, 'io')
     check(bytes(b & 0x0F for b in got) == bytes(b & 0x0F for b in want),
           f'colour RAM: trxmon {got.hex()} vs UE2 {want.hex()}')
     return got
+
+
+def session(run, what):
+    sh = next(l for l in run.trx().splitlines() if 'sh_status' in l)
+    check('session: yes' in sh, f'{what}: the debugger stop has no session: {" ".join(sh.split())}')
 
 
 def smoke(run, client):
@@ -205,12 +213,19 @@ def smoke(run, client):
     try:
         client.selftest(c)
         print('PASS RPC selftest')
+        # t21-p4 3302c85 (freeze_resp.v:550): with OWNER the loader's C64_STOP no longer keeps the block, so every
+        # foreground debugger stop has its session and the colour RAM reads (hw_session_read: SH_STATUS b0).
+        session(run, 'after the selftest')
+        colour_ram(run, c, put=False)
         # Right after the selftest's breakpoint: the frame from its snap holds no write from outside.
         # S40 phase E: the instruction trace (CAPS2 b7, stream 3).
         print(f"INFO {c.mon('trace on').strip()}")
         for _ in range(3):
             c.call('debug/step')
             c.wait_note('debug/stopped', 2.0)
+            session(run, 'a step')
+            got = colour_ram(run, c, put=False)
+        print(f'PASS colour RAM in every foreground debugger stop (session, C64_STOP held): {got[:8].hex(" ")}')
         tr = c.mon('trace status')
         print(f'INFO trace status: {" ".join(tr.split())[:200]}')
         check('needs the instruction trace' not in tr and re.search(r'ON .* [1-9]\d* of \d+ instructions', tr), f'trace: {tr}')
@@ -233,10 +248,10 @@ def smoke(run, client):
         border = c.read(0xD020, 1, 'io')[0] & 0x0F
         check(border == 5, f'wr d020 05 ({w.strip()}), then a step: the border is {border}')
         print(f'PASS wr d020 05 ({w.strip()}), a step: the border is 5')
-        # The colour RAM needs a session (hw_session_read: SH_STATUS b0). Here the loader's C64_STOP stands, so the
-        # debugger session's block never clears after the acquire's (freeze_resp.v:546 takes the raw app_stop).
-        sh = next(l for l in run.trx().splitlines() if 'sh_status' in l)
-        print(f'INFO colour RAM in the foreground: {" ".join(c.mon("m io d800 d807").split()[1:9])}  ({" ".join(sh.split())})')
+        # After `rstep` the machine is landed: the ring's land turned sessions off (trx_ring.cc land_locked ->
+        # scrub_begin_locked -> stop_machine: SH_CTRL 0) until its commit puts SH_CTRL back (commit_locked).
+        sh = next(l for l in run.trx().splitlines() if 'sh_ctrl' in l)
+        print(f'INFO colour RAM after rstep (landed): {" ".join(c.mon("m io d800 d807").split()[1:9])}  ({" ".join(sh.split())})')
     finally:
         c.close()
 
@@ -281,18 +296,17 @@ def smoke(run, client):
           f'bk e5cd, x: the record {reason} at ${ipc:04x}: {run.trx()}')
     check(run.console().count('trxmon: ends') == ends, 'trxmon ended after x')
     print('PASS bk e5cd, x: trxmon serves in the background, the breakpoint fires (REASON 3 at $e5cd)')
-    run.cmd('button', 'wait 3000')
+    # trxmon 165c22fe: `x` asks for the overlay to close (ui->close_menu, run_app returns MENU_HIDE), the C64 runs,
+    # and the break opens the monitor screen by itself (trx->ui_request); no menu button.
+    run.cmd('wait 2000')
     s = run.screen()
-    if re.search(r'PAUSED IB \$e5cd', s) and 'breakpoint 1 hit' in s:
-        print('PASS the menu closed: the monitor screen came back (trx->ui_request)')
-    else:
-        print('KNOWN the monitor screen did not come back after the menu closed: trxmon 553e2e17\'s ui_callback waits '
-              'for the serve loop with delay_ms(2) = vTaskDelay(0) at 200 Hz, in a task above the serve loop\'s '
-              '(S39 §11)')
+    check(re.search(r'PAUSED IB \$e5cd', s) and 'breakpoint 1 hit at .C:e5cd' in s,
+          f'x closed the menu, the break should open the monitor screen: {s}')
+    print('PASS x closed the menu, the break opened the monitor screen by itself ("breakpoint 1 hit at .C:e5cd")')
 
     c = client.Client('127.0.0.1', run.rpc_port, timeout=10.0)
     try:
-        # C64_STOP is off now: a run lets the session's block go (freeze_resp.v:546), the next stop has a session.
+        # C64_STOP is off now: a run lets the session's block go (freeze_resp.v:550), the next stop has a session.
         c.call('debug/break_del', {})
         c.call('debug/continue', {'source': 'llm'})
         run.cmd('wait 200')

@@ -410,20 +410,22 @@ impl Session {
     }
 
     /// After any change of the lines: a session whose condition fell ends (its list runs), the block clears while
-    /// C64_STOP is off, and a session starts where the condition holds.
+    /// C64_STOP is off (or OWNER is set) and no stop stands, and a session starts where the condition holds.
     pub fn step<C: Chips + ?Sized>(&mut self, l: Lines, c: &mut C) {
         if self.active && !self.keep(l) {
             let drop = self.mode == 0;
             self.end(drop, c);
         }
-        // freeze_resp.v:546: the block clears once neither C64_STOP, the pause nor a debugger stop stands.
-        if !l.stop && !l.paused() && !l.dbg_stop {
+        // freeze_resp.v:550 (t21-p4 3302c85): the block clears once neither the pause nor a debugger stop stands, and
+        // C64_STOP is off or the debugger owns the machine (OWNER): a foreground app's stop, held for the whole run,
+        // does not take the next debugger stop's session away.
+        if (!l.stop || l.owner) && !l.paused() && !l.dbg_stop {
             self.block = false;
         }
         let app = self.cond(l);
         if !self.active && !self.block && (app || self.cond_dbg(l)) && !l.reset {
             self.active = true;
-            // The app's cause wins when both are there (freeze_resp.v:539).
+            // The app's cause wins when both are there (freeze_resp.v:540).
             self.dbg = !app;
             self.ack19 = 0;
             self.count = self.count.wrapping_add(1);
@@ -468,7 +470,7 @@ impl Session {
     }
 
     /// The end of a session: the list runs as real bus cycles unless `drop` (S_RC0-S_RCW), then the overlay goes.
-    /// The debugger's session blocks a new one until its stop is gone (freeze_resp.v:884).
+    /// The debugger's session blocks a new one until its stop is gone (freeze_resp.v:888).
     fn end<C: Chips + ?Sized>(&mut self, drop: bool, c: &mut C) {
         if self.dbg {
             self.block = true;
@@ -974,7 +976,7 @@ mod tests {
         assert_eq!(s.list_reg(), 2 << 16 | 128);
     }
 
-    /// S39 §3.6 (freeze_resp.v:209-224, :539, :546, :884): a debugger stop starts a session in modes 1 and 2 without
+    /// S39 §3.6 (freeze_resp.v:209-224, :540, :550, :888): a debugger stop starts a session in modes 1 and 2 without
     /// C64_STOP or Ultimax (`SH_STATUS` b2); it lasts while the hold stands and nothing is requested; RUN ends it with
     /// its list written first, and no new one starts until the stop is gone. Mode 0: none. OWNER masks C64_STOP.
     #[test]
@@ -1004,6 +1006,61 @@ mod tests {
         assert!(!s.active);
         // OWNER: C64_STOP with FRZ is no pause.
         assert!(!Lines { owner: true, ..FROZEN }.paused() && FROZEN.paused());
+    }
+
+    /// t21-p4 3302c85 (freeze_resp.v:550, T12 §14.8 point 10): with OWNER set, a foreground app's C64_STOP held for
+    /// the whole run does not keep `block`: every debugger stop gets its session. Without OWNER C64_STOP still holds
+    /// it. `cond`/`keep_app` take the raw C64_STOP: an app's Ultimax freeze while OWNER is set stays the app's session.
+    #[test]
+    fn owner_lets_every_debugger_stop_have_a_session_while_c64_stop_is_held() {
+        let mut c = Fake::new();
+        // A foreground app (no Ultimax) holds C64_STOP under FRZ; the debugger owns the machine.
+        let app = Lines { ultimax: false, owner: true, ..FROZEN };
+        let stop = Lines { dbg_stop: true, dbg_hold: true, ..app };
+        let mut s = Session::default();
+        for i in 0..6 {
+            s.step(stop, &mut c);
+            assert!(s.active && s.dbg, "stop {i}: the debugger's session");
+            if i == 3 {
+                // A step: RUN requested with the hold kept, the stop falls while the CPU runs one instruction.
+                s.step(Lines { dbg_rel: true, ..stop }, &mut c);
+                s.step(Lines { dbg_hold: true, ..app }, &mut c);
+            } else {
+                s.step(Lines { dbg_rel: true, ..stop }, &mut c);
+                assert!(!s.active);
+                s.step(stop, &mut c);
+                assert!(!s.active, "stop {i}: blocked while the old stop stands");
+                s.step(app, &mut c);
+            }
+        }
+        // Without OWNER the held C64_STOP keeps the block: the next debugger stop has no session.
+        let app = Lines { ultimax: false, frz: false, ..FROZEN };
+        let stop = Lines { dbg_stop: true, dbg_hold: true, ..app };
+        let mut s = Session::default();
+        s.step(stop, &mut c);
+        assert!(s.active && s.dbg);
+        s.step(Lines { dbg_rel: true, ..stop }, &mut c);
+        s.step(app, &mut c);
+        s.step(stop, &mut c);
+        assert!(!s.active, "no OWNER: C64_STOP holds the block");
+        s.step(Lines { stop: false, ..app }, &mut c);
+        s.step(stop, &mut c);
+        assert!(s.active, "C64_STOP fell: unblocked");
+        // The app's freeze without OWNER is unchanged: an abort blocks until C64_STOP is off.
+        let (mut s, mut c) = started();
+        s.write_ctrl(1 | SH_ABORT);
+        s.step(FROZEN, &mut c);
+        assert!(!s.active, "blocked");
+        // An app's Ultimax freeze while OWNER is set: the app's session (it wins over a debugger stop too), kept by the
+        // raw C64_STOP, ended when C64_STOP falls.
+        let own = Lines { owner: true, ..FROZEN };
+        let mut s = Session::default();
+        s.step(Lines { dbg_stop: true, dbg_hold: true, ..own }, &mut c);
+        assert!(s.active && !s.dbg, "the app's session");
+        s.step(own, &mut c);
+        assert!(s.active, "kept by C64_STOP");
+        s.step(Lines { stop: false, ..own }, &mut c);
+        assert!(!s.active, "C64_STOP fell: the app's session ended");
     }
 
     #[test]
