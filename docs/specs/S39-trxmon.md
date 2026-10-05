@@ -1,6 +1,8 @@
 # S39 — trxmon in UE2: the debug block served from TRX64
 
-**Status:** spec (2026-10-05), local branch `s37-trx-pixel-layer`, not built. Waits for answers in §7.
+**Status:** spec (2026-10-05), local branch `s37-trx-pixel-layer`. Updated the same day from the FPGA session's
+answers (`run/trx/s39-answers.md`, t21-p4 RTL and app; they override this text where they differ) and S40. Phase A1
+(the gate's capture control and the state bus, shared with S40) is built with S40; A2-F are not.
 
 **Why:** the TRX64-Ultimate firmware session must test trxmon (the T21 monitor app) in UE2 as on the board: the
 monitor screen on the overlay (T21 §8), opened from the task menu or Ctrl-O and reopened by `trx->ui_request` when a
@@ -153,12 +155,17 @@ live (c64_core.v:746-749, :774).
 - **I/O writes and old-bitstream sidefx reads**: the window without MEMONLY, only when STATUS b0 and b5 (C64_STOP)
   are set (`bus_ok`). In a session that access is answered by the responder (S37 B2).
 - **Colour RAM**: `hw_session_read` = the window without MEMONLY, with CAPS2 b3, `SH_STATUS` b0 and STATUS b0. It
-  goes through `hw_bus_read`, which also needs b5 (§7 Q5).
+  goes through `hw_bus_read`, which also needs b5. On t21-p4 as built a `$Dxxx` window access without C64_STOP never
+  reaches the responder (`ultimate_sys.vhd:914-920`: reads `$FF`, writes dropped; answers 5, 6). Alex decided
+  (2026-10-05) that the RTL gets fixed: D-page accesses go to the session while a debugger stop holds. UE2 models the
+  fixed behaviour when it builds that path (phase C).
 
 ## 2. CAPS and CAPS2
 
-**`CAPS` = `$EB`** (S37: `$E1`): b0 gate, **b1 state bus**, **b3 debug**, b5 session, b6 video, b7 RGB565.
-**`CAPS2` = `$1C`** (S37: `$08`): **b2 CPU write path**, b3 session with commit list, **b4 lens unit**.
+**`CAPS`** grows with the pages built: `$E7` with phase A1 and S40 (b0 gate, **b1 state bus**, b2 engine (S40), b5
+session, b6 video, b7 RGB565), **`$EF`** with phase A2 (**b3 debug**). **`CAPS2`**: `$29` with S40 (b0 F4 order, b3
+commit list, b5 APPLY), **`$3D`** with phases B/C (**b2 CPU write path**, **b4 lens unit**). A bit is reported only
+when its pages are built (answer 3: the app reads none of the others; b1 BUILD only the boot ROM).
 
 The board reads `$FF` / `$BF` (trx_io.v:231-232). Each bit UE2 reports turns on firmware and app paths:
 
@@ -168,22 +175,20 @@ The board reads `$FF` / `$BF` (trx_io.v:231-232). Each bit UE2 reports turns on 
 | CAPS b3 debug | `app_trx_table()` non-NULL (the `trx` ABI table, so trxmon starts); `trx_dbg_yield` in `C64::stop`/`hard_stop` reads page 3 and gives OWNER back | report |
 | CAPS2 b2 | trxmon's `r a=…`, `g <addr>`, settled registers (w4/w5) | report |
 | CAPS2 b4 | the `cart` lens and IO1/IO2 through the look (trxmon, REST lens) | report |
-| CAPS b2 engine | `trx_ring_init` (the ring, page 2, DDR streams), `trx->ring` non-NULL, Timewarp UI, `/v1/timewarp` | **off**: S38 decided TRX64's rings, not the engine |
+| CAPS b2 engine | `trx_ring_init` (the ring, page 2, DDR streams), `trx->ring` non-NULL, Timewarp UI, `/v1/timewarp` | **on**: S40 serves the engine (Alex, 2026-10-05) |
 | CAPS b4 cartridge | trx_cart.cc page 4 write-back and descriptor | off (UE2 runs Gideon's cartridge registers) |
-| CAPS2 b7 trace | `trx_ring_trace_present` needs the ring as well | off |
-| CAPS2 b0, b1, b5, b6 | engine F4 order, BUILD, APPLY, T29 turbo | off |
+| CAPS2 b7 trace | `trx_ring_trace_present` needs the ring as well | off until S40 phase E |
+| CAPS2 b0, b5 | engine F4 order, APPLY | on with S40 |
+| CAPS2 b1, b6 | BUILD, T29 turbo | off (no reader in either app; no turbo on `main`) |
 
-**Without the engine** (`trx->ring` is NULL, `trx_ring_trace_present()` false) trxmon answers with the board's own
-text, exactly as a bitstream without CAPS b2 would: the ring verbs and `checkpoint/*` "no frame ring (the bitstream
-has no engine, or the firmware no ring table)" (ring.c, rpc.c), the trace verbs (`trace`, `chis`, `whowrote`,
-`triage`, `tracering`, `revdepth`, `runtime/who_wrote`, …) "needs the instruction trace" (trace.c). trxmon never
-touches page 2 itself; with b2 off nothing calls it. So these verbs do not return data in UE2; UE2's own monitor has
-their TRX64 forms (S38 §5). This is the one exception to "every verb" (§7 Q1).
+**The ring and trace verbs** (answer 1): `trx->ring` needs CAPS b2, which S40 now serves, so trxmon's ring verbs
+(`rstep`, `checkpoint/*`, land, commit) answer through the engine once phases A2/B are built. The trace verbs need
+CAPS2 b7 (t21-p4 trace former, S40 phase E); until then they answer the board's own "needs the instruction trace".
 
 `trx->video` works without the engine (app_api_net.cc `api_video` reads the System Mode). `GET /v1/info` and the
 ident then say `caps "0x000000EB"` and `rpc 4312` while trxmon serves.
 
-S38 §7 ("UE2 does not fake them") changes for b1 and b3: they are served, not faked. b2 stays off.
+S38 §7 ("UE2 does not fake them") changes for b1, b2 and b3: they are served, not faked.
 
 ## 3. How UE2 serves each register
 
@@ -215,7 +220,7 @@ Between those points the shadows hold, as on the board. Built from TRX64:
 |---|---|
 | 0.0 | `halted` (live), `cart_lines()` (present, EXROM, GAME), held = 0 (§5 T8), capture count |
 | 1.0, 1.4, 1.5 | TRX64's `reg_a/x/y/sp`, `status()`. TRX64 has only the settled registers, so 1.0 = 1.4 (§6) |
-| 1.1 | PC = IPC + 1 at an IB, else TRX64's `reg_pc` (§7 Q4); P; sync = 0 |
+| 1.1 | PC = TRX64's `reg_pc` (= IPC at an IB, answer 4; at a snap the fetched opcode's address); P; sync = 1 (UE2 always stands at an opcode boundary) |
 | 1.2 | `$00` DDR, `$01` latch, `$01` as read (pins for the bits not driven) |
 | 1.3 | the model's IPC, opcode, IB flag (§3.3), live |
 | 1.8-1.14 | a synthesized image: A, X, Y, S, P, PC = IPC, IR = opcode at IPC, proc_control state = decode, `intg` 0, `din_r` = opcode; every other bit 0 (§3.4) |
@@ -261,13 +266,14 @@ access first, as S37 does for `GATE_CTRL`).
 - **Settled words** 1.4/1.5 are TRX64's registers (§3.2).
 - **Staging**: `SB_DATA` writes to chip 1 words 8-14 are kept while `SB_STATUS` b0 (refused otherwise, b1).
   `SB_LOAD` b1 arms the load; it reads armed until the next opening (RUN or a step), as c64_core.v:402-403.
-- **The load**, at the next opening, before TRX64 runs: A, X, Y, S, P from bits 0-39 into TRX64; if the PC field
+- **The load**, at the next opening, before TRX64 runs: a staged image UE2 made itself (an S40 block) loads its kept
+  TRX64 parts (S40 §5.3); otherwise A, X, Y, S, P from bits 0-39 into TRX64; if the PC field
   differs from the served one (IPC), `set_pc(PC field)`: TRX64 fetches the opcode there itself (`din_r` is what the
   RTL's update takes; trxmon writes the byte at that address, so they agree unless it is I/O, which trxmon refuses).
   IR, `copy_d2p`, `flags_update`, `trigger_upd` are not used: TRX64 has no pending write-back to take out. Then
   `sync_after_monitor`.
 - **`IPC_SET`** sets IPC, opcode and the IB flag at once (trx_dbg.v:301-306); STATUS b2 and word 1.3 follow.
-- CIA staging (chips 3, 4) and `SB_LOAD` b3/b4 are only used by the engine's restore: accepted, ignored.
+- CIA staging (chips 3, 4) and `SB_LOAD` b3/b4 are the engine's restore (S40 §6.3, built with phase A1).
 
 ### 3.5 The drive
 
@@ -358,29 +364,33 @@ T1 and T2 decide whether trxmon's stops are exact in UE2. Everything else is exa
 - Answers of LK and of commands are immediate (no busy, no request bit).
 - The drive image at `0x0EE0000` follows the drive within 1 ms while it runs.
 
-## 7. Questions for the FPGA session
+## 7. The FPGA session's answers (2026-10-05, `run/trx/s39-answers.md`)
 
-1. Without the engine trxmon's ring and trace verbs answer "no frame ring" / "needs the instruction trace" in UE2: accepted, or must UE2 report CAPS b2 and model the engine (S38 decided against)?
-2. Is t21-p4 (debugger stop = session, RUN/steps as requests, `SH_STATUS` b2) the register API UE2 must match, and will it merge unchanged?
-3. CAPS2 is a constant per build (`$BF` on t21-p4): is UE2 reporting `$1C` (b2, b3, b4 only) a valid build for the app?
-4. Word 1.1 PC and the PC field of words 8-14 at an IB stop: IPC or IPC + 1?
-5. `hw_session_read` calls `hw_bus_read`, which needs STATUS b5 (C64_STOP): in a stop opened by `ui_request` (no C64_STOP) the colour RAM reads `$FF`. Intended?
-6. `mach_write` refuses I/O writes without STATUS b5, although in a debugger session the window would list them (T12 §14.8 board test 4, `wr d020 05`): should it check `SH_STATUS` b0 instead?
-7. Does trxmon rely on the A/X/Y/P qualifier lag at an IB, or may UE2 compare against the settled registers?
-8. Confirm: a bitmap bit at the interrupted PC does not fire on the replaced fetch, and fires when the handler returns there.
-9. Confirm: STEP_INSTR across an interrupt stops at the handler's first opcode, before it runs.
-10. Word 7.0: is `c64_cartridge.v`'s per-type `reg_0`/`reg_1` the contract for `bank`, and which types does trxmon interpret?
-11. With CAPS b1 the splash writes `CAP_CTRL` and waits for READY by captured PC: is that the only firmware use of `CAP_CTRL`/`CAP_STAT`/`IRQ_CAUSE` b3 without the engine?
-12. The far pages share one collect buffer and latch: trxmon's detached task and firmware tasks (REST lens, trx_ui, trx_video) can interleave bytes. Is there a lock, or is it a known race?
-13. The 80-column monitor screen: the `overlay.v` mode registers and the ABI call (name, arguments, restore on close)?
-14. `IRQ_CAUSE` b0 on every debugger stop: does any firmware handler act on it while trxmon owns the machine?
-15. LK REAL during a debugger session (halted, no C64_STOP): allowed as built?
+1. trxmon without the engine: the ring/checkpoint verbs answer "no frame ring", the trace verbs `NO_TRACE`. Now moot
+   for the ring: S40 serves the engine (§2).
+2. t21-p4 is not merged; the register map of pages 0/1/3/5 has no announced change; pending items are app-side, plus
+   the Q5/Q6 RTL fix, T29 and T55. CAPS2 numbering is per build.
+3. CAPS2 `$1C` is valid; each bit gates only its own path (§2).
+4. PC at an IB is **IPC**, not IPC + 1 (word 1.1 and the PC field of words 8-14). T21-monitor.md:165-166 is wrong.
+5. / 6. RTL gap on t21-p4: a `$Dxxx` window access without C64_STOP never reaches the session. Alex: fix the RTL;
+   UE2 models the fixed behaviour (§1.5).
+7. trxmon does not rely on the qualifier lag; UE2 compares against the settled registers.
+8. / 9. Confirmed as §3.3 says (bitmap at the interrupted PC; STEP_INSTR across an interrupt).
+10. Word 7.0 has no fixed per-type contract in the RTL: `reg_0`/`reg_1` are the descriptor's registers, the bytes the
+    program wrote (masked). trxmon prints `reg_0 & $7F`.
+11. The splash is the only firmware user of `CAP_CTRL` without the engine; `CAP_STAT` has no reader; `IRQ_CAUSE` b3
+    has no handler.
+12. No lock on t21-p4: one shared collect buffer and latch, a known race. UE2 keeps the one buffer and latch.
+13. 80 columns: no RTL change needed (`overlay.v` `r_cpl` is 8 bits); the ABI call is missing.
+14. No firmware handler acts on `IRQ_CAUSE` b0.
+15. LK REAL in a debugger stop: allowed as built (needs the gate shut only).
 
 ## 8. Phases
 
 | Phase | Content |
 |---|---|
-| A | Page 0 0x118-0x134, page 3 registers and `trx_dbg.rs` without a CPU (pure register model); page 1 with the shadows; CAPS `$EB`, CAPS2 `$1C`; `CAP_CTRL`/`CAP_STAT` and the capture; OWNER and the hold in `C64Port`; `monitor trx` |
+| A1 | Page 0 0x104-0x117 (`CAP_CTRL` RW, `CAP_STAT`, `RESUME_PHASE`, `STOP_POS`), page 1 with the shadows (captured at the snap and while the machine is halted) and the staging of chips 1, 3, 4; `SB_LOAD`; CAPS b1. One model with S40 (`trx_sb.rs`). **Built with S40.** |
+| A2 | Page 0 0x118-0x134, page 3 registers and `trx_dbg.rs` without a CPU (pure register model); CAPS b3; OWNER and the hold in `C64Port`; `monitor trx` for page 3 |
 | B | Stop sources and steps on TRX64 (§3.3): IB, bitmap, units (IB, read, write), CYC_CMP, pauses, steps, RUN; the stop record; `IRQ_CAUSE` b0; the CPU write path (§3.4) |
 | C | The debugger's session (§3.6); the lens unit (§3.7, U1); word 7.0 (U2) |
 | D | The drive (§3.5) |
