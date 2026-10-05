@@ -104,12 +104,32 @@ pub const OUT_H: usize = 1080;
 /// Source width limit: the line buffer holds 960 pixels (pix_layer.v `f_w`).
 const MAX_W: u16 = 960;
 
-/// The still capture's window (pix_layer.v `X0S`, `Y0S`, 400 × 270): VIC raster columns 96-495, lines 16-285, two
-/// pixels a byte, the first in the low nibble. Slot n is at `STILL_BASE` + n × 64 KB.
+/// The still capture's 50 Hz window (pix_layer.v `X0S`, `Y0S`, 400 × 270): VIC raster columns 96-495, lines 16-285,
+/// two pixels a byte, the first in the low nibble. Slot n is at `STILL_BASE` + n × 64 KB.
 pub const STILL_W: usize = 400;
 pub const STILL_H: usize = 270;
 pub const STILL_Y0: usize = 16;
 pub const STILL_SLOT: u32 = 0x1_0000;
+/// The 60 Hz still (pix_layer.v:519-521, :536, :544, :552): 400 × 240 of one VIC frame, rows 0-231 lines 31-262, rows
+/// 232-239 lines 0-7 (written first). Complete at word 2,899, on line 262.
+pub const STILL_H_60: usize = 240;
+pub const STILL_Y0_60: usize = 31;
+const STILL_LOW_60: usize = 8;
+
+/// The scaler's `v60` as UE2 has it: a VIC of fewer than 300 lines (render.rs `draw_c64_trx`).
+pub fn still_v60(lines: usize) -> bool {
+    lines != 0 && lines < 300
+}
+
+/// A VIC of `lines` lines (0: unknown, taken as PAL) completes a still: 50 Hz at line 285 (word 3,374), 60 Hz at line
+/// 262 (word 2,899).
+pub fn still_complete(lines: usize) -> bool {
+    match lines {
+        0 => true,
+        n if still_v60(n) => n >= STILL_Y0_60 + STILL_H_60 - STILL_LOW_60,
+        n => n >= STILL_Y0 + STILL_H,
+    }
+}
 
 /// The still capture (pix_layer.v): its settings as the app committed them and the status of the last complete
 /// frame.
@@ -118,31 +138,36 @@ pub struct Still {
     /// STILL_CTRL b0 and STILL_BASE.
     pub on: bool,
     pub base: u32,
-    /// STILL_STATUS b0 (a frame completed since power on), b1 (its slot), b31:8 (frames, 24 bits).
+    /// STILL_STATUS b0 (a frame completed since power on), b1 (its slot), b2 (it is 60 Hz, 400 × 240), b31:8
+    /// (frames, 24 bits).
     pub valid: bool,
     pub slot: u8,
+    pub v60: bool,
     pub count: u32,
     /// The slot the capture last completed (`last_slot`): 1 at power on, so the first frame goes to slot 0.
     pub last: u8,
 }
 
 impl Still {
-    pub const POWER_ON: Still = Still { on: true, base: 0x0505_0000, valid: false, slot: 0, count: 0, last: 1 };
+    pub const POWER_ON: Still =
+        Still { on: true, base: 0x0505_0000, valid: false, slot: 0, v60: false, count: 0, last: 1 };
 
     pub fn status(&self) -> u32 {
-        (self.count & 0xFF_FFFF) << 8 | u32::from(self.slot) << 1 | u32::from(self.valid)
+        (self.count & 0xFF_FFFF) << 8 | u32::from(self.v60) << 2 | u32::from(self.slot) << 1 | u32::from(self.valid)
     }
 
     /// `frames` VIC frames ended since the last look; the newest is captured. A complete one goes into the slot the
-    /// device would have used for it and counts them all; an incomplete one (a VIC that never reaches line 285) goes
-    /// into the slot after the last and changes no status. Returns the slot written.
-    pub fn frames(&mut self, frames: u64, complete: bool) -> u8 {
+    /// device would have used for it and counts them all, and b2 takes its mode `v60` with the slot (pix_layer.v:557,
+    /// :177); an incomplete one (a VIC that never reaches the window's last line) goes into the slot after the last
+    /// and changes no status. Returns the slot written.
+    pub fn frames(&mut self, frames: u64, complete: bool, v60: bool) -> u8 {
         if !complete {
             return self.last ^ 1;
         }
         let slot = self.last ^ (frames & 1) as u8;
         self.last = slot;
         self.slot = slot;
+        self.v60 = v60;
         self.valid = true;
         self.count = self.count.wrapping_add(frames as u32) & 0xFF_FFFF;
         slot
@@ -711,9 +736,12 @@ pub fn text_layer<C: Chips + ?Sized>(view: VicView, opaque: bool, c: &C) -> TrxT
     TrxText { glyphs, colours, background: view.d021, opaque, screen: codes, charset }
 }
 
-/// The still capture's window of `frame` (pix_layer.v:494-541), mapped onto TRX64's canvas as the composite maps it
-/// (render.rs `draw_c64_trx`): 200 bytes a line, as many lines as the VIC reaches. All 270 lines make a complete
-/// frame; a VIC of fewer than 286 lines never reaches the last (pix_layer.v:505, :535).
+/// The still capture's window of `frame` (pix_layer.v:496-563), mapped onto TRX64's canvas as the composite maps it
+/// (render.rs `draw_c64_trx`): 200 bytes a row from the slot's start, as many rows as the VIC reaches.
+/// 50 Hz: 270 rows from line 16; a complete frame needs 286 lines (pix_layer.v:520, :552).
+/// 60 Hz ([`still_v60`]): 240 rows, rows 0-231 lines 31-262 and rows 232-239 lines 0-7 of the same frame
+/// (pix_layer.v:519, :536, :544); a complete frame needs 263 lines. A shorter 60 Hz VIC gives the rows from line 31 it
+/// reaches; the device would also have written rows 232-239.
 pub fn still_window(frame: &crate::c64host::C64Frame) -> Vec<u8> {
     if frame.width == 0 || frame.height == 0 {
         return Vec::new();
@@ -722,12 +750,17 @@ pub fn still_window(frame: &crate::c64host::C64Frame) -> Vec<u8> {
         0 => (32, 16, 312),
         n => (frame.text_x, frame.first_line, n),
     };
-    let reached = lines.saturating_sub(STILL_Y0).min(STILL_H);
+    let rows: Vec<usize> = if still_v60(lines) {
+        let low = STILL_H_60 - STILL_LOW_60;
+        let tail = if still_complete(lines) { 0..STILL_LOW_60 } else { 0..0 };
+        (STILL_Y0_60..lines.min(STILL_Y0_60 + low)).chain(tail).collect()
+    } else {
+        (STILL_Y0..lines.min(STILL_Y0 + STILL_H)).collect()
+    };
     let cols: Vec<usize> =
         (0..STILL_W).map(|x| (crate::render::TRX_X0 + x + text_x).saturating_sub(crate::render::TRX_X_TEXT).min(frame.width - 1)).collect();
-    let mut out = Vec::with_capacity(reached * STILL_W / 2);
-    for y in 0..reached {
-        let line = STILL_Y0 + y;
+    let mut out = Vec::with_capacity(rows.len() * STILL_W / 2);
+    for line in rows {
         let row = if line < first { line + lines } else { line } - first;
         let src = &frame.indices[row.min(frame.height - 1) * frame.width..][..frame.width];
         out.extend(cols.chunks(2).map(|pair| src[pair[0]] & 0x0F | (src[pair[1]] & 0x0F) << 4));
@@ -1044,18 +1077,50 @@ mod tests {
     fn the_still_fills_slots_0_1_0_and_counts() {
         let mut s = Still::POWER_ON;
         assert_eq!(s.status(), 0);
-        assert_eq!(s.frames(1, true), 0, "the first frame goes to slot 0");
+        assert_eq!(s.frames(1, true, false), 0, "the first frame goes to slot 0");
         assert_eq!(s.status(), 1 << 8 | 0 << 1 | 1);
-        assert_eq!(s.frames(1, true), 1);
-        assert_eq!(s.frames(1, true), 0);
+        assert_eq!(s.frames(1, true, false), 1);
+        assert_eq!(s.frames(1, true, false), 0);
         assert_eq!(s.status(), 3 << 8 | 1);
         // Three frames in one sync: the newest goes where the device would have put it, all three count.
-        assert_eq!(s.frames(3, true), 1);
+        assert_eq!(s.frames(3, true, false), 1);
         assert_eq!(s.status(), 6 << 8 | 1 << 1 | 1);
         // A frame that never completes goes to the slot after the last and changes nothing.
         let before = s;
-        assert_eq!(s.frames(5, false), 0);
+        assert_eq!(s.frames(5, false, false), 0);
         assert_eq!(s, before);
+        // STILL_STATUS b2 is latched with the slot: the mode of the frame in it.
+        assert_eq!(s.frames(1, true, true), 0);
+        assert_eq!(s.status(), 7 << 8 | 1 << 2 | 1);
+        assert_eq!(s.frames(1, true, false), 1);
+        assert_eq!(s.status(), 8 << 8 | 1 << 1 | 1);
+    }
+
+    #[test]
+    fn a_still_completes_at_line_285_or_at_60_hz_on_line_262() {
+        assert!(still_complete(0) && still_complete(312) && still_complete(286));
+        assert!(!still_v60(300) && !still_v60(0), "300 lines and more, or unknown: 50 Hz");
+        assert!(still_v60(263) && still_complete(263));
+        assert!(still_v60(262) && !still_complete(262), "line 262 never comes");
+    }
+
+    #[test]
+    fn the_60_hz_still_is_lines_31_to_262_then_0_to_7() {
+        use crate::c64host::C64Frame;
+        // A canvas of all 263 lines from line 0, the pixel's index its line; text area at column 32 as in PAL.
+        let (w, h) = (384, 263);
+        let indices = (0..w * h).map(|i| (i / w) as u8 & 0x0F).collect();
+        let frame =
+            C64Frame { width: w, height: h, indices, text_x: 32, first_line: 0, raster_lines: 263, ..C64Frame::default() };
+        let still = still_window(&frame);
+        assert_eq!(still.len(), 48_000, "400 x 240, 3,000 words");
+        let row = |r: usize| still[r * 200] & 0x0F;
+        for (r, line) in [(0, 31), (1, 32), (231, 262), (232, 0), (239, 7)] {
+            assert_eq!(row(r), line as u8 & 0x0F, "row {r} is line {line}");
+        }
+        // A 262-line VIC never reaches line 262: the rows from line 31 it reaches, nothing completes.
+        let short = C64Frame { raster_lines: 262, ..frame };
+        assert_eq!(still_window(&short).len(), 231 * 200);
     }
 
     #[test]
@@ -1073,9 +1138,9 @@ mod tests {
         for k in [0, 1, 399, 400, 107_999] {
             assert_eq!(nibble(k), px(k % 400, k / 400), "pixel {k}");
         }
-        // A 263-line VIC never reaches line 285: 247 lines, no complete frame.
+        // A 263-line VIC: the 60 Hz window, 240 rows.
         let ntsc = C64Frame { raster_lines: 263, first_line: 28, height: 235, indices: vec![1; w * 235], ..frame };
-        assert_eq!(still_window(&ntsc).len(), 247 * 200);
+        assert_eq!(still_window(&ntsc).len(), 48_000);
     }
 
     #[test]

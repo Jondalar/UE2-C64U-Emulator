@@ -568,6 +568,8 @@ pub(crate) mod mock {
         pub(crate) sampler: Rc<RefCell<Option<Sampler>>>,
         /// S37: what `frame_counter` returns.
         pub(crate) frames: Rc<RefCell<u64>>,
+        /// S37: what `frame_lines` returns, and the frame's `raster_lines` (0: unknown).
+        pub(crate) lines: Rc<RefCell<usize>>,
         /// S37: `set_muted` calls, kept apart from `calls`.
         pub(crate) mutes: Rc<RefCell<Vec<bool>>>,
     }
@@ -646,7 +648,16 @@ pub(crate) mod mock {
         fn frame(&self) -> C64Frame {
             let mut palette = [0; 16];
             (palette[1], palette[2]) = (0x0011_2233, 0x0044_5566);
-            C64Frame { width: 2, height: 1, indices: vec![1, 2], palette, screen: vec![0x20; 1000], ..C64Frame::default() }
+            let raster_lines = *self.lines.borrow();
+            C64Frame {
+                width: 2,
+                height: 1,
+                indices: vec![1, 2],
+                palette,
+                screen: vec![0x20; 1000],
+                raster_lines,
+                ..C64Frame::default()
+            }
         }
         fn core_config_write(&mut self, off: u8, val: u8) {
             self.core.borrow_mut().push((off, val));
@@ -728,6 +739,9 @@ pub(crate) mod mock {
 
         fn frame_counter(&self) -> u64 {
             *self.frames.borrow()
+        }
+        fn frame_lines(&self) -> usize {
+            *self.lines.borrow()
         }
         fn set_paused(&mut self, paused: bool) {
             self.push(Call::Paused(paused));
