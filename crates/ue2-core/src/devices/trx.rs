@@ -5,8 +5,9 @@
 //! (page 6).
 //!
 //! Sixteen 4 KB pages, byte wide. Page 0 from 0x104 holds the gate's capture control and page 1 the state bus (S39
-//! phase A1, docs/specs/S39-trxmon.md; the model is `trx_sb.rs`). Pages 2, 3, 4 and 7 and every offset not listed
-//! read 0 and ignore writes.
+//! phase A1, docs/specs/S39-trxmon.md; the model is `trx_sb.rs`); page 2 is the engine (S40,
+//! docs/specs/S40-trx-engine.md; `trx_engine.rs`). Pages 3, 4 and 7 and every offset not listed read 0 and ignore
+//! writes.
 //!
 //! The layer's settings and a pending flip take effect at the frame start, one per VIC frame. The device sees a VIC
 //! frame through the count [`C64Port`] publishes after each sync, polled every millisecond, so the frame start comes
@@ -21,6 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::c64host::{C64Charset, C64Rom};
 use crate::devices::c64::C64Port;
+use crate::devices::trx_engine::{self as engine, Engine};
 use crate::devices::trx_sb::StateBus;
 use crate::devices::trx_session::{Chips, Session, VicView};
 use crate::host::{TrxLayer, TrxText};
@@ -36,21 +38,23 @@ pub const IRQ_HIGH_BIT: u8 = 2;
 
 /// Page 0 (trx_io.v): ID "TRX2" at 000-003, CAPS 004, CAPS2 005, BUILD 008-00B, IRQ_EN 010, IRQ_CAUSE 014.
 const ID: &[u8; 4] = b"TRX2";
-/// CAPS b0 page 0 gate, b1 page 1 state bus, b5 page 5 session, b6 page 6 video, b7 the layer is RGB565. The
-/// bitstream reads $FF; b2-b4 (engine, debug, cartridge) stay off, and with them every app path that needs pages 2-4.
-/// A bit is reported only when its pages are built (S39 §2).
-pub const CAPS: u8 = 0xE3;
-/// CAPS2 b3: the session has the commit list, so the app sets PROTO around Gideon's protocol (trx_video.cc
-/// `has_list`). The bitstream reads $3F; the other bits' features are not here.
-pub const CAPS2: u8 = 0x08;
+/// CAPS b0 page 0 gate, b1 page 1 state bus, b2 page 2 engine, b5 page 5 session, b6 page 6 video, b7 the layer is
+/// RGB565. The bitstream reads $FF; b3 (debug) and b4 (cartridge) stay off, and with them every app path that needs
+/// pages 3 and 4. A bit is reported only when its pages are built (S40 §2).
+pub const CAPS: u8 = 0xE7;
+/// CAPS2 b0: the drain writes stream 2's F4 only after a frame's F3 (`trx_ring.cc` `f4_after_blocks`); b3: the
+/// session has the commit list, so the app sets PROTO around Gideon's protocol (trx_video.cc `has_list`); b5: the
+/// engine applies stream 0 itself (APPLY, `apply_hw`). The bitstream reads $3F; the other bits' features are not here.
+pub const CAPS2: u8 = 0x29;
 const CAPS_OFF: u32 = 0x004;
 const CAPS2_OFF: u32 = 0x005;
 pub const IRQ_EN: u32 = 0x010;
 pub const IRQ_CAUSE: u32 = 0x014;
-/// IRQ_CAUSE b0, the machine halted (top.v `stop_tgl`: the pause or the position hold); b3, a capture or a halt
-/// (`cap_tgl`); b6, the frame start; b7, a flip was done. The other causes are pages UE2 does not build, so they stay
-/// 0.
+/// IRQ_CAUSE b0, the machine halted (top.v `stop_tgl`: the pause or the position hold); b1, an engine job ended
+/// (`eng_tgl`); b3, a capture or a halt (`cap_tgl`); b6, the frame start; b7, a flip was done. b2 (`gap_tgl`, records
+/// lost) never comes, the other causes are pages UE2 does not build.
 pub const CAUSE_STOP: u8 = 0x01;
+pub const CAUSE_ENGINE: u8 = 0x02;
 pub const CAUSE_CAPTURE: u8 = 0x08;
 pub const CAUSE_VSYNC: u8 = 0x40;
 pub const CAUSE_FLIP: u8 = 0x80;
@@ -227,6 +231,8 @@ pub struct TrxLink {
     /// CAP_CTRL and JTAG_PAGE as last written (they read back at once, trx_sys.v:216-218).
     pub cap_ctrl: u8,
     pub jtag_page: u8,
+    /// S40: the engine (page 2).
+    pub engine: Engine,
 }
 
 impl TrxLink {
@@ -243,6 +249,7 @@ impl TrxLink {
             sb: StateBus { halted: paused, ..StateBus::default() },
             cap_ctrl: 0,
             jtag_page: 0,
+            engine: Engine::default(),
         }
     }
 }
@@ -320,6 +327,21 @@ impl Shown {
     }
 }
 
+/// What `monitor trx` shows of the engine (page 2).
+#[derive(Clone, Debug)]
+pub struct EngineView {
+    pub on: bool,
+    /// `LOG_CTRL` b3:1: b0 outside, b1 cartridge RAM, b2 colour RAM.
+    pub taps: u8,
+    pub frame: u32,
+    pub dropped: u16,
+    pub cnt: [u32; 3],
+    /// Each stream's area: byte address and size.
+    pub areas: [(u32, u32); 3],
+    pub ap_jobs: Vec<crate::devices::trx_engine::ApJob>,
+    pub store_mb: usize,
+}
+
 /// Whether block offset `off` is one of trx_sys.v's pages (trx_io.v `far`): page 0 from 0x100, pages 1, 2, 3, 5, 7.
 fn far(off: u32) -> bool {
     match off >> 12 {
@@ -351,8 +373,9 @@ pub struct Trx {
     far_latch: u32,
     /// SB_ADDR (trx_sys.v `sb_a`): `{chip, word}`, moved on by every SB_DATA read and write.
     sb_a: u16,
-    /// The capture events (`cap_tgl`) seen.
+    /// The capture events (`cap_tgl`) and the engine's ended jobs (`eng_tgl`) seen.
     cap_seen: u64,
+    eng_seen: u64,
     /// c64_text.v: TX_CTRL b1:0, its own stage of byte 0 and its own latch.
     tx_ctrl: u8,
     tx_stage: u8,
@@ -373,9 +396,9 @@ pub struct Trx {
 
 impl Trx {
     pub fn new(link: Link) -> Self {
-        let (pause_seen, cap_seen) = {
+        let (pause_seen, cap_seen, eng_seen) = {
             let l = lock(&link);
-            (l.pause_starts, l.sb.cap_events)
+            (l.pause_starts, l.sb.cap_events, l.engine.done)
         };
         Trx {
             irq_en: 0,
@@ -390,6 +413,7 @@ impl Trx {
             far_latch: 0,
             sb_a: 0,
             cap_seen,
+            eng_seen,
             tx_ctrl: 0,
             tx_stage: 0,
             tx_latch: 0,
@@ -416,6 +440,22 @@ impl Trx {
     /// Whether the last frame start turned the layer on.
     pub fn shown(&self) -> bool {
         self.shown.on
+    }
+
+    /// The engine's state for a report (S40): what the monitor shows of page 2.
+    pub fn engine(&self) -> EngineView {
+        let l = lock(&self.link);
+        let e = &l.engine;
+        EngineView {
+            on: e.on,
+            taps: e.taps(),
+            frame: e.frame,
+            dropped: e.dropped,
+            cnt: e.cnt,
+            areas: e.areas(),
+            ap_jobs: e.ap_jobs.iter().copied().collect(),
+            store_mb: e.store.megabytes(),
+        }
     }
 
     /// The state bus and the capture control as the port keeps them (a copy).
@@ -503,6 +543,9 @@ impl Trx {
             }
             _ => {}
         }
+        if off & !0xFFF == engine::PAGE2 {
+            return l.engine.read(off & 0xFFF);
+        }
         if off & !0xFFF == PAGE1 {
             return match off & 0xFFF {
                 SB_ADDR => u32::from(self.sb_a),
@@ -535,9 +578,26 @@ impl Trx {
     }
 
     /// trx_sys.v's commit of byte 3 (trx_sys.v:310-346). What acts on the machine goes to the port, at this clock.
-    fn sys_commit(&mut self, off: u32, v: u32, now: u64) {
+    /// The mover runs at once, over guest DDR (`ram`) and the engine's store.
+    fn sys_commit(&mut self, off: u32, v: u32, now: u64, ram: &mut [u8]) {
         let mut l = lock(&self.link);
         let op = SysWrite { at: now, off, v };
+        if off & !0xFFF == engine::PAGE2 {
+            match off & 0xFFF {
+                engine::ENG_SRC | engine::ENG_DST | engine::ENG_LEN | engine::ENG_ARG | engine::AP_START
+                | engine::AP_COUNT => l.engine.write_regs(off & 0xFFF, v),
+                engine::ENG_CMD => {
+                    l.engine.eng_cmd(v, ram);
+                }
+                engine::AP_CMD => {
+                    if l.engine.ap_cmd(v) {
+                        l.ops.push(op);
+                    }
+                }
+                _ => l.ops.push(op),
+            }
+            return;
+        }
         match off {
             GATE_CTRL => {
                 l.frz = v & GATE_FRZ != 0;
@@ -625,6 +685,12 @@ impl Trx {
             self.cause |= CAUSE_CAPTURE;
             self.update_irq(irq);
         }
+        let done = lock(&self.link).engine.done;
+        if done != self.eng_seen {
+            self.eng_seen = done;
+            self.cause |= CAUSE_ENGINE;
+            self.update_irq(irq);
+        }
         if vic != 0 && vic != self.vic_seen {
             self.vic_seen = vic;
             self.frame_start(now, irq);
@@ -702,8 +768,9 @@ impl IoDevice for Trx {
             match off & 3 {
                 // trx_sys.v: a write answers 0, which is what the latch then holds.
                 3 => {
-                    self.sys_commit(off & !3, u32::from(val) << 24 | self.far_stage, ctx.now);
+                    self.sys_commit(off & !3, u32::from(val) << 24 | self.far_stage, ctx.now, ctx.ram);
                     self.far_latch = 0;
+                    self.poll(ctx.now, ctx.irq);
                 }
                 b => {
                     let shift = 8 * b;
@@ -937,7 +1004,7 @@ mod tests {
     fn page_0_reads_id_and_caps_and_other_pages_read_0() {
         let mut r = Rig::new();
         assert_eq!([r.r8(0), r.r8(1), r.r8(2), r.r8(3)], *b"TRX2");
-        assert_eq!((r.r8(4), r.r8(5)), (0xE3, 0x08), "gate, state bus, session, video, RGB565; the commit list");
+        assert_eq!((r.r8(4), r.r8(5)), (0xE7, 0x29), "gate, state bus, engine, session, video, RGB565; F4, list, APPLY");
         assert_eq!(r.r32(0x008), 0, "BUILD");
         r.w8(0x4000, 0xFF);
         assert!((0x4000..0x4010).chain(0xF000..0xF004).chain(0x2000..0x2004).chain(0x104..0x140).all(|o| r.r8(o) == 0));

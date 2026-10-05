@@ -2,7 +2,8 @@
 
 **Status:** spec (2026-10-05), local branch `s37-trx-pixel-layer`. Updated the same day from the FPGA session's
 answers (`run/trx/s40-answers.md`, from RTL and app code), the TRX64-Ultimate architecture reset
-(`docs/architecture-reset-2026-10-05.md` there) and Alex's decisions of 2026-10-05 (§0). Phases A-C are M1 (§13).
+(`docs/architecture-reset-2026-10-05.md` there) and Alex's decisions of 2026-10-05 (§0). Phases A-C are M1 (§13) and
+are built (as built: §10).
 
 **Why:** Alex decided (2026-10-05) that UE2 behaves like the TRX64-Ultimate board for the firmware, so its UI and UX
 can be tested without the board. On the board the app's frame ring, Timewarp (freeze menu and REST) and trxmon's
@@ -133,10 +134,12 @@ UE2 walks it as the sequencer does (:393-452) over the state bus model (S39 §1.
 **IRQ causes** (`trx_io.v`): b1 when a COPY, FILL or APPLY job ends (`eng_tgl`, :218, :556); b2 at the first lost
 record after a marker (`gap_tgl`, :309), never in UE2; b3 at every capture and every halt (`cap_tgl`, c64_core.v:675).
 
-**Ordering.** Page 0 (from 0x104), page 1 (but `SB_ADDR`, `SB_DATA`) and page 2 writes (but the mover's) take effect
-on the C64 side at the access's clock: UE2 queues them with the clock and the C64 port applies them in order as it
-runs the C64 up (as `GATE_CTRL` since S37). Reads answer from the state as of the last C64 sync (at most 1 ms old,
-the board's drain latency is of the same kind).
+**Ordering.** Page 0 (from 0x104), page 1 (but `SB_ADDR`, `SB_DATA`, `SB_STATUS`) and page 2 writes (but the
+mover's registers and `ENG_CMD`) take effect on the C64 side at the access's clock: UE2 queues them with the clock
+and the C64 port applies them in order as it runs the C64 up (as `GATE_CTRL` since S37). A queued write makes the port
+tick before the firmware's next instruction, so a read after a write sees its effect, as the block's own sequencing
+has it (the app's `STOP_POS` release then poll of b16 depends on it). Reads answer from the state as of the last C64
+sync.
 
 ## 4. The streams and how UE2 makes them
 
@@ -298,6 +301,10 @@ kept parts, their clocks moved to now (gap T5). The table holds 4096 entries per
 dropped first. A staged image that is no UE2 block (a board file, a hand-edited block) needs the decoder: M2/M3;
 in M1 it loads nothing and UE2 says so on stderr.
 
+Each kept CPU part also holds a hash of RAM and colour RAM at the snap. A load checks the memories the app put back
+(APPLY, the colour RAM bus writes) against it and says on stderr: `SB_LOAD: the 6510 and the CIAs of the snap N cycles
+back; RAM and colour RAM equal to the snap's` (or `DIFFER`). The firmware smoke counts on it.
+
 ## 6. The mover, APPLY and the restore path
 
 ### 6.1 COPY and FILL
@@ -364,23 +371,30 @@ writer has a bug to fix first (answer (b): it writes A/X/Y/S/P from w0/w1, one w
 - **UE2's monitor**: `monitor trx` also shows the state bus and page 2: on, taps, counts, frames, the areas, the
   position hold.
 
-## 10. In the code
+## 10. In the code (as built)
 
-- **c64-bridge** (`engine_tap.rs`): the observer wrapper on TRX64's runs (writes in order, a halt after a `$00/$01`
-  write or a write into a window a cartridge may take), the RAM and colour RAM mirror, the boundaries (snap, line 16,
-  position), the CPU-held run to a position, the side table and the restore. Events go to the port in order:
-  `{RAM, colour, cartridge RAM write}`, `{snap with the shadows, line 16, position hit, REU}`.
-- **ue2-core** (`c64.rs`): after each advance and around every window access the port moves the bridge's events into
-  the engine; the queued register writes are applied at their clocks.
-- **ue2-core** (`trx_engine.rs`, `trx_sb.rs`): registers, store, placement, the boundary model, markers, blocks,
-  mover, APPLY; the state bus words.
-- **trx_ff.rs**: the encoder.
+- **c64-bridge** (`engine_tap.rs`): TRX64's run is cut at the engine's points (`run_tapped`: the snap window from line
+  0 cycle 12, line 16, the stop position; one instruction at a time on line 0 while a REU transfer waits). While the
+  log is on every run goes through an observer wrapper (`Tapped`): the writes in order, a halt after a `$00/$01` write
+  or a write into a cartridge's window, the run then going on to its end; the writes are resolved after it under the
+  memory configuration they were made in (§4.3), with old bytes from the RAM and colour RAM mirror. A compare of the
+  mirror at each boundary and at the end of each slice logs what no tap saw (the REU, a monitor poke). The firmware's
+  window writes, the session's commit and S38's restores are tapped where the bridge serves them. The side table and
+  the load (§5.3). Events go to the port in order.
+- **c64-bridge** (`hwlog.rs`): the write log's engine sink: the cartridge logic's and the REU's guest DDR writes.
+- **ue2-core** (`c64.rs`): the queued register writes at their clocks, the bridge's events into the state bus model
+  and the engine after each advance and window access, APPLY through the RAM's second port, the halt (pause or
+  position hold), `SB_LOAD` at the next opening edge, the engine's records below 64 MB into guest DDR.
+- **ue2-core** (`trx_engine.rs`, `trx_sb.rs`): registers, store, placement, markers, blocks, mover, APPLY; the state
+  bus words, the capture cadence and arming, staging.
+- **trx_ff.rs**: the encoder; its layout is checked on the board's fixture.
 
 ## 11. TRX64 gaps
 
 | # | Gap | Until it closes |
 |---|---|---|
 | T1 | **A memory write tap**: every write that lands in the 64 KB RAM or colour RAM, with the old byte of that memory and the master (CPU, RMW dummy, REU DMA). `on_bus` gives the CPU-visible old byte (ROM under BASIC/KERNAL, 0 from `$D000`, `full_sc.rs:260-301`) and the REU writes RAM without it. (The same CPU-view `old` makes TRX64's own delta-ring undo write ROM bytes into RAM under ROM: answer (a).) | UE2's mirror: old from the mirror, landing by TRX64's memory configuration (§4.3), a halt after a `$00/$01` write; a compare after the run finds the writes no tap saw (the REU) and logs them before the marker |
+| T1' | TRX64 v0.12.5 (released 2026-10-05) records the RAM's own overwritten byte in its delta ring and trace, and leaves out stores a flash cart consumes: the board's stream 0 `old`. UE2 is pinned to v0.12.3 | UE2 keeps its own mirror as the source of stream 0 until the pin moves; after the bump stream 0 can be fed from the delta ring |
 | T2 | **Cycle-exact stop with the CPU running** (S39 T1) | `STOP_POS` with a running CPU lands at the next boundary |
 | T3 | **Snap conditions** as reads: VIC border flip-flops, sprite pixel pending, VIC access in the cycle | treated as met; the REU is checked |
 | T4 | **"The next `execute` takes an interrupt"** (S39 T2) | F1 b4 and the image's intg from UE2's own check |
@@ -447,16 +461,18 @@ and stream:
 - Turbo with `--trx-io`: `$D030`/`$D031` read `$FF`, a write and the menu strobe change nothing.
 - S38 `goto` with the log on: the changed bytes are outside records.
 
-**Firmware smoke** (`scripts/smoke-trx-ring.sh`): `run/trx/ultimate-a58f1a6e.elf`, `--board c64u --trx-io`, a fresh
-flash with the ROMs, System Mode PAL, the overlay interface, `--net user --hostfwd tcp:127.0.0.1:<port>:80`:
+**Firmware smoke** (`scripts/smoke-trx-ring.sh`, `smoke-trx-ring.py`): `run/trx/ultimate-a58f1a6e.elf`, `--board c64u
+--trx-io`, a fresh flash with the ROMs, System Mode PAL, Interface Type Freeze (the Timewarp works only over a frozen
+machine, `trx_timewarp_ui.cc:302`), `--net user --hostfwd`, the control port:
 
 | Step | Expected |
 |---|---|
-| boot, 8 s | console `[TRX] IO block present, CAPS E7`, `[RING] log on: streams at 7000000/6000000/5c00000` |
-| `10 poke1024,peek(1024)+1:goto10`, run 5 s | `GET /v1/timewarp:status`: frames ≈ 250, targets = frames, stream counts rising, `dropped` 0 |
-| `PUT /v1/timewarp:rewind?frames=100` | 200; `$0400` back by about 100 frames' worth, then counting on; the C64's RAM, CPU and CIAs equal UE2's own S38 anchor of that frame |
-| `PUT /v1/timewarp:scrub?frames=50`, then `scrubend` | console `[RING] scrub to seq …`; after `scrubend` the loop runs on from that frame |
-| freeze button, "C64 Machine" → "Timewarp", LEFT × 25, RETURN | each LEFT one scrub line on the console; RETURN closes the menu and the loop runs from 0.5 s back |
+| boot | console `[TRX] IO block present, CAPS E7`, `[RING] log on: streams at 7000000/6000000/5C00000` |
+| `10 a=a+1:poke1024,aand255:poke1025,int(a/256):goto10`, run 5 s | `GET /v1/timewarp:status`: ≥ 250 frames, every one but the newest a target, stream 2 ≥ 35 records a target, `dropped` 0 |
+| `PUT /v1/timewarp:rewind?frames=100` | 200, `frames_back` 100; the counter goes back, then on; one load, of the snap 100 frames back (± 2), RAM and colour RAM equal to the snap's (the CPU and CIAs are the snap's own) |
+| `PUT /v1/timewarp:scrub` 50, 50, 60, 50, then `scrubend` | the 2nd and 4th step (the timeline stands from the 2nd) leave the same machine (`monitor r`, `$0000-$00FF`, `$0400-$04FF`), the 3rd another; after `scrubend` the counter runs on; every load the snap's |
+| freeze button, F1, "C64 Machine" → "Timewarp", LEFT × 25, RETURN | 25 scrub lines on the console; `[RING] scrub rewind to seq`; the counter runs on; every load the snap's |
+| `$D030`/`$D031` | read `$FF` |
 
 **Not checked by the smoke:** cycle-exact `STOP_POS` with a running CPU (T2), the transitional CIA states (answer 3),
 the board loading anything of UE2's (M2/M3).

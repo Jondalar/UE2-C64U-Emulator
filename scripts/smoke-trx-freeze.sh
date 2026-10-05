@@ -83,7 +83,7 @@ log=run/freeze.log
 
 # Boot.
 grep -q "trx-io: on (TRX firmware: trx_lv_open)" run/freeze.err || fail "auto did not find the TRX firmware"
-grep -q "\[TRX\] IO block present, CAPS E3" $log || fail "CAPS is not E3"
+grep -q "\[TRX\] IO block present, CAPS E7" $log || fail "CAPS is not E7"
 grep -q "\[TRX\] freeze menu on the pixel layer: still at .*, text in hardware, commit list" $log ||
     fail "the freeze menu is not on the pixel layer with the commit list"
 block 1 $log | grep -q "READY." || fail "no READY. before the freeze"

@@ -551,6 +551,8 @@ impl Trx64Backend {
             }
         };
         notes.extend(self.show_picture(picture.as_deref()));
+        // S40 §9: the memories changed behind the firmware's back, as a JTAG write would: outside records.
+        self.tap_compare(true);
         let ring = self.ring.as_deref_mut().expect("checked above");
         ring.notes = notes;
         ring.cursor = Some(anchor.id.clone());

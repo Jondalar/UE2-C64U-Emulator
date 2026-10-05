@@ -12,6 +12,7 @@ use crate::c64host::{C64Backend, C64CartSlot, C64Frame, C64Rom, CartRom, EngineC
 use crate::devices::board::{add_table, at, span, Reg, RegTable, Span, RAM, RAM_PAGE};
 use crate::devices::drives::DriveRegs;
 use crate::devices::trx::{self, Link};
+use crate::devices::trx_engine as engine;
 use crate::devices::trx_session::Lines;
 use crate::io::{IoCtx, IoDevice, IoMap, IO_BASE};
 use crate::machine::MachineConfig;
@@ -615,16 +616,28 @@ impl C64Port {
                 self.trx_update();
             }
             o if o == trx::PAGE1 + trx::SB_LOAD => trx::lock(&link).sb.ldarm = (op.v & 0x1F) as u8,
+            o if o == engine::PAGE2 + engine::AP_CMD => {
+                // APPLY through the RAM's second port, logged by nothing (trx_engine.v:499-523, top.v:1299).
+                let mut l = trx::lock(&link);
+                if let (Some(job), Some(b)) = (l.engine.ap_jobs.pop_front(), self.backend.as_deref_mut()) {
+                    l.engine.apply(job, |a, v| b.apply_ram(a, v));
+                }
+            }
+            o if o & !0xFFF == engine::PAGE2 => {
+                trx::lock(&link).engine.write(o & 0xFFF, op.v);
+                self.trx_engine_cfg();
+            }
             _ => {}
         }
     }
 
-    /// What the engine wants of the C64's run now: the boundaries while the capture cadence is on.
+    /// What the engine wants of the C64's run now: the boundaries while the log or the capture cadence is on
+    /// (c64_core.v:665), the memory writes while the log is on.
     fn trx_engine_cfg(&mut self) {
         let Some(link) = self.trx.clone() else { return };
         let cfg = {
             let l = trx::lock(&link);
-            EngineCfg { boundaries: l.sb.cap_every != 0, records: false }
+            EngineCfg { boundaries: l.engine.on || l.sb.cap_every != 0, records: l.engine.on }
         };
         if cfg != self.engine_cfg {
             self.engine_cfg = cfg;
@@ -634,7 +647,8 @@ impl C64Port {
         }
     }
 
-    /// The engine's events since the last look: the boundaries go to the capture model; a position hit halts.
+    /// The engine's events since the last look, in order: the boundaries go to the capture model and make the
+    /// engine's markers and blocks, the writes its records; a position hit halts.
     fn trx_events(&mut self) {
         let Some(link) = self.trx.clone() else { return };
         let Some(b) = self.backend.as_deref_mut() else { return };
@@ -645,19 +659,23 @@ impl C64Port {
         let mut hit = false;
         {
             let mut l = trx::lock(&link);
+            let l = &mut *l;
             for ev in events {
                 match ev {
                     TapEvent::Snap(snap) => {
-                        l.sb.snap(&snap);
+                        let bd = l.sb.snap(&snap);
+                        // F2 counts the snap's edge: the fetch after the boundary (c64_core.v:652, trx_engine.v:360).
+                        l.engine.boundary(bd, snap.cycle + 1, snap.x, snap.line, snap.intg, &l.sb);
                     }
-                    TapEvent::Line16 { .. } => {
-                        l.sb.line16(false);
+                    TapEvent::Line16 { cycle, x } => {
+                        let bd = l.sb.line16(l.engine.on);
+                        l.engine.boundary(bd, cycle, x, 16, false, &l.sb);
                     }
                     TapEvent::PosHit => {
                         l.sb.pos_hit();
                         hit = true;
                     }
-                    _ => {}
+                    ev => l.engine.tap(&ev),
                 }
             }
         }
@@ -954,6 +972,14 @@ impl C64Port {
     fn return_ddr(&mut self, ram: &mut [u8]) {
         if let Some(b) = &mut self.backend {
             b.lend_ddr(None);
+        }
+        // S40: the engine's records below 64 MB, the same way.
+        if let Some(link) = &self.trx {
+            for (a, v) in std::mem::take(&mut trx::lock(link).engine.guest_out) {
+                if let Some(slot) = ram.get_mut(a as usize) {
+                    *slot = v;
+                }
+            }
         }
         // S37: the still capture writes guest DDR, once the backend holds none of it; bytes past its end are dropped.
         if let Some((addr, bytes)) = self.still_out.take() {
@@ -1252,8 +1278,14 @@ impl IoDevice for C64Port {
         }
     }
 
+    /// The periodic sync; with `--trx-io` also the first register write of the C64's clock the block queued (S40
+    /// §3): the port takes it before the firmware's next instruction, so a read after it sees its effect, as the
+    /// block's own sequencing has it.
     fn next_event(&self) -> Option<u64> {
-        self.backend.as_ref().map(|_| self.synced + SYNC_PERIOD)
+        self.backend.as_ref()?;
+        let periodic = self.synced + SYNC_PERIOD;
+        let op = self.trx.as_ref().and_then(|l| trx::lock(l).ops.first().map(|op| op.at));
+        Some(op.map_or(periodic, |at| at.min(periodic)))
     }
 
     fn tick(&mut self, ctx: &mut IoCtx) {
@@ -2025,6 +2057,67 @@ mod tests {
         assert_eq!(loads.len(), 1);
         assert_eq!(loads[0].cpu, Some([0x100, 0x101, 0x102, 0x103, 0x104, 0x105, 0x106]));
         assert_eq!(loads[0].cia, [Some([0; 12]), Some([0; 12])]);
+    }
+
+    /// S40: the app's start (`start_locked`): the log on asks the run for boundaries and records; the bridge's events
+    /// become records and markers in order; COPY reads them into guest DDR at once; APPLY waits for the C64 side,
+    /// which writes the old bytes through the RAM's second port, and raises IRQ_CAUSE b1.
+    #[test]
+    fn the_engine_logs_copies_and_applies() {
+        use crate::c64host::{EngineCfg, Snap, TapEvent};
+        use crate::devices::trx::{CAP_CTRL, CAUSE_ENGINE, IRQ_CAUSE};
+        use crate::devices::trx_engine::*;
+        let mut b = Bench::trx();
+        let p2 = TRX_ADDR + PAGE2;
+        b.w32(p2 + LOG_CTRL, 0);
+        for s in 0..3u32 {
+            b.w32(p2 + LOG_BASE + 0x10 * s, [0x700_0000, 0x600_0000, 0x5C0_0000][s as usize]);
+            b.w32(p2 + LOG_MASK + 0x10 * s, [0xFF_FFFF, 0x7F_FFFF, 0x3F_FFFF][s as usize]);
+        }
+        b.w32(TRX_ADDR + CAP_CTRL, 1);
+        b.w32(p2 + LOG_CTRL, 0x10F);
+        assert_eq!(b.r32(p2 + LOG_STAT), 0, "the log goes on at the next sync");
+        b.tick_at(10);
+        assert_eq!(b.r32(p2 + LOG_STAT), 1);
+        assert_eq!(b.mock.engine.borrow().last(), Some(&EngineCfg { boundaries: true, records: true }));
+        let ram = |addr: u16, old: u8, new: u8| TapEvent::Ram { addr, old, new, outside: false, cycle: 0 };
+        let mut snap = Snap { cycle: 1000, x: 103, line: 0, ..Snap::default() };
+        snap.shadow.cpu[1] = 0x0122_E5CF;
+        b.mock.tap.borrow_mut().extend([
+            TapEvent::Line16 { cycle: 10, x: 7 },
+            ram(0x400, 0x20, 0x21),
+            TapEvent::Snap(Box::new(snap)),
+            ram(0x400, 0x21, 0x22),
+            ram(0x401, 0x20, 0x01),
+        ]);
+        b.tick_at(20);
+        assert_eq!([b.r32(p2 + LOG_CNT), b.r32(p2 + LOG_CNT + 0x10), b.r32(p2 + LOG_CNT + 0x20)], [3, 0, 35]);
+        assert_eq!(b.r32(p2 + FRAME), 1);
+        for off in [LOG_CTRL, LOG_BASE, LOG_MASK + 0x10, LOG_PUT_LO, CAP_TAB_LEN, ENG_SRC, ENG_ARG, AP_COUNT] {
+            assert_eq!(b.r32(p2 + off), 0, "write-only {off:#05x} reads 0");
+        }
+        // The app's fetch of stream 2 into its bounce buffer.
+        b.w32(p2 + ENG_SRC, 0x5C0_0000);
+        b.w32(p2 + ENG_DST, 0x1000);
+        b.w32(p2 + ENG_LEN, 0x40);
+        b.w32(p2 + ENG_CMD, 1);
+        assert_eq!(b.r32(p2 + ENG_CMD), 0, "done at once");
+        let rec = |b: &Bench, n: usize| u64::from_le_bytes(b.ram[0x1000 + 8 * n..][..8].try_into().unwrap());
+        assert_eq!(rec(&b, 0) >> 56, 0xF1);
+        assert_eq!(rec(&b, 1), 0xF2 << 56 | 1001, "the count after the snap's edge");
+        assert_eq!(rec(&b, 3), 0xF4 << 56 | 1, "one write before the snap");
+        assert_eq!(rec(&b, 6) as u32, 0x0122_E5CF, "the block's third word: the PC");
+        assert_eq!(b.r8(TRX_ADDR + IRQ_CAUSE) & CAUSE_ENGINE, CAUSE_ENGINE);
+        // Undo of the two writes after the snap: newest first, old bytes, through the second port.
+        b.mock.take();
+        b.w32(p2 + AP_START, 2);
+        b.w32(p2 + AP_COUNT, 2);
+        b.w32(p2 + AP_CMD, 1);
+        assert_eq!(b.r32(p2 + AP_CMD), 1, "busy until the C64 side applies it");
+        b.tick_at(30);
+        assert_eq!(b.r32(p2 + AP_CMD), 0);
+        let writes: Vec<Call> = b.mock.take().into_iter().filter(|c| matches!(c, Call::DmaWrite(..))).collect();
+        assert_eq!(writes, [Call::DmaWrite(0x401, 0x20, true), Call::DmaWrite(0x400, 0x21, true)]);
     }
 
     /// S40 §0: a C64 on TRX64-Ultimate's bitstream is told so on attach; without `--trx-io` it is not.
