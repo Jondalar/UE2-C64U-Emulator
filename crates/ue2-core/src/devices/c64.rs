@@ -540,9 +540,8 @@ impl C64Port {
         if frames > l.frames && l.frames != 0 && l.still.on {
             let base = l.still.base & trx::DDR_ADDR_MASK;
             let lines = b.frame_lines();
-            let complete = lines == 0 || lines >= trx::STILL_Y0 + trx::STILL_H;
             let ended = frames - l.frames;
-            let slot = l.still.frames(ended, complete);
+            let slot = l.still.frames(ended, trx::still_complete(lines), trx::still_v60(lines));
             // The default base lies past UE2's 64 MB: nothing to write, so no frame to build.
             if (base as usize) < crate::bus::RAM_SIZE {
                 let bytes = trx::still_window(&b.frame());
@@ -1897,5 +1896,28 @@ mod tests {
         b.ram[0x11_0004] = 0;
         frame(&mut b, 5, 500);
         assert_eq!((b.r32(TRX_ADDR + PAGE6 + STILL_STATUS), b.ram[0x11_0004]), (3 << 8 | 1, 0));
+    }
+
+    #[test]
+    fn a_60_hz_still_completes_with_400_x_240_and_b2() {
+        use crate::devices::trx::{PAGE6, STILL_BASE, STILL_STATUS};
+        let mut b = Bench::trx();
+        let frame = |b: &mut Bench, n: u64, at: u64| {
+            *b.mock.frames.borrow_mut() = n;
+            b.tick_at(at);
+        };
+        b.w32(TRX_ADDR + PAGE6 + STILL_BASE, 0x10_0000);
+        *b.mock.lines.borrow_mut() = 263;
+        b.ram[0x10_0000 + 48_000] = 0xEE;
+        frame(&mut b, 1, 100);
+        frame(&mut b, 2, 200);
+        assert_eq!(b.r32(TRX_ADDR + PAGE6 + STILL_STATUS), 1 << 8 | 1 << 2 | 1, "complete in slot 0, b2: 60 Hz");
+        assert_eq!(b.ram[0x10_0000 + 47_999], 0x22, "240 rows");
+        assert_eq!(b.ram[0x10_0000 + 48_000], 0xEE, "and not one more");
+        // Back to 50 Hz: b2 goes with the next complete frame.
+        *b.mock.lines.borrow_mut() = 312;
+        frame(&mut b, 3, 300);
+        assert_eq!(b.r32(TRX_ADDR + PAGE6 + STILL_STATUS), 2 << 8 | 1 << 1 | 1);
+        assert_eq!(b.ram[0x11_0000 + 53_999], 0x22, "270 rows");
     }
 }

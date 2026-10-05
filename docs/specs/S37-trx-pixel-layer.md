@@ -268,27 +268,34 @@ the window's writes in a session fill (not mem-only):
 
 ### 5.5 Still capture
 
-Confirmed against pix_layer.v:
-- **Window:** VIC raster columns 96-495, lines 16-285 (pix_layer.v:65-66, :504-505): the pixels the composite's C64
-  window shows (phase A's mapping through `text_x` and `first_line`).
-- **Packing:** pixel k = 400 y + x is nibble k mod 2 of byte k / 2, the low nibble first (pix_layer.v:524-530).
-  200 bytes a line, 54,000 a frame.
+Confirmed against pix_layer.v (TRX64-Ultimate main, 8072ce9):
+- **Window, 50 Hz:** VIC raster columns 96-495, lines 16-285 (pix_layer.v:73-74, :518-520): the pixels the composite's
+  C64 window shows (phase A's mapping through `text_x` and `first_line`).
+- **Window, 60 Hz** (the scaler's `v60`, 2-FF into `vclk`, :512-515): the same columns, 240 rows of **one** VIC frame.
+  The capture starts on line 0 (:521); lines 0-7 go first, into rows 232-239 (words 2,900-2,999, :536), the word
+  index wraps to 0 (:544), and lines 31-262 fill rows 0-231 (:519). The mode is taken at the start and kept for the
+  frame (:537, `f60`). Against the scaler's window only rows 232-239 differ: the scaler shows the next frame's lines
+  0-7 there.
+- **Packing:** pixel k = 400 y + x is nibble k mod 2 of byte k / 2, the low nibble first (pix_layer.v:539-548).
+  200 bytes a row; 54,000 a frame at 50 Hz (3,375 words), 48,000 at 60 Hz (3,000 words).
 - **Slot:** a frame goes into the slot that is not the last one. The last starts as 1, so the first frame goes to
-  slot 0 (pix_layer.v:494, :518-519). Slot n is at `STILL_BASE` + n × 0x10000.
-- **Complete:** last = that slot; `STILL_STATUS` b0 = 1 (it stays 1), b1 = the slot, b31:8 counts (pix_layer.v:535-541,
-  :164-168).
-- **`STILL_CTRL` b0 and `STILL_BASE`** are taken at the window's first pixel (pix_layer.v:513, :518), so a frame is
+  slot 0 (pix_layer.v:504, :534-535). Slot n is at `STILL_BASE` + n × 0x10000.
+- **Complete:** after word 3,374 at 50 Hz (line 285), after word 2,899 at 60 Hz (line 262) (:552). last = that slot;
+  `STILL_STATUS` b0 = 1 (it stays 1), b1 = the slot, **b2 = that frame is 60 Hz (400 × 240; 0: 400 × 270)**, latched
+  with the slot, b31:8 counts (pix_layer.v:153, :172-177, :554-559).
+- **`STILL_CTRL` b0 and `STILL_BASE`** are taken at the window's first pixel (pix_layer.v:528, :534-535), so a frame is
   captured whole or not at all. UE2 takes them at the VIC frame end.
 - **Torn frames:** the device drops a frame that lost a DDR2 write and uses its slot again. UE2 loses none.
-- **Paused:** the VIC is gated, its pixel position stands, so nothing is emitted (pix_layer.v:503) and nothing
+- **Paused:** the VIC is gated, its pixel position stands, so nothing is emitted (pix_layer.v:517) and nothing
   captured; `STILL_STATUS` keeps the last.
-- **60 Hz:** the window is 270 lines from line 16 whatever the System Mode; a 263-line VIC never reaches line 285, so
-  no frame completes (pix_layer.v:505, :535) and `STILL_STATUS` stays as it was. UE2 does the same: the lines the VIC
-  reaches go into the slot after the last, nothing completes. A suspected RTL issue (§6).
+- **The app** (trx64/main a58f1a6e, trx_video.cc `grab_still`, `still_row`): b2 picks 48,000 bytes and draws the 240
+  rows onto the 540-row layer, 9 layer rows per 4 still rows (2, 2, 2, 3).
 - **In UE2:**
   - At each VIC frame end the C64 port, which has the frame and the guest DDR, writes the window into the slot when
-    `STILL_CTRL` b0 is set. Address bits 26:0; bytes past UE2's 64 MB are dropped. The default base `0x05050000` is
-    past it, so nothing is written until the app sets its own (trx_video.cc:821).
+    `STILL_CTRL` b0 is set. 60 Hz is a VIC of fewer than 300 lines, as the composite takes it (render.rs
+    `draw_c64_trx`); it completes with 263 lines. The rows are laid out as on the device (rows 232-239 the frame's
+    lines 0-7, mapped through the canvas as the composite maps them). Address bits 26:0; bytes past UE2's 64 MB are
+    dropped. The default base `0x05050000` is past it, so nothing is written until the app sets its own (trx_video.cc:821).
   - When several VIC frames ended since the last sync (`--speed max`), only the newest is written, into the slot the
     device would have used for it, and the count goes up by the frames that passed.
   - The still of a frame lands before that frame's frame start, as on the device (line 285 against line 9 of the next
@@ -392,7 +399,8 @@ In a session no access of the window becomes a bus cycle (freeze_resp.v):
   0; cleared at the end; mem-only writes do not count.
 - Still: the packing of pixels 0, 1, 399, 400 and 107,999; slots 0, 1, 0; `STILL_STATUS` valid, slot and count;
   `STILL_CTRL` 0 writes nothing and keeps the status; a base past 64 MB writes nothing; paused, no capture; a
-  263-line frame never completes.
+  263-line frame completes with 400 × 240 (48,000 bytes, rows 0-231 lines 31-262, rows 232-239 lines 0-7) and
+  `STILL_STATUS` b2, a 262-line one does not; b2 latched with the slot and cleared by the next 50 Hz frame.
 - Text: `TX_CTRL` reads `0x0100_0000` \| ctrl; a known screen at `$0400`, charset at `$0800` lands at (320, 140) at
   4 × 4 in the colour RAM's colours; background transparent and opaque; the char ROM case (bank 0, `$D018` = `$14`);
   hidden with ECM, BMM or MCM, without a session or without show; `TX_STATUS` b0 follows.
@@ -461,9 +469,9 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
 - The fade, decided (Alex, 2026-10-04): the smoke's check of the `PX_GALPHA` writes is enough for now; no intermediate
   picture is checked.
 - Phase B, for the FPGA side:
-  - **RTL bug, confirmed by the FPGA side (2026-10-04), fix in progress:** the still at 60 Hz. pix_layer.v's window is 270 lines from line 16 in every System Mode
-    (`Y0S`, :505), so a 263-line VIC never reaches line 285, no frame completes (:535), and the freeze shows only the
-    menu background behind the text. UE2 models it as it is.
+  - **The still at 60 Hz: built** (fixed in TRX64-Ultimate 8072ce9, app a58f1a6e; UE2 follows, §5.5 and "As built
+    (the 60 Hz still)"). Before the fix the window was 270 lines from line 16 in every System Mode, a 263-line VIC
+    never reached line 285 and the freeze showed only the menu background behind the text.
 - Phase B, decided (Alex, 2026-10-04): B1 and B2 together; `GATE_CTRL` b9 read as b8; the resume at once; B3 (overlay.v
   placement for "Overlay on HDMI") is built next (Alex, 2026-10-04).
 
@@ -549,3 +557,15 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
   the 1000 Hz tone back after each release), `the_mute_silences_the_voices_and_drains_them` (sampler).
   `scripts/smoke-trx-freeze.sh` plays a 1000 Hz tone before the freeze into `--audio-wav`: the WAV holds one stretch
   of zeros over 2 s with the tone right before and after it, and ends on the tone.
+
+## As built (the 60 Hz still)
+
+- **RTL** (TRX64-Ultimate main, 8072ce9 `pix_layer: still capture at 60 Hz`; bench `sim/pixlayer/run_still.sh`):
+  pix_layer.v:512-521, :536-537, :544, :552, :557, STILL_STATUS :153. The later `f_hm1` change (2f26598, on t21-p4,
+  not main) registers the layer height − 1 for timing; the compare is the same, nothing visible changes, so UE2 has
+  nothing to model.
+- **UE2:** `trx::still_v60` (fewer than 300 lines) and `trx::still_complete` (50 Hz 286 lines, 60 Hz 263);
+  `still_window` writes 240 rows in the device's order at 60 Hz; `Still` keeps b2 with the slot. 50 Hz unchanged.
+- **Tests:** `a_still_completes_at_line_285_or_at_60_hz_on_line_262`, `the_60_hz_still_is_lines_31_to_262_then_0_to_7`,
+  `the_still_fills_slots_0_1_0_and_counts` (b2), `a_60_hz_still_completes_with_400_x_240_and_b2` (the port: 48,000
+  bytes and not one more, b2 cleared by a 312-line frame).
