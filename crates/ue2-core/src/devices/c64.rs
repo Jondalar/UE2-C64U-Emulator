@@ -8,10 +8,11 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use crate::c64host::{C64Backend, C64CartSlot, C64Frame, C64Rom, CartRom, EngineCfg, TapEvent};
+use crate::c64host::{C64Backend, C64CartSlot, C64Frame, C64Rom, CartPeek, CartRom, EngineCfg, TapEvent};
 use crate::devices::board::{add_table, at, span, Reg, RegTable, Span, RAM, RAM_PAGE};
 use crate::devices::drives::DriveRegs;
 use crate::devices::trx::{self, Link};
+use crate::devices::trx_dbg::{self as dbg, Act};
 use crate::devices::trx_engine as engine;
 use crate::devices::trx_session::Lines;
 use crate::io::{IoCtx, IoDevice, IoMap, IO_BASE};
@@ -347,6 +348,10 @@ pub struct C64Port {
     still_out: Option<(u32, Vec<u8>)>,
     /// S40: what the engine last asked of the backend's run.
     engine_cfg: EngineCfg,
+    /// S39: the 6510's stop (C64_STOP without OWNER) as last given to the backend, and whether the debugger held the
+    /// machine at the last look.
+    cpu_stopped: bool,
+    dbg_held: bool,
 }
 
 impl Default for C64Port {
@@ -384,6 +389,8 @@ impl C64Port {
             muted: false,
             still_out: None,
             engine_cfg: EngineCfg::default(),
+            cpu_stopped: false,
+            dbg_held: false,
         }
     }
 
@@ -391,16 +398,26 @@ impl C64Port {
     /// 1581; `link` carries the pause, the session and the still between this port and the block.
     pub fn set_trx_io(&mut self, link: Link) {
         self.drives[1].refuse_1581();
+        let d = trx::lock(&link).dbg.clone();
         self.trx = Some(link);
         if let Some(b) = &mut self.backend {
             b.set_trx_bitstream(true);
+            b.set_dbg(Some(d));
         }
+    }
+
+    /// S37: the link to the TRX IO block, with `--trx-io`.
+    pub fn trx_link(&self) -> Option<Link> {
+        self.trx.clone()
     }
 
     /// Attach the C64 at clock `now`, which anchors its clock (S14 §3).
     pub fn attach(&mut self, mut backend: Box<dyn C64Backend>, now: u64) {
         backend.set_cart_rom(self.cart_rom);
         backend.set_trx_bitstream(self.trx.is_some());
+        if let Some(link) = &self.trx {
+            backend.set_dbg(Some(trx::lock(link).dbg.clone()));
+        }
         backend.advance_to(now);
         self.synced = now;
         self.backend = Some(backend);
@@ -578,6 +595,7 @@ impl C64Port {
             self.synced = to;
         }
         self.trx_events();
+        self.trx_dbg_follow();
     }
 
     /// The staged words load into the chips, and `SB_LOAD` reads 0 again.
@@ -627,8 +645,87 @@ impl C64Port {
                 trx::lock(&link).engine.write(o & 0xFFF, op.v);
                 self.trx_engine_cfg();
             }
+            o if dbg::is_dbg(o) => self.trx_dbg_op(o, op.v),
+            o if o == trx::PAGE5 + trx::LK_REQ => self.trx_lens(op.v),
             _ => {}
         }
+    }
+
+    /// S39: a debug block write at its clock (trx_dbg.v:331-381). RUN and the steps are requests the session's end
+    /// comes before: its commit list runs, then the hold goes or the step runs (S39 §3.6). The backend takes the
+    /// configuration; a pause stops at once where the machine stands if that boundary qualifies.
+    fn trx_dbg_op(&mut self, off: u32, v: u32) {
+        let Some(link) = self.trx.clone() else { return };
+        let (d, shut) = {
+            let l = trx::lock(&link);
+            (l.dbg.clone(), l.paused)
+        };
+        let act = dbg::lock(&d).write(off, v, shut);
+        match act {
+            Act::Run => {
+                self.trx_dbg_release();
+                dbg::lock(&d).release();
+            }
+            Act::Step(step) => {
+                self.trx_dbg_release();
+                dbg::lock(&d).start_step(step);
+                // The gate opens: the session's block clears, a load SB_LOAD armed is taken (c64_core.v:385-386).
+                self.trx_update();
+                {
+                    let mut l = trx::lock(&link);
+                    if l.sb.ldarm != 0 {
+                        self.trx_load(&mut l);
+                    }
+                }
+                if let Some(b) = self.backend.as_deref_mut() {
+                    b.dbg_step();
+                }
+            }
+            Act::DrvStep(n) => {
+                if let Some(b) = self.backend.as_deref_mut() {
+                    b.dbg_drive_step(n);
+                }
+            }
+            Act::DrvHold(hold) => {
+                let mut m = dbg::lock(&d);
+                m.drive.hold = hold;
+                m.gen += 1;
+            }
+            Act::Owner(_) | Act::Pause { .. } | Act::None => {}
+        }
+        if let Some(b) = self.backend.as_deref_mut() {
+            b.dbg_changed();
+        }
+        self.trx_events();
+        self.trx_update();
+    }
+
+    /// The debugger's session ends before RUN or a step is taken (freeze_resp.v:219 `dbg_rel`): its list is written.
+    fn trx_dbg_release(&mut self) {
+        let Some(link) = self.trx.clone() else { return };
+        let mut l = trx::lock(&link);
+        let lines = Lines { dbg_rel: true, ..self.trx_lines(&l) };
+        if let Some(b) = self.backend.as_deref_mut() {
+            l.session.step(lines, b);
+        }
+    }
+
+    /// S39 §3.7, the lens unit (freeze_resp.v:581-618, :750-795): a look at the cartridge model, or with REAL one bus
+    /// cycle with the select forced, only while the machine is halted.
+    fn trx_lens(&mut self, v: u32) {
+        let Some(link) = self.trx.clone() else { return };
+        let (addr, class, real) = (v as u16, (v >> 16 & 3) as u8, v & 1 << 18 != 0);
+        let halted = trx::lock(&link).paused;
+        let res = match self.backend.as_deref_mut() {
+            _ if real && !halted => trx::LK_DONE | trx::LK_REFUSED | 0xFF,
+            None => trx::LK_DONE | 0xFF,
+            Some(b) => match b.cart_look(addr, class, real) {
+                CartPeek::Hit(d) => trx::LK_DONE | trx::LK_HIT | if real { trx::LK_REAL } else { 0 } | u32::from(d),
+                CartPeek::Miss => trx::LK_DONE | 0xFF,
+                CartPeek::External => trx::LK_DONE | trx::LK_EXT | 0xFF,
+            },
+        };
+        trx::lock(&link).lk_res = res;
     }
 
     /// What the engine wants of the C64's run now: the boundaries while the log or the capture cadence is on
@@ -684,11 +781,25 @@ impl C64Port {
         }
     }
 
+    /// S39: the debugger's hold changed on the run (a stop): the halt, the shadows, the session follow.
+    fn trx_dbg_follow(&mut self) {
+        let Some(link) = self.trx.clone() else { return };
+        let held = dbg::lock(&trx::lock(&link).dbg).holds();
+        if held != self.dbg_held {
+            self.trx_update();
+        }
+    }
+
     /// The live words 1.3-1.5, and while the machine is halted the shadows: they follow it (c64_core.v:647).
     fn trx_live(&mut self) {
         let (Some(link), Some(b)) = (self.trx.clone(), self.backend.as_deref()) else { return };
         let mut l = trx::lock(&link);
         l.sb.live = b.sb_live();
+        // IPC_SET (trx_dbg.v:301-306): the IB state the app set after a redirect, until the machine moves.
+        let set = dbg::lock(&l.dbg).ipc_set;
+        if let Some((ipc, op, ib)) = set {
+            l.sb.live[0] = u32::from(ib) << 24 | u32::from(op) << 16 | u32::from(ipc);
+        }
     }
 
     /// While the machine is halted the shadows follow it: after an access that may have changed a chip.
@@ -697,8 +808,9 @@ impl C64Port {
         let mut l = trx::lock(&link);
         if l.sb.halted {
             l.sb.shadow = b.sb_shadow();
-            l.sb.live = b.sb_live();
         }
+        drop(l);
+        self.trx_live();
     }
 
     /// A window access that is a bus cycle (no MEMONLY, no session): while the machine is halted it is the edge that
@@ -717,14 +829,25 @@ impl C64Port {
             return;
         }
         self.trx_events();
+        self.trx_dbg_follow();
         if !mem_only {
             self.trx_follow();
         }
     }
 
-    /// S37 phase B: the lines as the session sees them.
-    fn trx_lines(&self, frz: bool) -> Lines {
-        Lines { frz, stop: self.stop, ultimax: self.mode & MODE_ULTIMAX != 0, reset: self.mode & MODE_RESET != 0 }
+    /// S37 phase B: the lines as the session sees them; S39: OWNER and the debugger's stop and hold.
+    fn trx_lines(&self, l: &trx::TrxLink) -> Lines {
+        let d = dbg::lock(&l.dbg);
+        Lines {
+            frz: l.frz,
+            stop: self.stop,
+            ultimax: self.mode & MODE_ULTIMAX != 0,
+            reset: self.mode & MODE_RESET != 0,
+            owner: d.own,
+            dbg_stop: d.holds(),
+            dbg_hold: d.hold,
+            dbg_rel: false,
+        }
     }
 
     /// S37 phase B: after the lines changed, the pause (`GATE_CTRL` FRZ with C64_STOP, no reset held) goes to the
@@ -736,19 +859,28 @@ impl C64Port {
         }
     }
 
-    /// [`Self::trx_update`] with FRZ as `frz`. The machine is halted by the pause or the position hold
-    /// (`c64_halted`): a halt start raises `IRQ_CAUSE` b0 and b3 and loads the shadows (c64_core.v:675-688,
-    /// top.v:1317).
+    /// [`Self::trx_update`] with FRZ as `frz`. The machine is halted by the pause, the position hold or the
+    /// debugger's hold (`c64_halted`): a halt start raises `IRQ_CAUSE` b0 and b3 and loads the shadows
+    /// (c64_core.v:675-688, top.v:1317). OWNER masks C64_STOP for the pause and the 6510's stop (top.v:1073-1074,
+    /// :1238); the mute keeps the raw bit (top.v:1059).
     fn trx_apply(&mut self, frz: bool) {
         let Some(link) = self.trx.clone() else { return };
         let mut l = trx::lock(&link);
-        let lines = self.trx_lines(frz);
+        l.frz = frz;
+        let lines = self.trx_lines(&l);
+        l.fw_stop = self.stop;
         let Some(b) = self.backend.as_deref_mut() else { return };
+        let cpu_stop = self.stop && !lines.owner;
+        if cpu_stop != self.cpu_stopped {
+            self.cpu_stopped = cpu_stop;
+            b.set_stopped(cpu_stop);
+        }
         if lines.paused() != self.paused {
             self.paused = lines.paused();
             b.set_paused(self.paused);
         }
-        let halted = self.paused || l.sb.pos_hold;
+        self.dbg_held = lines.dbg_stop;
+        let halted = self.paused || l.sb.pos_hold || lines.dbg_stop;
         if halted != l.paused {
             l.paused = halted;
             if halted {
@@ -770,14 +902,27 @@ impl C64Port {
 
     /// S37 phase B: a window access in a freeze session, answered by the session (`None` outside one, and for
     /// mem-only accesses, which go to the RAM's second port as before).
+    ///
+    /// S39 (t21-p4 df6d71c, ultimate_sys.vhd:918-930): in the debugger's session without C64_STOP only the D page
+    /// reaches the C64 side as the session's answer; the rest of the window is the RAM's second port, as without a
+    /// stop.
     fn session_access(&mut self, addr: u16, write: Option<u8>, mem_only: bool) -> Option<u8> {
         let link = self.trx.clone().filter(|_| !mem_only)?;
         let mut l = trx::lock(&link);
         if !l.session.active {
             return None;
         }
-        let lines = self.trx_lines(l.frz);
+        let lines = self.trx_lines(&l);
         let b = self.backend.as_deref_mut()?;
+        if l.session.dbg && !self.stop && addr >> 12 != 0xD {
+            return Some(match write {
+                Some(val) => {
+                    b.dma_write(addr, val, true);
+                    val
+                }
+                None => b.dma_read(addr, true),
+            });
+        }
         Some(match write {
             Some(val) => {
                 l.session.write(addr, val, lines, b);
@@ -844,7 +989,8 @@ impl C64Port {
             }
             STOP => {
                 self.stop = val & 1 != 0;
-                if let Some(b) = &mut self.backend {
+                if let Some(b) = self.backend.as_mut().filter(|_| self.trx.is_none()) {
+                    // With `--trx-io` `trx_apply` stops the 6510, OWNER masking C64_STOP (top.v:1238).
                     b.set_stopped(self.stop);
                     // A stopped C64 is silent on every bitstream (Alex, 2026-10-04); with `--trx-io` `trx_apply`
                     // does it as top.v:1059 does.
@@ -2153,6 +2299,50 @@ mod tests {
         b.w8(STOP_ADDR, 1);
         b.w8(STOP_ADDR, 0);
         assert_eq!(*b.mock.mutes.borrow(), [true, false], "no --trx-io: C64_STOP mutes too");
+    }
+
+    /// S39 §3.1, §3.6, §3.7, §1.5 (t21-p4 df6d71c): OWNER masks C64_STOP (no 6510 stop, no pause; it still reads 3
+    /// and mutes); a debugger stop holds the machine and is a session (`SH_STATUS` b0 | b2, IRQ_CAUSE b0, STATUS b0 |
+    /// b1); the window's D page goes to the session without C64_STOP, the rest to the RAM; RUN writes the list before
+    /// the release; the lens refuses REAL while the machine runs.
+    #[test]
+    fn the_debugger_owns_c64_stop_and_its_stop_is_a_session() {
+        use crate::devices::trx::{self, CAUSE_STOP, GATE_CTRL, IRQ_CAUSE, LK_REQ, LK_RES, PAGE5, SH_STATUS};
+        use crate::devices::trx_dbg as td;
+        let mut b = Bench::trx();
+        let status = |b: &mut Bench| b.r32(TRX_ADDR + td::PAGE3 + td::STATUS);
+        b.w32(TRX_ADDR + td::OWNER, 1);
+        b.w32(TRX_ADDR + GATE_CTRL, 1);
+        b.w32(TRX_ADDR + PAGE5 + LK_REQ, 0x4_8000);
+        b.tick_at(0);
+        assert_eq!(b.r32(TRX_ADDR + PAGE5 + LK_RES), trx::LK_DONE | trx::LK_REFUSED | 0xFF, "REAL while running");
+        b.mock.take();
+        b.w8(STOP_ADDR, 1);
+        let calls = b.mock.take();
+        assert!(!calls.iter().any(|c| matches!(c, Call::Stopped(true) | Call::Paused(true))), "{calls:?}");
+        assert_eq!(b.r8(STOP_ADDR), 3);
+        assert_eq!(b.mock.mutes.borrow().last(), Some(&true), "C64_STOP still mutes");
+        assert_eq!(status(&mut b) & 0x10_0021, 0x10_0020, "OWNER, C64_STOP, the gate open");
+        b.w8(STOP_ADDR, 0);
+        // A debugger stop, as the backend makes it on its run.
+        let d = trx::lock(b.port().trx.as_ref().unwrap()).dbg.clone();
+        td::lock(&d).stop(td::Record { reason: td::R_PAUSE, ipc: 0xC000, flags: td::F_IB, ..td::Record::default() }, false);
+        b.tick_at(1000);
+        assert_eq!(b.r32(TRX_ADDR + PAGE5 + SH_STATUS) & 7, 0b101, "the debugger's session");
+        assert_eq!(status(&mut b) & 0x0B, 0x0B, "shut, a debugger stop, STOP_NEW");
+        assert_eq!(b.r8(TRX_ADDR + IRQ_CAUSE) & CAUSE_STOP, CAUSE_STOP);
+        b.mock.take();
+        b.w8(DMA_ADDR + 0xD020, 0x05);
+        assert_eq!(b.r8(DMA_ADDR + 0xD020), 0xF5, "the session's overlay, unused bits 1");
+        b.r8(DMA_ADDR + 0x0400);
+        assert_eq!(b.mock.take(), [Call::DmaRead(0x0400, true)], "the D page answered by the session, the rest the RAM");
+        b.w32(TRX_ADDR + PAGE5 + LK_REQ, 0x4_8000);
+        b.tick_at(1000);
+        assert_eq!(b.r32(TRX_ADDR + PAGE5 + LK_RES), trx::LK_DONE | 0xFF, "REAL while halted: the cartridge (none here)");
+        b.w32(TRX_ADDR + td::PAGE3 + td::CMD, u32::from(td::CMD_RUN));
+        b.tick_at(1000);
+        assert!(b.mock.take().contains(&Call::DmaWrite(0xD020, 0x05, false)), "the list before the release");
+        assert_eq!((status(&mut b) & 0x0B, b.r32(TRX_ADDR + PAGE5 + SH_STATUS) & 1), (0, 0));
     }
 
     #[test]

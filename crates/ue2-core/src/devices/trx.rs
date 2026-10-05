@@ -6,8 +6,9 @@
 //!
 //! Sixteen 4 KB pages, byte wide. Page 0 from 0x104 holds the gate's capture control and page 1 the state bus (S39
 //! phase A1, docs/specs/S39-trxmon.md; the model is `trx_sb.rs`); page 2 is the engine (S40,
-//! docs/specs/S40-trx-engine.md; `trx_engine.rs`). Pages 3, 4 and 7 and every offset not listed read 0 and ignore
-//! writes.
+//! docs/specs/S40-trx-engine.md; `trx_engine.rs`); page 3 and page 0 0x118-0x13F are the debug block (S39,
+//! `trx_dbg.rs`); page 5 has the session and the lens unit. Pages 4 and 7 and every offset not listed read 0 and
+//! ignore writes.
 //!
 //! The layer's settings and a pending flip take effect at the frame start, one per VIC frame. The device sees a VIC
 //! frame through the count [`C64Port`] publishes after each sync, polled every millisecond, so the frame start comes
@@ -22,6 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::c64host::{C64Charset, C64Rom};
 use crate::devices::c64::C64Port;
+use crate::devices::trx_dbg::{self as dbg, DbgLink};
 use crate::devices::trx_engine::{self as engine, Engine};
 use crate::devices::trx_sb::StateBus;
 use crate::devices::trx_session::{Chips, Session, VicView};
@@ -38,14 +40,16 @@ pub const IRQ_HIGH_BIT: u8 = 2;
 
 /// Page 0 (trx_io.v): ID "TRX2" at 000-003, CAPS 004, CAPS2 005, BUILD 008-00B, IRQ_EN 010, IRQ_CAUSE 014.
 const ID: &[u8; 4] = b"TRX2";
-/// CAPS b0 page 0 gate, b1 page 1 state bus, b2 page 2 engine, b5 page 5 session, b6 page 6 video, b7 the layer is
-/// RGB565. The bitstream reads $FF; b3 (debug) and b4 (cartridge) stay off, and with them every app path that needs
-/// pages 3 and 4. A bit is reported only when its pages are built (S40 §2).
-pub const CAPS: u8 = 0xE7;
-/// CAPS2 b0: the drain writes stream 2's F4 only after a frame's F3 (`trx_ring.cc` `f4_after_blocks`); b3: the
-/// session has the commit list, so the app sets PROTO around Gideon's protocol (trx_video.cc `has_list`); b5: the
-/// engine applies stream 0 itself (APPLY, `apply_hw`). The bitstream reads $3F; the other bits' features are not here.
-pub const CAPS2: u8 = 0x29;
+/// CAPS b0 page 0 gate, b1 page 1 state bus, b2 page 2 engine, b3 page 3 debug, b5 page 5 session, b6 page 6 video,
+/// b7 the layer is RGB565. The bitstream reads $FF; b4 (cartridge, page 4) stays off and with it every app path that
+/// needs page 4. A bit is reported only when its pages are built (S39 §2, S40 §2).
+pub const CAPS: u8 = 0xEF;
+/// CAPS2 b0: the drain writes stream 2's F4 only after a frame's F3 (`trx_ring.cc` `f4_after_blocks`); b2: the CPU
+/// write path (state bus chip 1 w4/w5, the staged words 8-14, `IPC_SET`); b3: the session has the commit list, so the
+/// app sets PROTO around Gideon's protocol (trx_video.cc `has_list`); b4: the lens unit (page 5 `LK_REQ`/`LK_RES`);
+/// b5: the engine applies stream 0 itself (APPLY, `apply_hw`). t21-p4's bitstream reads $BF; b1 (BUILD), b6 (turbo)
+/// and b7 (the instruction trace) are not here.
+pub const CAPS2: u8 = 0x3D;
 const CAPS_OFF: u32 = 0x004;
 const CAPS2_OFF: u32 = 0x005;
 pub const IRQ_EN: u32 = 0x010;
@@ -90,6 +94,15 @@ pub const SH_GCLK: u32 = 0x010;
 pub const SH_UNMAPPED: u32 = 0x014;
 pub const SH_LIST: u32 = 0x018;
 pub const SH_COMMIT: u32 = 0x01C;
+/// The lens unit (trx_sys.v:63-70, freeze_resp.v:227-234): `LK_REQ` W `{REAL b18, class b17:16, address}`, `LK_RES` R
+/// `{busy b31, refused b12, real b11, ext b10, hit b9, done b8, data}`.
+pub const LK_REQ: u32 = 0x020;
+pub const LK_RES: u32 = 0x024;
+pub const LK_REFUSED: u32 = 1 << 12;
+pub const LK_REAL: u32 = 1 << 11;
+pub const LK_EXT: u32 = 1 << 10;
+pub const LK_HIT: u32 = 1 << 9;
+pub const LK_DONE: u32 = 1 << 8;
 /// The 128 overlay bytes and their valid bits.
 pub const SH_OVERLAY: u32 = 0x080;
 pub const SH_VALID: u32 = 0x100;
@@ -233,10 +246,15 @@ pub struct TrxLink {
     pub jtag_page: u8,
     /// S40: the engine (page 2).
     pub engine: Engine,
+    /// S39: the debug block (page 3), shared with the C64 backend that finds its stops.
+    pub dbg: DbgLink,
+    /// S39: C64_STOP as written (STATUS b5), and the lens unit's last result.
+    pub fw_stop: bool,
+    pub lk_res: u32,
 }
 
 impl TrxLink {
-    fn power_on(frames: u64, frame_clocks: u64, paused: bool, pause_starts: u64) -> Self {
+    fn power_on(frames: u64, frame_clocks: u64, paused: bool, pause_starts: u64, dbg: DbgLink) -> Self {
         TrxLink {
             frames,
             frame_clocks,
@@ -250,7 +268,15 @@ impl TrxLink {
             cap_ctrl: 0,
             jtag_page: 0,
             engine: Engine::default(),
+            dbg,
+            fw_stop: false,
+            lk_res: 0,
         }
+    }
+
+    /// What the debug block's reads know of the machine.
+    pub fn dbg_ctx(&self) -> dbg::Ctx {
+        dbg::Ctx { shut: self.paused, fw_stop: self.fw_stop }
     }
 }
 
@@ -258,7 +284,7 @@ pub type Link = Arc<Mutex<TrxLink>>;
 
 /// A new link at power on.
 pub fn link() -> Link {
-    Arc::new(Mutex::new(TrxLink::power_on(0, 0, false, 0)))
+    Arc::new(Mutex::new(TrxLink::power_on(0, 0, false, 0, Arc::new(Mutex::new(dbg::Dbg::default())))))
 }
 
 /// The link, also after a panic elsewhere held it.
@@ -373,9 +399,10 @@ pub struct Trx {
     far_latch: u32,
     /// SB_ADDR (trx_sys.v `sb_a`): `{chip, word}`, moved on by every SB_DATA read and write.
     sb_a: u16,
-    /// The capture events (`cap_tgl`) and the engine's ended jobs (`eng_tgl`) seen.
+    /// The capture events (`cap_tgl`), the engine's ended jobs (`eng_tgl`) and the debugger's stops (`ev`) seen.
     cap_seen: u64,
     eng_seen: u64,
+    dbg_seen: u64,
     /// c64_text.v: TX_CTRL b1:0, its own stage of byte 0 and its own latch.
     tx_ctrl: u8,
     tx_stage: u8,
@@ -396,9 +423,10 @@ pub struct Trx {
 
 impl Trx {
     pub fn new(link: Link) -> Self {
-        let (pause_seen, cap_seen, eng_seen) = {
+        let (pause_seen, cap_seen, eng_seen, dbg_seen) = {
             let l = lock(&link);
-            (l.pause_starts, l.sb.cap_events, l.engine.done)
+            let ev = dbg::lock(&l.dbg).ev;
+            (l.pause_starts, l.sb.cap_events, l.engine.done, ev)
         };
         Trx {
             irq_en: 0,
@@ -414,6 +442,7 @@ impl Trx {
             sb_a: 0,
             cap_seen,
             eng_seen,
+            dbg_seen,
             tx_ctrl: 0,
             tx_stage: 0,
             tx_latch: 0,
@@ -456,6 +485,18 @@ impl Trx {
             ap_jobs: e.ap_jobs.iter().copied().collect(),
             store_mb: e.store.megabytes(),
         }
+    }
+
+    /// S39 §3.8: the debugger (trxmon) owns run control: OWNER is set.
+    pub fn owner(&self) -> bool {
+        dbg::lock(&lock(&self.link).dbg).own
+    }
+
+    /// The debug block's model as it stands (a copy), and what its reads know of the machine.
+    pub fn debug(&self) -> (dbg::Dbg, dbg::Ctx) {
+        let l = lock(&self.link);
+        let d = dbg::lock(&l.dbg).clone();
+        (d, l.dbg_ctx())
     }
 
     /// The state bus and the capture control as the port keeps them (a copy).
@@ -546,6 +587,10 @@ impl Trx {
         if off & !0xFFF == engine::PAGE2 {
             return l.engine.read(off & 0xFFF);
         }
+        if dbg::is_dbg(off) {
+            let c = l.dbg_ctx();
+            return dbg::lock(&l.dbg).read(off, c, false);
+        }
         if off & !0xFFF == PAGE1 {
             return match off & 0xFFF {
                 SB_ADDR => u32::from(self.sb_a),
@@ -567,6 +612,7 @@ impl Trx {
             SH_UNMAPPED => s.unmapped,
             SH_LIST => s.list_reg(),
             SH_COMMIT => u32::from(s.last_commit),
+            LK_RES => l.lk_res,
             r @ SH_OVERLAY..=0x0FF => {
                 let i = (r - SH_OVERLAY) as usize;
                 u32::from_le_bytes(std::array::from_fn(|b| s.overlay(i + b)))
@@ -575,6 +621,16 @@ impl Trx {
             // SH_GCLK, LK_RES and the rest.
             _ => 0,
         }
+    }
+
+    /// [`Self::sys_reg`] with the read's side effects: the debug block's CYCLES latch and BMP_DATA's increment.
+    fn sys_read(&mut self, off: u32) -> u32 {
+        if dbg::is_dbg(off) {
+            let l = lock(&self.link);
+            let c = l.dbg_ctx();
+            return dbg::lock(&l.dbg).read(off, c, true);
+        }
+        self.sys_reg(off)
     }
 
     /// trx_sys.v's commit of byte 3 (trx_sys.v:310-346). What acts on the machine goes to the port, at this clock.
@@ -599,6 +655,8 @@ impl Trx {
             return;
         }
         match off {
+            // S39: the debug block's writes act at the C64's clock, in order with the rest; so does the lens unit.
+            o if dbg::is_dbg(o) || o == PAGE5 + LK_REQ => l.ops.push(op),
             GATE_CTRL => {
                 l.frz = v & GATE_FRZ != 0;
                 l.ops.push(op);
@@ -685,6 +743,13 @@ impl Trx {
             self.cause |= CAUSE_CAPTURE;
             self.update_irq(irq);
         }
+        let ev = dbg::lock(&lock(&self.link).dbg).ev;
+        if ev != self.dbg_seen {
+            // trx_dbg.v:295 `ev`, top.v:1328: every stop of the debugger raises b0, as a halt does.
+            self.dbg_seen = ev;
+            self.cause |= CAUSE_STOP;
+            self.update_irq(irq);
+        }
         let done = lock(&self.link).engine.done;
         if done != self.eng_seen {
             self.eng_seen = done;
@@ -745,7 +810,7 @@ impl IoDevice for Trx {
         let reg = off & 0xFFF;
         if off & 3 == 0 {
             if far(off) {
-                self.far_latch = self.sys_reg(off);
+                self.far_latch = self.sys_read(off);
                 // trx_sys.v:358-364: an SB_DATA read moves SB_ADDR on, after it latched the word.
                 if off == PAGE1 + SB_DATA {
                     self.sb_a = (self.sb_a + 1) & 0xFFF;
@@ -853,8 +918,10 @@ impl IoDevice for Trx {
     fn reset(&mut self) {
         {
             let mut l = lock(&self.link);
-            let (frames, clocks, paused, starts) = (l.frames, l.frame_clocks, l.paused, l.pause_starts);
-            *l = TrxLink::power_on(frames, clocks, paused, starts);
+            let (frames, clocks, paused, starts, d) = (l.frames, l.frame_clocks, l.paused, l.pause_starts, l.dbg.clone());
+            // The debug block resets with the block; the backend keeps the same model.
+            *dbg::lock(&d) = dbg::Dbg::default();
+            *l = TrxLink::power_on(frames, clocks, paused, starts, d);
         }
         let link = self.link.clone();
         *self = Trx::new(link);
@@ -1004,7 +1071,7 @@ mod tests {
     fn page_0_reads_id_and_caps_and_other_pages_read_0() {
         let mut r = Rig::new();
         assert_eq!([r.r8(0), r.r8(1), r.r8(2), r.r8(3)], *b"TRX2");
-        assert_eq!((r.r8(4), r.r8(5)), (0xE7, 0x29), "gate, state bus, engine, session, video, RGB565; F4, list, APPLY");
+        assert_eq!((r.r8(4), r.r8(5)), (0xEF, 0x3D), "gate, state bus, engine, debug, session, video, RGB565; F4, CPU write, list, lens, APPLY");
         assert_eq!(r.r32(0x008), 0, "BUILD");
         r.w8(0x4000, 0xFF);
         assert!((0x4000..0x4010).chain(0xF000..0xF004).chain(0x2000..0x2004).chain(0x104..0x140).all(|o| r.r8(o) == 0));
@@ -1035,6 +1102,29 @@ mod tests {
         assert_eq!(lock(&r.link).ops, [SysWrite { at: 0, off: GATE_CTRL, v: 1 }], "for the port, at its clock");
         lock(&r.link).paused = true;
         assert_eq!(r.r32(GATE_CTRL), 0x301);
+    }
+
+    /// S39 §1.1, §1.3, §1.4: the debug block's and the lens unit's registers on trx_sys.v's byte rule: the CYCLES read
+    /// latches CYCLES_HI, a BMP_DATA read moves BMP_IDX, writes go to the port at their clock, LK_RES reads the result.
+    #[test]
+    fn the_debug_block_and_the_lens_on_the_byte_rule() {
+        let mut r = Rig::new();
+        let d = lock(&r.link).dbg.clone();
+        (dbg::lock(&d).cycles, dbg::lock(&d).instrs) = (0x0002_1234_5678, 9);
+        assert_eq!(r.r32(dbg::CYCLES), 0x1234_5678);
+        dbg::lock(&d).cycles = 0x0005_0000_0000;
+        assert_eq!((r.r32(dbg::CYCLES_HI), r.r32(dbg::INSTRS)), (2, 9), "CYCLES_HI as the CYCLES read latched it");
+        assert_eq!(r.r32(dbg::PAGE3 + dbg::STATUS), 0x4, "an IB, nothing else");
+        dbg::lock(&d).bmp[5] = 0x55;
+        dbg::lock(&d).bmp_idx = 5;
+        assert_eq!(r.r32(dbg::PAGE3 + dbg::BMP_DATA), 0x55);
+        assert_eq!(dbg::lock(&d).bmp_idx, 6);
+        r.w32(dbg::PAGE3 + dbg::CMD, 2);
+        r.w32(PAGE5 + LK_REQ, 0x1_8000);
+        let ops = lock(&r.link).ops.clone();
+        assert_eq!(ops, [SysWrite { at: 0, off: dbg::PAGE3 + dbg::CMD, v: 2 }, SysWrite { at: 0, off: PAGE5 + LK_REQ, v: 0x1_8000 }]);
+        lock(&r.link).lk_res = LK_DONE | LK_HIT | 0x42;
+        assert_eq!(r.r32(PAGE5 + LK_RES), 0x342);
     }
 
     #[test]

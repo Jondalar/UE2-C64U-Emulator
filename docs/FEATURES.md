@@ -47,6 +47,10 @@ One line per feature, as of 0.5.1 (TRX64 v0.12.5). Details: `docs/status/`, spec
 - Ultimate Command Interface (UCI).
 - TRX64-Ultimate pixel layer (`--trx-io`, auto for TRX firmware): RGB565 layer with flip, key and alpha; the freeze
   menu with the machine pause, the freeze session and its commit list, the still and the text layer (S37).
+- TRX64-Ultimate's engine (`--trx-io`): the board's frame ring and Timewarp for the firmware, REST rewind and scrub
+  (S40, M1).
+- TRX64-Ultimate's debug block (`--trx-io`): trxmon, the board's monitor app, runs with breakpoints, watch units,
+  steps, the CPU write path, the lens unit and the debugger's session (S39; stops at instruction boundaries).
 - REU on the firmware's DDR, preload and "Save REU"; GeoRAM.
 
 ## Cartridges
@@ -56,7 +60,8 @@ One line per feature, as of 0.5.1 (TRX64 v0.12.5). Details: `docs/status/`, spec
 - EasyFlash flash writes, GMOD2 EEPROM, MegaByter, TwoMegabyter, Pagefox.
 - Cartridge RAM takes writes while banked out (AR/RR, SS5, Pagefox).
 - SID and MUS player cartridges.
-- Physical expansion port cartridge next to the internal one (`--cart-slot`), with save and flash decode.
+- Physical expansion port cartridge next to the internal one (`--cart-slot`), with save and flash decode; EasyFlash 3
+  (CRT type 90) with the reset it pulls.
 
 ## Drives
 

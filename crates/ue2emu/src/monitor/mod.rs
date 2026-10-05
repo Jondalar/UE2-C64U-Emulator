@@ -273,8 +273,12 @@ pub fn exec(
     state: &mut State,
     line: &str,
 ) -> Result<String, String> {
-    let mut host = Host::new(m, state).ok_or("the monitor needs a C64: start with --c64 trx64")?;
     let verb = line.split_whitespace().next().unwrap_or("").to_owned();
+    // S39 §3.8: while trxmon owns run control (OWNER) the C64 is its; reading verbs work.
+    if trx_owns(m) && moves_the_c64(&verb, line.split_whitespace().nth(1)) {
+        return Err(TRXMON_OWNS.into());
+    }
+    let mut host = Host::new(m, state).ok_or("the monitor needs a C64: start with --c64 trx64")?;
     // S38: what the line does to the C64 decides what happens to the transport, before the verb runs (the daemon's
     // order: a verb that appends anchors must not have them cut afterwards).
     host.on_effect(verbs::classify_in(&session.state, line));
@@ -291,6 +295,24 @@ pub fn exec(
         }
     }?;
     Ok(addr_spans::plain(&answer))
+}
+
+/// S39 §3.8: the answer to a run-control verb while trxmon owns the C64.
+pub const TRXMON_OWNS: &str = "trxmon owns run control (OWNER); use it, or /quit it";
+
+/// The TRX64-Ultimate debug block's OWNER is set (`--trx-io`): trxmon owns run control.
+pub fn trx_owns(m: &Machine) -> bool {
+    m.bus.io.get::<ue2_core::devices::trx::Trx>().is_some_and(|t| t.owner())
+}
+
+/// A verb that runs, steps or halts the C64, or moves it to an anchor (S38's transport); `arg` its first argument.
+fn moves_the_c64(verb: &str, arg: Option<&str>) -> bool {
+    match verb {
+        "g" | "x" | "z" | "n" | "next" | "step" | "ret" | "return" | "until" => true,
+        "goto" | "frame" | "rewind" | "ringload" | "rstep" | "reverse" => true,
+        "c64" => matches!(arg, Some("halt" | "go" | "step")),
+        _ => false,
+    }
 }
 
 /// Split a verb's arguments, honouring double quotes: store and item names have spaces ("C64 and Cartridge
@@ -715,7 +737,9 @@ mod tests {
         let mut m = Machine::from_parts(cfg, bus, 0x30000, Symbols::empty());
         m.attach_c64(Box::new(Trx64Backend::new(Path::new("/nonexistent"))));
         let out = exec(&mut m, &mut MonitorSession::new(), &mut State::default(), "trx").expect("trx");
-        assert!(out.contains("id            TRX2  caps 0xe7  caps2 0x29"), "{out}");
+        assert!(out.contains("id            TRX2  caps 0xef  caps2 0x3d"), "{out}");
+        assert!(out.contains("debug         owner no  status 0x00000004"), "{out}");
+        assert!(out.contains("unit 0        off  - $0000-$0000  action stop  hits 0"), "{out}");
         assert!(out.contains("engine        log off  taps   frames 0  dropped 0  apply idle"), "{out}");
         assert!(out.contains("stream 0      0x7000000 + 0x1000000  0 records"), "{out}");
         assert!(out.contains("cap_ctrl      every 0  cap_stat gen 0, cadence frames without a snap 0"), "{out}");
@@ -725,6 +749,33 @@ mod tests {
         assert!(out.contains("tx_ctrl       0x01000000"), "{out}");
         assert!(out.contains("px_ctrl       0x22  off, format 1, scale 2  (shown: no)"), "{out}");
         assert!(out.contains("px_size       960 x 540  stride 1920"), "{out}");
+    }
+
+    /// S39 §3.8: while trxmon owns run control (OWNER) UE2's monitor refuses the verbs that run, step, halt or move
+    /// the C64; reading verbs work.
+    #[test]
+    fn trxmon_owns_run_control() {
+        let mut cfg = MachineConfig::new(PathBuf::new(), PathBuf::new());
+        cfg.trx_io = ue2_core::TrxIo::On;
+        let mut bus = SystemBus::new();
+        c64::install(&mut bus.io, &cfg);
+        ue2_core::devices::trx::install(&mut bus.io, &cfg);
+        let mut m = Machine::from_parts(cfg, bus, 0x30000, Symbols::empty());
+        m.attach_c64(Box::new(Trx64Backend::new(Path::new("/nonexistent"))));
+        let link = m.bus.io.get::<ue2_core::devices::trx::Trx>().unwrap().debug();
+        assert!(!link.0.own);
+        {
+            let c64 = m.bus.io.get_mut::<C64Port>().unwrap();
+            let l = c64.trx_link().unwrap();
+            let d = ue2_core::devices::trx::lock(&l).dbg.clone();
+            ue2_core::devices::trx_dbg::lock(&d).own = true;
+        }
+        let (mut s, mut st) = (MonitorSession::new(), State::default());
+        for line in ["c64 halt", "c64 go", "z", "g", "n", "until c000", "ret", "goto x", "frame -1", "rstep"] {
+            assert_eq!(exec(&mut m, &mut s, &mut st, line).unwrap_err(), TRXMON_OWNS, "{line}");
+        }
+        assert!(exec(&mut m, &mut s, &mut st, "r").is_ok(), "reading verbs work");
+        assert!(exec(&mut m, &mut s, &mut st, "m c000").is_ok());
     }
 
     /// S23 M3: both CPUs have run control, and they are not symmetric.

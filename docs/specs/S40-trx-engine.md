@@ -90,10 +90,10 @@ Each bit is reported only when its pages are built.
 |---|---|---|---|---|
 | CAPS b1 state bus | 1 | 0 | **1** (S39 phase A1) | the splash's READY watch by captured PC (`trx_ui.cc:219`); the REST lens (`trx_lens_fw.cc:100`) |
 | CAPS b2 engine | 1 | 0 | **1** | `trx_ring_init` (`trx_ring.cc:1994`), the ring task, Timewarp UI, REST |
-| CAPS b3 debug | 1 | 0 | 0 until S39 phase A2 (page 3, 0x118-0x13F) | `app_trx_table()`, `rebase_cycles`, `dbg_handover` |
+| CAPS b3 debug | 1 | 0 | **1** (S39 phase A2, built) | `app_trx_table()`, `rebase_cycles`, `dbg_handover` |
 | CAPS2 b0 F4 order | 1 | 0 | **1** | the parser does not look for F4s after block records (`trx_ring.cc:1997`) |
 | CAPS2 b5 APPLY | 1 | 0 | **1** | `apply_hw`: stream 0 is undone by the engine (`trx_ring.cc:1998`) |
-| CAPS2 b2, b4 | 1 | 0 | 0 until S39 B/C | trxmon's CPU write path, the lens unit |
+| CAPS2 b2, b4 | 1 | 0 | **1** (S39 B/C, built) | trxmon's CPU write path, the lens unit |
 | CAPS2 b6 turbo (t29) | 0 on `main` | 0 | 0 | not on `main` (answer 1) |
 | CAPS2 b7 trace (t21-p4) | 0 on `main` | 0 | 0 | phase E |
 | CAPS2 b1 BUILD | 1 | 0 | 0 | read by the boot ROM only (answer 10) |

@@ -1,8 +1,8 @@
 # S39 — trxmon in UE2: the debug block served from TRX64
 
-**Status:** spec (2026-10-05), local branch `s37-trx-pixel-layer`. Updated the same day from the FPGA session's
-answers (`run/trx/s39-answers.md`, t21-p4 RTL and app; they override this text where they differ) and S40. Phase A1
-(the gate's capture control and the state bus, shared with S40) is built with S40; A2-F are not.
+**Status:** built (2026-10-05), local branch `s37-trx-pixel-layer`: phases A1-E against t21-p4 a85f741 (with the D-page
+fix df6d71c) and t21-p4-app; as built: §11. Phase F waits for TRX64 (§5 T1, T2). Updated the same day from the FPGA
+session's answers (`run/trx/s39-answers.md`, t21-p4 RTL and app; they override this text where they differ) and S40.
 
 **Why:** the TRX64-Ultimate firmware session must test trxmon (the T21 monitor app) in UE2 as on the board: the
 monitor screen on the overlay (T21 §8), opened from the task menu or Ctrl-O and reopened by `trx->ui_request` when a
@@ -163,8 +163,8 @@ live (c64_core.v:746-749, :774).
 ## 2. CAPS and CAPS2
 
 **`CAPS`** grows with the pages built: `$E7` with phase A1 and S40 (b0 gate, **b1 state bus**, b2 engine (S40), b5
-session, b6 video, b7 RGB565), **`$EF`** with phase A2 (**b3 debug**). **`CAPS2`**: `$29` with S40 (b0 F4 order, b3
-commit list, b5 APPLY), **`$3D`** with phases B/C (**b2 CPU write path**, **b4 lens unit**). A bit is reported only
+session, b6 video, b7 RGB565), **`$EF`** with phase A2 (**b3 debug**, built). **`CAPS2`**: `$29` with S40 (b0 F4 order,
+b3 commit list, b5 APPLY), **`$3D`** with phases B/C (**b2 CPU write path**, **b4 lens unit**, built). A bit is reported only
 when its pages are built (answer 3: the app reads none of the others; b1 BUILD only the boot ROM).
 
 The board reads `$FF` / `$BF` (trx_io.v:231-232). Each bit UE2 reports turns on firmware and app paths:
@@ -449,3 +449,85 @@ container, `apps/trxmon/build.sh`), `--board c64u --trx-io`, a fresh flash with 
 About 3,000 lines with tests: `trx_dbg.rs` and the page 1/3 registers 700, the bridge (stop sources, steps, CPU
 write, shadows, drive) 900, session and lens 250, ownership and `monitor trx` 150, unit tests 900, smoke script 100.
 Phases A-E without TRX64 changes; F waits for TRX64.
+
+## 11. As built (2026-10-05)
+
+Against t21-p4 a85f741 (the D-page fix df6d71c: STATUS b1, `ultimate_sys` opens the window's D page for a debugger
+stop) and the t21-p4-app firmware and `trxmon.u2a` in `/Users/alex/Development/TRX64-Ultimate-app-wt-t21` (the ELF from
+2026-10-04 22:49, the u2a from 2026-10-05 08:22: ec4a7327, before the app's D-page change 553e2e17). CAPS `$EF`, CAPS2
+`$3D`.
+
+- **The model** (`ue2-core/src/devices/trx_dbg.rs`): trx_dbg.v's and drv_dbg.v's registers, the commands, the stop
+  record (written only while STOP_NEW is 0, `ev` per stop), the units' qualifiers, chain and PASS, IPC_SET, the
+  drive's registers. Shared (`DbgLink`) by the IO block (reads, with the CYCLES latch and BMP_DATA's increment), the C64
+  port (every write at its clock, the run-control commands) and the backend (the stops, the counters).
+- **The run** (`c64-bridge/src/dbg_run.rs`): `run_obs` looks at each boundary the debugger wants (the exec bitmap and the
+  IB units through TRX64's exec watch; every boundary for a pause, an instruction step or the drive comparator), passes
+  it with one instruction when nothing fired, and ends the run at a stop. Read and write units watch their ranges
+  through `on_access` and stop at the next boundary with the access's ADDR and DATA (REASON 5). CYC_CMP and a cycle
+  step cut the budget and stop at the first boundary at or after the count. Count and log actions (log: engine stream 1
+  space 8, `TapEvent::DbgLog`). A stop holds the whole machine (the pause's mechanism, S37). PAUSE_IB and PAUSE_CB stop
+  at once where the machine stands when that boundary qualifies (UE2 stands between instructions); PAUSE_CB with the
+  6510 held stops at once, FLAGS b0 0. Steps run at once inside the command's access (the session's list written
+  first); a step that cannot end there (the 6510 held, a UCI wait) is left to the running machine.
+- **Counters:** `CYCLES` is the engine's counter (S40, the same edges, answer 11), with the window's bus cycles while the
+  machine stands counted on both (+1 each); at a stop the opcode fetch is counted (`ib_bias`, +1 on CYCLES and INSTRS).
+  `INSTRS` counts retired instructions.
+- **OWNER** masks C64_STOP for the pause and the 6510's stop; C64_STOP still reads 3, mutes and shows in STATUS b5.
+- **The CPU write path:** `SB_LOAD` b1 with an image that is the machine's own but for A, X, Y, S, P, PC, IR, the
+  write-back controls and `din_r` loads the registers and the PC into TRX64 (`engine_tap.rs` `tap_cpu_write`); UE2's
+  snap images still load from the side table (S40 §5.3); anything else is refused as before. Word 1.3 shows IPC_SET until
+  the machine moves.
+- **The session** (`trx_session.rs`): the debugger's stop is the second cause (modes 1, 2), `SH_STATUS` b2, kept while
+  the hold stands, ended by RUN or a step with its list written first, blocked until the stop is gone. In it the window's
+  D page is answered by the session and the rest goes to the RAM's second port without C64_STOP (df6d71c).
+- **The lens unit:** `LK_REQ` at its clock; the look by class (ROML, ROMH whether asked at `$A000` or `$E000`, IO1, IO2)
+  from the internal cartridge logic and the port's devices (U1 closed), `ext` for the physical port; REAL only while
+  halted (refused otherwise), a read with the select forced of the physical cartridge or the internal one.
+- **The drive:** DRV_STAT (DPC, DCYCLES from TRX64's drive CPU), DRV_PAUSE/DRV_RUN through the drive's own stop
+  (`set_stopped`), DRV_STEP n runs drive A alone while the C64 stands (REASON 9); the exec comparator is evaluated on
+  the drive's PC once per C64 instruction (T5) and stops the C64 at that boundary (REASON 8, FLAGS b1) with the drive
+  held. The write comparator is not served.
+- **Ownership:** UE2's monitor refuses `c64 halt|go|step`, `g`, `x`, `z`, `step`, `n`, `next`, `ret`, `until`, `goto`,
+  `frame`, `rewind`, `ringload`, `rstep`, `reverse` while OWNER is set ("trxmon owns run control (OWNER); use it, or
+  /quit it"); the VICE port refuses ADVANCE_INSTRUCTIONS, EXECUTE_UNTIL_RETURN and EXIT. OWNER taken while S38's
+  transport holds an anchor releases the transport and leaves the C64 held by the debugger.
+- **`monitor trx`** shows page 3: status, the record, the counters, the bitmap, the units (and why one is refused), the
+  drive, `LK_RES`.
+
+**Checks.** Unit tests: the model (`trx_dbg.rs`: counters and the latch, the bitmap index, the commands, the record,
+the qualifiers, chain and PASS, OWNER and the drive registers), the IO block (the byte rule on page 3 and LK), the
+session (the debugger's cause, its end and block), the port (OWNER masks C64_STOP, the debugger's session, the D page,
+RUN writes the list, LK refused while running), the bridge (pause and steps of instructions and cycles, the bitmap,
+`until`/`n`/`ret`, a store observer, CYC_CMP, the CPU write path then a step, PAUSE_CB with the 6510 held, a log
+action, the lens by class, the drive step and comparator, OWNER taking the C64 from the transport), the monitor (the
+refusal). Firmware smoke `scripts/smoke-trxmon.sh` (PASS): boot CAPS EF; Run App of `trxmon.u2a` from the SD, the
+screen `PAUSED IB`; `r`, `z`, `z 5` on the screen (registers as `monitor r`, REASON 2, INSTRS + n); the RPC selftest;
+`read c000 256 cpu` = `monitor m c000`; `m io dc0d` twice the same; `rstep` lands; `wr d020 05` (this u2a refuses it
+without the menu's C64_STOP: its text); `r pc=c000`, `r a=42` and a step over `STA $0400`: `$42`; `/quit`: OWNER 0,
+`print 6*7` gives 42.
+
+**Deviations and findings (for Alex):**
+- **The given `trxmon.u2a` predates t21-p4-app 553e2e17**: it gates I/O writes and the colour RAM read on the menu's
+  C64_STOP (STATUS b5), so in a debugger stop `wr d020` is refused and `m io d800` reads `--`. UE2 serves STATUS b1 and
+  the D page as df6d71c does; the RTL path is covered by the port test. A u2a built from 553e2e17 needs the U64 build
+  container (not on this machine).
+- **Typing on trxmon's screen:** the firmware's overlay keyboard takes W, A, S, D as cursor keys ("WASD=NAV"), so `d
+  e5cd`, `bk e5cd`, `io d000`, `wr d020`, `r a=42` cannot be typed there; the smoke sends those over the RPC. That is the
+  pending keymap item (app side).
+- **`bk` then `x`: the screen did not come back.** The breakpoint fires and trxmon reads the stop (STOP_NEW clears), but
+  opening the menu again shows the file browser, not the monitor. Not resolved: whether the detached task's
+  `ui_request` reached the UI task was not seen (no firmware print on that path). Open.
+- **`rstep` after a CPU write or a bus cycle while halted does not replay** ("the replay from the frame start did not
+  come back to the same stop"): a redirect is no part of the frame, and the bus cycle counts on CYCLES and the engine's
+  counter (as on the board) but the replay does not make it. The smoke does `rstep` first.
+- **`trace status`** answers the board's "needs the instruction trace" until S40 phase E.
+- **`m cart`** on the screen is not in the smoke (the lens is covered by the bridge test).
+
+**TRX64 gaps** as §5: T1 (no stop or step at a cycle boundary: PAUSE_CB, STEP_CYCLES, CYC_CMP and access stops land at
+the next boundary; raster and every-edge units refused), T2 (the interrupt sequence and the handler's first instruction
+are one `execute`: a bitmap bit at `$FF48` never stops; a step across an interrupt runs the handler's first
+instruction), T3 (A/X/Y/P qualifiers see the settled registers), T4 (`on_access` gives no operand fetch and no dummy
+read or write), T5 (the drive's PC is sampled once per C64 instruction; a drive step leaves the drive ahead of the pair),
+T6 (words 1.8-1.14 synthesized), T7 (the bridge's pause), T8 (no RDY park: `held` 0). **Phase F** (T1, T2) waits for
+TRX64.
