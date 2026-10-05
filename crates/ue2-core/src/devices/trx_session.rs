@@ -2,7 +2,9 @@
 //! DMA window while the machine is paused. Spec: docs/specs/S37-trx-pixel-layer.md §5.4, §5.8.
 //!
 //! A session starts when the app pauses the machine with C64_STOP under `GATE_CTRL` FRZ and C64_MODE Ultimax
-//! (`SH_MODE` 1) or with any pause (`SH_MODE` 2), and runs until that falls. Inside it no window access becomes a bus
+//! (`SH_MODE` 1) or with any pause (`SH_MODE` 2), and runs until that falls. S39 (t21-p4, T12 §14.8): a debugger stop
+//! starts the same session in `SH_MODE` 1 and 2 without C64_STOP or Ultimax, and it lasts while the debugger's hold
+//! does and no RUN or step is requested (freeze_resp.v:209-224). Inside it no window access becomes a bus
 //! cycle: RAM and ROM are read and written as they are, the I/O chips are answered from a 128-byte overlay where the
 //! app wrote them and from the frozen chip (without side effects) where it did not, and the I/O writes go into a commit
 //! list that runs as real bus cycles when the session ends (unless `PROTO` kept them out). A reset in a session writes
@@ -77,18 +79,26 @@ impl<T: C64Backend + ?Sized> Chips for T {
 pub struct Lines {
     /// `GATE_CTRL` b0: C64_STOP pauses the whole machine (`stop_is_pause`).
     pub frz: bool,
-    /// C64_STOP b0.
+    /// C64_STOP b0, as written (freeze_resp.v `app_stop` is the raw bit).
     pub stop: bool,
     /// C64_MODE b1.
     pub ultimax: bool,
     /// C64_MODE b2, the reset held.
     pub reset: bool,
+    /// S39: the debugger's OWNER masks C64_STOP for the halt (top.v:1073-1074).
+    pub owner: bool,
+    /// S39: a debugger stop (`dbg_stop`: its hold, the gate shut, no step), the hold alone (`dbg_hold`), and RUN or a
+    /// step requested (`dbg_rel`).
+    pub dbg_stop: bool,
+    pub dbg_hold: bool,
+    pub dbg_rel: bool,
 }
 
 impl Lines {
-    /// The machine pause (top.v `c64_halt_req`). In UE2 a held reset wins: the machine is in reset, not paused.
+    /// The machine pause (top.v `c64_halt_req` = C64_STOP & !OWNER & FRZ). In UE2 a held reset wins: the machine is in
+    /// reset, not paused.
     pub fn paused(&self) -> bool {
-        self.frz && self.stop && !self.reset
+        self.frz && self.stop && !self.owner && !self.reset
     }
 }
 
@@ -269,8 +279,9 @@ pub struct Session {
     pub mode: u8,
     pub sidefx: bool,
     pub proto: bool,
-    /// A session runs (`SH_STATUS` b0).
+    /// A session runs (`SH_STATUS` b0), and it is the debugger's stop (`sess_dbg`, b2).
     pub active: bool,
+    pub dbg: bool,
     /// No new session until C64_STOP falls (after an abort, a commit or a reset).
     block: bool,
     /// `SH_STATUS` b31:16, `SH_ACCESSES`, `SH_REAL`, `SH_UNMAPPED`. `SH_GCLK` (gate clock edges while paused) is not
@@ -301,6 +312,7 @@ impl Default for Session {
             sidefx: false,
             proto: false,
             active: false,
+            dbg: false,
             block: false,
             count: 0,
             accesses: 0,
@@ -325,9 +337,10 @@ impl Session {
         u32::from(self.proto) << 3 | u32::from(self.sidefx) << 2 | u32::from(self.mode)
     }
 
-    /// `SH_STATUS`: b0 session, b1 a commit runs (never, in UE2), b31:16 sessions started.
+    /// `SH_STATUS` (trx_sys.v:233): b0 session, b1 a commit runs (never, in UE2), b2 the session is the debugger's
+    /// stop, b31:16 sessions started.
     pub fn status(&self) -> u32 {
-        u32::from(self.count) << 16 | u32::from(self.active)
+        u32::from(self.count) << 16 | u32::from(self.active && self.dbg) << 2 | u32::from(self.active)
     }
 
     /// `SH_LIST`: b7:0 entries now, b31:16 entries a full list dropped.
@@ -369,18 +382,29 @@ impl Session {
         }
     }
 
-    /// `cond` and `keep` (freeze_resp.v:194-197).
+    /// `cond`, the app's start (freeze_resp.v:211-212): mode 1 the pause by C64_STOP under FRZ with Ultimax, mode 2
+    /// every pause (`halt_req`).
     fn cond(&self, l: Lines) -> bool {
         match self.mode {
             1 => l.frz && l.stop && l.ultimax,
-            2 => l.frz && l.stop,
+            2 => l.paused(),
             _ => false,
         }
     }
 
+    /// `cond_dbg` (freeze_resp.v:216-217): a debugger stop in mode 1 or 2.
+    fn cond_dbg(&self, l: Lines) -> bool {
+        self.mode != 0 && l.dbg_stop
+    }
+
+    /// `keep` (freeze_resp.v:213-214, :219): the debugger's session while its hold stands and nothing is requested.
     fn keep(&self, l: Lines) -> bool {
+        if self.dbg {
+            return self.mode != 0 && l.dbg_hold && !l.dbg_rel;
+        }
         match self.mode {
-            1 | 2 => l.frz && l.stop,
+            1 => l.frz && l.stop,
+            2 => l.paused(),
             _ => false,
         }
     }
@@ -392,11 +416,15 @@ impl Session {
             let drop = self.mode == 0;
             self.end(drop, c);
         }
-        if !l.stop {
+        // freeze_resp.v:546: the block clears once neither C64_STOP, the pause nor a debugger stop stands.
+        if !l.stop && !l.paused() && !l.dbg_stop {
             self.block = false;
         }
-        if !self.active && !self.block && self.cond(l) && !l.reset {
+        let app = self.cond(l);
+        if !self.active && !self.block && (app || self.cond_dbg(l)) && !l.reset {
             self.active = true;
+            // The app's cause wins when both are there (freeze_resp.v:539).
+            self.dbg = !app;
             self.ack19 = 0;
             self.count = self.count.wrapping_add(1);
             // S_INIT: the frozen CPU port and cartridge lines, once per session.
@@ -440,7 +468,11 @@ impl Session {
     }
 
     /// The end of a session: the list runs as real bus cycles unless `drop` (S_RC0-S_RCW), then the overlay goes.
+    /// The debugger's session blocks a new one until its stop is gone (freeze_resp.v:884).
     fn end<C: Chips + ?Sized>(&mut self, drop: bool, c: &mut C) {
+        if self.dbg {
+            self.block = true;
+        }
         self.close();
         if drop || self.list.is_empty() {
             self.drop_list();
@@ -768,7 +800,8 @@ mod tests {
         }
     }
 
-    const FROZEN: Lines = Lines { frz: true, stop: true, ultimax: true, reset: false };
+    const FROZEN: Lines =
+        Lines { frz: true, stop: true, ultimax: true, reset: false, owner: false, dbg_stop: false, dbg_hold: false, dbg_rel: false };
 
     fn started() -> (Session, Fake) {
         let (mut s, mut c) = (Session::default(), Fake::new());
@@ -939,6 +972,38 @@ mod tests {
             s.write(0xD400, i as u8, FROZEN, &mut c);
         }
         assert_eq!(s.list_reg(), 2 << 16 | 128);
+    }
+
+    /// S39 §3.6 (freeze_resp.v:209-224, :539, :546, :884): a debugger stop starts a session in modes 1 and 2 without
+    /// C64_STOP or Ultimax (`SH_STATUS` b2); it lasts while the hold stands and nothing is requested; RUN ends it with
+    /// its list written first, and no new one starts until the stop is gone. Mode 0: none. OWNER masks C64_STOP.
+    #[test]
+    fn a_debugger_stop_is_a_session() {
+        let (mut s, mut c) = (Session::default(), Fake::new());
+        let stop = Lines { dbg_stop: true, dbg_hold: true, ..Lines::default() };
+        s.step(stop, &mut c);
+        assert_eq!((s.active, s.status() & 7), (true, 0b101), "the debugger's session");
+        assert_eq!(s.read(0xDC0D, stop, &mut c), s.read(0xDC0D, stop, &mut c), "no flag cleared");
+        s.write(0xD020, 0x05, stop, &mut c);
+        assert_eq!((s.read(0xD020, stop, &mut c), c.io[0x020]), (0xF5, 0), "read back, not in the chip");
+        s.step(Lines { dbg_rel: true, ..stop }, &mut c);
+        assert!(!s.active);
+        assert_eq!(c.commits, [(0xD020, 0x05)], "the list ran before the release");
+        s.step(stop, &mut c);
+        assert!(!s.active, "blocked while the stop stands");
+        s.step(Lines { dbg_hold: true, ..Lines::default() }, &mut c);
+        s.step(stop, &mut c);
+        assert!(s.active && s.dbg, "the step ran: a new stop, a new session");
+        // The app's cause wins; mode 0 has none.
+        let mut s = Session::default();
+        s.step(Lines { dbg_stop: true, dbg_hold: true, ..FROZEN }, &mut c);
+        assert!(s.active && !s.dbg);
+        let mut s = Session::default();
+        s.write_ctrl(0);
+        s.step(stop, &mut c);
+        assert!(!s.active);
+        // OWNER: C64_STOP with FRZ is no pause.
+        assert!(!Lines { owner: true, ..FROZEN }.paused() && FROZEN.paused());
     }
 
     #[test]

@@ -189,6 +189,59 @@ fn trx(host: &mut Host) -> Result<String, String> {
         w1 >> 16 & 0xFF,
         w2 >> 16 & 0xFF,
     ));
+    // S39: the debug block (page 3, page 0 0x118-0x13F).
+    let (d, cx) = t.debug();
+    let status = d.status(cx);
+    out.push_str(&format!(
+        "  debug         owner {}  status {status:#010x}  shut {}, debugger stop {}, step {}, stop_new {}, stops {}\n",
+        yes(d.own),
+        yes(status & 1 != 0),
+        yes(status & 2 != 0),
+        yes(status & 0x80 != 0),
+        yes(d.stop_new),
+        d.stops,
+    ));
+    let r = &d.rec;
+    out.push_str(&format!(
+        "  stop record   reason {} unit {} flags {:#x}  ipc ${:04x} addr ${:04x} data ${:02x}  line {} cycle {}\n",
+        r.reason,
+        r.unit,
+        r.flags,
+        r.ipc,
+        r.addr,
+        r.data,
+        r.pos >> 7,
+        r.pos & 0x7F,
+    ));
+    out.push_str(&format!(
+        "  counters      cycles {}  instrs {}  cyc_cmp {:#010x} {}\n",
+        d.cycles_now(),
+        d.instrs_now(),
+        d.cyc_cmp,
+        if d.cmp_en { "armed" } else { "off" },
+    ));
+    let bits_set: u32 = d.bmp.iter().map(|w| w.count_ones()).sum();
+    out.push_str(&format!("  exec bitmap   {}  {bits_set} address(es)\n", on(d.bmp_en)));
+    for (i, u) in d.units.iter().enumerate() {
+        let kind = ["-", "IB", "read", "write", "read/write", "every edge", "-", "-"][usize::from(u.kind())];
+        let why = d.refused_units().into_iter().find(|(n, _)| *n == i).map_or(String::new(), |(_, w)| format!("  refused: {w} (S39 T1)"));
+        out.push_str(&format!(
+            "  unit {i}        {}  {kind} ${:04x}-${:04x}  action {}  hits {}{why}\n",
+            on(u.on()),
+            u.lo,
+            u.hi,
+            ["stop", "count", "log", "-"][usize::from(u.action())],
+            u.hits,
+        ));
+    }
+    out.push_str(&format!(
+        "  drive         dpc ${:04x}  dcycles {}  drv_cmp {:#07x}  held {}\n",
+        d.drive.dpc,
+        d.drive.dcycles,
+        d.drive.cmp,
+        yes(d.drive.hold),
+    ));
+    out.push_str(&format!("  lens          lk_res {:#010x}\n", t.sys_reg(trx::PAGE5 + trx::LK_RES)));
     let eng = t.engine();
     out.push_str(&format!(
         "  engine        log {}  taps {}  frames {}  dropped {}  apply {}\n",

@@ -14,6 +14,7 @@ mod board;
 mod cart;
 mod cart_eeprom;
 mod clock;
+mod dbg_run;
 mod drive;
 mod engine_tap;
 mod hwlog;
@@ -301,6 +302,8 @@ pub struct Trx64Backend {
     hwlog: HwLog,
     /// S39/S40: the board's engine on the run (engine_tap.rs).
     tap: engine_tap::Tap,
+    /// S39: the board's debug block on the run (dbg_run.rs).
+    dbg: dbg_run::DbgRun,
 }
 
 impl Trx64Backend {
@@ -411,6 +414,7 @@ impl Trx64Backend {
             ring: None,
             hwlog,
             tap: engine_tap::Tap::default(),
+            dbg: dbg_run::DbgRun::default(),
         }
     }
 
@@ -588,7 +592,7 @@ impl Trx64Backend {
         }
         loop {
             let clk = self.m.c64_core.clk;
-            if clk >= target || self.uci_wait.is_some() || self.slot.view().cart_reset_pending() {
+            if clk >= target || self.uci_wait.is_some() || self.slot.view().cart_reset_pending() || self.dbg.held {
                 break;
             }
             let events = self.uci_events();
@@ -644,15 +648,56 @@ impl Trx64Backend {
     /// needs. While the board's engine records (S40, engine_tap.rs) the run goes through its taps: every write in
     /// order, a halt after a write to the CPU port or into a cartridge's window, the writes resolved after it under
     /// the memory configuration they were made in.
+    ///
+    /// S39: with the debug block (`--trx-io`) the run goes through its observer and stops where the debugger looks
+    /// (dbg_run.rs): at each such boundary the stop sources are evaluated, and the run goes on past it if none fired.
     fn run_obs<O: Observer>(&mut self, budget: u64, max: u64, exec: bool, watch: Watch, obs: &mut O) -> RunStop {
+        if self.dbg.link.is_none() {
+            return self.run_obs_one(budget, max, exec, watch, obs, false);
+        }
+        let end = self.m.c64_core.clk.saturating_add(budget);
+        let mut left = max;
+        loop {
+            if self.dbg_boundary() {
+                return RunStop::Observer;
+            }
+            let clk = self.m.c64_core.clk;
+            if clk >= end || left == 0 {
+                return RunStop::CycleBudget;
+            }
+            let mut b = end - clk;
+            if let Some(l) = self.dbg_cycles_left() {
+                b = b.min(l.max(1));
+            }
+            // A boundary the debugger looks at is passed with one instruction; the tables apply from the next.
+            let single = self.dbg_single();
+            let (pc, count) = (self.m.c64_core.reg_pc, self.count_now());
+            let mut dobs = dbg_run::DbgObs::new(&mut *obs, &self.dbg, clk, count, pc);
+            let stop = self.run_obs_one(b, if single { 1 } else { left }, exec, watch, &mut dobs, !single);
+            let (inner, mine, retired) = (dobs.inner_halt, dobs.dbg_halt, dobs.retired);
+            self.dbg_after(dobs);
+            left = left.saturating_sub(retired.max(1));
+            let s23 = self.checkpoint_exec.as_ref().is_some_and(|w| w[usize::from(self.m.c64_core.reg_pc)] != 0);
+            match stop {
+                RunStop::Observer if inner || (!mine && exec && s23) => return stop,
+                RunStop::Observer | RunStop::CycleBudget | RunStop::Completed => {}
+                other => return other,
+            }
+        }
+    }
+
+    /// One TRX64 run (the body of [`Self::run_obs`]). `dbg_exec`: the debugger's boundaries join the exec watch;
+    /// its read and write units always join the access watch.
+    fn run_obs_one<O: Observer>(&mut self, budget: u64, max: u64, exec: bool, watch: Watch, obs: &mut O, dbg_exec: bool) -> RunStop {
         let nothing = |_: u16, _: u8, _: u8, _: u8, _: u8, _: u8, _: u64| {};
+        self.dbg_exec_table(exec, dbg_exec);
         if self.recording_writes() {
             let end = self.m.c64_core.clk.saturating_add(budget);
             loop {
                 let cfg = self.m.memconfig;
                 self.tap_build_watch(watch);
                 let windows = self.cart_windows_now();
-                let exec = if exec { self.checkpoint_exec.as_deref() } else { None };
+                let exec = self.dbg.exec_cache.as_ref().map(|(t, _)| &**t);
                 let table = self.tap.watch.as_ref().map(|(t, _)| &**t);
                 let mut tapped =
                     engine_tap::Tapped { inner: &mut *obs, writes: &mut self.tap.writes, windows, own_halt: false, inner_halt: false };
@@ -666,12 +711,15 @@ impl Trx64Backend {
                 }
             }
         }
-        let exec = if exec { self.checkpoint_exec.as_deref() } else { None };
-        let table: Option<&[u8; 0x1_0000]> = match watch {
-            Watch::None => None,
-            Watch::Uci => Some(&UCI_WATCH),
-            Watch::Io => Some(&IO_WATCH),
-            Watch::Checkpoint => Some(self.checkpoint_watch.as_deref().unwrap_or(&UCI_WATCH)),
+        let _ = exec;
+        self.dbg_access_table(watch);
+        let exec = self.dbg.exec_cache.as_ref().map(|(t, _)| &**t);
+        let table: Option<&[u8; 0x1_0000]> = match (&self.dbg.access_cache, watch) {
+            (Some((t, _)), _) => Some(&**t),
+            (None, Watch::None) => None,
+            (None, Watch::Uci) => Some(&UCI_WATCH),
+            (None, Watch::Io) => Some(&IO_WATCH),
+            (None, Watch::Checkpoint) => Some(self.checkpoint_watch.as_deref().unwrap_or(&UCI_WATCH)),
         };
         if exec.is_none() && table.is_none() {
             self.m.run_for_full_capped(budget, max, obs, nothing)
@@ -682,18 +730,72 @@ impl Trx64Backend {
 
     /// The watch table a tapped run takes for `watch`.
     fn tap_build_watch(&mut self, watch: Watch) {
-        // The base table is copied into the tap's; the pointer of a debugger's table names its build.
+        // The base table is copied into the tap's; the pointer of a debugger's table names its build. S39: the debug
+        // block's read and write units join it.
+        self.dbg_access_table(watch);
+        if let Some((t, (id, gen))) = &self.dbg.access_cache {
+            let (t, id) = (t.clone(), id ^ (*gen as usize).rotate_left(32) ^ 0x5A5A);
+            self.tap_watch(id, Some(&t));
+            return;
+        }
         let base: Option<Box<[u8; 0x1_0000]>> = match watch {
             Watch::None => None,
             Watch::Uci => Some(Box::new(UCI_WATCH)),
             Watch::Io => Some(Box::new(IO_WATCH)),
             Watch::Checkpoint => Some(self.checkpoint_watch.clone().unwrap_or_else(|| Box::new(UCI_WATCH))),
         };
-        let id = match watch {
-            Watch::Checkpoint => self.checkpoint_watch.as_deref().map_or(1, |t| t.as_ptr() as usize),
+        self.tap_watch(Self::watch_id(watch, self.checkpoint_watch.as_deref()), base.as_deref());
+    }
+
+    fn watch_id(watch: Watch, checkpoint: Option<&[u8; 0x1_0000]>) -> usize {
+        match watch {
+            Watch::Checkpoint => checkpoint.map_or(1, |t| t.as_ptr() as usize),
             w => w as usize + 2,
+        }
+    }
+
+    /// S39: the access table of a run for `watch` with the debug block's read and write units merged in, cached by
+    /// what it was built from; none while no unit watches accesses.
+    fn dbg_access_table(&mut self, watch: Watch) {
+        let Some(units) = self.dbg.access.as_deref() else {
+            self.dbg.access_cache = None;
+            return;
         };
-        self.tap_watch(id, base.as_deref());
+        let key = (Self::watch_id(watch, self.checkpoint_watch.as_deref()), self.dbg.gen());
+        if self.dbg.access_cache.as_ref().is_some_and(|(_, k)| *k == key) {
+            return;
+        }
+        let mut t: Box<[u8; 0x1_0000]> = match watch {
+            Watch::None => Box::new([0; 0x1_0000]),
+            Watch::Uci => Box::new(UCI_WATCH),
+            Watch::Io => Box::new(IO_WATCH),
+            Watch::Checkpoint => self.checkpoint_watch.clone().unwrap_or_else(|| Box::new(UCI_WATCH)),
+        };
+        for (b, &u) in t.iter_mut().zip(units.iter()) {
+            *b |= u;
+        }
+        self.dbg.access_cache = Some((t, key));
+    }
+
+    /// The exec table of a run: S23's exec checkpoints when `exec`, the debug block's boundaries when `dbg_exec`.
+    fn dbg_exec_table(&mut self, exec: bool, dbg_exec: bool) {
+        let s23 = self.checkpoint_exec.as_deref().filter(|_| exec);
+        let dbg = self.dbg.exec_table().filter(|_| dbg_exec);
+        let key = (s23.map_or(0, |t| t.as_ptr() as usize), if dbg.is_some() { self.dbg.gen() + 1 } else { 0 });
+        if key == (0, 0) {
+            self.dbg.exec_cache = None;
+            return;
+        }
+        if self.dbg.exec_cache.as_ref().is_some_and(|(_, k)| *k == key) {
+            return;
+        }
+        let mut t = Box::new([0u8; 0x1_0000]);
+        for src in [s23, dbg].into_iter().flatten() {
+            for (b, &x) in t.iter_mut().zip(src.iter()) {
+                *b |= x;
+            }
+        }
+        self.dbg.exec_cache = Some((t, key));
     }
 
     /// The UCI event bits waiting for the firmware ([`UCI_EVENTS`]).
@@ -737,9 +839,13 @@ impl Trx64Backend {
     /// firmware (UCI). The cycles run count on the engine's counter.
     fn run_to_plain(&mut self, target: u64) {
         let start = self.m.c64_core.clk;
-        (self.tap.run_clk, self.tap.run_cycles) = (start, self.tap.cycles);
-        if self.stopped || self.reset_held {
+        (self.tap.run_clk, self.tap.run_cycles, self.tap.in_run) = (start, self.tap.cycles, true);
+        if self.dbg.held {
+            // S39: the debugger's stop came in this slice; the machine stands until RUN or a step.
+        } else if self.stopped || self.reset_held {
             self.run_held(target);
+            // S39: a pause with the 6510 held stops at once (PAUSE_CB); the comparator and a cycle step at their count.
+            self.dbg_boundary();
         } else if self.uci_wait.is_none() && !self.slot.view().cart_reset_pending() {
             self.run_cpu(target);
             // W4-DRIVE: note what drive A wrote.
@@ -748,6 +854,7 @@ impl Trx64Backend {
             }
         }
         self.tap.cycles += self.m.c64_core.clk.saturating_sub(start);
+        self.tap.in_run = false;
     }
 
     /// The physical cartridge pulled the expansion port's RESET line (EasyFlash 3, `$DE0F`): TRX64 holds the C64 in
@@ -781,6 +888,32 @@ impl Trx64Backend {
         self.apply_joysticks();
         self.nmi_line = self.nmi;
         self.apply_interrupts();
+    }
+
+    /// TRX64's banking as a cartridge mapper sees it (full.rs `get_bank_info`), for a read outside a run.
+    fn bank_info_now(&self) -> trx64_core::cart::BankInfo {
+        let c = &self.m.memconfig;
+        trx64_core::cart::BankInfo {
+            cpu_port_direction: self.m.port_dir,
+            cpu_port_value: self.m.port_data,
+            basic_visible: c.basic,
+            kernal_visible: c.kernal,
+            io_visible: c.io,
+            char_visible: c.char_rom,
+            cartridge_attached: true,
+            cartridge_exrom: None,
+            cartridge_game: None,
+            phi1: 0xFF,
+        }
+    }
+
+    /// A window access that is a bus cycle: while the machine stands it is one phi2 edge of its own, which CYCLES and
+    /// the engine's counter count (trx_dbg.v:296, S40 answer 11).
+    fn window_cycle(&mut self) {
+        if self.stands() {
+            self.tap.cycles += 1;
+            self.tap.run_cycles += 1;
+        }
     }
 
     /// The C64 stood while the emulator's clock ran on: it continues from its cycle now.
@@ -1062,10 +1195,10 @@ impl C64Backend for Trx64Backend {
         // S37: while the machine pause stands no C64 cycle runs, so the CPU, VIC, CIAs, SID and drives stand and the
         // SID makes no sample of its own. The sampler is the FPGA's and runs on. S38: the same while the transport
         // holds the C64 on an anchor.
-        if self.paused || self.ring_holds() || self.tap.pos_hold {
+        if self.paused || self.ring_holds() || self.tap.pos_hold || self.dbg.held {
             self.sampler.with(|s| s.advance_to(now));
             // The pause mutes (top.v:1059), and the output goes on at its rate: the stretch is zeros, not missing.
-            if self.paused {
+            if self.paused || self.dbg.held {
                 self.sid.pause_gap(now.saturating_sub(since));
             }
             return;
@@ -1099,6 +1232,7 @@ impl C64Backend for Trx64Backend {
         if self.slot.with(Slot::take_cart_reset) {
             self.cart_generated_reset();
         }
+        self.dbg_publish();
         // S16: the voices are FPGA-clocked, so they follow the emulator's clock rather than the C64's — and they run
         // whether or not anyone is listening, because a finished voice sets the status bit `audio_detect()` polls.
         self.sampler.with(|s| s.advance_to(now));
@@ -1182,6 +1316,7 @@ impl C64Backend for Trx64Backend {
         if mem_only {
             self.m.ram[usize::from(addr)]
         } else {
+            self.window_cycle();
             if self.m.memconfig.io && sid::Sid::window(addr) {
                 // Socket 1 / UltiSID 1 per the SID decode; else 0 in the SID range, the cartridge at $DE00-$DFFF.
                 let clk = self.m.c64_core.clk;
@@ -1207,6 +1342,7 @@ impl C64Backend for Trx64Backend {
             // S40: the RAM's second port, an outside record.
             self.tap_outside_ram(addr, val);
         } else {
+            self.window_cycle();
             let (cfg, before) = (self.m.memconfig, self.m.ram[usize::from(addr)]);
             self.m.write_full(addr, val);
             // S40: a bus cycle, the machine's port A.
@@ -1548,7 +1684,7 @@ impl C64Backend for Trx64Backend {
             return;
         }
         self.paused = paused;
-        if !paused && !self.tap.pos_hold {
+        if !self.stands() {
             self.reanchor();
         }
     }
@@ -1591,6 +1727,66 @@ impl C64Backend for Trx64Backend {
 
     fn apply_ram(&mut self, addr: u16, val: u8) {
         self.tap_apply(addr, val);
+    }
+
+    fn set_dbg(&mut self, dbg: Option<ue2_core::devices::trx_dbg::DbgLink>) {
+        self.dbg = dbg_run::DbgRun::with_link(dbg);
+        self.dbg_sync();
+        self.dbg_publish();
+    }
+
+    /// S39: a register write or a command: the configuration and the hold. A pause stops here at once when this
+    /// boundary qualifies (PAUSE_IB at an IB, PAUSE_CB anywhere): UE2 stands between instructions.
+    fn dbg_changed(&mut self) {
+        self.dbg_sync();
+        if !self.dbg.held && !self.paused && !self.tap.pos_hold {
+            self.dbg_boundary();
+        }
+        self.dbg_publish();
+    }
+
+    fn dbg_step(&mut self) {
+        self.dbg_run_step();
+    }
+
+    fn dbg_drive_step(&mut self, n: u16) {
+        self.dbg_drive_step_now(n);
+    }
+
+    /// S39 §3.7, the lens unit: the internal cartridge logic at the window the class selects whatever the PLA maps
+    /// (U1), the port's devices in IO1/IO2; a cartridge in the physical port only by a real cycle.
+    fn cart_look(&mut self, addr: u16, class: u8, real: bool) -> CartPeek {
+        let off = addr & 0x1FFF;
+        let at = match class {
+            0 => 0x8000 | off,
+            1 => 0xA000 | off,
+            2 => 0xDE00 | (addr & 0xFF),
+            _ => 0xDF00 | (addr & 0xFF),
+        };
+        if self.slot.with(|s| s.physical().is_some()) {
+            if !real {
+                return CartPeek::External;
+            }
+            let info = self.bank_info_now();
+            let clk = self.m.c64_core.clk;
+            let v = self.slot.with(|s| {
+                let p = s.physical_mut().expect("checked");
+                let v = p.read_forced(at, &info, clk);
+                // ROMH asked at $A000 is the Ultimax window at $E000 for a cartridge that serves it there.
+                v.or_else(|| (class == 1).then(|| p.read_forced(0xE000 | off, &info, clk)).flatten())
+            });
+            return v.map_or(CartPeek::Miss, CartPeek::Hit);
+        }
+        let clk = self.m.c64_core.clk;
+        let look = |c: &mut CartLogic, a: u16| if real { c.bus_read(a, clk) } else { c.peek(a) };
+        let cart = self.cart.with(|c| look(c, at).or_else(|| if class == 1 { look(c, 0xE000 | off) } else { None }));
+        let device = if class >= 2 {
+            let profile = self.m.port_profile.as_ref().and_then(|d| d.peek(at, cart));
+            profile.or_else(|| self.m.expansion.as_ref().and_then(|d| d.peek(at, cart)))
+        } else {
+            None
+        };
+        device.or(cart).map_or(CartPeek::Miss, CartPeek::Hit)
     }
 
     /// TRX64's U64 profile with the enable word 0 and the menu speed 1 MHz with badline stalls: `$D030`/`$D031` (and
@@ -1970,7 +2166,7 @@ pub(crate) mod tests {
         c64.m.c64_core.reg_pc = 0xC000;
         let first = c64.m.vic.frame;
         run_ms(&mut c64, &mut now, 100);
-        let lines = |stop, ultimax| Lines { frz: true, stop, ultimax, reset: false };
+        let lines = |stop, ultimax| Lines { frz: true, stop, ultimax, ..Lines::default() };
         let mut session = Session::default();
         for _ in 0..10 {
             run_ms(&mut c64, &mut now, 37);
@@ -2311,6 +2507,35 @@ pub(crate) mod tests {
         c64.m.c64_core.reg_pc = 0xC000;
         run_ms(&mut c64, &mut now, 1);
         (c64, now)
+    }
+
+    /// S39 §3.7, §9: the lens unit's look for an EasyFlash in bank 2: ROML, ROMH (asked at `$A000` or `$E000`), IO2
+    /// as the cartridge serves them; with the cartridge in the physical port a look is `ext` and a real cycle reads it.
+    #[test]
+    fn the_lens_looks_at_the_cartridge_by_class() {
+        let mut ddr = ddr();
+        let (mut c64, _) = running_code(0x11, &[0x4C, 0x00, 0xC0], &mut ddr);
+        c64.dma_write(0xDE00, 2, false);
+        c64.dma_write(0xDE02, 0x07, false);
+        c64.dma_write(0xDF10, 0x5A, false);
+        let look = |c64: &mut Trx64Backend, a: u16, class: u8| c64.cart_look(a, class, false);
+        assert_eq!(look(&mut c64, 0x8000, 0), CartPeek::Hit(0x42), "ROML bank 2");
+        assert_eq!(look(&mut c64, 0xA123, 1), CartPeek::Hit(0x82), "ROMH bank 2");
+        assert_eq!(look(&mut c64, 0xE123, 1), look(&mut c64, 0xA123, 1), "ROMH asked at $E000");
+        assert_eq!(look(&mut c64, 0xDF10, 3), CartPeek::Hit(0x5A), "IO2: the cartridge's RAM");
+        assert_eq!(look(&mut c64, 0x8123, 0), look(&mut c64, 0x0123, 0), "the class, not the address, selects");
+        c64.lend_ddr(None);
+
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        c64.advance_to(0);
+        let chips: Vec<_> = (0..4u16)
+            .flat_map(|b| [(b, 0x8000, slot::tests::fill(b, 0x10), 2), (b, 0xA000, slot::tests::fill(b, 0x90), 2)])
+            .collect();
+        c64.insert_cart(&slot::tests::crt(32, 1, 0, &chips), FlashDecode::Both).unwrap();
+        c64.dma_write(0xDE00, 2, false);
+        assert_eq!(c64.cart_look(0x8000, 0, false), CartPeek::External);
+        assert_eq!(c64.cart_look(0x8000, 0, true), CartPeek::Hit(0x12), "a real cycle reads the physical cartridge");
+        assert_eq!(c64.cart_look(0xA000, 1, true), CartPeek::Hit(0x92));
     }
 
     #[test]
@@ -2785,6 +3010,25 @@ pub(crate) mod tests {
 
     /// `goto` puts the C64 back on an anchor — RAM, registers, cycle — and holds it there while the firmware's time
     /// runs on; the release continues from the anchor and cuts the anchors after it, marks excepted.
+    /// S39 §3.8: OWNER taken while the transport holds an anchor releases the transport (cut after the anchor) and
+    /// the C64 stays where it stands, now held by the debugger.
+    #[test]
+    fn owner_takes_the_c64_from_the_transport() {
+        let Some((mut c64, mut now)) = ringed() else { return };
+        run_ms(&mut c64, &mut now, 100);
+        let ids = c64.ring().unwrap().ids();
+        let back = ids[ids.len() - 3].0.clone();
+        c64.ring_goto(&back, RingMode::StepBack).unwrap();
+        let d = std::sync::Arc::new(std::sync::Mutex::new(ue2_core::devices::trx_dbg::Dbg::default()));
+        c64.set_dbg(Some(d.clone()));
+        let clk = c64.m.c64_core.clk;
+        ue2_core::devices::trx_dbg::lock(&d).write(ue2_core::devices::trx_dbg::OWNER, 1, false);
+        c64.dbg_changed();
+        assert!(!c64.ring_holds() && c64.dbg.held && ue2_core::devices::trx_dbg::lock(&d).holds());
+        run_ms(&mut c64, &mut now, 20);
+        assert_eq!(c64.m.c64_core.clk, clk, "where it stood, held by the debugger");
+    }
+
     #[test]
     fn goto_restores_the_c64_and_holds_it_until_the_release() {
         let Some((mut c64, mut now)) = ringed() else { return };

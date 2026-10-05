@@ -13,6 +13,7 @@ pub mod rmii;
 pub mod sdcard;
 pub mod streams;
 pub mod trx;
+pub mod trx_dbg;
 pub mod trx_engine;
 pub mod trx_sb;
 pub mod trx_session;

@@ -1043,6 +1043,12 @@ impl PhysicalCart {
         val
     }
 
+    /// S39, the lens unit's real cycle: a read of the cartridge at `addr` with its select forced, side effects and
+    /// all.
+    pub(crate) fn read_forced(&mut self, addr: u16, info: &BankInfo, clk: u64) -> Option<u8> {
+        self.read(addr, info, clk)
+    }
+
     fn peek(&self, addr: u16, info: &BankInfo) -> Option<u8> {
         match &self.device {
             Device::Mapper(m) => m.peek(addr, info),

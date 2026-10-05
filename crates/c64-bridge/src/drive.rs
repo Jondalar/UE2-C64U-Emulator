@@ -47,6 +47,8 @@ pub(crate) struct DriveSlot {
     power_noted: bool,
     /// S31: the WD177x fitted while the position is a 1581, shared with the controller TRX64 holds.
     fdc: FdcHandle,
+    /// S39: the debugger holds the drive (drv_dbg.v `hold`: DRV_PAUSE, a comparator hit, a step's end).
+    pub(crate) dbg_hold: bool,
 }
 
 impl DriveSlot {
@@ -71,6 +73,7 @@ impl DriveSlot {
             type_noted: false,
             power_noted: false,
             fdc: FdcHandle::default(),
+            dbg_hold: false,
         }
     }
 
@@ -170,7 +173,7 @@ impl DriveSlot {
         }
         self.reset = reset;
         // c1541_drive.vhd:164-165: `drive_stop and stop_on_freeze` stops the drive's whole tick.
-        d.set_stopped(l.stop_on_freeze && c64_stopped);
+        d.set_stopped(l.stop_on_freeze && c64_stopped || self.dbg_hold);
         let surface = surface.unwrap_or_else(empty_surface);
         if d.rotation.image.as_ref().is_some_and(is_marker) {
             d.rotation.image = Some(surface);
@@ -654,6 +657,47 @@ mod tests {
         insert_and_start(&mut c64, &mut now, 0, lines, &rom);
         assert!(run_until(&mut c64, &mut now, "READY.", 1, 3000), "no READY.");
         Some((c64, now))
+    }
+
+    /// S39 §3.5 (drv_dbg.v): DRV_STEP runs drive A alone for n instructions while the C64 stands (REASON 9, the drive
+    /// held after it); the exec comparator at a PC of the drive's idle loop stops the C64 (REASON 8, FLAGS b1) with the
+    /// drive held; RUN lets both go. TRX64 samples the drive's PC once per C64 instruction (S39 §5 T5).
+    #[test]
+    fn the_debuggers_drive_step_and_comparator() {
+        use std::sync::Mutex;
+        use ue2_core::c64host::C64Backend;
+        use ue2_core::devices::trx_dbg::{self as td, Act, Dbg};
+        let Some((mut c64, mut now)) = with_drive(running(0)) else { return };
+        let d = Arc::new(Mutex::new(Dbg::default()));
+        c64.set_dbg(Some(d.clone()));
+        let mut cmd = |c64: &mut Trx64Backend, off: u32, v: u32| {
+            let act = td::lock(&d).write(off, v, c64.stands());
+            match act {
+                Act::Run => td::lock(&d).release(),
+                Act::DrvStep(n) => c64.dbg_drive_step(n),
+                _ => {}
+            }
+            c64.dbg_changed();
+        };
+        cmd(&mut c64, td::PAGE3 + td::CMD, u32::from(td::CMD_PAUSE_CB));
+        assert!(td::lock(&d).holds());
+        cmd(&mut c64, td::PAGE3 + td::CMD, u32::from(td::CMD_CLEAR_STOP));
+        let (clk, dclk) = (c64.m.c64_core.clk, c64.m.drive8.cpu().clk);
+        cmd(&mut c64, td::PAGE3 + td::ARG, 3);
+        cmd(&mut c64, td::PAGE3 + td::CMD, u32::from(td::CMD_DRV_STEP));
+        let m = td::lock(&d).clone();
+        assert_eq!((m.rec.reason, m.drive.hold, c64.m.c64_core.clk), (td::R_DRV_STEP, true, clk), "the C64 stands");
+        assert!(c64.m.drive8.cpu().clk > dclk && m.drive.dpc == c64.m.drive8.cpu().reg_pc);
+        assert_eq!(m.drv_stat(td::Ctx { shut: true, fw_stop: false }) & 3, 3, "held by the debugger, halted");
+        // The comparator at a PC the idle loop passes.
+        let at = c64.m.drive8.cpu().reg_pc;
+        cmd(&mut c64, td::PAGE3 + td::DRV_CMP, 0x1_0000 | u32::from(at));
+        cmd(&mut c64, td::PAGE3 + td::CMD, u32::from(td::CMD_CLEAR_STOP));
+        cmd(&mut c64, td::PAGE3 + td::CMD, u32::from(td::CMD_RUN));
+        run_ms(&mut c64, &mut now, 200);
+        let m = td::lock(&d).clone();
+        assert_eq!((m.holds(), m.rec.reason, m.rec.flags & td::F_DRIVE, m.drive.hold), (true, td::R_DRIVE, td::F_DRIVE, true));
+        assert_eq!(c64.m.drive8.cpu().reg_pc, at);
     }
 
     fn running(device: u8) -> DriveLines {

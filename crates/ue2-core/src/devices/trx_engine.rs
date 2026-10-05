@@ -242,6 +242,12 @@ impl Engine {
                 }
             }
             TapEvent::Reu => self.reu = true,
+            // The debug block's log action takes LOG_PUT's holding register: with the log on, a stream 1 record.
+            TapEvent::DbgLog(rec) => {
+                if on {
+                    self.put(1, rec);
+                }
+            }
             _ => {}
         }
     }

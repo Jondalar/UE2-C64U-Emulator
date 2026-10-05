@@ -298,6 +298,11 @@ impl ViceServer {
             self.error(id, err::CMD_INVALID_API_VERSION);
             return;
         }
+        // S39 §3.8: while trxmon owns run control (OWNER) the run commands are refused, as in the text monitor.
+        if matches!(command, cmd::ADVANCE_INSTRUCTIONS | cmd::EXECUTE_UNTIL_RETURN | cmd::EXIT) && monitor::trx_owns(machine) {
+            self.error(id, err::CMD_FAILURE);
+            return;
+        }
         match command {
             cmd::PING => self.send(id, resp::PING, err::OK, &[]),
             cmd::VICE_INFO => {

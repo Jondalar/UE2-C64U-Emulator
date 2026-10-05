@@ -4,7 +4,7 @@
 Boots the app headless with `--trx-io`, a fresh flash with the C64 ROMs, the freeze interface and PAL, REST through
 `--net user`, and drives it over the control port:
 
-- boot: CAPS E7, the ring's log on in the reset layout;
+- boot: CAPS EF, the ring's log on in the reset layout;
 - a BASIC counter runs; `GET /v1/timewarp:status` counts the frames, every one a target, nothing dropped;
 - `PUT /v1/timewarp:rewind?frames=100`: the counter goes back, then on; the load is the snap's state (the bridge says
   so on stderr: the 6510 and CIAs from the snap, RAM and colour RAM equal to the snap's);
@@ -107,10 +107,10 @@ class Run:
 
 
 def smoke(run):
-    run.cmd('expect-console "[TRX] IO block present, CAPS E7" 20000')
+    run.cmd('expect-console "[TRX] IO block present, CAPS EF" 20000')
     run.cmd('expect-console "[RING] log on: streams at 7000000/6000000/5C00000" 30000')
     run.rest.wait_ready(120)
-    print('PASS boot: CAPS E7, the ring on in the reset layout')
+    print('PASS boot: CAPS EF, the ring on in the reset layout')
 
     run.cmd(f'type {PROGRAM}')
     run.cmd('key return')

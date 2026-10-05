@@ -229,6 +229,8 @@ pub(crate) struct Tap {
     /// The clock and the counter where the run in progress began: a write's cycle on the counter.
     pub run_clk: u64,
     pub run_cycles: u64,
+    /// A run is in progress (`run_to_plain`): the count is `run_cycles` plus what ran since `run_clk`.
+    pub in_run: bool,
     /// The merged watch table of the last tapped run and what it was built from (base table, cartridge windows).
     pub watch: Option<(Box<[u8; 0x1_0000]>, (usize, u8))>,
     pub side: Side,
@@ -540,7 +542,11 @@ impl Trx64Backend {
     pub(crate) fn tap_load(&mut self, load: &SbLoad) {
         let now = self.m.c64_core.clk;
         if let Some(w) = load.cpu {
-            match self.tap.side.cpu.get(&key(&w)) {
+            let kept = self.tap.side.cpu.contains_key(&key(&w));
+            if !kept && !self.tap_cpu_write(&w) {
+                self.tap_miss("6502");
+            }
+            match self.tap.side.cpu.get(&key(&w)).filter(|_| kept) {
                 Some(e) => {
                     // The app put the memories back first (APPLY, colour RAM by the bus): they must be the snap's.
                     let (back, mem) = (now.saturating_sub(e.clk), self.mem_now() == e.mem);
@@ -570,7 +576,7 @@ impl Trx64Backend {
                     (self.m.port_dir, self.m.port_data) = port;
                     self.update_pla();
                 }
-                None => self.tap_miss("6502"),
+                None => {}
             }
         }
         for (i, w) in load.cia.iter().enumerate() {
@@ -593,6 +599,37 @@ impl Trx64Backend {
         }
     }
 
+    /// S39 §3.4, the CPU write path: an image that is the machine's own as it stands with only the registers, the
+    /// PC, IR, the write-back controls (`copy_d2p`, `flags_update`, `trigger_upd`) and `din_r` changed is the
+    /// debugger's write (trxmon's `hw_cpu_write`, hw_trx.c:190-220). A, X, Y, S, P load into TRX64; a new PC sends the
+    /// 6510 there, and TRX64 fetches the opcode itself. TRX64 has no pending write-back to take out. False for any
+    /// other image.
+    fn tap_cpu_write(&mut self, w: &[u32; 7]) -> bool {
+        use trx_ff::cpu::{A, CTL, DIN, IR, PC};
+        let mut mask = [0u32; 7];
+        for (lo, n) in [(A, 56), (IR, 8), (CTL + 12, 1), (CTL + 15, 2), (DIN, 8)] {
+            trx_ff::put(&mut mask, lo, n, u64::MAX);
+        }
+        let now = self.shadow_now().cpuf;
+        if (0..7).any(|i| (w[i] ^ now[i]) & !mask[i] != 0) {
+            return false;
+        }
+        let f = |lo: usize, n: usize| (0..n).fold(0u64, |v, b| v | u64::from(w[(lo + b) / 32] >> ((lo + b) % 32) & 1) << b);
+        let c = &mut self.m.c64_core;
+        c.reg_a = f(A, 8) as u8;
+        c.reg_x = f(A + 8, 8) as u8;
+        c.reg_y = f(A + 16, 8) as u8;
+        c.reg_sp = f(A + 24, 8) as u8;
+        c.set_status_composite(f(A + 32, 8) as u8);
+        let pc = f(PC, 16) as u16;
+        if pc != c.reg_pc {
+            c.reg_pc = pc;
+        }
+        self.m.sync_after_monitor();
+        eprintln!("c64: SB_LOAD: the CPU write path: A X Y S P and PC ${pc:04x} into the 6510");
+        true
+    }
+
     fn tap_miss(&mut self, chip: &str) {
         self.tap.misses += 1;
         eprintln!(
@@ -612,7 +649,7 @@ impl Trx64Backend {
             return;
         }
         self.tap.pos_hold = false;
-        if !self.paused {
+        if !self.stands() {
             self.reanchor();
         }
     }
@@ -1007,11 +1044,18 @@ mod tests {
         assert_eq!(now_shadow.cpu, regs, "A X Y S P PC and the port as at the snap");
         assert_eq!(now_shadow.cia[0][..4], cia_read[0][..4], "CIA 1 as read: timers, TOD, ICR as at the snap");
         assert_eq!(now_shadow.cia[1], cia_read[1]);
-        // A foreign image: nothing loads.
+        // A foreign image (the address latch differs from the machine's): nothing loads.
         let mut foreign = snap.shadow.cpuf;
-        foreign[0] ^= 1;
+        foreign[2] ^= 1;
         c64.tap_load(&SbLoad { cpu: Some(foreign), cia: [None, None] });
         assert_eq!((c64.tap.misses, c64.shadow_now().cpu), (1, regs));
+        // S39 §3.4: the machine's own image with other registers is the CPU write path: A loads, nothing else moves.
+        let mut write = c64.shadow_now().cpuf;
+        trx_ff::put(&mut write, trx_ff::cpu::A, 8, 0x77);
+        trx_ff::put(&mut write, trx_ff::cpu::IR, 8, 0xEA);
+        c64.tap_load(&SbLoad { cpu: Some(write), cia: [None, None] });
+        assert_eq!((c64.tap.misses, c64.m.c64_core.reg_a, c64.shadow_now().cpu[1]), (1, 0x77, regs[1]));
+        c64.m.c64_core.reg_a = regs[0] as u8;
         c64.release_pos();
         c64.set_stopped(false);
         run_ms(&mut c64, &mut now, 20);

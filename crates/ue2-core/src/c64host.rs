@@ -285,6 +285,24 @@ pub trait C64Backend {
     fn release_pos(&mut self) {}
     /// `SB_LOAD`: the staged hidden-state words load into the chips now, before the machine moves on.
     fn sb_load(&mut self, _load: &crate::devices::trx_sb::SbLoad) {}
+    // ---- S39: the debug block, trx_dbg.v and drv_dbg.v (docs/specs/S39-trxmon.md §3.3-§3.5) ----
+
+    /// The debug block's model, shared with the IO block and the C64 port: the backend finds the stops on its run,
+    /// writes them and keeps the counters there. Ignored by default.
+    fn set_dbg(&mut self, _dbg: Option<crate::devices::trx_dbg::DbgLink>) {}
+    /// The model changed outside a run (a register write, a command): take its configuration and its hold, and stop
+    /// where the machine stands if a pause asks for it.
+    fn dbg_changed(&mut self) {}
+    /// Run the step the model holds, to its end, with the machine standing before and after it.
+    fn dbg_step(&mut self) {}
+    /// DRV_STEP: drive A alone for `n` instructions, the C64 standing.
+    fn dbg_drive_step(&mut self, _n: u16) {}
+    /// The lens unit (freeze_resp.v `LK_REQ`): the cartridge at `addr` as `class` (0 ROML, 1 ROMH, 2 IO1, 3 IO2)
+    /// whatever the PLA maps; `real`: one bus cycle with the select forced instead of the look (its side effects are
+    /// the cartridge's). `External`: the physical port serves it and only a real cycle reads it.
+    fn cart_look(&mut self, _addr: u16, _class: u8, _real: bool) -> CartPeek {
+        CartPeek::Miss
+    }
     /// APPLY: a byte into C64 RAM through the RAM's second port, logged by nothing.
     fn apply_ram(&mut self, addr: u16, val: u8) {
         self.dma_write(addr, val, true);
@@ -397,6 +415,8 @@ pub enum TapEvent {
     Line16 { cycle: u64, x: u16 },
     /// The machine stood at the stop position (`pos_hit`) and holds.
     PosHit,
+    /// S39: a watch unit's log action, engine stream 1 space 8 (trx_dbg.v:100-101, :251; trx_engine.v:417-427).
+    DbgLog(u64),
 }
 
 /// S40: what the board's engine wants of the C64's run.
