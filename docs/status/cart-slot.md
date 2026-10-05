@@ -270,6 +270,7 @@ unchanged.
   device -- ran out in under 3 s here and never saw the chip finish. `time::DMA_BYTE_CLOCKS` adds the remainder;
   the same measurement now reads 3.25 us. `--log cart` shows the cycle a cartridge is handed, which is the only
   place that clock is visible.
+- **EasyFlash 3 buttons** (Menu, Reset, Special) are not reachable from UE2: not needed (Alex, 2026-10-05).
 - **Freeze button** of a physical freezer (Action Replay, Retro Replay in the slot) is not wired; the U64 freeze
   button reaches the internal cartridge as before.
 - **GMod4** (type 87) and **EasyFlash XL** (232) are served but not exercised by the acceptance; GMod4's SPI flash is
