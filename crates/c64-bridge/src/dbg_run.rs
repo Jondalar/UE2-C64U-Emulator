@@ -469,6 +469,27 @@ impl Trx64Backend {
         true
     }
 
+    /// S40 phase E, the trace former's feed (t21-p4 trx_dbg.v:139-143, :288-294; trx_engine.v:343-377): at an IB with
+    /// the trace on, the instruction about to run. UE2 stands before the fetch, so the count after the fetch's edge is
+    /// one more than now; the registers are the settled ones (chip 1 w4/w5), the two bytes the operand bytes (the app
+    /// masks them by the opcode's length, S40 answer 9). A boundary whose fetch an interrupt replaces is no IB: no
+    /// record, and the handler's first instruction is one `execute` with the interrupt (S39 T2).
+    pub(crate) fn trace_boundary(&mut self) {
+        let clk = self.m.c64_core.clk;
+        if !self.tap.cfg.trace || self.tap.trace_clk == Some(clk) {
+            return;
+        }
+        self.tap.trace_clk = Some(clk);
+        if self.stopped || self.reset_held || self.irq_due() || self.nmi_due() {
+            return;
+        }
+        let c = &self.m.c64_core;
+        let (pc, regs) = (c.reg_pc, [c.reg_a, c.reg_x, c.reg_y, c.reg_sp, c.status()]);
+        let (op, b1, b2) = (self.m.read_full(pc), self.m.read_full(pc.wrapping_add(1)), self.m.read_full(pc.wrapping_add(2)));
+        let cycle = self.count_now() + 1;
+        self.tap.events.push(ue2_core::c64host::TapEvent::Trace { cycle, pc, op, b1, b2, regs });
+    }
+
     /// The budget the next run may take before a cycle point of the debugger: CYC_CMP, the end of a step of cycles.
     pub(crate) fn dbg_cycles_left(&self) -> Option<u64> {
         let count = self.count_now();
@@ -803,6 +824,31 @@ mod tests {
         let cycles = r.model().cycles_now();
         r.step(1, true);
         assert_eq!((r.c64.m.ram[0x0400], r.model().cycles_now() - cycles, r.pc()), (0x77, 4, 0xC004));
+    }
+
+    /// S40 phase E: with the trace on every instruction comes at its IB with its PC, opcode, operand bytes and the
+    /// registers before it, its RAM writes after it, so the engine counts them to it; the count is one past the fetch.
+    #[test]
+    fn the_trace_feed_comes_before_each_instructions_writes() {
+        let Some(mut r) = Rig::new() else { return };
+        r.code(&[0x78, 0xA9, 0x55, 0x8D, 0x00, 0x04, 0xEE, 0x00, 0x04, 0x4C, 0x09, 0xC0]);
+        r.cmd(td::CMD_PAUSE_IB);
+        r.c64.set_engine(ue2_core::c64host::EngineCfg { boundaries: false, records: true, trace: true });
+        let count = r.c64.count_now();
+        r.c64.take_tap();
+        r.step(4, true);
+        let ev: Vec<TapEvent> = r.c64.take_tap().into_iter().filter(|e| matches!(e, TapEvent::Trace { .. } | TapEvent::Ram { .. })).collect();
+        let kinds: Vec<String> = ev
+            .iter()
+            .map(|e| match e {
+                TapEvent::Trace { pc, .. } => format!("T{pc:04x}"),
+                TapEvent::Ram { addr, new, .. } => format!("W{addr:04x}={new:02x}"),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(kinds, ["Tc000", "Tc001", "Tc003", "W0400=55", "Tc006", "W0400=55", "W0400=56"]);
+        let TapEvent::Trace { cycle, op, b1, b2, regs, .. } = ev[2] else { unreachable!() };
+        assert_eq!((cycle, op, b1, b2, regs[0]), (count + 4 + 1, 0x8D, 0x00, 0x04, 0x55), "after SEI and LDA, its fetch");
     }
 
     /// PAUSE_CB with the 6510 held (C64_STOP alone): the stop comes at once, no IB (FLAGS b0 0). A log action puts

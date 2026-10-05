@@ -417,6 +417,9 @@ pub enum TapEvent {
     PosHit,
     /// S39: a watch unit's log action, engine stream 1 space 8 (trx_dbg.v:100-101, :251; trx_engine.v:417-427).
     DbgLog(u64),
+    /// S40 phase E: an instruction starts at an IB (the trace former's feed, t21-p4 trx_engine.v:343-377): the engine
+    /// count after its fetch edge, its PC, opcode, the two bytes after it, and A, X, Y, S, P before it (settled).
+    Trace { cycle: u64, pc: u16, op: u8, b1: u8, b2: u8, regs: [u8; 5] },
 }
 
 /// S40: what the board's engine wants of the C64's run.
@@ -426,6 +429,8 @@ pub struct EngineCfg {
     pub boundaries: bool,
     /// Memory writes: the log is on.
     pub records: bool,
+    /// S40 phase E: the instruction trace (`LOG_CTRL` b4 with the log on).
+    pub trace: bool,
 }
 
 /// S37: what the cartridge answers to a read without its side effects (freeze_resp.v `pk_*`).

@@ -231,6 +231,8 @@ pub(crate) struct Tap {
     pub run_cycles: u64,
     /// A run is in progress (`run_to_plain`): the count is `run_cycles` plus what ran since `run_clk`.
     pub in_run: bool,
+    /// S40 phase E: the boundary the trace last took an instruction from.
+    pub trace_clk: Option<u64>,
     /// The merged watch table of the last tapped run and what it was built from (base table, cartridge windows).
     pub watch: Option<(Box<[u8; 0x1_0000]>, (usize, u8))>,
     pub side: Side,
@@ -892,7 +894,7 @@ mod tests {
         let before = c64.m.ram[0x0400];
         let port_ram = c64.m.ram[1];
         put_code(&mut c64, &code);
-        c64.set_engine(EngineCfg { boundaries: false, records: true });
+        c64.set_engine(EngineCfg { boundaries: false, records: true, trace: false });
         run_ms(&mut c64, &mut now, 2);
         let ev = c64.take_tap();
         assert_eq!(
@@ -931,7 +933,7 @@ mod tests {
     #[test]
     fn writes_and_snaps_in_order() {
         let Some((mut c64, mut now)) = booted() else { return };
-        c64.set_engine(EngineCfg { boundaries: true, records: true });
+        c64.set_engine(EngineCfg { boundaries: true, records: true, trace: false });
         run_ms(&mut c64, &mut now, 100);
         let ev = c64.take_tap();
         let mut last_snap = None;
@@ -974,7 +976,7 @@ mod tests {
         }
         let code = crate::tests::reu_program(0x91, 0x0500, 0, 16);
         crate::tests::load(&mut c64, 0xC000, &code);
-        c64.set_engine(EngineCfg { boundaries: false, records: true });
+        c64.set_engine(EngineCfg { boundaries: false, records: true, trace: false });
         c64.m.c64_core.reg_pc = 0xC000;
         crate::tests::run_ms_lent(&mut c64, &mut now, 5, &mut ddr);
         let ev = c64.take_tap();
@@ -996,7 +998,7 @@ mod tests {
         c64.set_cart(0x1B, &[]);
         c64.dma_write(0xDE00, 0x20, false);
         c64.dma_write(0x0001, 0x35, false);
-        c64.set_engine(EngineCfg { boundaries: false, records: true });
+        c64.set_engine(EngineCfg { boundaries: false, records: true, trace: false });
         c64.dma_write(0x8123, 0x5A, false);
         let ev = c64.take_tap();
         assert!(ev.contains(&TapEvent::CartRam { off: 0x123, old: 0, new: 0x5A, cycle: 0 }), "{ev:?}");
@@ -1011,7 +1013,7 @@ mod tests {
         let back = c64.ring().unwrap().ids()[0].0.clone();
         c64.m.ram[0xC000] = 0x22;
         run_ms(&mut c64, &mut now, 60);
-        c64.set_engine(EngineCfg { boundaries: false, records: true });
+        c64.set_engine(EngineCfg { boundaries: false, records: true, trace: false });
         c64.ring_goto(&back, crate::RingMode::StepBack).unwrap();
         let r = rams(&c64.take_tap());
         assert!(r.contains(&(0xC000, 0x22, 0x11, true)), "{r:?}");
@@ -1023,7 +1025,7 @@ mod tests {
     #[test]
     fn a_load_of_ue2s_own_image_is_exact() {
         let Some((mut c64, mut now)) = booted() else { return };
-        c64.set_engine(EngineCfg { boundaries: true, records: false });
+        c64.set_engine(EngineCfg { boundaries: true, records: false, trace: false });
         run_ms(&mut c64, &mut now, 25);
         let ev = c64.take_tap();
         let snap = snaps(&ev).last().map(|s| (*s).clone()).expect("a snap");
@@ -1068,7 +1070,7 @@ mod tests {
     #[test]
     fn a_snap_a_frame_on_line_0_from_cycle_12() {
         let Some((mut c64, mut now)) = booted() else { return };
-        c64.set_engine(EngineCfg { boundaries: true, records: false });
+        c64.set_engine(EngineCfg { boundaries: true, records: false, trace: false });
         let (clk0, cycles0) = (c64.m.c64_core.clk, c64.engine_cycles());
         run_ms(&mut c64, &mut now, 200);
         assert_eq!(c64.engine_cycles() - cycles0, c64.m.c64_core.clk - clk0, "the counter counts what ran");
@@ -1099,7 +1101,7 @@ mod tests {
     #[test]
     fn a_held_6510_gives_line_16_and_no_snap() {
         let Some((mut c64, mut now)) = booted() else { return };
-        c64.set_engine(EngineCfg { boundaries: true, records: false });
+        c64.set_engine(EngineCfg { boundaries: true, records: false, trace: false });
         c64.set_stopped(true);
         run_ms(&mut c64, &mut now, 100);
         let ev = c64.take_tap();

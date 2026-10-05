@@ -177,7 +177,7 @@ The board reads `$FF` / `$BF` (trx_io.v:231-232). Each bit UE2 reports turns on 
 | CAPS2 b4 | the `cart` lens and IO1/IO2 through the look (trxmon, REST lens) | report |
 | CAPS b2 engine | `trx_ring_init` (the ring, page 2, DDR streams), `trx->ring` non-NULL, Timewarp UI, `/v1/timewarp` | **on**: S40 serves the engine (Alex, 2026-10-05) |
 | CAPS b4 cartridge | trx_cart.cc page 4 write-back and descriptor | off (UE2 runs Gideon's cartridge registers) |
-| CAPS2 b7 trace | `trx_ring_trace_present` needs the ring as well | off until S40 phase E |
+| CAPS2 b7 trace | `trx_ring_trace_present` needs the ring as well | on with S40 phase E (built) |
 | CAPS2 b0, b5 | engine F4 order, APPLY | on with S40 |
 | CAPS2 b1, b6 | BUILD, T29 turbo | off (no reader in either app; no turbo on `main`) |
 
@@ -454,8 +454,8 @@ Phases A-E without TRX64 changes; F waits for TRX64.
 
 Against t21-p4 a85f741 (the D-page fix df6d71c: STATUS b1, `ultimate_sys` opens the window's D page for a debugger
 stop) and the t21-p4-app firmware and `trxmon.u2a` in `/Users/alex/Development/TRX64-Ultimate-app-wt-t21` (the ELF from
-2026-10-04 22:49, the u2a from 2026-10-05 08:22: ec4a7327, before the app's D-page change 553e2e17). CAPS `$EF`, CAPS2
-`$3D`.
+2026-10-04 22:49, the u2a from 2026-10-05 08:22: ec4a7327, before the app's D-page change 553e2e17; no build of
+553e2e17 exists there). CAPS `$EF`, CAPS2 `$3D`, `$BD` with the trace (S40 phase E).
 
 - **The model** (`ue2-core/src/devices/trx_dbg.rs`): trx_dbg.v's and drv_dbg.v's registers, the commands, the stop
   record (written only while STOP_NEW is 0, `ev` per stop), the units' qualifiers, chain and PASS, IPC_SET, the
@@ -521,7 +521,7 @@ without the menu's C64_STOP: its text); `r pc=c000`, `r a=42` and a step over `S
 - **`rstep` after a CPU write or a bus cycle while halted does not replay** ("the replay from the frame start did not
   come back to the same stop"): a redirect is no part of the frame, and the bus cycle counts on CYCLES and the engine's
   counter (as on the board) but the replay does not make it. The smoke does `rstep` first.
-- **`trace status`** answers the board's "needs the instruction trace" until S40 phase E.
+- **`trace status`** reports the trace since S40 phase E (the app turns it on with the ring; the smoke checks records).
 - **`m cart`** on the screen is not in the smoke (the lens is covered by the bridge test).
 
 **TRX64 gaps** as §5: T1 (no stop or step at a cycle boundary: PAUSE_CB, STEP_CYCLES, CYC_CMP and access stops land at

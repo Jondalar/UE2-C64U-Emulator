@@ -3,7 +3,8 @@
 **Status:** spec (2026-10-05), local branch `s37-trx-pixel-layer`. Updated the same day from the FPGA session's
 answers (`run/trx/s40-answers.md`, from RTL and app code), the TRX64-Ultimate architecture reset
 (`docs/architecture-reset-2026-10-05.md` there) and Alex's decisions of 2026-10-05 (§0). Phases A-C are M1 (§13) and
-are built (as built: §10).
+are built (as built: §10); phase E (the instruction trace, t21-p4) is built (§4.5); stream 0's source after the TRX64
+v0.12.5 pin: §11 T1'.
 
 **Why:** Alex decided (2026-10-05) that UE2 behaves like the TRX64-Ultimate board for the firmware, so its UI and UX
 can be tested without the board. On the board the app's frame ring, Timewarp (freeze menu and REST) and trxmon's
@@ -225,9 +226,24 @@ After a marker with F1 b1 (:394-452):
 UE2 reads the words from the shadows loaded at that snap in the same step: never torn, never skipped, `CAP_GEN`
 equal at both ends (answer 12: fine for both apps).
 
-### 4.5 Stream 3: the trace (t21-p4, phase E)
+### 4.5 Stream 3: the trace (t21-p4, phase E; built)
 
-Unchanged from the draft: one record per instruction into `0x6800000`; `LOG_CNT[3]` (byte 058); CAPS2 b7. Not M1.
+t21-p4 `trx_engine.v:91-102, :260-283, :343-377, :720-723, :838-841`, `trx_dbg.v:139-143, :288-294`. CAPS2 b7 (`$BD`).
+
+- **Registers:** `LOG_CTRL` b4 the trace on (with b0), b9 drops the instruction waiting; the restart (b8) zeroes the
+  word index and the count. `LOG_CNT[3]` at byte 058: records written, wrapping at 349,525 × 768.
+- **Placement:** fixed area `0x6800000`, 8 MB: word n (8 bytes) at `{0x680000 | (off[26:4] & 0x7FFFF), off[3:0]}`, off =
+  8n, n wrapping at 1,048,575; a record is three words, so none straddles the wrap.
+- **The record of instruction I** goes out at I+1's IB: word 0 `{cycles 24}` (the count after I's fetch edge), word 1
+  `{write_count 16, pc 16, 4'd0, write_start 28}` over stream 0's records pushed (since the restart, outside ones
+  included), word 2 `{b2, b1, opcode, P, S, Y, X, A}` with the registers before I (the settled ones) and the two bytes
+  after the opcode. I waits only if the trace was on at its IB.
+- **In UE2:** the bridge takes each instruction at its IB (`dbg_run.rs` `trace_boundary`, `TapEvent::Trace`): with the
+  trace on the run goes one instruction at a time, so the event comes before the instruction's writes and the engine
+  counts them to it. The opcode and the two bytes are read at PC (the app masks them by length, answer 9); the count
+  is UE2's count at the boundary + 1. A boundary whose fetch an interrupt replaces is no IB and gives no record, and
+  the handler's first instruction runs in the same TRX64 `execute` as the interrupt (S39 T2): its writes count to the
+  instruction before. The trace costs a run per instruction while it is on (t21-p4-app turns it on with the ring).
 
 ### 4.6 Timing and the drain
 
@@ -394,7 +410,7 @@ writer has a bug to fix first (answer (b): it writes A/X/Y/S/P from w0/w1, one w
 | # | Gap | Until it closes |
 |---|---|---|
 | T1 | **A memory write tap**: every write that lands in the 64 KB RAM or colour RAM, with the old byte of that memory and the master (CPU, RMW dummy, REU DMA). `on_bus` gives the CPU-visible old byte (ROM under BASIC/KERNAL, 0 from `$D000`, `full_sc.rs:260-301`) and the REU writes RAM without it. (The same CPU-view `old` makes TRX64's own delta-ring undo write ROM bytes into RAM under ROM: answer (a).) | UE2's mirror: old from the mirror, landing by TRX64's memory configuration (§4.3), a halt after a `$00/$01` write; a compare after the run finds the writes no tap saw (the REU) and logs them before the marker |
-| T1' | TRX64 v0.12.5 (released 2026-10-05) records the RAM's own overwritten byte in its delta ring and trace, and leaves out stores a flash cart consumes: the board's stream 0 `old`. UE2 is pinned to v0.12.3 | UE2 keeps its own mirror as the source of stream 0 until the pin moves; after the bump stream 0 can be fed from the delta ring |
+| T1' | TRX64 v0.12.5 (pinned since 2026-10-05) records the RAM's own overwritten byte in its delta ring and trace, and leaves out stores a flash cart consumes: the board's stream 0 `old` | UE2 keeps its own mirror as the source of stream 0 until it is decided whether the delta ring can feed it |
 | T2 | **Cycle-exact stop with the CPU running** (S39 T1) | `STOP_POS` with a running CPU lands at the next boundary |
 | T3 | **Snap conditions** as reads: VIC border flip-flops, sprite pixel pending, VIC access in the cycle | treated as met; the REU is checked |
 | T4 | **"The next `execute` takes an interrupt"** (S39 T2) | F1 b4 and the image's intg from UE2's own check |
