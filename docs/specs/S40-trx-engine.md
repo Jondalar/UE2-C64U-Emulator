@@ -4,7 +4,7 @@
 answers (`run/trx/s40-answers.md`, from RTL and app code), the TRX64-Ultimate architecture reset
 (`docs/architecture-reset-2026-10-05.md` there) and Alex's decisions of 2026-10-05 (§0). Phases A-C are M1 (§13) and
 are built (as built: §10); phase E (the instruction trace, t21-p4) is built (§4.5); stream 0's source after the TRX64
-v0.12.5 pin: §11 T1'.
+v0.12.5 pin is decided in §11 T1'.
 
 **Why:** Alex decided (2026-10-05) that UE2 behaves like the TRX64-Ultimate board for the firmware, so its UI and UX
 can be tested without the board. On the board the app's frame ring, Timewarp (freeze menu and REST) and trxmon's
@@ -410,7 +410,7 @@ writer has a bug to fix first (answer (b): it writes A/X/Y/S/P from w0/w1, one w
 | # | Gap | Until it closes |
 |---|---|---|
 | T1 | **A memory write tap**: every write that lands in the 64 KB RAM or colour RAM, with the old byte of that memory and the master (CPU, RMW dummy, REU DMA). `on_bus` gives the CPU-visible old byte (ROM under BASIC/KERNAL, 0 from `$D000`, `full_sc.rs:260-301`) and the REU writes RAM without it. (The same CPU-view `old` makes TRX64's own delta-ring undo write ROM bytes into RAM under ROM: answer (a).) | UE2's mirror: old from the mirror, landing by TRX64's memory configuration (§4.3), a halt after a `$00/$01` write; a compare after the run finds the writes no tap saw (the REU) and logs them before the marker |
-| T1' | TRX64 v0.12.5 (pinned since 2026-10-05) records the RAM's own overwritten byte in its delta ring and trace, and leaves out stores a flash cart consumes: the board's stream 0 `old` | UE2 keeps its own mirror as the source of stream 0 until it is decided whether the delta ring can feed it |
+| T1' | TRX64 v0.12.5 (pinned since 2026-10-05) records the RAM's own overwritten byte in its delta ring and trace, and leaves out stores a flash cart consumes | **Decided: stream 0 stays on the mirror.** The delta ring has the CPU's stores only (no REU DMA, no firmware window write, no session commit, no S38 restore, no colour RAM nibbles), records I/O stores too (old 0, to be told apart by the memory configuration of each write), keeps the port's own value as `old` for `$00`/`$01` (the RTL logs RAM[0]/[1]'s byte, answer 7), and is readable only as a whole (`slice_by_cycle` walks the ring, 10 s at the S38 default) or not at all with `--ring=off`. The mirror is exact for all of these, costs one 64 KB compare per slice and a write list per run, and is needed for the REU and colour RAM anyway |
 | T2 | **Cycle-exact stop with the CPU running** (S39 T1) | `STOP_POS` with a running CPU lands at the next boundary |
 | T3 | **Snap conditions** as reads: VIC border flip-flops, sprite pixel pending, VIC access in the cycle | treated as met; the REU is checked |
 | T4 | **"The next `execute` takes an interrupt"** (S39 T2) | F1 b4 and the image's intg from UE2's own check |
