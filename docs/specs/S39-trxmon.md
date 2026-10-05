@@ -1,7 +1,7 @@
 # S39 — trxmon in UE2: the debug block served from TRX64
 
 **Status:** built (2026-10-05), local branch `s37-trx-pixel-layer`: phases A1-E against t21-p4 a85f741 (with the D-page
-fix df6d71c) and t21-p4-app; as built: §11. Phase F waits for TRX64 (§5 T1, T2). Updated the same day from the FPGA
+fix df6d71c) and t21-p4-app, smoke-tested with the app build 553e2e17 (the D-page change); as built: §11. Phase F waits for TRX64 (§5 T1, T2). Updated the same day from the FPGA
 session's answers (`run/trx/s39-answers.md`, t21-p4 RTL and app; they override this text where they differ) and S40.
 
 **Why:** the TRX64-Ultimate firmware session must test trxmon (the T21 monitor app) in UE2 as on the board: the
@@ -432,9 +432,11 @@ container, `apps/trxmon/build.sh`), `--board c64u --trx-io`, a fresh flash with 
 | `button`, browse to `trxmon.u2a`, Run App | the monitor screen (40 x 23 from row 2), `PAUSED IB $xxxx`; console `trxmon: serving the TRX64 runtime contract on TCP 4312` |
 | type `r`, `m c000`, `d e5cd`, `io d000` | registers equal UE2's `monitor r`; `m`/`d` equal `monitor m`; VIC registers equal TRX64's `peek_lens(…, "io")` |
 | `z`, `z 5` | the PC equals UE2's own trace of the same steps; cycles + the instructions' cycles |
-| `bk e5cd`, `x` (leave with a stop armed) | the overlay closes, the C64 runs; on the next keyboard wait the screen comes back by itself with `breakpoint 1 hit at .C:e5cd` |
+| `bk e5cd`, `x` (leave with a stop armed) | the C64 runs (the loader leaves the browser up); when the menu is closed the screen comes back with `breakpoint 1 hit at .C:e5cd` (§11: not with 553e2e17) |
 | `m io dc0d` twice | the same value (no flag cleared) |
-| `wr d020 05`, `z` | the border colour changes after the step (§7 Q6 decides whether trxmon allows the write) |
+| `wr d020 05`, `z` | the border colour changes after the step |
+| `wr d020 03` in a debugger stop with a session, RUN | on the commit list (the chip keeps its colour), written at RUN |
+| `m io d800` in a debugger stop with a session | UE2's colour RAM |
 | `r a=42`, `z` over `STA $0400` (a program put in with `a c000`) | `$0400` = `$42` |
 | `m cart 8000` with an EasyFlash in `--cart` | the bank's bytes |
 | `trace status`, `rstep` | the board's "needs the instruction trace" and "no frame ring" text |
@@ -453,9 +455,10 @@ Phases A-E without TRX64 changes; F waits for TRX64.
 ## 11. As built (2026-10-05)
 
 Against t21-p4 a85f741 (the D-page fix df6d71c: STATUS b1, `ultimate_sys` opens the window's D page for a debugger
-stop) and the t21-p4-app firmware and `trxmon.u2a` in `/Users/alex/Development/TRX64-Ultimate-app-wt-t21` (the ELF from
-2026-10-04 22:49, the u2a from 2026-10-05 08:22: ec4a7327, before the app's D-page change 553e2e17; no build of
-553e2e17 exists there). CAPS `$EF`, CAPS2 `$3D`, `$BD` with the trace (S40 phase E).
+stop) and t21-p4-app 553e2e17 (trxmon: a debugger stop holds the window like C64_STOP), built by the FPGA session and
+kept as `run/trx/ultimate-553e2e17.elf` and `run/trx/trxmon-553e2e17.u2a`:
+`scripts/smoke-trxmon.sh --elf $PWD/run/trx/ultimate-553e2e17.elf --u2a $PWD/run/trx/trxmon-553e2e17.u2a` (absolute
+paths: the emulator runs in the run directory). CAPS `$EF`, CAPS2 `$3D`, `$BD` with the trace (S40 phase E).
 
 - **The model** (`ue2-core/src/devices/trx_dbg.rs`): trx_dbg.v's and drv_dbg.v's registers, the commands, the stop
   record (written only while STOP_NEW is 0, `ev` per stop), the units' qualifiers, chain and PASS, IPC_SET, the
@@ -501,23 +504,44 @@ session (the debugger's cause, its end and block), the port (OWNER masks C64_STO
 RUN writes the list, LK refused while running), the bridge (pause and steps of instructions and cycles, the bitmap,
 `until`/`n`/`ret`, a store observer, CYC_CMP, the CPU write path then a step, PAUSE_CB with the 6510 held, a log
 action, the lens by class, the drive step and comparator, OWNER taking the C64 from the transport), the monitor (the
-refusal). Firmware smoke `scripts/smoke-trxmon.sh` (PASS): boot CAPS EF; Run App of `trxmon.u2a` from the SD, the
-screen `PAUSED IB`; `r`, `z`, `z 5` on the screen (registers as `monitor r`, REASON 2, INSTRS + n); the RPC selftest;
-`read c000 256 cpu` = `monitor m c000`; `m io dc0d` twice the same; `rstep` lands; `wr d020 05` (this u2a refuses it
-without the menu's C64_STOP: its text); `r pc=c000`, `r a=42` and a step over `STA $0400`: `$42`; `/quit`: OWNER 0,
-`print 6*7` gives 42.
+refusal). Firmware smoke `scripts/smoke-trxmon.sh` with 553e2e17 (PASS; Navigation Style "Quick Search", so W, A, S, D
+can be typed): boot CAPS EF; Run App of `trxmon.u2a` from the SD, the screen `PAUSED IB`; typed `r`, `z`, `z 5`
+(registers as `monitor r`, REASON 2, INSTRS + n) and `d e5cd` (UE2's bytes); the RPC selftest; `read c000 256 cpu` =
+`monitor m c000`; `m io dc0d` twice the same; `rstep` lands; `wr d020 05` and a step: border 5; typed `r pc=c000`,
+`r a=42` and `z` over `STA $0400`: `$42`; `/quit`: OWNER 0, `print 6*7` gives 42. Then Run App again, typed `bk e5cd`
+and `x`: trxmon serves in the background and the breakpoint fires (REASON 3 at `$e5cd`); the reopen is reported KNOWN
+(below). With C64_STOP off, RPC continue and pause: a debugger stop with a session, the colour RAM reads UE2's pattern,
+`wr d020 03` is on the commit list with the chip unchanged, RUN writes it.
 
 **Deviations and findings (for Alex):**
-- **The given `trxmon.u2a` predates t21-p4-app 553e2e17**: it gates I/O writes and the colour RAM read on the menu's
-  C64_STOP (STATUS b5), so in a debugger stop `wr d020` is refused and `m io d800` reads `--`. UE2 serves STATUS b1 and
-  the D page as df6d71c does; the RTL path is covered by the port test. A u2a built from 553e2e17 needs the U64 build
-  container (not on this machine).
-- **Typing on trxmon's screen:** the firmware's overlay keyboard takes W, A, S, D as cursor keys ("WASD=NAV"), so `d
-  e5cd`, `bk e5cd`, `io d000`, `wr d020`, `r a=42` cannot be typed there; the smoke sends those over the RPC. That is the
-  pending keymap item (app side).
-- **`bk` then `x`: the screen did not come back.** The breakpoint fires and trxmon reads the stop (STOP_NEW clears), but
-  opening the menu again shows the file browser, not the monitor. Not resolved: whether the detached task's
-  `ui_request` reached the UI task was not seen (no firmware print on that path). Open.
+- **`bk` then `x`: the screen does not come back. The cause is in the app (trxmon 553e2e17), not in UE2.** Traced with
+  `--gdb` on the 553e2e17 ELF:
+  1. After `x` the request is queued: `s_uireq_fn` = trxmon's `ui_callback` (app_api_net.cc:446-457). The loader leaves
+     the browser up after the app returns (app_loader.cc:470 `appear()`, :473 `MENU_C64_RESUME`), so the request waits
+     until the person leaves the menu: ultimate.cc:210-212 turns it into `doIt = 3` only in the init task's loop. HPD
+     plays no part (ultimate.cc:213-219 picks the interface for `doIt` 1 only; case 3 calls the overlay's `run_once`).
+  2. The menu button closes the browser; `open_request_run` (app_loader.cc:92-111) is reached and starts `ui_callback`
+     in the task "app_ui" at `tskIDLE_PRIORITY + 2` (app_loader.cc:104).
+  3. `ui_callback` sets `s_want_ui` and waits up to 1000 ms for the serve loop to park (`s_in_ui`, main.c:437) with
+     `A->sys->delay_ms(2)` (main.c:412). `api_delay_ms` is `vTaskDelay(pdMS_TO_TICKS(ms))` (app_api_impl.cc:763); at
+     `configTICK_RATE_HZ` 200 (FreeRTOSConfig.h:21) that is `vTaskDelay(0)`, which only yields (tasks.c:1338, :1365).
+     The serve loop runs in "app_resident" at `tskIDLE_PRIORITY` (app_api_net.cc:285), below "app_ui", so it never
+     runs: the callback leaves at the `!s_in_ui` exit with `s_want_ui` 1, `s_in_ui` 0, and the monitor screen never
+     opens. The stop record stays read (STOP_NEW 0), so nothing asks again.
+  4. With the two `delay_ms(2)` in `ui_callback` patched to `delay_ms(5)` (one tick) in RAM, the same run brings the
+     screen back with `breakpoint 1 hit at .C:e5cd`. The fix belongs in the app (a wait that blocks for at least one
+     tick, or the serve task at the same priority); the board behaves the same (same FreeRTOS, same priorities).
+  The smoke checks UE2's part (the breakpoint after `x`, trxmon alive) and reports the reopen as KNOWN; it turns into
+  a PASS when a fixed app brings the screen back.
+- **The colour RAM in a debugger stop needs a session, and the RTL's block keeps it off while C64_STOP stands.**
+  `hw_session_read` needs `SH_STATUS` b0. freeze_resp.v:546 clears `block` only when the raw `app_stop` (top.v:1149,
+  C64_STOP not masked by OWNER), `halt_req` and `dbg_stop` are all low; a debugger session's end sets it (:884). The
+  loader holds C64_STOP for a foreground app (app_loader.cc:334 `MENU_C64_PAUSE`), so only the acquire's first stop
+  has a session; every later stop in the foreground has none and `m io d800` reads `--` (the smoke prints it as INFO).
+  After `x` the breakpoint at `$e5cd` fires before the loader's `MENU_C64_RESUME`, so that stop has none either. A run
+  with C64_STOP off clears the block and the next stop has its session: the colour RAM reads the real values and
+  `wr d020` goes to the commit list. UE2 models freeze_resp.v as built; whether the block should ignore C64_STOP while
+  OWNER is set is a question for the RTL. In the foreground `wr d020` works through the C64_STOP path (a bus cycle).
 - **`rstep` after a CPU write or a bus cycle while halted does not replay** ("the replay from the frame start did not
   come back to the same stop"): a redirect is no part of the frame, and the bus cycle counts on CYCLES and the engine's
   counter (as on the board) but the replay does not make it. The smoke does `rstep` first.

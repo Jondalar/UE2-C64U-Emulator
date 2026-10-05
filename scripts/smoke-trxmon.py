@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """S39: trxmon, TRX64-Ultimate's monitor app, on the board's debug block in UE2 (docs/specs/S39-trxmon.md §9).
 
-Boots the t21-p4-app firmware headless with `--trx-io`, a fresh flash with the C64 ROMs, PAL, an SD image with
-`trxmon.u2a`, `--net user` with the RPC port forwarded, and drives it over the control port and trxmon's RPC
-(TRX64-Ultimate's tests/trxmon_client.py):
+Boots the t21-p4-app firmware headless with `--trx-io`, a fresh flash with the C64 ROMs, PAL, Navigation Style
+"Quick Search" (W, A, S, D can be typed on the monitor screen), an SD image with `trxmon.u2a`, `--net user` with the
+RPC port forwarded, and drives it over the control port and trxmon's RPC (TRX64-Ultimate's tests/trxmon_client.py):
 
 - boot: CAPS EF;
 - the file browser, `trxmon.u2a`, Run App: the monitor screen (`PAUSED IB $xxxx`), the RPC server on 4312;
-- `r`, `z`, `z 5` typed on the screen: the registers are UE2's own (`monitor r`), each step one stop record of REASON 2
-  and INSTRS + n;
+- `r`, `z`, `z 5`, `d e5cd` typed on the screen: the registers are UE2's own (`monitor r`), each step one stop record
+  of REASON 2 and INSTRS + n; the listing is UE2's bytes;
 - RPC: `selftest`; `read c000 256 cpu` equals `monitor m c000`; `m io dc0d` twice the same (no flag cleared);
 - RPC: `trace on`, three steps: `trace status` has records (S40 phase E); `rstep` lands on the frame since the
   selftest's breakpoint;
-- RPC: `wr d020 05`, then a step: the border colour is 5 (or the refusal of a trxmon older than t21-p4-app 553e2e17
-  without the menu's C64_STOP);
-- RPC: `r pc=c000` (the CPU write path's redirect with IPC_SET) and `r a=42` on `STA $0400`, then a step: $0400 = $42
-  (a redirect and a bus cycle while halted are no part of a frame's replay, so `rstep` comes before them);
-- `/quit` on the screen: OWNER 0, the C64 runs again; `print 6*7` gives 42.
+- RPC: `wr d020 05`, then a step: the border colour is 5 (in the foreground the loader's C64_STOP holds the window,
+  so the write is a bus cycle);
+- typed: `r pc=c000` (the CPU write path's redirect with IPC_SET), `r a=42` on `STA $0400`, `z`: $0400 = $42 (a
+  redirect and a bus cycle while halted are no part of a frame's replay, so `rstep` comes before them);
+- `/quit` on the screen: OWNER 0, the C64 runs again; `print 6*7` gives 42;
+- Run App again, `bk e5cd`, `x`: trxmon goes on in the background, the breakpoint fires (REASON 3 at $e5cd); the
+  menu button closes the browser and the monitor screen should come back (trx->ui_request). trxmon 553e2e17 does not
+  bring it back (S39 §11: its ui_callback spins in a task above the serve loop's), so that step reports KNOWN;
+- RPC, C64_STOP off: continue and pause, a debugger stop with a session (SH_STATUS b0 | b2): the colour RAM reads
+  UE2's values; `wr d020 03` goes to the commit list (SH_COUNTS; the chip keeps its value) and RUN writes it.
 
-The screen is typed with the control port's `type`; the firmware's overlay keyboard takes W, A, S and D for cursor
-keys, so lines with those letters go over the RPC's `monitor/exec`.
+The screen is typed with the control port's `type`.
 
 Exits non-zero at the first failure and keeps the run directory then.
 
@@ -112,14 +116,19 @@ class Run:
         check(m, f'monitor r: {text}')
         return tuple(int(g, 16) for g in m.groups())
 
-    def mem(self, addr, n):
-        text = '\n'.join(self.cmd(f'monitor m {addr:04x} {addr + n - 1:04x}'))
-        out = []
+    def mem(self, addr, n, lens=''):
+        """`monitor m`: its rows start at a multiple of $10 and show from there, so each byte is taken by address."""
+        text = '\n'.join(self.cmd(f'monitor m {lens} {addr:04x} {addr + n - 1:04x}'))
+        got = {}
         for line in text.splitlines():
-            m = re.match(r'\s*>C:([0-9a-f]{4})\s+((?:[0-9a-f]{2} ?)+)', line)
+            m = re.match(r'\s*>[A-Z]:([0-9a-f]{4})\s+((?:[0-9a-f]{2} ?)+)', line)
             if m:
-                out += [int(b, 16) for b in m.group(2).split()]
-        return bytes(out[:n])
+                for i, b in enumerate(m.group(2).split()):
+                    got[int(m.group(1), 16) + i] = int(b, 16)
+        return bytes(got[a] for a in range(addr, addr + n))
+
+    def mem_io(self, addr, n):
+        return self.mem(addr, n, 'io')
 
     def console(self):
         return (self.work / 'console.log').read_text(errors='replace')
@@ -135,12 +144,8 @@ class Run:
             self.proc.kill()
 
 
-def smoke(run, client):
-    run.cmd('expect-console "[TRX] IO block present, CAPS EF" 30000', 'wait 4000')
-    check('READY.' in '\n'.join(run.cmd('c64screen')), 'no READY.')
-    print('PASS boot: CAPS EF, READY.')
-
-    run.cmd('button', 'wait 1500', 'key return', 'wait 800', 'key right', 'wait 800')
+def run_app(run):
+    """The browser on the SD card, `trxmon.u2a`, Run App: the monitor screen."""
     check('trxmon.u2a' in run.screen(), f'trxmon.u2a not in the browser: {run.screen()}')
     run.cmd('key down', 'key down', 'key down', 'key return', 'wait 800')
     check('Run App' in run.screen(), 'no Run App')
@@ -150,6 +155,25 @@ def smoke(run, client):
     run.cmd('expect-console "trxmon: serving the TRX64 runtime contract on TCP 4312" 10000')
     s = run.screen()
     check(re.search(r'PAUSED IB \$[0-9a-f]{4}', s), f'the monitor screen: {s}')
+
+
+def colour_ram(run, c):
+    """A pattern UE2 puts in the colour RAM, read back through trxmon's lens (the window's D page in a session)."""
+    run.cmd('monitor wr io d800 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 00')
+    want = run.mem_io(0xD800, 16)
+    got = c.read(0xD800, 16, 'io')
+    check(bytes(b & 0x0F for b in got) == bytes(b & 0x0F for b in want),
+          f'colour RAM: trxmon {got.hex()} vs UE2 {want.hex()}')
+    return got
+
+
+def smoke(run, client):
+    run.cmd('expect-console "[TRX] IO block present, CAPS EF" 30000', 'wait 4000')
+    check('READY.' in '\n'.join(run.cmd('c64screen')), 'no READY.')
+    print('PASS boot: CAPS EF, READY.')
+
+    run.cmd('button', 'wait 1500', 'key return', 'wait 800', 'key right', 'wait 800')
+    run_app(run)
     print('PASS Run App: the monitor screen ("PAUSED IB"), the RPC server on 4312')
 
     pc, a, x, y, sp = run.regs()
@@ -170,6 +194,12 @@ def smoke(run, client):
         check(after[1] - before[1] == n and after[0] > before[0], f'z {n}: instrs {before} -> {after}')
         check(re.search(rf'\${pc:04x} ', run.screen()), f'z {n}: ${pc:04x} not on the screen')
     print('PASS r, z, z 5: the registers are UE2\'s, each step a stop record of REASON 2, INSTRS + n')
+
+    # W, A, S, D typed (Quick Search): the listing of the KERNAL's keyboard wait.
+    run.type_line('d e5cd')
+    lda = run.mem(0xE5CD, 2)
+    check(re.search(rf'\$e5cd  {lda[0]:02x} {lda[1]:02x} +LDA \${lda[1]:02x}', run.screen()), f'd e5cd (UE2 {lda.hex()}): {run.screen()}')
+    print(f'PASS d e5cd typed: $e5cd  {lda.hex(" ")}  LDA ${lda[1]:02x}')
 
     c = client.Client('127.0.0.1', run.rpc_port, timeout=10.0)
     try:
@@ -196,36 +226,32 @@ def smoke(run, client):
         check(t1 == t2, f'm io dc0d twice: {t1!r} / {t2!r}')
         print(f'PASS m io dc0d twice the same: {t1.split()[1:3]}')
 
-        # trxmon before t21-p4-app 553e2e17 takes an I/O write only under the menu's C64_STOP (STATUS b5); from
-        # 553e2e17 on also in a debugger stop (STATUS b1, the D page the RTL opens for it, df6d71c).
-        try:
-            w = c.mon('wr d020 05')
-        except client.TrxmonError as e:
-            w = str(e)
-        if 'needs the machine paused (and the menu' in w:
-            print(f'PASS wr d020 05 refused by this trxmon build (no C64_STOP): {w.strip()}')
-        else:
-            c.call('debug/step')
-            c.wait_note('debug/stopped', 2.0)
-            border = c.read(0xD020, 1, 'io')[0] & 0x0F
-            check(border == 5, f'wr d020 05 ({w.strip()}), then a step: the border is {border}')
-            print(f'PASS wr d020 05 ({w.strip()}), a step: the border is 5')
-
-        pc0, a0 = run.regs()[:2]
-        run.cmd('monitor wr ram c000 8d 00 04 4c 03 c0')
-        r1 = c.mon('r pc=c000')
-        r2 = c.mon('r a=42')
+        # In the foreground the loader's C64_STOP holds the window (STATUS b5): the write is a bus cycle.
+        w = c.mon('wr d020 05')
         c.call('debug/step')
         c.wait_note('debug/stopped', 2.0)
-        check(run.mem(0x0400, 1)[0] == 0x42 and run.regs()[0] == 0xC003,
-              f'r pc=c000 ({r1.strip()}), r a=42 ({r2.strip()}), a step over STA $0400: '
-              f'$0400 = {run.mem(0x0400, 1)[0]:02x}, pc ${run.regs()[0]:04x}')
-        print('PASS the CPU write path: r pc=c000, r a=42, a step over STA $0400 stores $42')
-        c.mon(f'r pc={pc0:04x}')
-        c.mon(f'r a={a0:02x}')
-
+        border = c.read(0xD020, 1, 'io')[0] & 0x0F
+        check(border == 5, f'wr d020 05 ({w.strip()}), then a step: the border is {border}')
+        print(f'PASS wr d020 05 ({w.strip()}), a step: the border is 5')
+        # The colour RAM needs a session (hw_session_read: SH_STATUS b0). Here the loader's C64_STOP stands, so the
+        # debugger session's block never clears after the acquire's (freeze_resp.v:546 takes the raw app_stop).
+        sh = next(l for l in run.trx().splitlines() if 'sh_status' in l)
+        print(f'INFO colour RAM in the foreground: {" ".join(c.mon("m io d800 d807").split()[1:9])}  ({" ".join(sh.split())})')
     finally:
         c.close()
+
+    pc0, a0 = run.regs()[:2]
+    run.cmd('monitor wr ram c000 8d 00 04 4c 03 c0')
+    run.type_line('r pc=c000')
+    run.type_line('r a=42')
+    check(re.search(r'\.;c000 42 ', run.screen(), re.I), f'r a=42 on the screen: {run.screen()}')
+    run.type_line('z')
+    check(run.mem(0x0400, 1)[0] == 0x42 and run.regs()[0] == 0xC003,
+          f'r pc=c000, r a=42, z over STA $0400: $0400 = {run.mem(0x0400, 1)[0]:02x}, pc ${run.regs()[0]:04x}: '
+          f'{run.screen()}')
+    print('PASS typed r pc=c000, r a=42, z over STA $0400: $0400 = $42')
+    run.type_line(f'r pc={pc0:04x}')
+    run.type_line(f'r a={a0:02x}')
 
     run.type_line('/quit', 2000)
     check('owner no' in run.trx(), f'OWNER after /quit: {run.trx()}')
@@ -238,6 +264,59 @@ def smoke(run, client):
         diag += [l for l in run.trx().splitlines() if 'counters' in l]
         raise Fail(f'print 6*7: {run.cmd("c64screen")[:8]} / {diag} / {run.cmd("monitor r")} / {run.screen()[:300]}')
     print('PASS /quit: OWNER 0, the C64 runs, print 6*7 gives 42')
+
+    # The background: `x` with a breakpoint armed leaves trxmon serving in a task of its own (trx->detach); the
+    # loader lets the C64 go (MENU_C64_RESUME) and leaves the browser up.
+    run.cmd('button', 'wait 1500')
+    for _ in range(4):
+        run.cmd('key up')
+    run.cmd('wait 500')
+    run_app(run)
+    ends = run.console().count('trxmon: ends')
+    run.type_line('bk e5cd')
+    run.type_line('x', 1500)
+    run.cmd('wait 1000')
+    reason, ipc = run.record()
+    check(reason == 3 and ipc == 0xE5CD and 'debugger stop yes' in run.trx(),
+          f'bk e5cd, x: the record {reason} at ${ipc:04x}: {run.trx()}')
+    check(run.console().count('trxmon: ends') == ends, 'trxmon ended after x')
+    print('PASS bk e5cd, x: trxmon serves in the background, the breakpoint fires (REASON 3 at $e5cd)')
+    run.cmd('button', 'wait 3000')
+    s = run.screen()
+    if re.search(r'PAUSED IB \$e5cd', s) and 'breakpoint 1 hit' in s:
+        print('PASS the menu closed: the monitor screen came back (trx->ui_request)')
+    else:
+        print('KNOWN the monitor screen did not come back after the menu closed: trxmon 553e2e17\'s ui_callback waits '
+              'for the serve loop with delay_ms(2) = vTaskDelay(0) at 200 Hz, in a task above the serve loop\'s '
+              '(S39 §11)')
+
+    c = client.Client('127.0.0.1', run.rpc_port, timeout=10.0)
+    try:
+        # C64_STOP is off now: a run lets the session's block go (freeze_resp.v:546), the next stop has a session.
+        c.call('debug/break_del', {})
+        c.call('debug/continue', {'source': 'llm'})
+        run.cmd('wait 200')
+        c.call('debug/pause', {'source': 'llm'})
+        sh = [l for l in run.trx().splitlines() if 'sh_status' in l]
+        check(sh and 'session: yes' in sh[0], f'the debugger stop has no session: {sh}')
+        got = colour_ram(run, c)
+        print(f'PASS colour RAM in a debugger stop (session): {got.hex(" ")}')
+        old = run.mem_io(0xD020, 1)[0] & 0x0F
+        new = 3 if old != 3 else 4
+        w = c.mon(f'wr d020 {new:02x}')
+        # trxmon reads the VIC from the state bus (the chip), so the list is seen in SH_COUNTS.
+        lst = re.search(r'list (\d+)', next(l for l in run.trx().splitlines() if 'sh_counts' in l))
+        check(lst and int(lst.group(1)) >= 1 and run.mem_io(0xD020, 1)[0] & 0x0F == old,
+              f'wr d020 {new:02x} ({w.strip()}): the list {lst and lst.group(1)}, the chip {run.mem_io(0xD020, 1)[0]:02x}')
+        c.call('debug/continue', {'source': 'llm'})
+        run.cmd('wait 200')
+        border = run.mem_io(0xD020, 1)[0] & 0x0F
+        check(border == new, f'wr d020 {new:02x}, RUN: the border is {border}')
+        print(f'PASS wr d020 {new:02x} in a session: on the commit list, the chip keeps {old}, RUN writes it')
+        c.call('debug/pause', {'source': 'llm'})
+        c.mon('/quit')
+    finally:
+        c.close()
 
 
 def main():
@@ -259,7 +338,8 @@ def main():
     work = Path(tempfile.mkdtemp(prefix='ue2-trxmon.'))
     print(f'run directory: {work}')
     subprocess.run([str(HERE / 'make-sd-image.sh'), str(work / 'sd.img')], check=True, stdout=subprocess.DEVNULL)
-    subprocess.run([str(HERE / 'add-sd-files.sh'), str(work / 'sd.img'), str(args.u2a)], check=True,
+    shutil.copyfile(args.u2a, work / 'trxmon.u2a')  # the browser steps look for this name
+    subprocess.run([str(HERE / 'add-sd-files.sh'), str(work / 'sd.img'), str(work / 'trxmon.u2a')], check=True,
                    stdout=subprocess.DEVNULL)
     run = Run(args, work)
     try:
