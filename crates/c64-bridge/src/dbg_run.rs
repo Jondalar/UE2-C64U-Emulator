@@ -809,6 +809,29 @@ mod tests {
         assert!(past < 8, "at the edge or the boundary after it: {past}");
     }
 
+    /// trx_dbg.v:296-297: a window bus cycle while the machine stands is a phi2 edge CYCLES counts, and a read shows it
+    /// at once. A land (trx_ring.cc `land_locked`) arms CYC_CMP with the CYCLES it reads after bus cycles on the stop
+    /// position; RUN then stops on the next edge.
+    #[test]
+    fn cycles_reads_the_window_cycles_and_cyc_cmp_from_it_stops() {
+        let Some(mut r) = Rig::new() else { return };
+        r.code(&[0x78, 0xEE, 0x00, 0x04, 0x4C, 0x01, 0xC0]);
+        r.cmd(td::CMD_PAUSE_IB);
+        let before = r.model().cycles_now();
+        for _ in 0..5 {
+            r.c64.dma_read(0xD012, false);
+        }
+        assert_eq!(r.model().cycles_now(), before + 5, "five bus cycles while held");
+        let now = r.model().cycles_now() as u32;
+        r.w(td::CYC_CMP, now);
+        r.cmd(td::CMD_CLEAR_STOP);
+        r.cmd(td::CMD_RUN);
+        r.run(5);
+        let m = r.model();
+        assert_eq!((r.held(), m.rec.reason), (true, td::R_CYC_CMP));
+        assert!(m.cycles_now() - u64::from(now) < 8, "at once, not after the counter wraps: {}", m.cycles_now());
+    }
+
     /// S39 §3.4: the CPU write path: `r a=77` staged into the image, loaded at the step's opening edge, then
     /// `STA $0400` stores it in 4 cycles.
     #[test]

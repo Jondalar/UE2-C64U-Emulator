@@ -910,11 +910,14 @@ impl Trx64Backend {
     }
 
     /// A window access that is a bus cycle: while the machine stands it is one phi2 edge of its own, which CYCLES and
-    /// the engine's counter count (trx_dbg.v:296, S40 answer 11).
+    /// the engine's counter count (trx_dbg.v:296, S40 answer 11). CYCLES reads the live counter (trx_dbg.v:297), so the
+    /// model takes the count at once: a land reads it on the stop position after `clear_vic_latches`' bus cycles and
+    /// arms CYC_CMP with it (trx_ring.cc `land_locked`).
     fn window_cycle(&mut self) {
         if self.stands() {
             self.tap.cycles += 1;
             self.tap.run_cycles += 1;
+            self.dbg_publish();
         }
     }
 

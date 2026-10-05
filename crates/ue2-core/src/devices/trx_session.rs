@@ -447,9 +447,12 @@ impl Session {
             self.ack19 = 0;
         }
         if self.active && (v & SH_ABORT != 0 || self.mode == 0) {
+            // freeze_resp.v:888: an abort blocks, and so does the end of the debugger's session (mode 0 ends it too:
+            // `keep` falls with `cond_dbg_on`); the block clears once its stop is gone (:550).
+            let block = v & SH_ABORT != 0 || self.dbg;
             self.close();
             self.drop_list();
-            if v & SH_ABORT != 0 {
+            if block {
                 self.block = true;
             }
         }
@@ -1006,6 +1009,19 @@ mod tests {
         assert!(!s.active);
         // OWNER: C64_STOP with FRZ is no pause.
         assert!(!Lines { owner: true, ..FROZEN }.paused() && FROZEN.paused());
+        // freeze_resp.v:888: SH_CTRL 0 ends the debugger's session and blocks; the mode written back while its stop
+        // stands starts none (trx_ring.cc `land_locked` from a land), the next stop after the stop fell does.
+        let mut s = Session::default();
+        s.write_ctrl(1);
+        s.step(stop, &mut c);
+        s.write_ctrl(0);
+        assert!(!s.active);
+        s.write_ctrl(1);
+        s.step(stop, &mut c);
+        assert!(!s.active, "blocked while the stop stands");
+        s.step(Lines::default(), &mut c);
+        s.step(stop, &mut c);
+        assert!(s.active && s.dbg, "the stop fell: a new stop, a new session");
     }
 
     /// t21-p4 3302c85 (freeze_resp.v:550, T12 §14.8 point 10): with OWNER set, a foreground app's C64_STOP held for
