@@ -715,7 +715,9 @@ mod tests {
         let mut m = Machine::from_parts(cfg, bus, 0x30000, Symbols::empty());
         m.attach_c64(Box::new(Trx64Backend::new(Path::new("/nonexistent"))));
         let out = exec(&mut m, &mut MonitorSession::new(), &mut State::default(), "trx").expect("trx");
-        assert!(out.contains("id            TRX2  caps 0xe3  caps2 0x08"), "{out}");
+        assert!(out.contains("id            TRX2  caps 0xe7  caps2 0x29"), "{out}");
+        assert!(out.contains("engine        log off  taps   frames 0  dropped 0  apply idle"), "{out}");
+        assert!(out.contains("stream 0      0x7000000 + 0x1000000  0 records"), "{out}");
         assert!(out.contains("cap_ctrl      every 0  cap_stat gen 0, cadence frames without a snap 0"), "{out}");
         assert!(out.contains("stop_pos      0x00000000  armed no, cycle 0, holding: no"), "{out}");
         assert!(out.contains("gate_ctrl     0x00000000  frz off  paused: no"), "{out}");

@@ -140,6 +140,16 @@ const UCI_EVENT_WAIT: u64 = 10 * ue2_core::time::CLOCKS_PER_MS;
 /// abort (TRX64 `uci.rs` `handshake_in`).
 const UCI_EVENTS: u8 = 0x07;
 
+/// The access-watch table a run needs: none, the UCI's control register, the cartridge's I/O, or a debugger's
+/// checkpoints (with the UCI's register and the cartridge's I/O; the UCI's alone while there are none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Watch {
+    None,
+    Uci,
+    Io,
+    Checkpoint,
+}
+
 /// The TRX64 observer for runs without cartridge hints.
 ///
 /// Two jobs in one, because a run has one observer: it halts after a C64 write to the UCI control register, and it
@@ -557,8 +567,6 @@ impl Trx64Backend {
     /// where the cart's EXROM/GAME can change behind TRX64's PLA: after an I/O access that changed them, at a timed
     /// change, and instruction by instruction while a freeze waits for the interrupt (docs/status/carts.md).
     fn run_cpu(&mut self, target: u64) {
-        // W4-SID: the SID tap records the CPU's SID writes with their cycle in every run.
-        let plain = |m: &mut Machine, budget| m.run_for_full_capped(budget, u64::MAX, &mut sid::SidTap, |_, _, _, _, _, _, _| {});
         // UCI: with the block on the bus, a run halts after a C64 write to its control register, so the C64 can wait
         // for the firmware to handle the event ([`UCI_EVENT_WAIT`]).
         let uci = self.m.uci().is_some_and(|u| u.status().enabled);
@@ -566,8 +574,9 @@ impl Trx64Backend {
         // and the observer is the only hook that can end a run (S23 §8).
         let watching = !self.checkpoints.is_empty();
         if self.m.cartridge.is_none() && !uci && !watching {
+            // W4-SID: the SID tap records the CPU's SID writes with their cycle in every run.
             let clk = self.m.c64_core.clk;
-            plain(&mut self.m, target - clk);
+            self.run_obs(target - clk, u64::MAX, false, Watch::None, &mut sid::SidTap);
             return;
         }
         if self.m.cartridge.is_none() {
@@ -577,10 +586,6 @@ impl Trx64Backend {
             self.wait_for_uci(events);
             return;
         }
-        let with_uci = |m: &mut Machine, budget| {
-            let mut obs = UciObserver::default();
-            m.run_for_full_capped_dbg(budget, u64::MAX, None, None, Some(&UCI_WATCH), &mut obs, |_, _, _, _, _, _, _| {});
-        };
         loop {
             let clk = self.m.c64_core.clk;
             if clk >= target || self.uci_wait.is_some() {
@@ -592,9 +597,9 @@ impl Trx64Backend {
             let hints = self.slot.with(|s| s.run_hints(cart, clk));
             if hints == RunHints::default() {
                 if uci {
-                    with_uci(&mut self.m, target - clk);
+                    self.run_obs(target - clk, u64::MAX, false, Watch::Uci, &mut UciObserver::default());
                 } else {
-                    plain(&mut self.m, target - clk);
+                    self.run_obs(target - clk, u64::MAX, false, Watch::None, &mut sid::SidTap);
                 }
             } else {
                 // freezer.vhd switches the cart in after the three stack pushes, before the vector fetch.
@@ -616,14 +621,13 @@ impl Trx64Backend {
                 // With checkpoints the merged table covers this run's own needs too, so the gate never costs the
                 // cart path its watch.
                 let watch = match (&self.checkpoint_watch, hints.watch_io) {
-                    (Some(watch), _) => Some(&**watch),
-                    (None, true) => Some(&IO_WATCH),
-                    (None, false) => uci.then_some(&UCI_WATCH),
+                    (Some(_), _) => Watch::Checkpoint,
+                    (None, true) => Watch::Io,
+                    (None, false) if uci => Watch::Uci,
+                    (None, false) => Watch::None,
                 };
                 let budget = end.saturating_sub(clk).max(1);
-                let exec = self.checkpoint_exec.as_deref();
-                let stop =
-                    self.m.run_for_full_capped_dbg(budget, max, None, exec, watch, &mut obs, |_, _, _, _, _, _, _| {});
+                let stop = self.run_obs(budget, max, true, watch, &mut obs);
                 self.note_checkpoint(stop, obs.hit);
                 if let Some(vector) = obs.vector.filter(|_| self.cart.with(|c| c.run_hints().freeze_pending)) {
                     self.freeze_after_vector(vector);
@@ -634,6 +638,62 @@ impl Trx64Backend {
             self.cart_changed();
             self.wait_for_uci(events);
         }
+    }
+
+    /// One TRX64 run with `obs`: `exec` the debugger's exec checkpoints, `watch` the access-watch table the run
+    /// needs. While the board's engine records (S40, engine_tap.rs) the run goes through its taps: every write in
+    /// order, a halt after a write to the CPU port or into a cartridge's window, the writes resolved after it under
+    /// the memory configuration they were made in.
+    fn run_obs<O: Observer>(&mut self, budget: u64, max: u64, exec: bool, watch: Watch, obs: &mut O) -> RunStop {
+        let nothing = |_: u16, _: u8, _: u8, _: u8, _: u8, _: u8, _: u64| {};
+        if self.recording_writes() {
+            let end = self.m.c64_core.clk.saturating_add(budget);
+            loop {
+                let cfg = self.m.memconfig;
+                self.tap_build_watch(watch);
+                let windows = self.cart_windows_now();
+                let exec = if exec { self.checkpoint_exec.as_deref() } else { None };
+                let table = self.tap.watch.as_ref().map(|(t, _)| &**t);
+                let mut tapped =
+                    engine_tap::Tapped { inner: &mut *obs, writes: &mut self.tap.writes, windows, own_halt: false, inner_halt: false };
+                let left = end.saturating_sub(self.m.c64_core.clk).max(1);
+                let stop = self.m.run_for_full_capped_dbg(left, max, None, exec, table, &mut tapped, nothing);
+                let mine_only = stop == RunStop::Observer && tapped.own_halt && !tapped.inner_halt;
+                self.tap_resolve(cfg);
+                // A halt only the taps asked for (a new memory configuration) goes on to the run's end.
+                if !(mine_only && max == u64::MAX && self.m.c64_core.clk < end) {
+                    return stop;
+                }
+            }
+        }
+        let exec = if exec { self.checkpoint_exec.as_deref() } else { None };
+        let table: Option<&[u8; 0x1_0000]> = match watch {
+            Watch::None => None,
+            Watch::Uci => Some(&UCI_WATCH),
+            Watch::Io => Some(&IO_WATCH),
+            Watch::Checkpoint => Some(self.checkpoint_watch.as_deref().unwrap_or(&UCI_WATCH)),
+        };
+        if exec.is_none() && table.is_none() {
+            self.m.run_for_full_capped(budget, max, obs, nothing)
+        } else {
+            self.m.run_for_full_capped_dbg(budget, max, None, exec, table, obs, nothing)
+        }
+    }
+
+    /// The watch table a tapped run takes for `watch`.
+    fn tap_build_watch(&mut self, watch: Watch) {
+        // The base table is copied into the tap's; the pointer of a debugger's table names its build.
+        let base: Option<Box<[u8; 0x1_0000]>> = match watch {
+            Watch::None => None,
+            Watch::Uci => Some(Box::new(UCI_WATCH)),
+            Watch::Io => Some(Box::new(IO_WATCH)),
+            Watch::Checkpoint => Some(self.checkpoint_watch.clone().unwrap_or_else(|| Box::new(UCI_WATCH))),
+        };
+        let id = match watch {
+            Watch::Checkpoint => self.checkpoint_watch.as_deref().map_or(1, |t| t.as_ptr() as usize),
+            w => w as usize + 2,
+        };
+        self.tap_watch(id, base.as_deref());
     }
 
     /// The UCI event bits waiting for the firmware ([`UCI_EVENTS`]).
@@ -677,6 +737,7 @@ impl Trx64Backend {
     /// firmware (UCI). The cycles run count on the engine's counter.
     fn run_to_plain(&mut self, target: u64) {
         let start = self.m.c64_core.clk;
+        (self.tap.run_clk, self.tap.run_cycles) = (start, self.tap.cycles);
         if self.stopped || self.reset_held {
             self.run_held(target);
         } else if self.uci_wait.is_none() {
@@ -800,13 +861,7 @@ impl Trx64Backend {
     /// any. The table is [`UCI_WATCH`] unless checkpoints widened it.
     fn run_watched(&mut self, budget: u64) {
         let mut obs = UciObserver { checkpoints: self.checkpoints.clone(), hit: None };
-        let table: &[u8; 0x1_0000] = match &self.checkpoint_watch {
-            Some(watch) => watch,
-            None => &UCI_WATCH,
-        };
-        let exec = self.checkpoint_exec.as_deref();
-        let stop =
-            self.m.run_for_full_capped_dbg(budget, u64::MAX, None, exec, Some(table), &mut obs, |_, _, _, _, _, _, _| {});
+        let stop = self.run_obs(budget, u64::MAX, true, Watch::Checkpoint, &mut obs);
         self.note_checkpoint(stop, obs.hit);
     }
 
@@ -1005,6 +1060,8 @@ impl C64Backend for Trx64Backend {
         } else {
             self.run_to(target);
         }
+        // S40: what no tap saw since (the REU's DMA) goes to the engine at the end of the slice.
+        self.tap_compare(false);
         self.sid.advance(self.m.c64_core.clk);
         // S16: the voices are FPGA-clocked, so they follow the emulator's clock rather than the C64's — and they run
         // whether or not anyone is listening, because a finished voice sets the status bit `audio_detect()` polls.
@@ -1111,8 +1168,13 @@ impl C64Backend for Trx64Backend {
     fn dma_write(&mut self, addr: u16, val: u8, mem_only: bool) {
         if mem_only {
             self.m.ram[usize::from(addr)] = val;
+            // S40: the RAM's second port, an outside record.
+            self.tap_outside_ram(addr, val);
         } else {
+            let (cfg, before) = (self.m.memconfig, self.m.ram[usize::from(addr)]);
             self.m.write_full(addr, val);
+            // S40: a bus cycle, the machine's port A.
+            self.tap_bus_write(addr, val, cfg, before);
             self.sid.dma_written(self.m.c64_core.clk);
             if self.m.cartridge.is_some() {
                 self.cart_changed();
@@ -1487,6 +1549,14 @@ impl C64Backend for Trx64Backend {
         self.tap.cycles
     }
 
+    fn sb_load(&mut self, load: &ue2_core::devices::trx_sb::SbLoad) {
+        self.tap_load(load);
+    }
+
+    fn apply_ram(&mut self, addr: u16, val: u8) {
+        self.tap_apply(addr, val);
+    }
+
     /// TRX64's U64 profile with the enable word 0 and the menu speed 1 MHz with badline stalls: `$D030`/`$D031` (and
     /// `$D03C`, `$D07A`/`$D07B`) decode nothing and read `$FF`, `u64_speed` is (0, stalls), as Kawari on `main`
     /// (`registers_scaled.v:1063-1067`). Off again: the firmware's last latched settings, as its next strobe would.
@@ -1580,6 +1650,10 @@ impl C64Backend for Trx64Backend {
         }
         for &(addr, val) in writes {
             self.m.write_full(addr, val);
+            // S40: the commit reaches colour RAM through its second port (port D): an outside record.
+            if (0xD800..0xDC00).contains(&addr) {
+                self.tap_outside_colour(addr, val);
+            }
         }
         self.sid.dma_written(self.m.c64_core.clk);
         if forced {
@@ -2111,7 +2185,7 @@ pub(crate) mod tests {
     }
 
     /// DDR of guest size with cart ROM bank `b` filled with `0x40 + b` (ROML) and `0x80 + b` (ROMH).
-    fn ddr() -> Vec<u8> {
+    pub(crate) fn ddr() -> Vec<u8> {
         cart::tests::ddr()
     }
 
@@ -2323,7 +2397,7 @@ pub(crate) mod tests {
 
     /// `C64Port::tick`'s shape: DDR lent around the run and taken back after it. That window is the only time the
     /// REU's store has anything behind it.
-    fn run_ms_lent(c64: &mut Trx64Backend, now: &mut u64, ms: u64, ddr: &mut [u8]) {
+    pub(crate) fn run_ms_lent(c64: &mut Trx64Backend, now: &mut u64, ms: u64, ddr: &mut [u8]) {
         for _ in 0..ms {
             *now += CLOCKS_PER_MS;
             c64.lend_ddr(Some(ddr));
@@ -2335,7 +2409,7 @@ pub(crate) mod tests {
     /// A 6510 program for $C000 that runs one REU transfer and then loops: `cmd` is the command byte ($90 stash
     /// C64→REU, $91 fetch REU→C64, both with the $FF00 trigger disabled), between `c64_addr` and `reu_addr`, `len`
     /// bytes.
-    fn reu_program(cmd: u8, c64_addr: u16, reu_addr: u32, len: u16) -> Vec<u8> {
+    pub(crate) fn reu_program(cmd: u8, c64_addr: u16, reu_addr: u32, len: u16) -> Vec<u8> {
         let ([c_lo, c_hi], [l_lo, l_hi]) = (c64_addr.to_le_bytes(), len.to_le_bytes());
         let mut code = Vec::new();
         let regs = [
@@ -2357,14 +2431,14 @@ pub(crate) mod tests {
         code
     }
 
-    fn load(c64: &mut Trx64Backend, at: u16, bytes: &[u8]) {
+    pub(crate) fn load(c64: &mut Trx64Backend, at: u16, bytes: &[u8]) {
         for (i, &b) in bytes.iter().enumerate() {
             c64.dma_write(at + i as u16, b, false);
         }
     }
 
     /// Run `code` from $C000 with DDR lent, as an access that reaches the C64 bus does.
-    fn run_program(c64: &mut Trx64Backend, now: &mut u64, code: &[u8], ddr: &mut [u8]) {
+    pub(crate) fn run_program(c64: &mut Trx64Backend, now: &mut u64, code: &[u8], ddr: &mut [u8]) {
         load(c64, 0xC000, code);
         c64.m.c64_core.reg_pc = 0xC000;
         run_ms_lent(c64, now, 20, ddr);
@@ -2571,7 +2645,7 @@ pub(crate) mod tests {
     // ---- S38: TRX64's rings (docs/specs/S38-trx64-ring.md §7) ----
 
     /// A booted C64 with the rings on, and the anchors it holds.
-    fn ringed() -> Option<(Trx64Backend, u64)> {
+    pub(crate) fn ringed() -> Option<(Trx64Backend, u64)> {
         let (mut c64, now) = booted()?;
         c64.set_ring(true);
         Some((c64, now))

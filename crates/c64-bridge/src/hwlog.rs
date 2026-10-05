@@ -102,6 +102,9 @@ struct State {
     cap: usize,
     /// Guest DDR, lent with the cartridge logic's lease (`C64Backend::lend_ddr`).
     ddr: Option<(*mut u8, usize)>,
+    /// S40: every write into guest DDR for the board's engine taps (cartridge RAM, the REU's memory), while it
+    /// listens: (offset, old, new), unchanged bytes too.
+    engine: Option<Vec<(usize, u8, u8)>>,
 }
 
 impl State {
@@ -121,7 +124,17 @@ fn new_id() -> u64 {
 
 impl Default for State {
     fn default() -> Self {
-        State { recs: VecDeque::new(), start: 0, pos: 0, id: new_id(), cuts: Vec::new(), on: false, cap: DEFAULT_CAP, ddr: None }
+        State {
+            recs: VecDeque::new(),
+            start: 0,
+            pos: 0,
+            id: new_id(),
+            cuts: Vec::new(),
+            on: false,
+            cap: DEFAULT_CAP,
+            ddr: None,
+            engine: None,
+        }
     }
 }
 
@@ -146,6 +159,11 @@ impl HwLog {
     /// A write into `space` at `addr`, `old` → `new`. Kept only while the log takes records and the byte changed.
     #[inline]
     pub fn note(&self, space: Space, addr: usize, old: u8, new: u8) {
+        self.with(|s| {
+            if let Some(e) = s.engine.as_mut().filter(|_| space == Space::Ddr) {
+                e.push((addr, old, new));
+            }
+        });
         if old == new {
             return;
         }
@@ -160,6 +178,16 @@ impl HwLog {
             }
             s.pos = s.head();
         })
+    }
+
+    /// S40: the engine's taps listen to guest DDR writes (or stop).
+    pub fn set_engine(&self, on: bool) {
+        self.with(|s| s.engine = on.then(Vec::new));
+    }
+
+    /// S40: the guest DDR writes since the last call.
+    pub fn take_engine(&self) -> Vec<(usize, u8, u8)> {
+        self.with(|s| s.engine.as_mut().map(std::mem::take).unwrap_or_default())
     }
 
     pub fn set_on(&self, on: bool) {
@@ -250,8 +278,8 @@ impl HwLog {
     /// A new log: no records, a new identity.
     pub fn clear(&self) {
         self.with(|s| {
-            let (on, cap, ddr) = (s.on, s.cap, s.ddr);
-            *s = State { on, cap, ddr, ..State::default() };
+            let (on, cap, ddr, engine) = (s.on, s.cap, s.ddr, s.engine.take());
+            *s = State { on, cap, ddr, engine, ..State::default() };
         })
     }
 

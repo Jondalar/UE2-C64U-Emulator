@@ -189,6 +189,25 @@ fn trx(host: &mut Host) -> Result<String, String> {
         w1 >> 16 & 0xFF,
         w2 >> 16 & 0xFF,
     ));
+    let eng = t.engine();
+    out.push_str(&format!(
+        "  engine        log {}  taps {}  frames {}  dropped {}  apply {}\n",
+        on(eng.on),
+        ["outside", "cartridge RAM", "colour RAM"]
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| eng.taps >> i & 1 != 0)
+            .map(|(_, n)| *n)
+            .collect::<Vec<_>>()
+            .join(", "),
+        eng.frame,
+        eng.dropped,
+        if eng.ap_jobs.is_empty() { "idle" } else { "waiting" },
+    ));
+    for (s, (base, size)) in eng.areas.iter().enumerate() {
+        out.push_str(&format!("  stream {s}      {:#09x} + {:#x}  {} records\n", base, size, eng.cnt[s]));
+    }
+    out.push_str(&format!("  engine store  {} MB\n", eng.store_mb));
     let (ctrl, status) = (t.sys_reg(trx::PAGE5 + trx::SH_CTRL), t.sys_reg(trx::PAGE5 + trx::SH_STATUS));
     out.push_str(&format!(
         "  sh_ctrl       {ctrl:#010x}  mode {}, sidefx {}, proto {}\n",
