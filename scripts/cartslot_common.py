@@ -136,7 +136,7 @@ FAMILIES = {
     'megabyter': dict(hw=86, exrom=0, game=1, model='trx64', windows=('roml',), capacity=128, chip_type=2,
                       select=lambda n: [(0xDE02, 0x00), (0xDE00, n)]),
     # $DE00 bank bits 7:0, $DF00 bank bits 13:8 and mode 7:6 (00 = 8 K).
-    'c64megacart': dict(hw=61, exrom=0, game=1, model='trx64', windows=('roml',), capacity=256, chip_type=2,
+    'c64megacart': dict(hw=88, exrom=0, game=1, model='trx64', windows=('roml',), capacity=256, chip_type=2,
                         select=lambda n: [(0xDF00, (n >> 8) & 0x3F), (0xDE00, n & 0xFF)]),
     # Types TRX64 has no mapper for: the U64 cart logic (all_carts_v5.vhd) serves them from the CRT.
     'supergames': dict(hw=8, exrom=0, game=0, model='u64-logic', windows=('roml', 'romh'), capacity=4,

@@ -4,7 +4,7 @@
 rewinds with it), §4.3 (the picture comes back with the anchor) and §7's board files built the same day. See "As
 built" at the end.
 
-**Why:** UE2's C64 is TRX64 (`trx64-core`, tag v0.12.3). TRX64 has its own time travel: a delta ring per
+**Why:** UE2's C64 is TRX64 (`trx64-core`, tag v0.12.5). TRX64 has its own time travel: a delta ring per
 instruction, a CPU history, and a checkpoint ring with marks. Its daemon runs all three by default. UE2 runs the
 same machinery the same way, so `rstep`, `whowrote`, `goto` and marks work on a C64 that runs behind the U64
 firmware. TRX64 is the reference for Alex's FPGA, which gets a ring and a monitor of its own (TRX64-Ultimate T20,
@@ -230,7 +230,7 @@ Over the control port (`monitor <line>`) and the MCP tool `emu_monitor`, the sam
 - Not here: `play`, `pause` (wall-clock pacing), `rawframe` (UE2 shows the frame that ended at the anchor, §4.3, and
   draws no other), `diff`, `cdiff`, thumbnails, `buildtrace`.
 - `on_effect` is implemented, and `files()` gives the library our `Files`. The library calls neither `timeline()`
-  nor `files()` in v0.12.3, so the verbs are ours.
+  nor `files()` in v0.12.5, so the verbs are ours.
 - The VICE binary monitor port has no time-travel commands and is unchanged.
 
 ## 6. Files

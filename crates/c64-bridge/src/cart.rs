@@ -26,7 +26,7 @@ use ue2_core::c64host::CartRom;
 
 use crate::cart_eeprom::{Eeprom, EepromRegs};
 use crate::hwlog::{HwLog, Space};
-use crate::slot::SlotHandle;
+use crate::slot::{Slot, SlotHandle};
 
 /// C64_CARTRIDGE_TYPE bits 4:0 select the logic, bits 7:5 the variant (c64.h:115-163, cart_slot_registers.vhd).
 pub const TYPE_MASK: u8 = 0x1F;
@@ -1099,6 +1099,20 @@ impl CartMapper for CartProxy {
 
     fn reset(&mut self) {
         self.slot.with(|s| s.reset(&self.cart));
+    }
+
+    /// A reset the physical cartridge pulled (EasyFlash 3) is run by the bridge (`Slot::cart_reset_pending`), not by
+    /// TRX64 inside its run: TRX64's reset restarts its cycle counter, which the bridge re-anchors only between runs.
+    fn take_reset_request(&mut self) -> bool {
+        false
+    }
+
+    fn reset_generated(&mut self) {
+        self.slot.with(|s| s.reset_generated(&self.cart));
+    }
+
+    fn reset_vector_fetched(&mut self) {
+        self.slot.with(Slot::reset_vector_fetched);
     }
 
     /// GMod4 in the expansion port holds ULTIMAX and resolves the windows itself (TRX64 cart.rs `fake_ultimax`).

@@ -204,7 +204,7 @@ C64_STOP (the debugger owner of top.v:1070 is page 3, not in UE2).
 | any | 0 | runs |
 
 **In UE2:**
-- TRX64 v0.12.3 has no hold for the whole machine (`Hold::Cpu` keeps the chips running, expansion.rs:68-75). The
+- TRX64 v0.12.5 has no hold for the whole machine (`Hold::Cpu` keeps the chips running, expansion.rs:68-75). The
   bridge gets `C64Backend::set_paused(bool)`: while paused `advance_to` runs no cycle, so the C64's cycle count,
   VIC, CIAs, SID and the drives stand. At the release the clock is re-anchored at the current time, as after a reset.
   The output carries zeros while paused (the mute, "As built (the mute)").
@@ -498,7 +498,7 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
 
 ## As built (phase B1, B2)
 
-- **The pause** is the bridge's: TRX64 v0.12.3 has no hold for the whole machine, so `Trx64Backend::advance_to` runs
+- **The pause** is the bridge's: TRX64 v0.12.5 has no hold for the whole machine, so `Trx64Backend::advance_to` runs
   no cycle while it stands (the sampler, the FPGA's, runs on) and the release re-anchors the clock at the cycle it
   stood at. `GATE_CTRL` writes reach the C64 port with their clock: the C64 runs up to it, then the pause changes.
 - **Frame starts while paused** come every frame period of the C64's row from the last one; the window, `png` and
