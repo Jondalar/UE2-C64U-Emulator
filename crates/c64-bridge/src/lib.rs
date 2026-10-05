@@ -239,6 +239,8 @@ pub struct Trx64Backend {
     /// applied values is not a menu set; one with new values is.
     turbo_applied: Option<(u8, u8)>,
     reset_since_turbo: bool,
+    /// S40 §0: TRX64-Ultimate's bitstream (`--trx-io`): no turbo, the firmware's strobe changes nothing.
+    trx_bitstream: bool,
     palette: Palette,
     /// The sockets and UltiSIDs on reSID, the mixer and the sample stream (S17).
     sid: sid::Sid,
@@ -373,6 +375,7 @@ impl Trx64Backend {
             speed_prefer: 0x80,
             turbo_applied: None,
             reset_since_turbo: false,
+            trx_bitstream: false,
             palette: Palette::default(),
             sid,
             drives,
@@ -844,6 +847,9 @@ impl Trx64Backend {
     /// C64_SPEED_UPDATE: hand the latched turbo settings to TRX64 as a menu set, unless this is the reset task's
     /// repeat of the applied values (see `turbo_applied`).
     fn speed_update(&mut self) {
+        if self.trx_bitstream {
+            return;
+        }
         let set = (self.turbo_regs_en, self.speed_prefer);
         let repeat = std::mem::take(&mut self.reset_since_turbo) && self.turbo_applied == Some(set);
         if !repeat {
@@ -1430,6 +1436,22 @@ impl C64Backend for Trx64Backend {
         self.sid.set_mute(muted, self.m.c64_core.clk);
     }
 
+    /// TRX64's U64 profile with the enable word 0 and the menu speed 1 MHz with badline stalls: `$D030`/`$D031` (and
+    /// `$D03C`, `$D07A`/`$D07B`) decode nothing and read `$FF`, `u64_speed` is (0, stalls), as Kawari on `main`
+    /// (`registers_scaled.v:1063-1067`). Off again: the firmware's last latched settings, as its next strobe would.
+    fn set_trx_bitstream(&mut self, on: bool) {
+        if on == self.trx_bitstream {
+            return;
+        }
+        self.trx_bitstream = on;
+        if on {
+            self.m.set_u64_turbo(0x00, 0x80);
+        } else {
+            self.m.set_u64_turbo(self.turbo_regs_en, self.speed_prefer);
+        }
+        self.turbo_applied = None;
+    }
+
     fn frame_clocks(&self) -> u64 {
         let t = self.m.timing();
         u64::from(t.lines_per_frame) * u64::from(t.cycles_per_line) * ue2_core::time::CLOCK_HZ / self.cpu_hz()
@@ -1652,6 +1674,40 @@ mod tests {
         c64.set_reset(false);
         strobe(&mut c64, 0x8C);
         assert_ne!(c64.m.peek_lens(0xD031, "io"), 0x00, "new values after a reset are a menu change");
+    }
+
+    /// S40 §0: on TRX64-Ultimate's bitstream (`main`, no T29) the menu's strobe changes nothing, `$D030`/`$D031` read
+    /// `$FF` and a program's write there does nothing: the CPU stays at 1 MHz.
+    #[test]
+    fn the_trx_bitstream_has_no_turbo() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        let mut now = 0;
+        c64.advance_to(now);
+        c64.set_trx_bitstream(true);
+        for (en, prefer) in [(0x01, 0x89), (0x05, 0x8C), (0x07, 0x0F)] {
+            c64.core_config_write(CORE_TURBOREGS_EN, en);
+            c64.core_config_write(CORE_SPEED_PREFER, prefer);
+            c64.core_config_write(CORE_SPEED_UPDATE, 1);
+            run_ms(&mut c64, &mut now, 5);
+            assert!(!c64.m.turbo_engaged(), "the strobe {en:#04x} {prefer:#04x} engages no turbo");
+            assert_eq!([0xD030, 0xD031, 0xD03C].map(|a| c64.m.peek_lens(a, "io")), [0xFF; 3]);
+        }
+        c64.m.write_full(0xD031, 0x09);
+        c64.m.write_full(0xD030, 0x01);
+        c64.m.write_full(0xD07B, 0x00);
+        assert!(!c64.m.turbo_engaged(), "a program's write does nothing");
+        assert_eq!(c64.m.peek_lens(0xD031, "io"), 0xFF);
+        // 1 MHz: a PAL second is 985,248 cycles.
+        let clk = c64.m.c64_core.clk;
+        run_ms(&mut c64, &mut now, 1000);
+        let ran = c64.m.c64_core.clk - clk;
+        assert!((985_000..985_600).contains(&ran), "{ran} cycles in a second");
+        // Back on Gideon's bitstream the firmware's next strobe is a menu set again.
+        c64.set_trx_bitstream(false);
+        c64.core_config_write(CORE_TURBOREGS_EN, 0x01);
+        c64.core_config_write(CORE_SPEED_PREFER, 0x89);
+        c64.core_config_write(CORE_SPEED_UPDATE, 1);
+        assert_ne!(c64.m.peek_lens(0xD031, "io"), 0xFF);
     }
 
     /// S25 §2-§3: a switch while the C64 runs lands at a frame boundary, and from there the clock counts at the new row's

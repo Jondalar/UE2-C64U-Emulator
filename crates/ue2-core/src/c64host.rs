@@ -263,6 +263,10 @@ pub trait C64Backend {
     /// chips are not touched: under C64_STOP alone they run on beneath the cut. Gideon's bitstream has no such cut,
     /// so only `--trx-io` calls it. Ignored by default.
     fn set_muted(&mut self, _muted: bool) {}
+    /// S40 §0: the C64 sits on TRX64-Ultimate's bitstream (`--trx-io`), whose `main` RTL has no turbo: the CPU runs at
+    /// 1 MHz whatever the firmware's menu sets, and `$D030`/`$D031` are the VIC's unused registers (read `$FF`, take no
+    /// write). Ignored by default.
+    fn set_trx_bitstream(&mut self, _on: bool) {}
     /// One VIC frame in emulator clocks (lines × cycles per line at the row's clock), 0 when unknown.
     fn frame_clocks(&self) -> u64 {
         0
@@ -572,6 +576,8 @@ pub(crate) mod mock {
         pub(crate) lines: Rc<RefCell<usize>>,
         /// S37: `set_muted` calls, kept apart from `calls`.
         pub(crate) mutes: Rc<RefCell<Vec<bool>>>,
+        /// S40: the last `set_trx_bitstream`.
+        pub(crate) trx_bitstream: Rc<RefCell<bool>>,
     }
 
     impl Mock {
@@ -748,6 +754,9 @@ pub(crate) mod mock {
         }
         fn set_muted(&mut self, muted: bool) {
             self.mutes.borrow_mut().push(muted);
+        }
+        fn set_trx_bitstream(&mut self, on: bool) {
+            *self.trx_bitstream.borrow_mut() = on;
         }
     }
 }
