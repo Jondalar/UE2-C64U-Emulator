@@ -443,6 +443,16 @@ impl Trx64Backend {
         Some(SlotCart(cart))
     }
 
+    /// S41 §5: the ROMs of a core loaded by partial reconfiguration: BASIC, KERNAL and CHAR live in the core's block RAM
+    /// (c64_mem.v `rom_lo`/`rom_hi`, dfx-trial a75c356), which the bitstream initialises only for simulation
+    /// (`TRX_SIM_ROMS`), so they read 0 until the firmware writes them through the ROM window.
+    pub fn blank_roms(&mut self) {
+        let m = &mut *self.m;
+        for rom in [&mut m.basic_rom[..], &mut m.kernal_rom[..], &mut m.char_rom[..]] {
+            rom.fill(0);
+        }
+    }
+
     /// S41 §5: the UCI block off this core, for the next one.
     pub fn take_uci(&mut self) -> Option<UciBlock> {
         self.m.set_port_profile_device(None).map(UciBlock)
@@ -2168,6 +2178,20 @@ pub(crate) mod tests {
         assert!(!c64.m.uci().unwrap().status().routed_io2, "the route stays off");
         assert_eq!(c64.uci_take_events(), UciEvents::default());
         assert!(c64.has_uci() && c64.has_sampler());
+    }
+
+    /// S41 §5: a core from a partial bitstream has blank ROMs (c64_mem.v): they read 0 through the ROM window until
+    /// the firmware writes them.
+    #[test]
+    fn a_swapped_in_core_has_blank_roms() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        c64.rom_write(C64Rom::Kernal, 0x1FFC, 0xE2);
+        c64.blank_roms();
+        for rom in [C64Rom::Basic, C64Rom::Kernal, C64Rom::Char] {
+            assert!(c64.rom(rom).iter().all(|&b| b == 0), "{rom:?}");
+        }
+        c64.rom_write(C64Rom::Char, 8, 0x3C);
+        assert_eq!(c64.rom_read(C64Rom::Char, 8), 0x3C, "the firmware's writes land");
     }
 
     /// S41 §5: the UCI block is the host's on the board, so it moves to the next core with its state, and the new
