@@ -216,6 +216,8 @@ const CORE_CONFIG: &[Span] = &[
 
 /// Core config offsets (u64.h:104-154).
 const DMA_MEMONLY: u32 = 0x03;
+/// C64_SPEED_UPDATE, a strobe: a new core is not handed it (S41 §5).
+const SPEED_UPDATE: u32 = 0x2E;
 const JOY1_SWOUT: u32 = 0x30;
 const JOY2_SWOUT: u32 = 0x31;
 
@@ -355,6 +357,9 @@ pub struct C64Port {
     /// S41 §5: the swappable core is not loaded. The bus keeps the firmware out of the core's windows; here the C64
     /// stops: no sync, no tick, no frame, no backend for the monitor. The backend stays, for its physical cartridge.
     core_absent: bool,
+    /// S41 §5: the core config offsets written since power-up (or since the decoupler reset them), which a new core
+    /// is handed when it comes; the rest are at their power-up values on both sides.
+    core_written: [bool; 0x100],
 }
 
 impl Default for C64Port {
@@ -395,6 +400,7 @@ impl C64Port {
             cpu_stopped: false,
             dbg_held: false,
             core_absent: false,
+            core_written: [false; 0x100],
         }
     }
 
@@ -439,16 +445,21 @@ impl C64Port {
         self.backend.as_deref().filter(|_| !self.core_absent)
     }
 
-    /// S41 §5: the core goes (`core_decouple` = 1): the C64 runs up to `now` and stops there, with no clock, no picture
-    /// and no sound, and the drives' WD177x interrupts into the ITU drop. The decoupler holds the cart registers and the
-    /// core config at their power-up values (and the palette with them; it reads 0 anyway): they read those, and a write
-    /// does not stick until the core is back. MATRIX_KEYB (the host's page 1) and the UCI keep what they have.
-    pub fn set_core_absent(&mut self, now: u64, irq: &mut crate::irq::IrqState) {
+    /// S41 §5: the core goes: the C64 runs up to `now` and stops there, with no clock, no picture and no sound, and the
+    /// drives' WD177x interrupts into the ITU drop. With the host's decoupler (`decouple`, ultimate_sys.vhd 155353d, on
+    /// the rise of `core_decouple`) the cart registers and the core config go back to their power-up values once, with
+    /// the C64's reset held (`c64_reset_i`), which the firmware hears as the reset sense, ITU low bit 7; after that they
+    /// take writes as always. MATRIX_KEYB (the host's page 1) and the UCI keep what they have.
+    pub fn set_core_absent(&mut self, now: u64, irq: &mut crate::irq::IrqState, decouple: bool) {
         self.sync(now);
         self.core_absent = true;
-        let fresh = C64Port::new();
-        (self.cart, self.mode, self.stop, self.core) = (fresh.cart, fresh.mode, fresh.stop, fresh.core);
-        self.apply_joysticks();
+        if decouple {
+            let fresh = C64Port::new();
+            (self.cart, self.mode, self.stop, self.core) = (fresh.cart, MODE_RESET, fresh.stop, fresh.core);
+            self.core_written = [false; 0x100];
+            self.apply_joysticks();
+            irq.pulse(C64_RESET_IRQ_BIT);
+        }
         for unit in 0..2 {
             irq.set_high(WD_IRQ_HIGH_BIT + unit, false);
         }
@@ -464,18 +475,27 @@ impl C64Port {
         self.backend.take()
     }
 
-    /// S41 §5: a core is loaded (`core_decouple` = 0): every register of the core's side at its power-on value — the
-    /// cart registers and the core config the decoupler held there — and `backend` (a fresh one) attached at `now`.
-    /// What is the host's stays: MATRIX_KEYB (ultimate_sys page 1) with the rows, RESTORE and freeze it drives into the
-    /// new C64, the physical joysticks and RESTORE key, the lines shared with `U64Io`, the cartridge ROM's place in DDR
-    /// and the link to the TRX block.
-    pub fn power_up(&mut self, backend: Option<Box<dyn C64Backend>>, now: u64) {
+    /// S41 §5: a core is loaded (`core_decouple` = 0): `backend`, a fresh C64 from power-up, attached at `now`, and the
+    /// port's own state for the core side (the session, the pause, the engine's wishes) new. The registers are the
+    /// host's and stay as they are — the cart registers and the core config (pages 0 and 3; what the decoupler reset on
+    /// entry and the firmware wrote since), MATRIX_KEYB (page 1) — and the new C64 is handed them as a core reads the
+    /// host's lines: its reset held while C64_MODE holds it (so it waits for the firmware, as at power-up), the
+    /// cartridge type, the REU and the sampler, the written core config, the keyboard rows, RESTORE and freeze. Its
+    /// UCI events of the power-up are dropped: the release raises nothing (ultimate_sys.vhd 155353d). Also kept: the
+    /// physical joysticks and RESTORE key, the lines shared with `U64Io`, the cartridge ROM's place in DDR, the link to
+    /// the TRX block.
+    pub fn power_up(&mut self, backend: Option<Box<dyn C64Backend>>, now: u64, ram: &[u8]) {
         let (joysticks, joy_lines, restore, keys) = (self.joysticks, self.joy_lines.clone(), self.restore, self.dma.keys);
-        let (cart_detect, cart_rom, link) = (self.cart_detect.take(), self.cart_rom, self.trx.take());
-        let matrix = std::mem::replace(&mut self.matrix, RegTable::new("matrix-keyb", RAM_PAGE));
+        let (cart_detect, rom_place, link) = (self.cart_detect.take(), self.cart_rom, self.trx.take());
+        let blank = || RegTable::new("matrix-keyb", RAM_PAGE);
+        let matrix = std::mem::replace(&mut self.matrix, blank());
+        let cart = std::mem::replace(&mut self.cart, RegTable::new("c64-cartregs", CART_REGS));
+        let core = std::mem::replace(&mut self.core, RegTable::new("c64-core-config", CORE_CONFIG));
+        let (mode, stop, written) = (self.mode, self.stop, self.core_written);
         *self = C64Port::new();
         (self.joysticks, self.joy_lines, self.restore, self.dma.keys) = (joysticks, joy_lines, restore, keys);
-        (self.cart_detect, self.cart_rom, self.matrix) = (cart_detect, cart_rom, matrix);
+        (self.cart_detect, self.cart_rom, self.matrix) = (cart_detect, rom_place, matrix);
+        (self.cart, self.core, self.mode, self.stop, self.core_written) = (cart, core, mode, stop, written);
         if let Some(link) = link {
             self.set_trx_io(link);
         }
@@ -484,12 +504,37 @@ impl C64Port {
         }
         let rows = std::array::from_fn(|i| self.matrix.get(i as u32));
         let freeze = self.matrix.get(MATRIX_FREEZE) != 0;
+        let (cart_type, rom) = (self.cart.get(CARTRIDGE_TYPE), self.cart_rom);
+        let written: Vec<(u8, u8)> =
+            (0..0x100u32).filter(|&r| self.core_written[r as usize] && r != SPEED_UPDATE).map(|r| (r as u8, self.core.get(r))).collect();
+        let (size_kb, reu_on, sampler_on) = (
+            reu_size_kb(self.cart.get(REU_SIZE)),
+            self.cart.get(REU_ENABLE) & 0x01 != 0,
+            self.cart.get(SAMPLER_ENABLE) & 0x01 != 0,
+        );
+        let (mode, stop, trx) = (self.mode, self.stop, self.trx.is_some());
         if let Some(b) = &mut self.backend {
             b.set_matrix_keyb(rows);
             b.set_freeze_button(freeze);
+            for (reg, val) in written {
+                b.core_config_write(reg, val);
+            }
+            b.set_reu_size_kb(size_kb);
+            b.set_reu_enabled(reu_on);
+            b.set_sampler_enabled(sampler_on);
+            b.set_cart(cart_type, cart_rom(ram, rom));
+            b.set_reset(mode & MODE_RESET != 0);
+            b.set_ultimax(mode & MODE_ULTIMAX != 0);
+            if !trx {
+                b.set_stopped(stop);
+                b.set_muted(stop);
+                self.muted = stop;
+            }
+            let _ = b.uci_take_events();
         }
         self.apply_joysticks();
         self.apply_nmi();
+        self.trx_update();
     }
 
     /// S41: tell the backend which blocks this bitstream lacks.
@@ -1012,8 +1057,7 @@ impl C64Port {
     }
 
     fn cart_get(&self, off: u32) -> u8 {
-        // S41 §5: an absent core answers nothing here; the held power-up values do.
-        match (off & 0x0F, self.backend()) {
+        match (off & 0x0F, &self.backend) {
             (MODE, _) => self.mode,
             // 00 §2 C12/C17, 10 H1-H3: STOP reads req | req<<1. HAS_STOPPED follows the request at once, so
             // `hard_stop`'s `while(!(C64_STOP & 2));` (c64.cc:405) and the forced poll in `stop()`
@@ -1021,7 +1065,8 @@ impl C64Port {
             (STOP, _) => u8::from(self.stop) * 0x03,
             // 10 H4: RESET sense follows the held reset.
             (CLOCK_DETECT, Some(_)) if self.mode & MODE_RESET != 0 => CD_PHI2_DETECT | CD_RESET_SENSE,
-            (CARTRIDGE_KILL, Some(b)) => u8::from(b.cart_active()),
+            // S41 §5: an absent core has no cartridge to be active.
+            (CARTRIDGE_KILL, Some(b)) if !self.core_absent => u8::from(b.cart_active()),
             (r, _) => self.cart.get(r),
         }
     }
@@ -1146,6 +1191,7 @@ impl C64Port {
 
     fn core_write(&mut self, reg: u32, val: u8) {
         self.core.set(reg, val);
+        self.core_written[reg as usize & 0xFF] = true;
         // W4-SID: the SID decode (SIDx/EMUSIDx BASE, MASK, EN, WAVES, SPLIT) is the backend's (S14 §W4-SID).
         if let Some(b) = &mut self.backend {
             b.core_config_write(reg as u8, val);
@@ -1351,10 +1397,6 @@ impl IoDevice for C64Port {
     }
 
     fn write8(&mut self, off: u32, val: u8, ctx: &mut IoCtx) {
-        // S41 §5: the decoupler holds these at their power-up values while the core is absent.
-        if self.core_absent && matches!(off, CART..=CART_END | CORE..=CORE_END | PALETTE..=PALETTE_END) {
-            return;
-        }
         match off {
             CART..=CART_END => {
                 self.lend_ddr(ctx);

@@ -266,12 +266,21 @@ struct CoreFactory {
 }
 
 impl CoreFactory {
-    /// A C64 from power-up. The core it replaces (`old`) hands over the cartridge in the physical expansion port and is
-    /// dropped first, its rings with it (S38: a swap ends the ring).
+    /// A C64 from power-up. The core it replaces (`old`) hands over what is not the core's — the cartridge in the
+    /// physical expansion port and the UCI block, the host's on the board — and is dropped first, its rings with it
+    /// (S38: a swap ends the ring).
     #[cfg(feature = "trx64")]
     fn build(&self, old: Option<Box<dyn ue2_core::c64host::C64Backend>>) -> Box<dyn ue2_core::c64host::C64Backend> {
-        let cart = old.and_then(|mut b| b.as_any_mut()?.downcast_mut::<c64_bridge::Trx64Backend>()?.take_slot_cart());
+        let (cart, uci) = old
+            .and_then(|mut b| {
+                let old = b.as_any_mut()?.downcast_mut::<c64_bridge::Trx64Backend>()?;
+                Some((old.take_slot_cart(), old.take_uci()))
+            })
+            .unwrap_or((None, None));
         let mut c64 = new_trx64(&self.rom_dir, self.sink.clone(), self.armsid, self.sid_thread, self.ring);
+        if let Some(uci) = uci {
+            c64.insert_uci(uci);
+        }
         if let Some(cart) = cart {
             c64.insert_slot_cart(cart);
             c64.set_log_cart(self.log_cart);

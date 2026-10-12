@@ -120,7 +120,13 @@ pub(super) fn c64(host: &mut Host, args: &[&str]) -> Result<String, String> {
         }
         ["step"] => c64_step(host, 1),
         ["step", n] => c64_step(host, n.parse().map_err(|_| format!("c64 step: {n} is not a number"))?),
-        _ => Err("c64: usage: c64 [halt | go | step [n]]".into()),
+        // S41: a reset and its release through C64_MODE, as the firmware writes them; it also lets a C64 out of a
+        // reset the firmware holds (a new core after `core present`).
+        ["reset"] => {
+            reset(host, false)?;
+            Ok(c64_state(host))
+        }
+        _ => Err("c64: usage: c64 [halt | go | step [n] | reset]".into()),
     }
 }
 

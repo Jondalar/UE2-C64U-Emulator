@@ -1003,7 +1003,8 @@ impl Machine {
         let now = self.bus.now;
         let (io, irq) = (&mut self.bus.io, &mut self.bus.irq);
         if let Some(port) = io.get_mut::<C64Port>() {
-            port.set_core_absent(now, irq);
+            // ack0 is the host's decoupler, which resets the C64 side's registers once; noack is a host without one.
+            port.set_core_absent(now, irq, mode == Mode::Ack0);
         }
         if let Some(trx) = io.get_mut::<devices::trx::Trx>() {
             trx.set_core_absent(true, now, irq);
@@ -1031,7 +1032,7 @@ impl Machine {
         let absent = self.backend_absent();
         let apply_absent = self.cfg.absent.has(Block::Apply);
         let cart_detect = self.bus.io.get::<U64Io>().map(|io| io.cart_detect.clone());
-        let (io, irq) = (&mut self.bus.io, &mut self.bus.irq);
+        let (io, irq, ram) = (&mut self.bus.io, &mut self.bus.irq, &self.bus.ram);
         if let Some(trx) = io.get_mut::<devices::trx::Trx>() {
             IoDevice::reset(trx);
             trx.set_apply_absent(apply_absent);
@@ -1041,7 +1042,7 @@ impl Machine {
             IoDevice::reset(gcr);
         }
         if let Some(port) = io.get_mut::<C64Port>() {
-            port.power_up(backend, now);
+            port.power_up(backend, now, ram);
             if let Some(cell) = cart_detect {
                 port.set_cart_detect(cell);
             }
@@ -1801,66 +1802,103 @@ mod tests {
         assert!(summary.contains("0x10048000 sampler          1         0  0x00030004 probe+0x4"), "{summary}");
     }
 
-    /// S41 §5: `core absent` stops the C64 (no tick, no frame, no backend for the monitor) and blanks the TRX output
-    /// to the overlay; `core present` attaches a fresh backend at power-up, with the bitstream's absent blocks.
-    #[test]
-    fn core_absent_and_present_swap_the_c64() {
-        use crate::c64host::mock::{Call, Mock};
+    /// A TRX machine of parts with the C64 port, the TRX block and the bitstream's `absent` and `modes`, the mock C64
+    /// attached.
+    fn swap_machine(absent: &str, modes: Option<&str>) -> (Machine, crate::c64host::mock::Mock) {
         let mut config = cfg();
         config.trx_io = TrxIo::On;
-        config.absent = AbsentConfig::parse(Some("sampler"), Some("core=noack"), true).unwrap();
+        config.absent = AbsentConfig::parse(Some(absent), modes, true).unwrap();
         let mut bus = SystemBus::new();
         devices::install_all(&mut bus.io, &config);
         let mut m = Machine::from_parts(config, bus, 0x30000, Symbols::empty());
         m.start_absent();
-        let old = Mock::default();
+        let old = crate::c64host::mock::Mock::default();
         m.attach_c64(Box::new(old.clone()));
+        (m, old)
+    }
+
+    /// The host's registers: REU_SIZE and JOY1_SWOUT (cart page 0, core page 3), MATRIX_KEYB row 0 (page 1),
+    /// ETHSTREAM_ENA (page 2), C64_PLD_ACC (page 4), U64_DEBUG_REGISTER (page 5).
+    const PAGES: [u32; 6] = [0x1004_0009, 0x1018_0030, 0x1010_0300, 0x1010_040F, 0x1018_1000, 0x1018_1800];
+
+    fn pages(m: &mut Machine) -> [u8; 6] {
+        PAGES.map(|addr| rv32::Bus::read8(&mut m.bus, addr))
+    }
+
+    fn write_pages(m: &mut Machine, vals: [u8; 6]) {
+        for (addr, val) in PAGES.into_iter().zip(vals) {
+            rv32::Bus::write8(&mut m.bus, addr, val);
+        }
+    }
+
+    /// S41 §5, the decoupler (ultimate_sys.vhd 155353d): `core absent` stops the C64 (no tick, no frame, no backend for
+    /// the monitor), blanks the TRX output to the overlay, resets pages 0 and 3 once with the C64's reset held and
+    /// raises the reset sense; then pages 0 and 3 take writes, the core's windows ack 0, the DMA window's SID range too.
+    /// `core present` attaches a fresh backend that is handed the host's registers as they stand, with no reset event;
+    /// pages 1, 2, 4 and 5 are never touched.
+    #[test]
+    fn core_absent_and_present_swap_the_c64() {
+        use crate::c64host::mock::Call;
+        let (mut m, old) = swap_machine("sampler", None);
         assert!(old.take().contains(&Call::Absent(Block::Sampler)));
         assert!(m.display().c64.is_some() && !m.core_is_absent());
         assert_eq!(m.core_present(None), Err("core present: the core is present".into()));
-        // The host's registers: REU_SIZE and JOY1_SWOUT (cart page 0, core page 3), MATRIX_KEYB row 0 (page 1),
-        // ETHSTREAM_ENA (page 2), C64_PLD_ACC (page 4), U64_DEBUG_REGISTER (page 5).
-        let pages = [(0x1004_0009, 0x02), (0x1018_0030, 0x7F), (0x1010_0300, 0x55), (0x1010_040F, 0x21), (0x1018_1000, 0x66), (0x1018_1800, 0x77)];
-        for (addr, val) in pages {
-            rv32::Bus::write8(&mut m.bus, addr, val);
-        }
-        let read = |m: &mut Machine| pages.map(|(addr, _)| rv32::Bus::read8(&mut m.bus, addr));
-        assert_eq!(read(&mut m), [0x02, 0x7F, 0x55, 0x21, 0x66, 0x77]);
+        write_pages(&mut m, [0x02, 0x7F, 0x55, 0x21, 0x66, 0x77]);
+        assert_eq!(pages(&mut m), [0x02, 0x7F, 0x55, 0x21, 0x66, 0x77]);
+        m.bus.irq.mask = 0x80;
 
-        assert!(m.core_absent().unwrap().starts_with("core absent (noack)"));
-        assert_eq!(read(&mut m), [0x07, 0xFF, 0x55, 0x21, 0x66, 0x77], "the decoupler holds pages 0 and 3 at power-up");
-        for (addr, val) in pages {
-            rv32::Bus::write8(&mut m.bus, addr, val ^ 0x01);
-        }
-        assert_eq!(read(&mut m), [0x07, 0xFF, 0x54, 0x20, 0x67, 0x76], "writes to pages 0 and 3 do not stick");
+        assert!(m.core_absent().unwrap().starts_with("core absent (ack0)"));
+        assert_eq!(pages(&mut m), [0x07, 0xFF, 0x55, 0x21, 0x66, 0x77], "pages 0 and 3 back at power-up, once");
+        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1004_0000) & 0x04, 0x04, "C64_MODE: the reset is held");
+        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1004_0003), 0x11, "C64_CLOCK_DETECT: the reset sensed");
+        assert_eq!(m.bus.irq.active(), 0x80, "the reset sense, ITU low bit 7");
+        m.bus.irq.clear(0x80);
+        write_pages(&mut m, [0x03, 0x7E, 0x54, 0x20, 0x67, 0x76]);
+        assert_eq!(pages(&mut m), [0x03, 0x7E, 0x54, 0x20, 0x67, 0x76], "writes stick while decoupled");
         assert_eq!(m.core_absent(), Err("core absent: the core is already absent".into()));
         let port = m.bus.io.get::<C64Port>().unwrap();
         assert!(port.next_event().is_none() && port.backend().is_none());
         let snap = m.display();
         assert_eq!((snap.c64, snap.trx), (None, Some(TrxOutput::default())));
         assert_eq!(m.picture_counter(), 0);
-        assert_eq!(m.bus.absent_at(0x1002_0000), Some((Block::Core, Mode::NoAck)));
+        assert_eq!(m.bus.absent_at(0x1002_0000), Some((Block::Core, Mode::Ack0)));
         assert_eq!(m.bus.absent_at(0x1004_4000), None, "the UCI is the host's");
         assert_eq!(m.bus.absent_at(0x1004_0000), None, "the cart registers are the host's");
-        // ultimate_sys answers a DMA read of $D400-$D7FF itself with $FF unless MEMONLY (no SID for the app's probe);
-        // MEMONLY is held at its power-up 0 while the core is absent.
-        rv32::Bus::write8(&mut m.bus, 0x1018_0003, 1);
-        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1005_D400), 0xFF);
+        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1005_D400), 0, "the decoupler acks the DMA window's SID range with 0");
+        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1002_0000), 0);
         assert!(m.bus.noack.is_none());
-        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1005_0400), 0);
-        assert!(m.bus.noack.take().is_some(), "the rest of the DMA window is the core's");
 
         old.take();
         assert!(m.take_c64_backend().is_some());
-        let new = Mock::default();
+        let new = crate::c64host::mock::Mock::default();
         assert!(m.core_present(Some(Box::new(new.clone()))).unwrap().starts_with("core present"));
-        assert_eq!(read(&mut m), [0x07, 0xFF, 0x54, 0x20, 0x67, 0x76], "pages 0 and 3 clean, pages 1, 2, 4, 5 kept");
+        assert_eq!(pages(&mut m), [0x03, 0x7E, 0x54, 0x20, 0x67, 0x76], "the host's registers as they were");
+        assert_eq!(m.bus.irq.active(), 0, "the release raises nothing");
         let calls = new.take();
-        assert!(calls.contains(&Call::Matrix([0x54, 0, 0, 0, 0, 0, 0, 0])), "the new C64 sees the host's matrix");
+        for call in [Call::Matrix([0x54, 0, 0, 0, 0, 0, 0, 0]), Call::Reset(true), Call::ReuSize(1024), Call::Absent(Block::Sampler)] {
+            assert!(calls.contains(&call), "{call:?} in {calls:?}");
+        }
+        assert!(new.core.borrow().contains(&(0x30, 0x7E)), "the written core config");
         assert!(!m.core_is_absent() && m.bus.absent_at(0x1002_0000).is_none());
-        assert!(calls.contains(&Call::Absent(Block::Sampler)), "the new core lacks the sampler too");
         assert!(m.bus.io.get::<C64Port>().unwrap().next_event().is_some());
         assert!(m.display().c64.is_some());
         assert!(old.take().is_empty(), "the old core is gone");
+    }
+
+    /// S41 §5, a host without the decoupler (`core=noack`): nothing is reset and no reset is sensed on entry, the
+    /// core's windows never answer, ultimate_sys answers the DMA window's SID range itself with $FF unless MEMONLY.
+    #[test]
+    fn without_the_decoupler_nothing_resets_and_the_core_stalls() {
+        let (mut m, _old) = swap_machine("sampler", Some("core=noack"));
+        write_pages(&mut m, [0x02, 0x7F, 0x55, 0x21, 0x66, 0x77]);
+        m.bus.irq.mask = 0x80;
+        assert!(m.core_absent().unwrap().starts_with("core absent (noack)"));
+        assert_eq!(pages(&mut m), [0x02, 0x7F, 0x55, 0x21, 0x66, 0x77]);
+        assert_eq!(m.bus.irq.active(), 0);
+        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1005_D400), 0xFF);
+        assert!(m.bus.noack.is_none());
+        rv32::Bus::write8(&mut m.bus, 0x1018_0003, 1);
+        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1005_D400), 0);
+        assert!(m.bus.noack.take().is_some(), "MEMONLY: the byte goes to the core, which is not there");
     }
 }
