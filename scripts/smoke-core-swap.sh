@@ -20,7 +20,7 @@
 #           sensed ($11) and the cartridge type 0, every other cart register byte as before; the app's reset handler
 #           runs (the reset sense); after `core present` the reset is still held, the host's pages 1, 2, 4 and 5
 #           (MATRIX_KEYB, the U64 board IO, C64_PLD_ACC, U64_DEBUG_REGISTER) read what they read before the swap, and
-#           the ROM windows read 0; released bare through C64_MODE (`monitor c64 reset`) the C64 runs blank ROMs and
+#           the ROM windows and the C64 RAM (screen $0400, $C000, through the DMA window) read 0; released bare through C64_MODE (`monitor c64 reset`) the C64 runs blank ROMs and
 #           does not reach READY
 #   rest    the decoupler with the network: REST answers while the core is absent. After `core present`,
 #           `PUT /v1/machine:reset` runs the app's C64::reset, which puts back BASIC and KERNAL from its own snapshot
@@ -138,7 +138,9 @@ monitor fw m 10181800 10181803'
 cart='monitor fw m 10040000 1004000f'
 romwin='monitor fw m 10188000 1018800f
 monitor fw m 1018a000 1018a00f
-monitor fw m 1018c000 1018c00f'
+monitor fw m 1018c000 1018c00f
+monitor fw m 10050400 1005040f
+monitor fw m 1005c000 1005c00f'
 swap="$booted
 $pages
 $cart
@@ -157,8 +159,8 @@ png present.png"
 run swap "$swap" || fail swap "exit code $?"
 [[ $(grep -c "^core absent (ack0): " swap.err) == 1 && $(grep -c "^core present: a fresh core" swap.err) == 1 ]] ||
     fail swap "not one swap"
-for rom in 10188000 1018a000 1018c000; do
-    grep -q "^  $rom  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00$" swap.log || fail swap "ROM window $rom is not blank"
+for win in 10188000 1018a000 1018c000 10050400 1005c000; do
+    grep -q "^  $win  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00$" swap.log || fail swap "window $win is not blank"
 done
 carts=$(grep "^  10040000 " swap.log)
 # Before the swap, then on entry: bytes 0, 1, 3, 5 and 6 read latches (reset held, no stop, reset sensed, no
@@ -174,7 +176,7 @@ for page in 10100300 10100400 10181000 10181800; do
 done
 ! c64 swap 1 | grep -q "READY." || fail swap "the fresh C64 reached READY on blank ROMs"
 echo "PASS swap: on entry $(sed -n 2p <<<"$carts" | cut -c13-), the app's reset handler ran; held in reset after"
-echo "     core present; pages 1, 2, 4, 5 kept; ROMs blank; a bare release does not reach READY"
+echo "     core present; pages 1, 2, 4, 5 kept; ROMs and C64 RAM blank; a bare release does not reach READY"
 
 # rest: a swap with the network on, driven over the control port while the REST API is called.
 python3 - "$bin" "$elf" "$roms" "$repo/scripts" <<'PY' >rest.out 2>&1 || fail rest "$(tail -n 5 rest.out)"

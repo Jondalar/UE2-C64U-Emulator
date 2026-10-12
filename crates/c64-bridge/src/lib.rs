@@ -443,14 +443,17 @@ impl Trx64Backend {
         Some(SlotCart(cart))
     }
 
-    /// S41 §5: the ROMs of a core loaded by partial reconfiguration: BASIC, KERNAL and CHAR live in the core's block RAM
-    /// (c64_mem.v `rom_lo`/`rom_hi`, dfx-trial a75c356), which the bitstream initialises only for simulation
-    /// (`TRX_SIM_ROMS`), so they read 0 until the firmware writes them through the ROM window.
-    pub fn blank_roms(&mut self) {
+    /// S41 §5: the memories of a core loaded by partial reconfiguration, all block RAM the bitstream does not
+    /// initialise (dfx-trial 1e7838e), so they read 0: BASIC, KERNAL and CHAR (c64_mem.v `rom_lo`/`rom_hi`, filled only
+    /// for simulation, `TRX_SIM_ROMS`) until the firmware writes them through the ROM window; the 64K of C64 RAM
+    /// (c64_mem.v `ram_lo`/`ram_hi`); the colour RAM (c64_top.v `color_mem`), its low nibbles in TRX64's I/O shadow.
+    pub fn blank_block_ram(&mut self) {
         let m = &mut *self.m;
         for rom in [&mut m.basic_rom[..], &mut m.kernal_rom[..], &mut m.char_rom[..]] {
             rom.fill(0);
         }
+        m.ram.fill(0);
+        trx64_core::c64re_snapshot::write_color_ram(m, &[0; 0x400], false);
     }
 
     /// S41 §5: the UCI block off this core, for the next one.
@@ -2180,16 +2183,20 @@ pub(crate) mod tests {
         assert!(c64.has_uci() && c64.has_sampler());
     }
 
-    /// S41 §5: a core from a partial bitstream has blank ROMs (c64_mem.v): they read 0 through the ROM window until
-    /// the firmware writes them.
+    /// S41 §5: a core from a partial bitstream has its block RAM at 0 (c64_mem.v, c64_top.v): the ROMs read 0 through
+    /// the ROM window until the firmware writes them, the C64 RAM and the colour RAM are 0, not the power-on pattern.
     #[test]
-    fn a_swapped_in_core_has_blank_roms() {
+    fn a_swapped_in_core_has_blank_block_ram() {
         let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
         c64.rom_write(C64Rom::Kernal, 0x1FFC, 0xE2);
-        c64.blank_roms();
+        c64.dma_write(0xD800, 0x0E, true);
+        assert!(c64.m.ram.iter().any(|&b| b != 0), "the power-on pattern first");
+        c64.blank_block_ram();
         for rom in [C64Rom::Basic, C64Rom::Kernal, C64Rom::Char] {
             assert!(c64.rom(rom).iter().all(|&b| b == 0), "{rom:?}");
         }
+        assert!(c64.m.ram.iter().all(|&b| b == 0), "64K of C64 RAM at 0");
+        assert!((0xD800..0xDC00u16).all(|a| c64.io_peek(a) & 0x0F == 0), "the colour RAM at 0");
         c64.rom_write(C64Rom::Char, 8, 0x3C);
         assert_eq!(c64.rom_read(C64Rom::Char, 8), 0x3C, "the firmware's writes land");
     }
