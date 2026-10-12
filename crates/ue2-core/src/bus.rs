@@ -174,7 +174,7 @@ impl SystemBus {
         let (block, mode) = self.absent_at(addr)?;
         // Without the decoupler (`noack`) ultimate_sys answers a DMA read of $D400-$D7FF itself with $FF unless
         // MEMONLY is set (`dma_stub`: no SID for the app's socket probe); with it (`ack0`) the read is acked with 0 like
-        // the rest of the window (`core_to`, ultimate_sys.vhd 155353d).
+        // the rest of the window (`core_to`, ultimate_sys.vhd a75c356).
         if block == Block::Core
             && mode == Mode::NoAck
             && !write

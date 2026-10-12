@@ -7,18 +7,22 @@
 #
 # ROMs come from $UE2_FIRMWARE (default firmware/1541ultimate), each run has a fresh flash image.
 #
-# `core absent` is the host's decoupler (`core_decouple` = 1, ultimate_sys.vhd 155353d): on its rise the cart
-# registers and the core config go back to power-up once, with the C64's reset held, and the firmware senses the reset
-# (ITU low bit 7); the core's windows answer ack0 at once. `core present` loads a fresh core that stays in reset until
+# `core absent` is the host's decoupler (`core_decouple` = 1, ultimate_sys.vhd a75c356): on its rise the latches behind
+# the cart registers and the core config go back to power-up once, with the C64's reset held, and the firmware senses
+# the reset (ITU low bit 7); bytes that read back from the page RAM keep their values; the core's windows answer ack0
+# at once. `core present` loads a fresh core that stays in reset until
 # the firmware releases it, as at power-up, and raises nothing. `--absent-mode core=noack` is a host without the
 # decoupler, where an access into the core never completes and nothing is reset.
 #
 # Runs:
-#   swap    the decoupler, twice: right after `core absent` the cart registers read power-up with the reset held
-#           (04 00 00 11 ... 07 .. 01); the app's reset handler runs (the reset sense); after `core present` the
+#   swap    the decoupler, twice: right after `core absent` C64_MODE reads the reset held ($04), C64_STOP 0, the
+#           reset sensed ($11) and the cartridge type 0, every other cart register byte as before; the app's reset
+#           handler runs (the reset sense); after `core present` the
 #           reset is still held and the host's pages 1, 2, 4 and 5 (MATRIX_KEYB, the U64 board IO, C64_PLD_ACC,
 #           U64_DEBUG_REGISTER) read what they read before the swap; `monitor c64 reset`, standing in for the app's
 #           release (it writes C64_MODE as the firmware does), boots the fresh C64 to READY
+#   rest    the decoupler with the network: the REST API answers while the core is absent, and after
+#           `core present` `PUT /v1/machine:reset` (the app's own reset path) boots the new core to READY
 #   log     core=noack with --absent-continue: the C64 screen is empty and the picture black without the core, every
 #           access of the app into the core's windows is logged and counted (the app's reaction, printed)
 #   halt    core=noack: `core absent` halts the RISC-V on its first access into the core's windows, with the report
@@ -94,6 +98,7 @@ monitor fw m 10181800 10181803'
 cart='monitor fw m 10040000 1004000f'
 swap="$booted
 $pages
+$cart
 core absent
 $cart
 expect-console \"U64 reset handler\" 2000
@@ -115,16 +120,71 @@ run swap "$swap" || fail swap "exit code $?"
 [[ $(grep -c "^core absent (ack0): " swap.err) == 2 && $(grep -c "^core present: a fresh core" swap.err) == 2 ]] ||
     fail swap "not two swaps"
 carts=$(grep "^  10040000 " swap.log)
-[[ $(sed -n 1p <<<"$carts") == "  10040000  04 00 00 11 00 00 00 00 00 07 00 00 01 00 00 00" ]] ||
-    fail swap "the decoupler did not reset the cart registers with the reset held: $(sed -n 1p <<<"$carts")"
-[[ $(sed -n 2p <<<"$carts" | cut -c13-14) == 04 ]] || fail swap "the fresh C64 is not held in reset after core present"
+# Before the swap, then on entry: bytes 0, 1, 3, 5 and 6 read latches (reset held, no stop, reset sensed, no
+# cartridge, not active), the rest the page RAM.
+want=$(sed -n 1p <<<"$carts" | awk '{ $2 = "04"; $3 = "00"; $5 = "11"; $7 = "00"; $8 = "00"; print }' |
+    sed 's/^10040000 /  10040000  /')
+[[ $(sed -n 2p <<<"$carts") == "$want" ]] ||
+    fail swap "on entry the cart registers read $(sed -n 2p <<<"$carts"), not $want"
+[[ $(sed -n 3p <<<"$carts" | cut -c13-14) == 04 ]] || fail swap "the fresh C64 is not held in reset after core present"
 for page in 10100300 10100400 10181000 10181800; do
     [[ $(grep -c "^  $page " swap.log) == 2 && $(grep "^  $page " swap.log | sort -u | wc -l) -eq 1 ]] ||
         fail swap "host page $page changed over the swap"
 done
 c64 swap 1 | grep -q "READY." || fail swap "the fresh C64 did not boot after its release"
-echo "PASS swap: on entry $(sed -n 1p <<<"$carts" | cut -c13-), the app's reset handler ran; held in reset after"
+echo "PASS swap: on entry $(sed -n 2p <<<"$carts" | cut -c13-), the app's reset handler ran; held in reset after"
 echo "     core present; pages 1, 2, 4, 5 kept; READY after the release, twice"
+
+# rest: a swap with the network on, driven over the control port while the REST API is called.
+python3 - "$bin" "$elf" "$roms" "$repo/scripts" <<'PY' >rest.out 2>&1 || fail rest "$(tail -n 5 rest.out)"
+import socket, subprocess, sys, time
+bin_, elf, roms, scripts = sys.argv[1:5]
+sys.path.insert(0, scripts)
+import cartslot_common as cs
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+http, ctl = free_port(), free_port()
+proc = subprocess.Popen([bin_, 'run', '--headless', '--speed', 'max', '--board', 'c64u', '--firmware', elf, '--roms', roms,
+                         '--flash', 'rest-flash.bin', '--c64-roms', '--net', 'user', '--hostfwd',
+                         f'tcp:127.0.0.1:{http}:80', '--control', f'127.0.0.1:{ctl}'],
+                        stdout=open('rest.log', 'wb'), stderr=open('rest.err', 'wb'))
+deadline = time.time() + 60
+while True:
+    try:
+        c = cs.Control(f'127.0.0.1:{ctl}')
+        break
+    except OSError:
+        if time.time() > deadline or proc.poll() is not None:
+            sys.exit('no control port')
+        time.sleep(0.2)
+rest = cs.Rest(f'http://127.0.0.1:{http}')
+try:
+    c.cmd('expect-console "[TRX UI] splash done; UI parked" 15000')
+    rest.wait_ready(120)
+    c.cmd('core absent')
+    info = rest.request('GET', '/v1/info')
+    c.cmd('wait 1000')
+    c.cmd('core present')
+    mode = c.cmd('monitor fw m 10040000 10040000')
+    if not mode or mode[0].split()[-1] != '04':
+        sys.exit(f'not held in reset after core present: {mode}')
+    rest.request('PUT', '/v1/machine:reset', idempotent=False)
+    c.cmd('expect-c64 READY. 8000')
+    print(f'REST answered while the core was absent ({len(info)} bytes of /v1/info); after core present '
+          'PUT /v1/machine:reset booted the new core to READY')
+    c.cmd('quit')
+finally:
+    c.close()
+    try:
+        proc.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+PY
+echo "PASS rest: $(tail -n 1 rest.out)"
 
 log="$booted
 core absent

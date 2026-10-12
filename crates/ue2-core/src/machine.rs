@@ -1831,11 +1831,11 @@ mod tests {
         }
     }
 
-    /// S41 §5, the decoupler (ultimate_sys.vhd 155353d): `core absent` stops the C64 (no tick, no frame, no backend for
-    /// the monitor), blanks the TRX output to the overlay, resets pages 0 and 3 once with the C64's reset held and
-    /// raises the reset sense; then pages 0 and 3 take writes, the core's windows ack 0, the DMA window's SID range too.
-    /// `core present` attaches a fresh backend that is handed the host's registers as they stand, with no reset event;
-    /// pages 1, 2, 4 and 5 are never touched.
+    /// S41 §5, the decoupler (ultimate_sys.vhd a75c356): `core absent` stops the C64 (no tick, no frame, no backend for
+    /// the monitor), blanks the TRX output to the overlay, resets the latches behind pages 0 and 3 once with the C64's
+    /// reset held and raises the reset sense, while the read-back bytes keep their values; then pages 0 and 3 take
+    /// writes, the core's windows ack 0, the DMA window's SID range too. `core present` attaches a fresh backend that is
+    /// handed the latches as they stand, with no reset event; pages 1, 2, 4 and 5 are never touched.
     #[test]
     fn core_absent_and_present_swap_the_c64() {
         use crate::c64host::mock::Call;
@@ -1848,13 +1848,16 @@ mod tests {
         m.bus.irq.mask = 0x80;
 
         assert!(m.core_absent().unwrap().starts_with("core absent (ack0)"));
-        assert_eq!(pages(&mut m), [0x07, 0xFF, 0x55, 0x21, 0x66, 0x77], "pages 0 and 3 back at power-up, once");
+        assert_eq!(pages(&mut m), [0x02, 0x7F, 0x55, 0x21, 0x66, 0x77], "the read-back bytes keep their values");
         assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1004_0000) & 0x04, 0x04, "C64_MODE: the reset is held");
         assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1004_0003), 0x11, "C64_CLOCK_DETECT: the reset sensed");
         assert_eq!(m.bus.irq.active(), 0x80, "the reset sense, ITU low bit 7");
         m.bus.irq.clear(0x80);
-        write_pages(&mut m, [0x03, 0x7E, 0x54, 0x20, 0x67, 0x76]);
-        assert_eq!(pages(&mut m), [0x03, 0x7E, 0x54, 0x20, 0x67, 0x76], "writes stick while decoupled");
+        rv32::Bus::write8(&mut m.bus, 0x1004_0009, 0x03);
+        for (addr, val) in [(0x1010_0300, 0x54), (0x1010_040F, 0x20), (0x1018_1000, 0x67), (0x1018_1800, 0x76)] {
+            rv32::Bus::write8(&mut m.bus, addr, val);
+        }
+        assert_eq!(pages(&mut m), [0x03, 0x7F, 0x54, 0x20, 0x67, 0x76], "writes stick while decoupled");
         assert_eq!(m.core_absent(), Err("core absent: the core is already absent".into()));
         let port = m.bus.io.get::<C64Port>().unwrap();
         assert!(port.next_event().is_none() && port.backend().is_none());
@@ -1872,13 +1875,21 @@ mod tests {
         assert!(m.take_c64_backend().is_some());
         let new = crate::c64host::mock::Mock::default();
         assert!(m.core_present(Some(Box::new(new.clone()))).unwrap().starts_with("core present"));
-        assert_eq!(pages(&mut m), [0x03, 0x7E, 0x54, 0x20, 0x67, 0x76], "the host's registers as they were");
+        assert_eq!(pages(&mut m), [0x03, 0x7F, 0x54, 0x20, 0x67, 0x76], "the host's registers as they were");
         assert_eq!(m.bus.irq.active(), 0, "the release raises nothing");
         let calls = new.take();
-        for call in [Call::Matrix([0x54, 0, 0, 0, 0, 0, 0, 0]), Call::Reset(true), Call::ReuSize(1024), Call::Absent(Block::Sampler)] {
+        // The latches: REU_SIZE written while decoupled (1 MB); JOY1_SWOUT reset by the rise to $FF although its byte
+        // still reads $7F, and not handed on as a core config write.
+        for call in [
+            Call::Matrix([0x54, 0, 0, 0, 0, 0, 0, 0]),
+            Call::Reset(true),
+            Call::ReuSize(1024),
+            Call::Joystick(1, 0xFF),
+            Call::Absent(Block::Sampler),
+        ] {
             assert!(calls.contains(&call), "{call:?} in {calls:?}");
         }
-        assert!(new.core.borrow().contains(&(0x30, 0x7E)), "the written core config");
+        assert!(!new.core.borrow().iter().any(|&(off, _)| off == 0x30), "the latch was reset, not written");
         assert!(!m.core_is_absent() && m.bus.absent_at(0x1002_0000).is_none());
         assert!(m.bus.io.get::<C64Port>().unwrap().next_event().is_some());
         assert!(m.display().c64.is_some());

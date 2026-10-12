@@ -90,20 +90,32 @@ IEC processor's idle constants (`r_iec`) and UE2's drive B (0x10024000, `r_none`
 register models while the C64 stands still.
 
 **A swap is a full cold boot** (Alex, 2026-10-12): nothing of the old core survives. On the board the host's DFX
-decoupler does it (T79.1; RTL in ultimate_sys.vhd, dfx-trial 155353d; top.v in 975a728, the page sweep on the app's write
-port in 2565e6d; the debug register `core_decouple` is JTAG 0x100029 bit 0, read back in the same register). A swap is `core_decouple` = 1, the partial bitstream
-loaded, `core_decouple` = 0.
-- **On the rise** (`core absent`), once: the cart registers (page 0) and the core config (page 3) go back to their
-  power-up values, with the C64's reset held (`c64_reset_i` = 1); a 512-cycle sweep clears their read-back bytes,
-  rewrites the palette to Colodore and holds `sidcv_we` at 0. The held reset is the reset sense: `c64_reset_req`
-  (ultimate_sys:1508-1509), top.v's `core_reset_req` (top.v:1217, 1249), `rst_sense_s`, ITU low bit 7
-  (ultimate_sys:619, 1156), all on the host side. The read mux's constant offsets are unchanged.
+decoupler does it (T79.1; RTL in dfx-trial a75c356, ultimate_sys.vhd and top.v; the decoupler came in 975a728;
+the debug register `core_decouple` is JTAG 0x100029 bit 0, read back in the same register; top.v is not finished, so
+the address is provisional). A swap is `core_decouple` = 1, the partial bitstream loaded, `core_decouple` = 0. The
+board PoC 3 (46afe1f) did that over JTAG in 2.8 s with REST answering 200 throughout; after
+`PUT /v1/machine:reset` the new core booted to BASIC V2.
+- **On the rise** (`core absent`), once: the latches behind pages 0 and 3 go back to their power-up values, with the
+  C64's reset held (`c64_reset_i` = 1), and a 64-cycle sweep rewrites the palette to Colodore and holds `sidcv_we` at
+  0. The held reset is the reset sense: `c64_reset_req`, top.v's `core_reset_req` (top.v:1225, 1257), `rst_sense_s`,
+  ITU low bit 7, all on the host side. There is no sweep over the page RAM (a75c356; 2565e6d had one): every byte
+  that reads back from it keeps what the firmware last wrote until the firmware writes it again. Per offset:
+  - page 0 (cart registers): C64_MODE (+0: reset, ULTIMAX, NMI), C64_STOP (+1) and C64_CARTRIDGE_TYPE (+5) read their
+    latches, which reset (MODE reads $04, STOP 0, type 0); C64_CLOCK_DETECT (+3) reads the reset sense ($11),
+    CARTRIDGE_ACTIVE (+6) the core; REU_ENABLE (+8), REU_SIZE (+9) and C64_SAMPLER_ENABLE (+E) have latches that
+    reset (off, 16 MB, off) behind read-back bytes that keep their values; every other offset is a read-back byte
+    only (STOP_MODE +2, +4, +7, +A-+D, +F).
+  - page 3 (core config): every offset reads back from the page RAM except CORE_VERSION (+10, $01) and the voice
+    levels (+80-+9F). Latches that reset sit behind +00 (scan lines), +01 (video format), +02/+2D (turbo), +03
+    (MEMONLY), +0A/+0B/+0E/+0F (SID base and mask), +20-+23, +27-+29 (SID waves, filter, digis, split), +2B/+2C (bus
+    sharing) and +30/+31 (the software joystick outputs); +2E (speed update) is a strobe.
 - **While it is 1:** `r_drive`, `r_gcr`, `r_cw`, `r_dma` and `r_rom` are answered by the host at once, ack and data
   0 (the DMA window's `$D400-$D7FF` included), no DMA starts; the host takes no DDR2 request from the core, the
   toggle handshakes, slot, IEC and the core's IRQs are held (top.v, unfinished). Pages 0 and 3 take writes as always,
   so the firmware's `C64::hard_stop` sees its stop.
-- **On the fall** (`core present`): nothing is raised. The new core comes up with the host's registers as they stand,
-  so its C64 stays in reset until the firmware releases it through C64_MODE, as at power-up. The FW side accepts
+- **On the fall** (`core present`): nothing is raised. The new core comes up with the host's latches as they stand
+  (not the read-back bytes): its C64 stays in reset until the firmware releases it through C64_MODE, as at power-up;
+  the REU, the sampler, MEMONLY and the joystick outputs are at power-up unless written since the rise. The FW side accepts
   this as the cold-boot behaviour: the board PoC releases it by hand, later the T81 core selector app as its last
   swap step.
 - Pages 1, 2, 4 and 5 of `r_page` (MATRIX_KEYB 0x10100300, the U64 board IO 0x10100400, C64_PLD_ACC 0x10181000,
@@ -155,13 +167,15 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
   bytes 0x10048000-0x100480E0) 1.45 s after boot, console "Speed regs: 00 80". With `ack0` the app boots to the
   parked UI; with `--absent-continue` those eight writes are the only stalls of a boot. All seven blocks absent in
   their default modes: the app boots, CAPS2 reads $9D.
-- `smoke-core-swap.sh`: all five runs pass (decoupler: 155353d).
+- `smoke-core-swap.sh`: all six runs pass (decoupler: a75c356).
   - With the decoupler, a swap during a run: right after `core absent` the cart registers read
-    `04 00 00 11 00 00 00 00 00 07 00 00 01 00 00 00` (power-up, the reset held and sensed), and the unmodified app
+    `04 00 02 11 00 00 00 00 00 04 00 00 00 00 00 00`: MODE, STOP, CLOCK_DETECT and the type from their latches (the
+    reset held and sensed), STOP_MODE ($02) and REU_SIZE ($04) still what the app wrote. The unmodified app
     reacts to the reset sense at once with its reset handler ("U64 reset handler. Resetting Settings"), writing the
     core config again. After `core present` the C64 is still in reset (C64_MODE $04), nothing is raised, pages 1, 2,
     4 and 5 read as before; the app does not release the reset by itself, so the C64 stands until something writes
-    C64_MODE: the smoke's `monitor c64 reset` (the firmware's own write) boots it to READY, twice in a row.
+    C64_MODE: the smoke's `monitor c64 reset` (the firmware's own write) boots it to READY, twice in a row, and so
+    does `PUT /v1/machine:reset` over REST, which answers all through the swap (the board's PoC 3 sequence).
   - With the decoupler and `--absent core` from power-on the app runs its whole init ("All Init functions called")
     and stays up; its cart init reads "Mode: 04" (the C64 held in reset) and the reset handler runs twice. The
     `C64::hard_stop` hang of the held version (d6b9cd8) is gone.
@@ -183,11 +197,15 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
   `dma_req_tgl`) and acks it on the core's `dma_done_tgl`. 70bd378 added it to the host timeout ("found by ue2emu
   S41"), and the decoupler answers it. Without either, the DMA watchdog (`dma_wd`) acks it after 2^25 clocks
   (335 ms) with $FF; UE2 does not model that wait (`noack` halts).
-- **The decoupler follows the RTL** (ultimate_sys.vhd 155353d) on the reset of pages 0 and 3 on the rise, the
-  held reset and its sense, the windows' ack with 0 and the quiet fall. Two parts are UE2's own: the palette is the
-  core's in UE2 (TRX64's), so the new core starts with its default palette and a palette write while the core is
-  absent goes to the old one and is lost, where the RTL's sweep rewrites `pal_ram` to Colodore; the SID curves are a
-  write sink in UE2 (S17), so there is nothing to clear. top.v's half (DDR2, handshakes, pins, IRQ masks) needs no
+- **The decoupler follows the RTL** (dfx-trial a75c356) on the reset of the latches behind pages 0 and 3 on the
+  rise with the read-back bytes kept, the held reset and its sense, the windows' ack with 0 and the quiet fall. UE2
+  models the latches it hands a core (`Latches` in c64.rs: REU, sampler, MEMONLY, joystick outputs; C64_MODE,
+  C64_STOP and the type are the port's own); the other page 3 latches are the core config offsets written since the
+  rise, which the new core gets, and the rest stays at its power-up value in the new core. Two parts are UE2's own:
+  the palette is the core's in UE2 (TRX64's), so the new core starts with its default palette and a palette write
+  while the core is absent goes to the old one and is lost, where the RTL's sweep rewrites `pal_ram` to Colodore;
+  the SID curves are a write sink in UE2 (S17), so there is nothing to clear. The read-back of REU_ENABLE and
+  C64_SAMPLER_ENABLE in UE2 is bit 0 only (`CART_REGS`), where the page RAM keeps the whole byte; unchanged here. top.v's half (DDR2, handshakes, pins, IRQ masks) needs no
   model: an absent core in UE2 runs nothing.
 - **Host registers read their latches, not 0**: ultimate_sys reads the cart registers and the core config from its
   own registers and constants (`page_data`), and UE2's register models give that answer.
