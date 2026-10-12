@@ -544,7 +544,18 @@ impl Trx {
         lock(&self.link).frames
     }
 
-    /// Page 6 register `off` (its first byte) as a 32-bit read returns it; c64_text.v's two read 0 here.
+    /// Page 6 register `off` (its first byte) as a 32-bit read returns it: the configuration registers are write-only
+    /// and read 0, only STILL_STATUS and PX_STATUS answer (pix_layer.v `cur`, since 28d8b69); c64_text.v's two read 0
+    /// here too.
+    pub fn bus_reg(&self, off: u32) -> u32 {
+        match off {
+            STILL_STATUS | PX_STATUS => self.reg(off),
+            _ => 0,
+        }
+    }
+
+    /// Page 6 register `off` (its first byte) as the app last committed it, for the monitor and the tests; the app
+    /// reads these through [`Self::bus_reg`].
     pub fn reg(&self, off: u32) -> u32 {
         let s = &self.set;
         match off {
@@ -844,7 +855,7 @@ impl IoDevice for Trx {
                 }
                 return self.far_latch as u8;
             } else if off & !0xFFF == PAGE6 {
-                self.latch = self.reg(reg);
+                self.latch = self.bus_reg(reg);
                 if tx_sel(reg) {
                     self.tx_latch = self.tx_reg(reg);
                 }
@@ -923,7 +934,7 @@ impl IoDevice for Trx {
             PAGE6 => {
                 let tx = tx_sel(reg);
                 match off & 3 {
-                    0 => (self.reg(reg) | if tx { self.tx_reg(reg) } else { 0 }) as u8,
+                    0 => (self.bus_reg(reg) | if tx { self.tx_reg(reg) } else { 0 }) as u8,
                     _ => ((self.latch | if tx { self.tx_latch } else { 0 }) >> byte) as u8,
                 }
             }
@@ -1194,7 +1205,7 @@ mod tests {
         let regs = [STILL_CTRL, STILL_BASE, STILL_STATUS, PX_CTRL, PX_FRONT, PX_SIZE, PX_STRIDE, PX_POS, PX_GALPHA, PX_KEY];
         let want = [1, 0x0505_0000, 0, 0x22, 0, 540 << 16 | 960, 1920, 0, 255, 0];
         for (reg, want) in regs.into_iter().zip(want) {
-            assert_eq!(r.r32(PAGE6 + reg), want, "{reg:#05x}");
+            assert_eq!(r.trx.reg(reg), want, "{reg:#05x}");
         }
         assert!(!r.trx.shown(), "0x22 is format 1 but not on");
     }
@@ -1205,19 +1216,19 @@ mod tests {
         for (i, b) in [0x34, 0x12, 0x78].into_iter().enumerate() {
             r.w8(PAGE6 + PX_POS + i as u32, b);
         }
-        assert_eq!(r.r32(PAGE6 + PX_POS), 0, "staged, not committed");
+        assert_eq!(r.trx.reg(PX_POS), 0, "staged, not committed");
         r.w8(PAGE6 + PX_POS + 3, 0x05);
-        assert_eq!(r.r32(PAGE6 + PX_POS), 0x0578_1234);
+        assert_eq!(r.trx.reg(PX_POS), 0x0578_1234);
         // One stage for all registers: byte 3 commits the register it is written to.
         r.w8(PAGE6 + PX_SIZE, 0xAA);
         r.w8(PAGE6 + PX_GALPHA + 3, 0);
-        assert_eq!(r.r32(PAGE6 + PX_GALPHA), 0xAA);
+        assert_eq!(r.trx.reg(PX_GALPHA), 0xAA);
         // Masks on commit: addresses and the stride to 16 bytes, PX_CTRL 6 bits, the key 17.
         r.w32(PAGE6 + PX_FRONT, 0x0123_456F);
         r.w32(PAGE6 + PX_STRIDE, 0xFFFF_FFFF);
         r.w32(PAGE6 + PX_CTRL, 0xFF);
         r.w32(PAGE6 + PX_KEY, 0xFFFF_FFFF);
-        let got = [PX_FRONT, PX_STRIDE, PX_CTRL, PX_KEY].map(|reg| r.r32(PAGE6 + reg));
+        let got = [PX_FRONT, PX_STRIDE, PX_CTRL, PX_KEY].map(|reg| r.trx.reg(reg));
         assert_eq!(got, [0x0123_4560, 0xFFF0, 0x3F, 0x1_FFFF]);
         r.w32(PAGE6 + STILL_BASE, 0x0012_345F);
         r.w32(PAGE6 + STILL_CTRL, 0);
@@ -1228,12 +1239,21 @@ mod tests {
     #[test]
     fn byte_0_read_latches_bytes_1_to_3() {
         let mut r = Rig::new();
+        r.frame();
+        assert_eq!(r.r8(PAGE6 + PX_STATUS) & 1, 0);
+        r.frame();
+        assert_eq!(r.r8(PAGE6 + PX_STATUS + 2), 1, "the frame count from the latch of the first read");
+        assert_eq!(r.r32(PAGE6 + PX_STATUS) >> 16, 2, "a new byte-0 read takes the new value");
+    }
+
+    #[test]
+    fn configuration_registers_are_write_only() {
+        let mut r = Rig::new();
         r.w32(PAGE6 + PX_SIZE, 0x0111_0222);
-        assert_eq!(r.r8(PAGE6 + PX_SIZE), 0x22);
-        r.w32(PAGE6 + PX_SIZE, 0x0333_0444);
-        let late = [1, 2, 3].map(|b| r.r8(PAGE6 + PX_SIZE + b));
-        assert_eq!(late, [0x02, 0x11, 0x01], "bytes 1-3 from the latch of the first read");
-        assert_eq!(r.r32(PAGE6 + PX_SIZE), 0x0333_0444, "a new byte-0 read takes the new value");
+        r.w32(PAGE6 + STILL_BASE, 0x0012_3450);
+        let regs = [STILL_CTRL, STILL_BASE, PX_CTRL, PX_FRONT, PX_BACK, PX_SIZE, PX_STRIDE, PX_POS, PX_GALPHA, PX_KEY];
+        assert_eq!(regs.map(|reg| r.r32(PAGE6 + reg)), [0; 10], "pix_layer.v reads 0 there (28d8b69)");
+        assert_eq!(r.trx.reg(PX_SIZE), 0x0111_0222, "committed all the same");
     }
 
     #[test]
@@ -1264,12 +1284,12 @@ mod tests {
         r.w8(IRQ_CAUSE, 0xFF);
         r.w32(PAGE6 + PX_BACK, 0x20_0000);
         assert_eq!(r.r32(PAGE6 + PX_STATUS) & 1, 1, "flip pending");
-        assert_eq!((r.r32(PAGE6 + PX_FRONT), r.r8(IRQ_CAUSE)), (0x10_0000, 0), "nothing before the frame start");
+        assert_eq!((r.trx.reg(PX_FRONT), r.r8(IRQ_CAUSE)), (0x10_0000, 0), "nothing before the frame start");
         r.now += POLL;
         r.with(|t, ctx| t.tick(ctx));
         assert_eq!(r.r8(IRQ_CAUSE), 0, "no VIC frame, no frame start");
         r.frame();
-        assert_eq!(r.r32(PAGE6 + PX_FRONT), 0x20_0000);
+        assert_eq!(r.trx.reg(PX_FRONT), 0x20_0000);
         assert_eq!(r.r8(IRQ_CAUSE), CAUSE_FLIP | CAUSE_VSYNC);
         assert_eq!(r.r32(PAGE6 + PX_STATUS) & 1, 0);
         // PX_FRONT: from the next frame start, without b7.

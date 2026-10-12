@@ -46,6 +46,9 @@ The interrupt is `(IRQ_EN & IRQ_CAUSE) != 0` on **ITU high IRQ 2**.
 **Page 6 at 0x101A6000** (`pix_layer.v`). 32-bit registers, little endian:
 - Writing byte 0-2 stages them; writing byte 3 commits all four.
 - Reading byte 0 latches the register, and bytes 1-3 come from the latch.
+- Only `STILL_STATUS` and `PX_STATUS` read back. The configuration registers are write-only and read 0
+  (`pix_layer.v` `cur`, TRX64-Ultimate 28d8b69, 2026-10-06). UE2's monitor (`monitor trx`) still shows what the app
+  last committed.
 
 | Off | Name | Default | Meaning |
 |---|---|---|---|
@@ -122,7 +125,7 @@ The interrupt is `(IRQ_EN & IRQ_CAUSE) != 0` on **ITU high IRQ 2**.
 
 ## 4. Checks (phase A; phase B: §5.9)
 
-- **Unit:** byte staging and commit; reading through the byte-0 latch; a flip lands only at the frame start and
+- **Unit:** byte staging and commit; reading through the byte-0 latch; configuration registers read 0; a flip lands only at the frame start and
   raises b7; W1C on `IRQ_CAUSE`; the IRQ line follows `IRQ_EN & IRQ_CAUSE`.
 - **Composite:** the RGB565 widening; the key; the blend at alpha 0, 128 and 255 against values from the Verilog's
   arithmetic; scale 1, 2 and 3; the layer clipped at 1920 × 1080; the C64 at 4× with its bars.
