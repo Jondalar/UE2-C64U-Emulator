@@ -50,6 +50,8 @@ pub const CAPS: u8 = 0xEF;
 /// b5: the engine applies stream 0 itself (APPLY, `apply_hw`). t21-p4's bitstream reads $BF; b1 (BUILD) and b6 (turbo)
 /// are not here; b7: the instruction trace (stream 3, S40 phase E).
 pub const CAPS2: u8 = 0xBD;
+/// CAPS2 b5, APPLY: clear on a bitstream built without it (trx_io.v `NO_APPLY`, S41 §2).
+pub const CAPS2_APPLY: u8 = 0x20;
 const CAPS_OFF: u32 = 0x004;
 const CAPS2_OFF: u32 = 0x005;
 pub const IRQ_EN: u32 = 0x010;
@@ -419,6 +421,11 @@ pub struct Trx {
     pause_seen: u64,
     next_poll: u64,
     link: Link,
+    /// S41: the engine has no APPLY unit (trx_engine.v `NO_APPLY`): AP_START, AP_COUNT and AP_CMD writes do nothing,
+    /// AP_CMD never reads busy, CAPS2 b5 reads 0. A build switch, so a reset keeps it.
+    apply_absent: bool,
+    /// S41 §5: the core is not loaded: the block neither polls nor drives its interrupt.
+    core_absent: bool,
 }
 
 impl Trx {
@@ -455,6 +462,24 @@ impl Trx {
             pause_seen,
             next_poll: POLL,
             link,
+            apply_absent: false,
+            core_absent: false,
+        }
+    }
+
+    /// S41 §2: the bitstream has no APPLY unit.
+    pub fn set_apply_absent(&mut self, absent: bool) {
+        self.apply_absent = absent;
+    }
+
+    /// S41 §5: the core goes (its interrupt drops and it stops polling) or comes back; a core that comes back is a
+    /// fresh one, which the caller gets with a reset.
+    pub fn set_core_absent(&mut self, absent: bool, now: u64, irq: &mut IrqState) {
+        self.core_absent = absent;
+        if absent {
+            irq.set_high(IRQ_HIGH_BIT, false);
+        } else {
+            self.next_poll = now + POLL;
         }
     }
 
@@ -640,6 +665,8 @@ impl Trx {
         let op = SysWrite { at: now, off, v };
         if off & !0xFFF == engine::PAGE2 {
             match off & 0xFFF {
+                // S41: without the APPLY unit its registers take nothing and no job starts (trx_engine.v NO_APPLY).
+                engine::AP_START | engine::AP_COUNT | engine::AP_CMD if self.apply_absent => {}
                 engine::ENG_SRC | engine::ENG_DST | engine::ENG_LEN | engine::ENG_ARG | engine::AP_START
                 | engine::AP_COUNT => l.engine.write_regs(off & 0xFFF, v),
                 engine::ENG_CMD => {
@@ -887,7 +914,7 @@ impl IoDevice for Trx {
             0 => match reg {
                 0..=3 => ID[reg as usize],
                 CAPS_OFF => CAPS,
-                CAPS2_OFF => CAPS2,
+                CAPS2_OFF => CAPS2 & if self.apply_absent { !CAPS2_APPLY } else { 0xFF },
                 IRQ_EN => self.irq_en,
                 IRQ_CAUSE => self.cause,
                 // BUILD 008-00B: no bitstream, no build stamp.
@@ -905,7 +932,7 @@ impl IoDevice for Trx {
     }
 
     fn next_event(&self) -> Option<u64> {
-        Some(self.next_poll)
+        (!self.core_absent).then_some(self.next_poll)
     }
 
     fn tick(&mut self, ctx: &mut IoCtx) {
@@ -923,8 +950,9 @@ impl IoDevice for Trx {
             *dbg::lock(&d) = dbg::Dbg::default();
             *l = TrxLink::power_on(frames, clocks, paused, starts, d);
         }
-        let link = self.link.clone();
+        let (link, apply_absent) = (self.link.clone(), self.apply_absent);
         *self = Trx::new(link);
+        self.apply_absent = apply_absent;
     }
 
     crate::impl_as_any!();
@@ -1076,6 +1104,39 @@ mod tests {
         r.w8(0x4000, 0xFF);
         assert!((0x4000..0x4010).chain(0xF000..0xF004).chain(0x2000..0x2004).chain(0x104..0x140).all(|o| r.r8(o) == 0));
         assert!((0x140..0x1000).step_by(0x3C).all(|o| r.r8(o) == 0), "140-FFF");
+    }
+
+    /// S41 §2: without APPLY (trx_engine.v and trx_io.v `NO_APPLY`) CAPS2 b5 reads 0, the AP_* writes take nothing and
+    /// AP_CMD never reads busy; a reset keeps the build switch. t80-lean-ring's $F7 reads $D7 that way, UE2's $BD $9D.
+    #[test]
+    fn without_apply_caps2_b5_is_clear_and_no_job_starts() {
+        let mut r = Rig::new();
+        r.trx.set_apply_absent(true);
+        assert_eq!(r.r8(5), 0x9D);
+        r.w32(engine::PAGE2 + engine::AP_START, 0);
+        r.w32(engine::PAGE2 + engine::AP_COUNT, 16);
+        r.w32(engine::PAGE2 + engine::AP_CMD, 0);
+        assert_eq!(r.r32(engine::PAGE2 + engine::AP_CMD), 0, "never busy");
+        assert!(lock(&r.link).engine.ap_jobs.is_empty() && lock(&r.link).ops.is_empty(), "no job for the C64 side");
+        IoDevice::reset(&mut r.trx);
+        assert_eq!(r.r8(5), 0x9D, "a build switch outlives a reset");
+        r.trx.set_apply_absent(false);
+        r.w32(engine::PAGE2 + engine::AP_COUNT, 16);
+        r.w32(engine::PAGE2 + engine::AP_CMD, 0);
+        assert_eq!((r.r8(5), r.r32(engine::PAGE2 + engine::AP_CMD)), (0xBD, 1), "with APPLY the job waits for the C64 side");
+    }
+
+    /// S41 §5: without a core the block's interrupt drops and it stops polling; back, it polls again.
+    #[test]
+    fn an_absent_core_drops_the_interrupt_and_stops_polling() {
+        let mut r = Rig::new();
+        r.w8(IRQ_EN, CAUSE_VSYNC);
+        r.frame();
+        assert!(r.irq());
+        r.trx.set_core_absent(true, r.now, &mut r.irq);
+        assert!(!r.irq() && r.trx.next_event().is_none());
+        r.trx.set_core_absent(false, 1000, &mut r.irq);
+        assert_eq!(r.trx.next_event(), Some(1000 + POLL));
     }
 
     #[test]

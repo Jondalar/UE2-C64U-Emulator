@@ -124,7 +124,8 @@ fn trx(host: &mut Host) -> Result<String, String> {
     let ctrl = reg(trx::PX_CTRL);
     let (size, pos, key, status) = (reg(trx::PX_SIZE), reg(trx::PX_POS), reg(trx::PX_KEY), reg(trx::PX_STATUS));
     let mut out = String::new();
-    out.push_str(&format!("  id            {id}  caps {:#04x}  caps2 {:#04x}\n", trx::CAPS, trx::CAPS2));
+    // As the app reads them: CAPS2 b5 is clear on a bitstream without APPLY (S41).
+    out.push_str(&format!("  id            {id}  caps {:#04x}  caps2 {:#04x}\n", t.peek8(4), t.peek8(5)));
     out.push_str(&format!("  irq enabled   {}\n", bits(t.irq_en(), &TRX_CAUSES)));
     out.push_str(&format!("  irq cause     {}\n", bits(t.cause(), &TRX_CAUSES)));
     out.push_str(&format!(

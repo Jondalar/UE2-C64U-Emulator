@@ -25,6 +25,7 @@
 //! | `monitor <cmd>` | Run one line of TRX64's monitor against the C64 and print what it prints (S23; needs `--c64 trx64`). |
 //! | `cart-info` | Print the physical expansion port's cartridge (`--cart-slot`) as `key: value` lines: type, banks, lines, bus sharing, flash decode, dirty flag (docs/status/cart-slot.md). |
 //! | `cart-save <path>` | Write that cartridge as it is now, every bank with flash and EEPROM contents, to a CRT file. |
+//! | `core absent` / `core present` | Take the swappable core away while the firmware runs, or load a fresh one from power-up (docs/specs/S41-core-dev-mode.md §5; needs `--trx-io`). |
 //! | `quit` | Stop the emulator. |
 //!
 //! `<text>` is one word, or a double-quoted string with `\"` and `\\` escapes. An `expect` that times out
@@ -128,6 +129,8 @@ pub enum ControlCmd {
     CartInfo,
     /// `cart-save <path>`.
     CartSave(PathBuf),
+    /// S41 §5: `core absent` (true) / `core present` (false).
+    Core(bool),
     Quit,
 }
 
@@ -164,6 +167,8 @@ pub trait Target {
     fn cart(&mut self, req: CartRequest) -> Result<Vec<String>>;
     /// Run one monitor line (S23) and return its text.
     fn monitor(&mut self, line: &str) -> Result<String>;
+    /// S41 §5: take the core away (`absent`) or load a fresh one; a line saying what happened.
+    fn core(&mut self, absent: bool) -> Result<String>;
     /// Ask the emulator to stop.
     fn quit(&mut self);
 }
@@ -368,6 +373,11 @@ pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
             }
             ControlCmd::CartSave(PathBuf::from(rest.trim()))
         }
+        "core" => match args.as_slice() {
+            ["absent"] => ControlCmd::Core(true),
+            ["present"] => ControlCmd::Core(false),
+            _ => return Err("'core' takes absent or present".into()),
+        },
         "quit" => {
             arity(0, 0)?;
             ControlCmd::Quit
@@ -510,6 +520,10 @@ pub fn execute(t: &mut dyn Target, cmd: &ControlCmd, out: &mut dyn Write) -> Res
         }
         ControlCmd::CartInfo => print_lines(out, &t.cart(CartRequest::Info)?)?,
         ControlCmd::CartSave(path) => print_lines(out, &t.cart(CartRequest::Save(path.clone()))?)?,
+        ControlCmd::Core(absent) => {
+            let line = t.core(*absent)?;
+            print_lines(out, &[line])?;
+        }
         ControlCmd::Quit => {
             t.quit();
             return Ok(Flow::Quit);
@@ -840,6 +854,12 @@ impl Target for HandleTarget {
         result.recv().map_err(|_| anyhow!("emulator stopped"))?.map_err(|e| anyhow!(e))
     }
 
+    fn core(&mut self, absent: bool) -> Result<String> {
+        let (done, result) = mpsc::channel();
+        self.ctl.commands.send(Command::Core { absent, done }).map_err(|_| anyhow!("emulator stopped"))?;
+        result.recv().map_err(|_| anyhow!("emulator stopped"))?.map_err(|e| anyhow!(e))
+    }
+
     fn quit(&mut self) {
         // The emulation thread may already be gone; then there is nothing left to stop.
         let _ = self.ctl.commands.send(Command::Quit);
@@ -1048,6 +1068,10 @@ mod tests {
             }
         }
 
+        fn core(&mut self, absent: bool) -> Result<String> {
+            Ok(if absent { "core absent (noack)".into() } else { "core present".into() })
+        }
+
         fn quit(&mut self) {
             self.quit = true;
         }
@@ -1188,6 +1212,18 @@ mod tests {
         let (r, _) = run(&mut fake, "monitor nope\n");
         assert_eq!(format!("{:#}", r.unwrap_err()), "line 1: unknown monitor command 'nope'");
         assert_eq!(fake.monitor, ["r", "nope"]);
+    }
+
+    /// S41 §5: `core absent` / `core present` reach the target and print its line.
+    #[test]
+    fn core_swaps_reach_the_target() {
+        assert_eq!(parse_line("core absent"), Ok(Some(ControlCmd::Core(true))));
+        assert_eq!(parse_line("core present"), Ok(Some(ControlCmd::Core(false))));
+        assert!(parse_line("core").is_err() && parse_line("core gone").is_err() && parse_line("core absent now").is_err());
+        let mut fake = Fake::default();
+        let (r, out) = run(&mut fake, "core absent\ncore present\n");
+        r.unwrap();
+        assert_eq!(out, "core absent (noack)\ncore present\n");
     }
 
     #[test]
@@ -1558,6 +1594,9 @@ joy-release 2").0.unwrap();
                         }
                         Ok(Command::Monitor { done, .. }) => {
                             let _ = done.send(Err("no monitor in the fake".into()));
+                        }
+                        Ok(Command::Core { done, .. }) => {
+                            let _ = done.send(Err("no core in the fake".into()));
                         }
                         Ok(Command::Quit) => {
                             log.push((now, None));

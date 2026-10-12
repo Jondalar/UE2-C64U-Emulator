@@ -106,6 +106,8 @@ pub enum Command {
     Cart { req: CartRequest, done: CartDone },
     /// S23: one monitor line, answered with its text. The session lives on the emulation thread, with the machine.
     Monitor { line: String, done: Sender<Result<String, String>> },
+    /// S41 §5: `core absent` (true) / `core present` (false), answered with a line saying what happened.
+    Core { absent: bool, done: Sender<Result<String, String>> },
     Quit,
 }
 
@@ -140,7 +142,8 @@ pub struct EmuHandle {
 ///
 /// The machine is built on that thread (device models are not `Send`); construction errors are returned here.
 /// The thread runs `Machine::run` slices until `Command::Quit`, all command senders are gone, or the firmware
-/// halts, and prints the machine stats (plus the unmapped summary with `--log unmapped`) to stderr when it ends.
+/// halts, and prints the machine stats (plus the unmapped summary with `--log unmapped` and the stall summary with
+/// `--absent-continue`) to stderr when it ends.
 pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
     let gdb = opts.gdb.as_deref().map(gdb::listen).transpose()?;
     let vice = vice_server(opts.vice_monitor.as_deref())?;
@@ -186,12 +189,12 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
         .spawn(move || {
             let _running = running;
             match build(cfg, net_opts.as_ref(), c64, ring, sink, armsid, sid_thread, &usb_dirs, &usb_dir_work, cart_slot) {
-                Ok((mut machine, net, dirs, cart)) => {
+                Ok((mut machine, net, dirs, cart, core)) => {
                     for (_, ev) in hold {
                         machine.input(ev);
                     }
                     let _ = ready_tx.send(Ok(()));
-                    emu.run(machine, net, dirs, cart, &command_rx, gdb.map(GdbServer::new), vice)
+                    emu.run(machine, net, dirs, cart, core, &command_rx, gdb.map(GdbServer::new), vice)
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
@@ -216,8 +219,9 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
 }
 
 /// The machine with its C64 and network backends, all built on the emulation thread (none is `Send`), the
-/// `--usb-dir` sticks, built (or resumed) and attached before the machine runs, and the `--cart-slot` cartridge.
-#[allow(clippy::too_many_arguments)]
+/// `--usb-dir` sticks, built (or resumed) and attached before the machine runs, the `--cart-slot` cartridge, and with
+/// a C64 the factory of the cores a `core present` loads (S41 §5).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn build(
     cfg: MachineConfig,
     net: Option<&NetOptions>,
@@ -229,8 +233,17 @@ fn build(
     usb_dirs: &[DirSpec],
     usb_dir_work: &std::path::Path,
     cart_slot: Option<CartSlotSpec>,
-) -> Result<(Machine, Option<net::Backend>, UsbDirs, CartSlot)> {
+) -> Result<(Machine, Option<net::Backend>, UsbDirs, CartSlot, Option<CoreFactory>)> {
     let mut machine = Machine::new(cfg)?;
+    let sink = sink.map(audio::SharedSink::new);
+    let core = c64.then(|| CoreFactory {
+        rom_dir: machine.cfg.rom_dir.clone(),
+        sink: sink.clone(),
+        armsid,
+        sid_thread,
+        ring,
+        log_cart: machine.cfg.log.cart,
+    });
     if c64 {
         attach_trx64_audio(&mut machine, sink, armsid, sid_thread, cart_slot.as_ref(), ring)?;
     }
@@ -238,7 +251,75 @@ fn build(
     let net = net.map(|opts| net::attach(&mut machine, opts)).transpose()?;
     let first_port = machine.cfg.usb.images.len() + 1;
     let dirs = UsbDirs::attach(&mut machine, usb_dirs, usb_dir_work, first_port)?;
-    Ok((machine, net, dirs, cart))
+    Ok((machine, net, dirs, cart, core))
+}
+
+/// S41 §5: what a fresh core is built from: the C64 as `--c64 trx64` attaches it, on the run's one audio sink.
+#[cfg_attr(not(feature = "trx64"), allow(dead_code))]
+struct CoreFactory {
+    rom_dir: PathBuf,
+    sink: Option<audio::SharedSink>,
+    armsid: bool,
+    sid_thread: bool,
+    ring: bool,
+    log_cart: bool,
+}
+
+impl CoreFactory {
+    /// A C64 from power-up. The core it replaces (`old`) hands over the cartridge in the physical expansion port and is
+    /// dropped first, its rings with it (S38: a swap ends the ring).
+    #[cfg(feature = "trx64")]
+    fn build(&self, old: Option<Box<dyn ue2_core::c64host::C64Backend>>) -> Box<dyn ue2_core::c64host::C64Backend> {
+        let cart = old.and_then(|mut b| b.as_any_mut()?.downcast_mut::<c64_bridge::Trx64Backend>()?.take_slot_cart());
+        let mut c64 = new_trx64(&self.rom_dir, self.sink.clone(), self.armsid, self.sid_thread, self.ring);
+        if let Some(cart) = cart {
+            c64.insert_slot_cart(cart);
+            c64.set_log_cart(self.log_cart);
+        }
+        Box::new(c64)
+    }
+
+    #[cfg(not(feature = "trx64"))]
+    fn build(&self, _old: Option<Box<dyn ue2_core::c64host::C64Backend>>) -> Box<dyn ue2_core::c64host::C64Backend> {
+        unreachable!("a CoreFactory exists only with a C64, which needs the trx64 feature")
+    }
+}
+
+/// S41 §5 `core present`: the old core's backend off the port, a new one from the factory (none without a C64), and
+/// the machine's core windows back.
+fn core_present(machine: &mut Machine, core: Option<&CoreFactory>) -> Result<String, String> {
+    if !machine.core_is_absent() {
+        return Err("core present: the core is present".into());
+    }
+    let old = machine.take_c64_backend();
+    let new = core.map(|f| f.build(old));
+    machine.core_present(new)
+}
+
+/// TRX64 as the C64 with its ROMs seeded from `rom_dir`, the SID's samples going to `sink` when given (on the SID
+/// worker when a device listens and `sid_thread`), an ARMSID in socket 1 when `armsid` (S14 §W4-SID) and TRX64's rings
+/// on when `ring` (S38).
+#[cfg(feature = "trx64")]
+fn new_trx64(
+    rom_dir: &std::path::Path,
+    sink: Option<audio::SharedSink>,
+    armsid: bool,
+    sid_thread: bool,
+    ring: bool,
+) -> c64_bridge::Trx64Backend {
+    let mut c64 = c64_bridge::Trx64Backend::new(rom_dir);
+    c64.set_ring(ring);
+    c64.set_sid_socket1(armsid);
+    if let Some(sink) = sink {
+        // S20: with a device listening the engines, the mixing and the sink move to the SID worker.
+        let rate = sink.rate();
+        if sid_thread && sink.has_device() {
+            c64.set_audio_threaded(rate, Box::new(sink));
+        } else {
+            c64.set_audio(rate, Box::new(sink));
+        }
+    }
+    c64
 }
 
 /// Attach TRX64 as the C64 (`--c64 trx64`, docs/specs/S14-c64-trx64.md §3), its ROMs seeded from `MachineConfig::rom_dir`,
@@ -252,7 +333,7 @@ pub fn attach_trx64(machine: &mut Machine, cart_slot: Option<&CartSlotSpec>) -> 
 /// §W4-SID) and TRX64's rings on when `ring` (S38).
 fn attach_trx64_audio(
     machine: &mut Machine,
-    sink: Option<audio::Sink>,
+    sink: Option<audio::SharedSink>,
     armsid: bool,
     sid_thread: bool,
     cart_slot: Option<&CartSlotSpec>,
@@ -260,18 +341,7 @@ fn attach_trx64_audio(
 ) -> Result<()> {
     #[cfg(feature = "trx64")]
     {
-        let mut c64 = c64_bridge::Trx64Backend::new(&machine.cfg.rom_dir);
-        c64.set_ring(ring);
-        c64.set_sid_socket1(armsid);
-        if let Some(sink) = sink {
-            // S20: with a device listening the engines, the mixing and the sink move to the SID worker.
-            let rate = sink.rate();
-            if sid_thread && sink.has_device() {
-                c64.set_audio_threaded(rate, Box::new(sink));
-            } else {
-                c64.set_audio(rate, Box::new(sink));
-            }
-        }
+        let mut c64 = new_trx64(&machine.cfg.rom_dir, sink, armsid, sid_thread, ring);
         if let Some(spec) = cart_slot {
             let decode = c64_bridge::FlashDecode::parse(&spec.flash_decode).map_err(|e| anyhow!("--cart-slot: {e}"))?;
             let crt = spec.read()?;
@@ -371,12 +441,14 @@ struct EmuThread {
 }
 
 impl EmuThread {
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         mut machine: Machine,
         mut net: Option<net::Backend>,
         mut usb_dirs: UsbDirs,
         mut cart: CartSlot,
+        core: Option<CoreFactory>,
         commands: &Receiver<Command>,
         mut gdb: Option<GdbServer>,
         #[allow(unused_mut, unused_variables)] mut vice: Option<ViceServer>,
@@ -403,7 +475,7 @@ impl EmuThread {
                 if let Some(server) = vice.as_mut() {
                     server.poll(&mut machine, &mut monitor.ours);
                 }
-                if apply_commands(&mut machine, commands, &mut inputs, &mut usb_dirs, &mut cart, &mut monitor) {
+                if apply_commands(&mut machine, commands, &mut inputs, &mut usb_dirs, &mut cart, &mut monitor, core.as_ref()) {
                     usb_dirs.finish(&mut machine, true);
                     cart.finish(&mut machine);
                     report(&machine);
@@ -439,8 +511,9 @@ impl EmuThread {
                 self.console.lock().unwrap_or_else(PoisonError::into_inner).push(&console);
             }
 
-            let quit = apply_commands(&mut machine, commands, &mut inputs, &mut usb_dirs, &mut cart, &mut monitor)
-                || quit_at.is_some();
+            let quit =
+                apply_commands(&mut machine, commands, &mut inputs, &mut usb_dirs, &mut cart, &mut monitor, core.as_ref())
+                    || quit_at.is_some();
             usb_dirs.poll(&mut machine);
 
             let now_ms = machine.now_ms();
@@ -542,6 +615,14 @@ impl MonitorState {
     fn exec(&mut self, _machine: &mut Machine, _line: &str) -> Result<String, String> {
         Err("this build has no C64, so no monitor (build with the trx64 feature)".into())
     }
+
+    /// S41 §5: a new core is not the machine the session's cursors and ring position were about.
+    fn core_swapped(&mut self) {
+        #[cfg(feature = "trx64")]
+        {
+            self.session = trx64_monitor::MonitorSession::default();
+        }
+    }
 }
 
 /// Apply queued commands, then the timed inputs now due; true when the thread should stop (`Quit`, or every
@@ -553,6 +634,7 @@ fn apply_commands(
     usb_dirs: &mut UsbDirs,
     cart: &mut CartSlot,
     monitor: &mut MonitorState,
+    core: Option<&CoreFactory>,
 ) -> bool {
     let quit = loop {
         match commands.try_recv() {
@@ -581,6 +663,16 @@ fn apply_commands(
             }
             Ok(Command::Monitor { line, done }) => {
                 let _ = done.send(monitor.exec(machine, &line));
+            }
+            Ok(Command::Core { absent, done }) => {
+                let result = if absent { machine.core_absent() } else { core_present(machine, core) };
+                if result.is_ok() && !absent {
+                    monitor.core_swapped();
+                }
+                if let Ok(line) = &result {
+                    eprintln!("{line}");
+                }
+                let _ = done.send(result);
             }
             Ok(Command::Quit) | Err(TryRecvError::Disconnected) => break true,
             Err(TryRecvError::Empty) => break false,
@@ -615,6 +707,9 @@ pub struct ViceServer;
 fn report(machine: &Machine) {
     eprintln!("{}", machine.stats());
     if let Some(summary) = machine.unmapped_summary() {
+        eprint!("{summary}");
+    }
+    if let Some(summary) = machine.absent_summary() {
         eprint!("{summary}");
     }
 }

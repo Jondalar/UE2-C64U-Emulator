@@ -141,6 +141,37 @@ impl c64_bridge::AudioSink for Sink {
     }
 }
 
+/// S41 §5: the one [`Sink`] behind every core the run loads: a core that is swapped out drops its handle, the next
+/// one takes another, and the device and the WAV file go on.
+#[derive(Clone)]
+pub struct SharedSink {
+    sink: std::sync::Arc<std::sync::Mutex<Sink>>,
+    rate: u32,
+    device: bool,
+}
+
+impl SharedSink {
+    pub fn new(sink: Sink) -> Self {
+        let (rate, device) = (sink.rate(), sink.has_device());
+        SharedSink { sink: std::sync::Arc::new(std::sync::Mutex::new(sink)), rate, device }
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    pub fn has_device(&self) -> bool {
+        self.device
+    }
+}
+
+#[cfg(feature = "trx64")]
+impl c64_bridge::AudioSink for SharedSink {
+    fn samples(&mut self, pcm: &[i16]) {
+        self.sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(pcm);
+    }
+}
+
 /// The default output device at its own rate when that is 44.1 or 48 kHz, else at 48 or 44.1 kHz, else at its own rate
 /// whatever it is (WASAPI in shared mode takes only the device's mix rate, often 96 or 192 kHz; the engines render at
 /// any rate); left and right go to channels 0 and 1, their mean to a mono device and to any further channel.

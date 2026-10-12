@@ -1,5 +1,6 @@
 //! U64-II / C64 Ultimate machine core. See docs/ARCHITECTURE.md.
 
+pub mod absent;
 pub mod bus;
 pub mod c64host;
 pub mod devices;

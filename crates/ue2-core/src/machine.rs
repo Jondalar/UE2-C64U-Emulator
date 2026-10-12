@@ -9,11 +9,13 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::PathBuf;
 
+use crate::absent::{AbsentConfig, AbsentMap, Block, Mode, NoAck};
 use crate::bus::{Access, SystemBus, IO_BIT, RAM_MASK};
 use crate::c64host::{C64Backend, C64CartSlot};
 use crate::devices::overlay::{Overlay, REG_TRANSPARENCY};
 use crate::devices::{self, c64::C64Port, itu::Itu, u64io::U64Io};
 use crate::host::{DisplaySnapshot, HostInput, TrxOutput};
+use crate::io::IoDevice;
 use crate::loader;
 use crate::symbols::Symbols;
 use crate::time;
@@ -66,6 +68,9 @@ pub struct MachineConfig {
     /// of drive B's WD177x. [`Machine::new`] turns `Auto` into on or off from the firmware image; a machine built
     /// from parts takes `Auto` as off.
     pub trx_io: TrxIo,
+    /// S41: the blocks this bitstream lacks, how their windows answer, and whether a stall halts
+    /// (docs/specs/S41-core-dev-mode.md). Needs the TRX block.
+    pub absent: AbsentConfig,
 }
 
 /// S37: whether the board carries the TRX bitstream's IO block (`--trx-io[=auto|on|off]`).
@@ -126,6 +131,7 @@ impl MachineConfig {
             idle_skip: true,
             settings: Vec::new(),
             trx_io: TrxIo::Auto,
+            absent: AbsentConfig::default(),
         }
     }
 }
@@ -136,7 +142,7 @@ pub enum RunExit {
     Budget,
     /// PC reached a breakpoint (instruction not yet executed).
     Breakpoint(u32),
-    /// Firmware fault hook fired or illegal instruction.
+    /// Firmware fault hook fired, illegal instruction, or an access to an absent block that never completes (S41).
     Halted(String),
 }
 
@@ -282,7 +288,18 @@ pub struct Machine {
     streamed_frame: u64,
     /// Whether the audio stream's tap is installed in the C64 backend.
     streaming_audio: bool,
+    /// S41: the registers before the executing instruction, kept while a `noack` stall halts, so a halt leaves the
+    /// machine on the instruction that never completes.
+    noack_x: [u32; 32],
+    /// S41: the end of the console output drained so far, for the last line in a stall report.
+    console_tail: Vec<u8>,
 }
+
+/// Console bytes [`Machine`] keeps for the last line of a stall report.
+const CONSOLE_TAIL: usize = 512;
+/// Return addresses a stall report's stack scan lists at most, and the stack bytes it looks at.
+const BACKTRACE_DEPTH: usize = 12;
+const BACKTRACE_STACK: u32 = 0x1000;
 
 /// One loop head the idle skip watches: the machine state at the last arrival there (S19 §3).
 #[derive(Clone, Debug, Default)]
@@ -321,6 +338,10 @@ impl Machine {
             eprintln!("{why}");
         }
         cfg.trx_io = trx_io;
+        // S41 §1: the absent blocks are the TRX bitstream's build switches.
+        if cfg.absent.is_set() && trx_io != TrxIo::On {
+            anyhow::bail!("--absent, --absent-mode and --absent-continue need the TRX block (--trx-io, or TRX firmware with auto)");
+        }
         devices::install_all(&mut bus.io, &cfg);
         // The FPGA reads the cartridge ROM where this firmware puts it (docs/status/carts.md, "Cartridge ROM in DDR").
         let cart_rom = crate::fwlayout::cart_rom(&bus.ram, &fw.segments).unwrap_or_else(|| {
@@ -341,6 +362,7 @@ impl Machine {
         }
         let mut machine = Self::from_parts(cfg, bus, fw.entry, symbols);
         machine.segments = fw.segments;
+        machine.start_absent();
         Ok(machine)
     }
 
@@ -367,6 +389,8 @@ impl Machine {
             idle_insns: 0,
             streamed_frame: 0,
             streaming_audio: false,
+            noack_x: [0; 32],
+            console_tail: Vec::new(),
         }
     }
 
@@ -378,6 +402,8 @@ impl Machine {
         let check_pc = breakpoints || hooks.armed();
         let trace = self.cfg.trace;
         let idle_skip = self.cfg.idle_skip && !breakpoints && !trace && !self.cfg.log.io;
+        // S41: a `noack` stall that halts puts the instruction back, so its registers are kept before each step.
+        let noack_halts = self.bus.absent.as_deref().is_some_and(AbsentMap::halts);
         // The host may have changed RAM or devices since the last run (S19 §3).
         self.bus.idle_dirty = true;
         let mut resume = self.resume_pc.take();
@@ -399,9 +425,17 @@ impl Machine {
                 self.trace.push(self.cpu.pc);
             }
             let pc_before = self.cpu.pc;
+            if noack_halts {
+                self.noack_x = self.cpu.x;
+            }
             self.pre_step();
             let exit = self.cpu.step(&mut self.bus);
             self.post_step();
+            if self.bus.noack.is_some() {
+                if let Some(exit) = self.take_noack(pc_before, noack_halts) {
+                    return exit;
+                }
+            }
             // A loop head is where a backward branch or jump lands, `j .` included (S19 §3).
             if idle_skip && exit == rv32::Exit::Stepped && self.cpu.pc <= pc_before {
                 left -= self.idle_arrival(left);
@@ -589,9 +623,10 @@ impl Machine {
 
     /// `io R/W addr val device+off @pc sym+off t=seconds`, the time in emulated seconds to the 10 ns tick.
     fn format_io(&self, a: &Access) -> String {
-        let target = match self.bus.io.resolve(a.addr) {
-            Some((dev, off)) => format!("{}+{off:#x}", self.bus.io.devices[dev].name()),
-            None => "unmapped".to_owned(),
+        let target = match (self.bus.absent_at(a.addr), self.bus.io.resolve(a.addr)) {
+            (Some((block, mode)), _) => format!("absent:{}({})", block.name(), mode.name()),
+            (None, Some((dev, off))) => format!("{}+{off:#x}", self.bus.io.devices[dev].name()),
+            (None, None) => "unmapped".to_owned(),
         };
         format!(
             "io {} {:#010x} {:#04x} {target} @{:#010x} {} t={}.{:08}",
@@ -612,7 +647,12 @@ impl Machine {
     }
 
     pub fn drain_console(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.bus.console)
+        let out = std::mem::take(&mut self.bus.console);
+        self.console_tail.extend_from_slice(&out);
+        if self.console_tail.len() > 2 * CONSOLE_TAIL {
+            self.console_tail.drain(..self.console_tail.len() - CONSOLE_TAIL);
+        }
+        out
     }
 
     /// Attach a C64 behind the cart/DMA registers (docs/specs/S14-c64-trx64.md §3). Without `devices::c64::C64Port`
@@ -621,11 +661,14 @@ impl Machine {
         let now = self.bus.now;
         // CARTSLOT: U64_CART_DETECT (U64Io) reads the lines of the backend's physical cartridge (docs/status/cart-slot.md).
         let cart_detect = self.bus.io.get::<U64Io>().map(|io| io.cart_detect.clone());
+        let absent = self.backend_absent();
         if let Some(port) = self.bus.io.get_mut::<C64Port>() {
             port.attach(backend, now);
             if let Some(cell) = cart_detect {
                 port.set_cart_detect(cell);
             }
+            // S41: the C64 side of the blocks this bitstream lacks.
+            port.set_absent(&absent);
         }
         self.next_deadline = self.bus.next_deadline();
     }
@@ -768,6 +811,10 @@ impl Machine {
             // The TRX bitstream always outputs its 1920 × 1080 frame, layer or not, so the picture keeps one shape.
             Some(TrxOutput { layer, paused, text })
         });
+        // S41 §5: without a core the TRX output is the overlay over black.
+        if self.core_is_absent() {
+            snap.trx = snap.trx.as_ref().map(|_| TrxOutput::default());
+        }
         // The text dump shows what the text layer draws while it is shown, not what the paused VIC points at.
         if let (Some(frame), Some(text)) = (snap.c64.as_mut(), snap.trx.as_ref().and_then(|t| t.text.as_ref())) {
             (frame.screen, frame.charset) = (text.screen.clone(), text.charset);
@@ -783,6 +830,10 @@ impl Machine {
     /// What the picture follows: the VIC frame counter, or with `--trx-io` the TRX output's frame starts, which go on
     /// while the machine pause stands the VIC (S37).
     pub fn picture_counter(&self) -> u64 {
+        // S41 §5: without a core nothing counts frames; the display follows emulated time.
+        if self.core_is_absent() {
+            return 0;
+        }
         match self.bus.io.get::<devices::trx::Trx>() {
             Some(trx) => trx.frame_starts(),
             None => self.frame_counter(),
@@ -872,6 +923,260 @@ impl Machine {
         }
         for (addr, count) in counts {
             let _ = writeln!(out, "  {addr:#010x} {:>9} {:>9}", count.reads, count.writes);
+        }
+        Some(out)
+    }
+}
+
+/// S41: absent blocks (docs/specs/S41-core-dev-mode.md).
+impl Machine {
+    /// The blocks absent from power-on whose C64 side goes with the backend (`C64Backend::set_absent`).
+    fn backend_absent(&self) -> Vec<Block> {
+        self.cfg.absent.blocks.iter().copied().filter(|&b| b != Block::Core).collect()
+    }
+
+    /// §1: the absent blocks from power-on: the bus's map, the TRX block's APPLY, one line each on what it changes, and
+    /// `--absent core` as a `core absent` before the first instruction. The C64 side follows with the backend
+    /// ([`Machine::attach_c64`]).
+    fn start_absent(&mut self) {
+        if !self.cfg.absent.is_set() {
+            return;
+        }
+        let cfg = self.cfg.absent.clone();
+        let mut map = AbsentMap::new(&cfg);
+        // The core goes through `core_absent`, which also stops the C64 and the TRX block.
+        map.set(Block::Core, false);
+        self.bus.absent = Some(Box::new(map));
+        if let Some(trx) = self.bus.io.get_mut::<devices::trx::Trx>() {
+            trx.set_apply_absent(cfg.has(Block::Apply));
+        }
+        for &block in &cfg.blocks {
+            let what = match block {
+                Block::Sampler | Block::Uci => {
+                    let (start, end) = block.windows()[0];
+                    let c64 = if block == Block::Sampler {
+                        "C64 $DF20-$DFFF not mapped, IRQ 0, no DDR fetch"
+                    } else {
+                        "nothing on the C64 bus, firmware and C64 IRQ 0"
+                    };
+                    format!("{} {start:#010x}-{:#010x}; {c64}", cfg.mode(block).name(), end - 1)
+                }
+                Block::Reu => "C64 $DF00-$DFFF reads $FF while REU_ENABLE is set, no DMA, IRQ 0".into(),
+                Block::Turbo => "the TRX model has no turbo engine (S40 §0), so nothing changes".into(),
+                Block::Jtag => "no bus effect".into(),
+                Block::Apply => "AP_* writes ignored, AP_CMD never busy, CAPS2 b5 clear".into(),
+                Block::Core => continue,
+            };
+            eprintln!("absent: {}: {what}", block.name());
+        }
+        if cfg.keep_going {
+            eprintln!("absent: --absent-continue: a noack stall is logged and completed as ack0");
+        }
+        if cfg.has(Block::Core) {
+            if let Ok(line) = self.core_absent() {
+                eprintln!("{line}");
+            }
+        }
+    }
+
+    /// Whether the swappable core is absent (§5).
+    pub fn core_is_absent(&self) -> bool {
+        self.bus.absent.as_deref().is_some_and(|a| a.is_absent(Block::Core))
+    }
+
+    /// §5 `core absent`: every register window of the core answers as absent, the C64 stops where it is (no clock, no
+    /// picture, no sound), the core's interrupts into the ITU drop. The host runs on.
+    pub fn core_absent(&mut self) -> Result<String, String> {
+        if self.cfg.trx_io != TrxIo::On {
+            return Err("core absent: the core's windows are the TRX bitstream's; this machine has no TRX block (--trx-io)".into());
+        }
+        let cfg = &self.cfg.absent;
+        let map = self.bus.absent.get_or_insert_with(|| Box::new(AbsentMap::new(cfg)));
+        if map.is_absent(Block::Core) {
+            return Err("core absent: the core is already absent".into());
+        }
+        map.set(Block::Core, true);
+        let mode = map.mode(Block::Core);
+        let now = self.bus.now;
+        let (io, irq) = (&mut self.bus.io, &mut self.bus.irq);
+        if let Some(port) = io.get_mut::<C64Port>() {
+            port.set_core_absent(now, irq);
+        }
+        if let Some(trx) = io.get_mut::<devices::trx::Trx>() {
+            trx.set_core_absent(true, now, irq);
+        }
+        self.next_deadline = self.bus.next_deadline();
+        Ok(format!("core absent ({}): its windows answer {}, the C64 stopped at {}", mode.name(), mode.name(), self.time_text()))
+    }
+
+    /// The backend of the core about to be replaced, for its physical cartridge (§5 `core present`).
+    pub fn take_c64_backend(&mut self) -> Option<Box<dyn C64Backend>> {
+        self.bus.io.get_mut::<C64Port>()?.take_backend()
+    }
+
+    /// §5 `core present`: a fresh core image from power-up, as a reconfiguration loads it: the core's windows answer
+    /// again, every register of the C64 port, the TRX block and the GCR codec at its power-on value, `backend` (a new
+    /// C64, or None for none) attached now. Blocks absent from the bitstream stay absent in the new core.
+    pub fn core_present(&mut self, backend: Option<Box<dyn C64Backend>>) -> Result<String, String> {
+        if !self.core_is_absent() {
+            return Err("core present: the core is present".into());
+        }
+        if let Some(map) = self.bus.absent.as_deref_mut() {
+            map.set(Block::Core, false);
+        }
+        let now = self.bus.now;
+        let absent = self.backend_absent();
+        let apply_absent = self.cfg.absent.has(Block::Apply);
+        let cart_detect = self.bus.io.get::<U64Io>().map(|io| io.cart_detect.clone());
+        let (io, irq) = (&mut self.bus.io, &mut self.bus.irq);
+        if let Some(trx) = io.get_mut::<devices::trx::Trx>() {
+            IoDevice::reset(trx);
+            trx.set_apply_absent(apply_absent);
+            trx.set_core_absent(false, now, irq);
+        }
+        if let Some(gcr) = io.get_mut::<devices::misc::GcrCodec>() {
+            IoDevice::reset(gcr);
+        }
+        if let Some(port) = io.get_mut::<C64Port>() {
+            port.power_up(backend, now);
+            if let Some(cell) = cart_detect {
+                port.set_cart_detect(cell);
+            }
+            port.set_absent(&absent);
+        }
+        self.next_deadline = self.bus.next_deadline();
+        Ok(format!("core present: a fresh core from power-up at {}", self.time_text()))
+    }
+
+    /// `t=seconds` of emulated time since power-on.
+    fn time_text(&self) -> String {
+        format!("t={}.{:08}", self.bus.now / time::CLOCK_HZ, self.bus.now % time::CLOCK_HZ)
+    }
+
+    /// The `noack` access the last step made: a halt with the instruction put back (its registers, its PC, its count),
+    /// or with `--absent-continue` a stall completed as `ack0`, logged the first time at its site and counted.
+    #[cold]
+    fn take_noack(&mut self, pc: u32, halts: bool) -> Option<RunExit> {
+        let s = self.bus.noack.take()?;
+        if halts {
+            self.cpu.pc = pc;
+            self.cpu.x = self.noack_x;
+            self.cpu.insns -= 1;
+            return Some(RunExit::Halted(self.noack_report(&s)));
+        }
+        if self.bus.absent.as_deref_mut().is_some_and(|m| m.count(&s)) {
+            let width = self.access_width(s.pc).map_or(String::new(), |w| w.to_string());
+            let val = if s.write { format!(" {:#04x}", s.val) } else { String::new() };
+            eprintln!(
+                "absent: {} noack {}{width} {:#010x}{val} @{:#010x} {} t={}.{:08} (completed as ack0)",
+                s.block.name(),
+                rw(s.write),
+                s.addr,
+                s.pc,
+                self.symbols.format(s.pc),
+                s.now / time::CLOCK_HZ,
+                s.now % time::CLOCK_HZ,
+            );
+        }
+        None
+    }
+
+    /// The width in bits of the load or store at `pc`, from the instruction in DDR.
+    fn access_width(&self, pc: u32) -> Option<u32> {
+        let insn = self.ram_word(pc)?;
+        match (insn & 0x7F, insn >> 12 & 7) {
+            (0x03, 0 | 4) | (0x23, 0) => Some(8),
+            (0x03, 1 | 5) | (0x23, 1) => Some(16),
+            (0x03, 2) | (0x23, 2) => Some(32),
+            _ => None,
+        }
+    }
+
+    /// A word of DDR, without side effects; None for an IO address.
+    fn ram_word(&self, addr: u32) -> Option<u32> {
+        if addr & IO_BIT != 0 {
+            return None;
+        }
+        let at = (addr & RAM_MASK) as usize;
+        Some(u32::from_le_bytes(self.bus.ram.get(at..at + 4)?.try_into().ok()?))
+    }
+
+    /// §3: what a halt on a `noack` access reports: the access, the PC, a backtrace, the last console line and the
+    /// time since boot.
+    fn noack_report(&self, s: &NoAck) -> String {
+        let width = self.access_width(s.pc).map_or("a".to_owned(), |w| format!("{w}-bit"));
+        let what = if s.write { format!("write ({:#04x}) to", s.val) } else { "read of".to_owned() };
+        let mut out = format!(
+            "absent {} ({}): {width} {what} {:#010x} never completes\n",
+            s.block.name(),
+            Mode::NoAck.name(),
+            s.addr
+        );
+        let x = &self.cpu.x;
+        let _ = writeln!(out, "  pc {:#010x} {}", s.pc, self.symbols.format(s.pc));
+        let _ = writeln!(out, "  ra {:#010x} {}", x[1], self.symbols.format(x[1]));
+        let frames = self.stack_return_addresses();
+        if frames.is_empty() {
+            let _ = writeln!(out, "  backtrace: no return address found on the stack (sp {:#010x})", x[2]);
+        } else {
+            let _ = writeln!(out, "  backtrace (return addresses on the stack from sp {:#010x}, innermost first):", x[2]);
+            for ra in frames {
+                let _ = writeln!(out, "    {ra:#010x} {}", self.symbols.format(ra));
+            }
+        }
+        let _ = writeln!(out, "  last console line: {:?}", self.last_console_line());
+        let _ = write!(
+            out,
+            "  {} s emulated since boot, {} instructions",
+            format_args!("{}.{:08}", s.now / time::CLOCK_HZ, s.now % time::CLOCK_HZ),
+            self.cpu.insns + self.idle_insns
+        );
+        out
+    }
+
+    /// Return addresses on the stack, innermost first: words above `sp` that point into a symbol right behind a call
+    /// (`jal ra` or `jalr ra`). The firmware keeps no frame pointer, so this is a scan, and a stale slot of a returned
+    /// call can show up in it.
+    fn stack_return_addresses(&self) -> Vec<u32> {
+        let sp = self.cpu.x[2] & !3;
+        let mut out = Vec::new();
+        let mut at = sp;
+        while at < sp.saturating_add(BACKTRACE_STACK) && out.len() < BACKTRACE_DEPTH {
+            let Some(word) = self.ram_word(at) else { break };
+            let call = word.checked_sub(4).and_then(|a| self.ram_word(a));
+            let is_call = call.is_some_and(|c| (c & 0x7F == 0x6F || c & 0x707F == 0x67) && c >> 7 & 0x1F == 1);
+            if word & 3 == 0 && is_call && self.symbols.lookup(word).is_some() {
+                out.push(word);
+            }
+            at += 4;
+        }
+        out
+    }
+
+    /// The last non-empty line of the console output, drained or not.
+    fn last_console_line(&self) -> String {
+        let bytes: Vec<u8> = self.console_tail.iter().chain(&self.bus.console).copied().filter(|&b| b != b'\r').collect();
+        let text = String::from_utf8_lossy(&bytes);
+        text.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_owned()
+    }
+
+    /// §3: the stalls `--absent-continue` completed, per address, for the end of a run; None without it.
+    pub fn absent_summary(&self) -> Option<String> {
+        let map = self.bus.absent.as_deref().filter(|m| m.keep_going)?;
+        let mut out = format!("absent summary: {} addresses stalled (noack, completed as ack0)\n", map.stalls.len());
+        if !map.stalls.is_empty() {
+            out.push_str("  address    block        reads    writes  first pc\n");
+        }
+        for (addr, c) in &map.stalls {
+            let block = c.block.map_or("?", Block::name);
+            let _ = writeln!(
+                out,
+                "  {addr:#010x} {block:<8} {:>9} {:>9}  {:#010x} {}",
+                c.reads,
+                c.writes,
+                c.first_pc,
+                self.symbols.format(c.first_pc)
+            );
         }
         Some(out)
     }
@@ -1453,5 +1758,81 @@ mod tests {
             let fw = loader::load_firmware(&image, &mut ram).unwrap();
             assert_eq!(trx_firmware(&Symbols::empty(), &ram, &fw.segments), Some("\"[TRX UI]\" in the image"));
         }
+    }
+
+    /// 0x30000: addi x5,x0,7; 0x30004: lw x5,0(x6); 0x30008: j . — with x6 at the sampler's window.
+    fn noack_machine(absent: &str, mode: &str, keep_going: bool) -> Machine {
+        let mut m = machine(cfg(), Vec::new(), Symbols::from_symbols(vec![sym(0x30000, 12, "probe")]));
+        for (addr, word) in [(0x30000, 0x0070_0293u32), (0x30004, 0x0003_2283), (0x30008, 0x0000_006F)] {
+            m.bus.ram[addr..addr + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        m.cpu.x[6] = 0x1004_8000;
+        let cfg = AbsentConfig::parse(Some(absent), Some(mode), keep_going).unwrap();
+        m.bus.absent = Some(Box::new(AbsentMap::new(&cfg)));
+        m
+    }
+
+    /// S41 §3: a `noack` load halts on its instruction, which is put back as if it never ran, and the report names the
+    /// block, the access, the PC and the time; `ack0` and `--absent-continue` run on, the latter counting the stall.
+    #[test]
+    fn a_noack_access_halts_on_its_instruction() {
+        let mut m = noack_machine("sampler", "sampler=noack", false);
+        m.bus.console.extend_from_slice(b"boot\r\nSampler init\r\n");
+        let RunExit::Halted(msg) = m.run(10) else { panic!("no halt") };
+        assert!(msg.starts_with("absent sampler (noack): 32-bit read of 0x10048000 never completes\n"), "{msg}");
+        assert!(msg.contains("  pc 0x00030004 probe+0x4\n") && msg.contains("last console line: \"Sampler init\""), "{msg}");
+        assert!(msg.contains(" s emulated since boot, 1 instructions"), "{msg}");
+        assert_eq!((m.cpu.pc, m.cpu.x[5], m.cpu.insns), (0x30004, 7, 1), "the load never completed");
+        assert!(m.bus.noack.is_none());
+
+        let mut m = noack_machine("sampler", "sampler=ack0", false);
+        assert_eq!(m.run(10), RunExit::Budget);
+        assert_eq!(m.cpu.x[5], 0, "ack0 reads 0");
+        assert!(m.absent_summary().is_none());
+
+        let mut m = noack_machine("sampler", "sampler=noack", true);
+        assert_eq!(m.run(10), RunExit::Budget);
+        assert_eq!((m.cpu.x[5], m.cpu.pc), (0, 0x30008), "completed as ack0");
+        let summary = m.absent_summary().unwrap();
+        assert!(summary.starts_with("absent summary: 1 addresses stalled"), "{summary}");
+        assert!(summary.contains("0x10048000 sampler          1         0  0x00030004 probe+0x4"), "{summary}");
+    }
+
+    /// S41 §5: `core absent` stops the C64 (no tick, no frame, no backend for the monitor) and blanks the TRX output
+    /// to the overlay; `core present` attaches a fresh backend at power-up, with the bitstream's absent blocks.
+    #[test]
+    fn core_absent_and_present_swap_the_c64() {
+        use crate::c64host::mock::{Call, Mock};
+        let mut config = cfg();
+        config.trx_io = TrxIo::On;
+        config.absent = AbsentConfig::parse(Some("sampler"), None, true).unwrap();
+        let mut bus = SystemBus::new();
+        devices::install_all(&mut bus.io, &config);
+        let mut m = Machine::from_parts(config, bus, 0x30000, Symbols::empty());
+        m.start_absent();
+        let old = Mock::default();
+        m.attach_c64(Box::new(old.clone()));
+        assert!(old.take().contains(&Call::Absent(Block::Sampler)));
+        assert!(m.display().c64.is_some() && !m.core_is_absent());
+        assert_eq!(m.core_present(None), Err("core present: the core is present".into()));
+
+        assert!(m.core_absent().unwrap().starts_with("core absent (noack)"));
+        assert_eq!(m.core_absent(), Err("core absent: the core is already absent".into()));
+        let port = m.bus.io.get::<C64Port>().unwrap();
+        assert!(port.next_event().is_none() && port.backend().is_none());
+        let snap = m.display();
+        assert_eq!((snap.c64, snap.trx), (None, Some(TrxOutput::default())));
+        assert_eq!(m.picture_counter(), 0);
+        assert_eq!(m.bus.absent_at(0x1004_0000), Some((Block::Core, Mode::NoAck)));
+        assert_eq!(m.bus.absent_at(0x1004_4000), None, "the UCI is the host's");
+
+        assert!(m.take_c64_backend().is_some());
+        let new = Mock::default();
+        assert!(m.core_present(Some(Box::new(new.clone()))).unwrap().starts_with("core present"));
+        assert!(!m.core_is_absent() && m.bus.absent_at(0x1004_0000).is_none());
+        assert!(new.take().contains(&Call::Absent(Block::Sampler)), "the new core lacks the sampler too");
+        assert!(m.bus.io.get::<C64Port>().unwrap().next_event().is_some());
+        assert!(m.display().c64.is_some());
+        assert!(old.take().is_empty(), "the old core is gone");
     }
 }

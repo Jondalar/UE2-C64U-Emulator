@@ -32,7 +32,7 @@ const STRIDE: u16 = 0x20;
 
 /// Every **odd** offset in the window reads this (`sampler_regs.vhd:84-85`); the firmware's `SAMPLER_VERSION` is just
 /// the first of them. Hardware on 3.15 reports 16, which is what the demos display.
-const VERSION: u8 = 0x10;
+pub(crate) const VERSION: u8 = 0x10;
 
 /// The C64 window (`$DF20-$DFFF`), offset 0 = voice 0 register 0.
 const C64_WINDOW_START: u16 = 0xDF20;

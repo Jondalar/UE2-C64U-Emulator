@@ -148,6 +148,18 @@ struct RunArgs {
     /// C64 runs at 1 MHz (docs/specs/S38-trx64-ring.md)
     #[arg(long, value_enum, value_name = "MODE", num_args = 0..=1, default_missing_value = "on", default_value = "on")]
     ring: RingArg,
+    /// FPGA blocks the bitstream lacks, by their TRX_FEATURES names: reu, sampler, uci, jtag, turbo, apply, and core for
+    /// the whole swappable core; none = all present. Needs --trx-io (docs/specs/S41-core-dev-mode.md)
+    #[arg(long, value_name = "LIST")]
+    absent: Option<String>,
+    /// How an absent block's app window answers: noack (the access never completes) or ack0, for all, or per block as
+    /// sampler=noack,uci=ack0,core=noack [default: as the trial bitstream: sampler and uci ack0, core noack]
+    #[arg(long, value_name = "MODE")]
+    absent_mode: Option<String>,
+    /// A noack access is logged and completed as ack0 instead of halting; the end of the run counts the stalls per
+    /// address
+    #[arg(long)]
+    absent_continue: bool,
     /// The directory the monitor's file verbs (asm-file, ringdump, ringload, ls, cd) are confined to [default: the
     /// current directory]
     #[arg(long, value_name = "DIR")]
@@ -252,6 +264,8 @@ fn run(a: RunArgs) -> Result<()> {
         TrxIoArg::On => ue2_core::TrxIo::On,
         TrxIoArg::Off => ue2_core::TrxIo::Off,
     };
+    cfg.absent = ue2_core::absent::AbsentConfig::parse(a.absent.as_deref(), a.absent_mode.as_deref(), a.absent_continue)
+        .map_err(|e| anyhow::anyhow!(e))?;
     cfg.halt_on_fault = !a.no_halt;
     cfg.trace = a.trace || a.gdb.is_some();
     cfg.idle_skip = !a.no_idle_skip;

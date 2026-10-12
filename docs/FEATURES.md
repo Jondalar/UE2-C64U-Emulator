@@ -52,6 +52,9 @@ One line per feature, as of 0.5.1 (TRX64 v0.12.5). Details: `docs/status/`, spec
 - TRX64-Ultimate's debug block (`--trx-io`): trxmon, the board's monitor app, runs with breakpoints, watch units,
   steps, the CPU write path, the lens unit, the debugger's session and the instruction trace (S39, S40 phase E; stops at
   instruction boundaries).
+- Core dev mode (`--trx-io`): FPGA blocks absent as the TRX bitstream's build switches leave them (`--absent`), their
+  windows `noack` (halt with a report) or `ack0`, and the whole core swapped out and back while the firmware runs
+  (`core absent` / `core present`) (S41).
 - REU on the firmware's DDR, preload and "Save REU"; GeoRAM.
 
 ## Cartridges

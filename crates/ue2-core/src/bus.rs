@@ -10,12 +10,16 @@
 //! - anything else: read 0, write ignored, never a fault (00 §1, 01 H16). rvlite would alias higher bit-28
 //!   addresses onto the IO bus; that is OPEN (00 Q-A4) and the firmware never uses them, so they only show up
 //!   in the unmapped log.
+//! - S41: an IO address in the window of an absent block ([`crate::absent`]) reaches no device. `ack0` reads 0 and
+//!   drops the write; `noack` does the same and records the access in [`SystemBus::noack`], which the machine turns
+//!   into a halt or a logged stall after the instruction.
 //!
 //! Instruction fetches go through a second converter without IO support (rvlite_wrapper.vhd:101-106), so a
 //! fetch ignores bit 28 and only the boot BRAM page is special.
 
 use std::collections::BTreeMap;
 
+use crate::absent::{AbsentMap, Block, Mode, NoAck};
 use crate::io::{IoCtx, IoMap, IO_BASE, IO_SIZE};
 use crate::irq::IrqState;
 
@@ -81,6 +85,11 @@ pub struct SystemBus {
     /// Set by every CPU write to DDR, every IO access and every device tick; the idle skip clears it where it looks
     /// for a loop that cannot change anything (docs/specs/S19-idle-skip.md §3).
     pub idle_dirty: bool,
+    /// S41: the absent blocks' windows; None while every block is present and none was ever absent.
+    pub absent: Option<Box<AbsentMap>>,
+    /// S41: the `noack` access the executing instruction waits on. Once set, the instruction's later IO bytes reach
+    /// nothing either; the machine takes it after the step.
+    pub noack: Option<NoAck>,
 }
 
 impl Default for SystemBus {
@@ -135,7 +144,32 @@ impl SystemBus {
             accesses: Vec::new(),
             unmapped: BTreeMap::new(),
             idle_dirty: true,
+            absent: None,
+            noack: None,
         }
+    }
+
+    /// S41: the absent block answering for IO address `addr`, if any.
+    #[inline]
+    pub fn absent_at(&self, addr: u32) -> Option<(Block, Mode)> {
+        self.absent.as_deref()?.hit(addr)
+    }
+
+    /// S41: an IO byte in an absent window, or any IO byte after a `noack` one in the same instruction: no device sees
+    /// it. Returns whether it was one.
+    #[cold]
+    fn absent_access(&mut self, addr: u32, write: bool, val: u8) -> bool {
+        if self.noack.is_some() {
+            return true;
+        }
+        let Some((block, mode)) = self.absent_at(addr) else { return false };
+        if mode == Mode::NoAck {
+            self.noack = Some(NoAck { block, addr, write, val, pc: self.pc, now: self.now });
+        }
+        if self.trace_io {
+            self.record(write, addr, if write { val } else { 0 }, true, true);
+        }
+        true
     }
 
     /// Earliest `next_event` over all devices; `u64::MAX` when none is scheduled.
@@ -160,6 +194,9 @@ impl SystemBus {
     fn io_read8(&mut self, addr: u32) -> u8 {
         self.io_touched = true;
         self.idle_dirty = true;
+        if (self.absent.is_some() || self.noack.is_some()) && self.absent_access(addr, false, 0) {
+            return 0;
+        }
         match self.io.resolve(addr) {
             Some((dev, off)) => {
                 let mut ctx = IoCtx { stall: 0,
@@ -187,9 +224,9 @@ impl SystemBus {
 
     /// One write into a device register from outside the CPU, with every side effect the firmware's own write
     /// would have (S23 §3: the monitor stops the C64 through `C64_STOP`, the register the firmware uses itself).
-    /// DDR addresses are not this door's business and are refused.
+    /// DDR addresses are not this door's business and are refused, and so is the window of an absent block (S41).
     pub fn poke_io8(&mut self, addr: u32, val: u8) -> bool {
-        if !matches!(region(addr), Region::Io) || self.io.resolve(addr).is_none() {
+        if !matches!(region(addr), Region::Io) || self.io.resolve(addr).is_none() || self.absent_at(addr).is_some() {
             return false;
         }
         self.io_write8(addr, val);
@@ -199,6 +236,9 @@ impl SystemBus {
     fn io_write8(&mut self, addr: u32, val: u8) {
         self.io_touched = true;
         self.idle_dirty = true;
+        if (self.absent.is_some() || self.noack.is_some()) && self.absent_access(addr, true, val) {
+            return;
+        }
         match self.io.resolve(addr) {
             Some((dev, off)) => {
                 let mut ctx = IoCtx { stall: 0,
@@ -488,6 +528,34 @@ mod tests {
             [(true, 0x1000_0002, 0xEF, true, false), (true, 0x1000_0003, 0xBE, true, false), (false, 0x10FF_0000, 0, true, false)]
         );
         assert!(bus.unmapped.is_empty(), "unmapped counting is off");
+    }
+
+    /// S41: an absent window reaches no device; `noack` records the first byte of the instruction and keeps the rest
+    /// from every device, `ack0` only answers 0.
+    #[test]
+    fn absent_windows_reach_no_device() {
+        use crate::absent::AbsentConfig;
+        let mut bus = SystemBus::new();
+        bus.io.add(0x1004_4000, 0x100, probe(1, None));
+        bus.io.add(0x1004_8000, 0x100, probe(2, None));
+        bus.io.add(0x1000_0000, 0x100, probe(3, None));
+        let cfg = AbsentConfig::parse(Some("sampler,uci"), Some("sampler=noack"), false).unwrap();
+        bus.absent = Some(Box::new(AbsentMap::new(&cfg)));
+        bus.pc = 0x4242;
+        assert_eq!(bus.read32(0x1004_4000), 0, "uci: ack0");
+        bus.write8(0x1004_4001, 0x55);
+        assert!(bus.noack.is_none() && probe_log(&bus, 0).is_empty());
+        assert_eq!(bus.read32(0x1004_8004), 0, "sampler: noack");
+        assert_eq!(bus.noack, Some(NoAck { block: Block::Sampler, addr: 0x1004_8004, write: false, val: 0, pc: 0x4242, now: 0 }));
+        assert!(probe_log(&bus, 1).is_empty());
+        bus.write8(0x1000_0000, 1);
+        assert!(probe_log(&bus, 2).is_empty(), "nothing else in the stalled instruction reaches a device");
+        assert!(!bus.poke_io8(0x1004_8000, 1), "the monitor's door refuses an absent window");
+        bus.noack = None;
+        bus.write8(0x1000_0000, 1);
+        assert_eq!(probe_log(&bus, 2), [(true, 0, 1)]);
+        bus.absent.as_mut().unwrap().set(Block::Sampler, false);
+        assert_eq!(bus.read8(0x1004_8004), 0xA4, "present again");
     }
 
     #[test]
