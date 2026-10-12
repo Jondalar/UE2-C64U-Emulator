@@ -316,6 +316,12 @@ pub trait C64Backend {
     /// 1 MHz whatever the firmware's menu sets, and `$D030`/`$D031` are the VIC's unused registers (read `$FF`, take no
     /// write). Ignored by default.
     fn set_trx_bitstream(&mut self, _on: bool) {}
+
+    /// S41: `block` is not built into this bitstream (docs/specs/S41-core-dev-mode.md §2). The bus already keeps the
+    /// firmware out of its app window; this takes away the C64 side: no `$DF20-$DFFF` and no IRQ without the sampler,
+    /// no block on the C64 bus and no firmware IRQ without the UCI, `$DF00-$DFFF` reading `$FF` and no DMA without the
+    /// REU. A block stays absent for the life of the backend. Ignored by default.
+    fn set_absent(&mut self, _block: crate::absent::Block) {}
     /// One VIC frame in emulator clocks (lines × cycles per line at the row's clock), 0 when unknown.
     fn frame_clocks(&self) -> u64 {
         0
@@ -666,6 +672,8 @@ pub(crate) mod mock {
         Mixer(u8, u8),
         /// S37: the machine pause.
         Paused(bool),
+        /// S41: `set_absent`.
+        Absent(crate::absent::Block),
     }
 
     /// Shared with the test after the backend moved into the device.
@@ -884,6 +892,9 @@ pub(crate) mod mock {
         }
         fn set_trx_bitstream(&mut self, on: bool) {
             *self.trx_bitstream.borrow_mut() = on;
+        }
+        fn set_absent(&mut self, block: crate::absent::Block) {
+            self.push(Call::Absent(block));
         }
         fn sb_shadow(&self) -> super::SbShadow {
             self.shadow.borrow().clone()

@@ -50,6 +50,7 @@
 | `expect-console <text> [ms]` | Waits until the console output after the previous `expect-console` match contains the text. |
 | `expect-c64 <text> [ms]` | Waits until the C64 text screen (`c64screen`) contains the text; a timeout prints that screen. |
 | `monitor <cmd>` | Runs one line of TRX64's monitor against the C64 and prints its text (S23; needs `--c64 trx64`). |
+| `core absent` / `core present` | Takes the swappable core away while the firmware runs, or loads a fresh one from power-up, and prints what happened (S41 §5; needs `--trx-io`). |
 | `quit` | Quits. |
 
 - Lines starting with `#` are comments.

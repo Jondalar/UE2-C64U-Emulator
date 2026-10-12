@@ -352,6 +352,9 @@ pub struct C64Port {
     /// machine at the last look.
     cpu_stopped: bool,
     dbg_held: bool,
+    /// S41 §5: the swappable core is not loaded. The bus keeps the firmware out of the core's windows; here the C64
+    /// stops: no sync, no tick, no frame, no backend for the monitor. The backend stays, for its physical cartridge.
+    core_absent: bool,
 }
 
 impl Default for C64Port {
@@ -391,6 +394,7 @@ impl C64Port {
             engine_cfg: EngineCfg::default(),
             cpu_stopped: false,
             dbg_held: false,
+            core_absent: false,
         }
     }
 
@@ -425,14 +429,62 @@ impl C64Port {
     }
 
     /// The attached backend, for a frontend that needs more of it than [`C64Backend`] offers (S23's monitor host
-    /// downcasts through `C64Backend::as_any_mut`).
+    /// downcasts through `C64Backend::as_any_mut`). None while the core is absent (S41 §5).
     pub fn backend_mut(&mut self) -> Option<&mut (dyn C64Backend + 'static)> {
-        self.backend.as_deref_mut()
+        self.backend.as_deref_mut().filter(|_| !self.core_absent)
     }
 
-    /// The attached backend, for reads (S37: the TRX text layer).
+    /// The attached backend, for reads (S37: the TRX text layer). None while the core is absent (S41 §5).
     pub fn backend(&self) -> Option<&(dyn C64Backend + 'static)> {
-        self.backend.as_deref()
+        self.backend.as_deref().filter(|_| !self.core_absent)
+    }
+
+    /// S41 §5: the core goes: the C64 runs up to `now` and stops there, with no clock, no picture and no sound, and the
+    /// drives' WD177x interrupts into the ITU drop. The UCI is the host's and keeps its line.
+    pub fn set_core_absent(&mut self, now: u64, irq: &mut crate::irq::IrqState) {
+        self.sync(now);
+        self.core_absent = true;
+        for unit in 0..2 {
+            irq.set_high(WD_IRQ_HIGH_BIT + unit, false);
+        }
+    }
+
+    /// S41 §5: whether the core is absent.
+    pub fn core_absent(&self) -> bool {
+        self.core_absent
+    }
+
+    /// S41 §5: the backend, taken off the port (the core being replaced keeps nothing but its physical cartridge).
+    pub fn take_backend(&mut self) -> Option<Box<dyn C64Backend>> {
+        self.backend.take()
+    }
+
+    /// S41 §5: a core is loaded: every register of the port at its power-on value, `backend` (a fresh one) attached at
+    /// `now`. What is the host's stays: the physical joysticks and RESTORE, the lines shared with `U64Io`, the
+    /// cartridge ROM's place in DDR and the link to the TRX block.
+    pub fn power_up(&mut self, backend: Option<Box<dyn C64Backend>>, now: u64) {
+        let (joysticks, joy_lines, restore, keys) = (self.joysticks, self.joy_lines.clone(), self.restore, self.dma.keys);
+        let (cart_detect, cart_rom, link) = (self.cart_detect.take(), self.cart_rom, self.trx.take());
+        *self = C64Port::new();
+        (self.joysticks, self.joy_lines, self.restore, self.dma.keys) = (joysticks, joy_lines, restore, keys);
+        (self.cart_detect, self.cart_rom) = (cart_detect, cart_rom);
+        if let Some(link) = link {
+            self.set_trx_io(link);
+        }
+        if let Some(backend) = backend {
+            self.attach(backend, now);
+        }
+        self.apply_joysticks();
+        self.apply_nmi();
+    }
+
+    /// S41: tell the backend which blocks this bitstream lacks.
+    pub fn set_absent(&mut self, blocks: &[crate::absent::Block]) {
+        if let Some(b) = &mut self.backend {
+            for &block in blocks {
+                b.set_absent(block);
+            }
+        }
     }
 
     /// Where this firmware keeps the cartridge ROM (docs/status/carts.md, "Cartridge ROM in DDR"); passed on to the
@@ -502,9 +554,9 @@ impl C64Port {
         self.apply_nmi();
     }
 
-    /// The C64 frame, None without a backend.
+    /// The C64 frame, None without a backend and while the core is absent (S41 §5).
     pub fn frame(&self) -> Option<C64Frame> {
-        self.backend.as_ref().map(|b| b.frame())
+        self.backend().map(|b| b.frame())
     }
 
     /// The attached C64's frame counter, or 0 with no C64 (S24 §4).
@@ -525,6 +577,10 @@ impl C64Port {
     }
 
     fn sync(&mut self, now: u64) {
+        // S41 §5: an absent core has no clock.
+        if self.core_absent {
+            return;
+        }
         if self.trx.is_some() {
             self.trx_sync(now);
             return;
@@ -1432,7 +1488,7 @@ impl IoDevice for C64Port {
     /// §3): the port takes it before the firmware's next instruction, so a read after it sees its effect, as the
     /// block's own sequencing has it.
     fn next_event(&self) -> Option<u64> {
-        self.backend.as_ref()?;
+        self.backend.as_ref().filter(|_| !self.core_absent)?;
         let periodic = self.synced + SYNC_PERIOD;
         let op = self.trx.as_ref().and_then(|l| trx::lock(l).ops.first().map(|op| op.at));
         Some(op.map_or(periodic, |at| at.min(periodic)))
@@ -1453,12 +1509,14 @@ impl IoDevice for C64Port {
     /// Power-on register state; an attached backend stays attached, keys held on the keyboard stay held, and so does
     /// `--trx-io` (S37), which is the bitstream's, not a register's. The
     /// backend's own UCI block is not reset here either: only the FPGA system reset clears it
-    /// (command_protocol.vhd:292-306), which on TRX64 is `Machine::new` (Spec 852 §2).
+    /// (command_protocol.vhd:292-306), which on TRX64 is `Machine::new` (Spec 852 §2). An absent core stays absent
+    /// (S41 §5).
     fn reset(&mut self) {
         let (backend, synced, keys, cart_detect) = (self.backend.take(), self.synced, self.dma.keys, self.cart_detect.take());
-        let (link, paused) = (self.trx.take(), self.paused);
+        let (link, paused, core_absent) = (self.trx.take(), self.paused, self.core_absent);
         *self = C64Port::new();
         (self.backend, self.synced, self.dma.keys, self.cart_detect) = (backend, synced, keys, cart_detect);
+        self.core_absent = core_absent;
         // The backend keeps a pause until the next sync takes it away (C64_STOP is 0 now).
         self.paused = paused;
         if let Some(link) = link {

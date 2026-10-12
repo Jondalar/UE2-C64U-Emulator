@@ -59,6 +59,9 @@ use slot::{PhysicalCart, Slot, SlotHandle};
 pub use board::{check_board_ring, BoardCheck, BOARD_MAX_ENTRIES, BOARD_NODE};
 pub use ring::{BoardDumpInfo, Mode as RingMode, Ring, UE2_NODE};
 pub use slot::FlashDecode;
+
+/// S41 §5: the cartridge in the physical expansion port, on its way from one core to the next.
+pub struct SlotCart(PhysicalCart);
 use video::Palette;
 
 pub use sid::AudioSink;
@@ -304,6 +307,12 @@ pub struct Trx64Backend {
     tap: engine_tap::Tap,
     /// S39: the board's debug block on the run (dbg_run.rs).
     dbg: dbg_run::DbgRun,
+    /// S41: blocks the bitstream lacks (`C64Backend::set_absent`). Without the REU, `reu_stub` is whether
+    /// [`reu::AbsentReu`] answers `$DF00-$DFFF` (C64_REU_ENABLE set).
+    sampler_absent: bool,
+    uci_absent: bool,
+    reu_absent: bool,
+    reu_stub: bool,
 }
 
 impl Trx64Backend {
@@ -415,7 +424,28 @@ impl Trx64Backend {
             hwlog,
             tap: engine_tap::Tap::default(),
             dbg: dbg_run::DbgRun::default(),
+            sampler_absent: false,
+            uci_absent: false,
+            reu_absent: false,
+            reu_stub: false,
         }
+    }
+
+    /// S41 §5: take the cartridge out of the physical expansion port, for the next core: the cartridge is in the slot,
+    /// not in the core, and it keeps its flash.
+    pub fn take_slot_cart(&mut self) -> Option<SlotCart> {
+        let cart = self.slot.with(|s| s.eject())?;
+        self.install_cart();
+        Some(SlotCart(cart))
+    }
+
+    /// S41 §5: put the cartridge [`Self::take_slot_cart`] took into this core's physical expansion port.
+    pub fn insert_slot_cart(&mut self, cart: SlotCart) {
+        let mut cart = cart.0;
+        cart.set_log(&self.hwlog);
+        self.slot.with(|s| s.insert(cart));
+        self.install_cart();
+        self.apply_interrupts();
     }
 
     /// Send the SID's mono samples at `sample_rate` Hz to `sink`, following emulated time (S14 §W4-SID).
@@ -1453,7 +1483,7 @@ impl C64Backend for Trx64Backend {
             // Spec 852 §5: the U64 bus multiplexer decides whether the internal IO1/IO2 range — and with it the UCI
             // window — reaches the C64 bus. `unlock_irq` sets bit 1 for exactly that (u64_config.cc:1015-1016).
             slot::CORE_BUS_INTERNAL => {
-                if let Some(uci) = self.m.uci_mut() {
+                if let Some(uci) = self.m.uci_mut().filter(|_| !self.uci_absent) {
                     uci.set_routed(val & BUS_IO1 != 0, val & BUS_IO2 != 0);
                 }
             }
@@ -1536,6 +1566,18 @@ impl C64Backend for Trx64Backend {
     /// Neither touches the UCI block, which is the machine profile's own device in a slot of its own (Spec 852), nor
     /// the cartridge, which is `Machine::cartridge`.
     fn set_reu_enabled(&mut self, on: bool) {
+        // S41: without the REU the enable maps the stub that reads $FF (c64_top.v NO_REU, c64_bus_arbiter.v IO2).
+        if self.reu_absent {
+            if on != self.reu_stub {
+                self.reu_stub = on;
+                if on {
+                    self.m.attach_expansion_also(Box::new(reu::AbsentReu));
+                } else {
+                    self.m.detach_expansion_device::<reu::AbsentReu>();
+                }
+            }
+            return;
+        }
         match (on, self.m.reu().is_some()) {
             // Switched back on within the grace time: it never left.
             (true, true) => self.reu_off_since = None,
@@ -1597,7 +1639,44 @@ impl C64Backend for Trx64Backend {
     /// `C64_SAMPLER_ENABLE`. The block stays on the port either way — this opens or closes its `$DF20-$DFFF` window
     /// and, with it, the IRQ into the C64 (`slot_to_io_bridge.vhd:51,85-88`).
     fn set_sampler_enabled(&mut self, on: bool) {
+        // S41: a sampler that is not built has no window to open.
+        if self.sampler_absent {
+            return;
+        }
         self.sampler.with(|s| s.set_enabled(on));
+    }
+
+    /// S41 §2: the C64 side of a block the bitstream lacks.
+    /// - sampler (c64_core.v `NO_SAMPLER`): off the port, so `$DF20-$DFFF` is not mapped, no IRQ, no DDR fetch;
+    /// - uci (ultimate_sys.vhd `gen_no_uci`): the block disabled and unrouted, so it never drives the C64 bus, and its
+    ///   firmware IRQ and events read nothing;
+    /// - reu (c64_top.v `NO_REU`): the REU off the port; C64_REU_ENABLE maps [`reu::AbsentReu`] instead.
+    ///
+    /// The capability bits stay: the trial clears none (S41 §2).
+    fn set_absent(&mut self, block: ue2_core::absent::Block) {
+        use ue2_core::absent::Block;
+        match block {
+            Block::Sampler => {
+                self.sampler_absent = true;
+                self.m.detach_expansion_device::<sampler::SamplerHandle>();
+            }
+            Block::Uci => {
+                self.uci_absent = true;
+                self.uci_off_since = None;
+                self.uci_wait = None;
+                if let Some(u) = self.m.uci_mut() {
+                    u.fw_write(UCI_SLOT_ENABLE, 0);
+                    u.set_routed(false, false);
+                }
+            }
+            Block::Reu => {
+                self.reu_absent = true;
+                self.m.detach_reu();
+                self.parked_reu = None;
+                self.reu_off_since = None;
+            }
+            Block::Turbo | Block::Jtag | Block::Apply | Block::Core => {}
+        }
     }
 
     // S27: drive A is TRX64's position A, drive B position B (drive.rs).
@@ -1670,12 +1749,16 @@ impl C64Backend for Trx64Backend {
     }
 
     fn uci_irq(&self) -> bool {
-        self.m.uci().is_some_and(|u| u.fw_irq())
+        !self.uci_absent && self.m.uci().is_some_and(|u| u.fw_irq())
     }
 
     /// `Machine::uci_mut` hands the block any C64 reset since the last call first, so `take_events` reports it.
     fn uci_take_events(&mut self) -> UciEvents {
         let events = self.m.uci_mut().map(|u| u.take_events()).unwrap_or_default();
+        // S41: without the UCI nothing reaches the ITU (`gen_no_uci`).
+        if self.uci_absent {
+            return UciEvents::default();
+        }
         UciEvents { c64_reset: events.c64_reset, unlock: events.unlock }
     }
 
@@ -2036,6 +2119,38 @@ pub(crate) mod tests {
         c64.set_reset(false);
         strobe(&mut c64, 0x8C);
         assert_ne!(c64.m.peek_lens(0xD031, "io"), 0x00, "new values after a reset are a menu change");
+    }
+
+    /// S41 §2: the C64 side of blocks the bitstream lacks: no sampler at `$DF20-$DFFF`; the UCI block disabled,
+    /// unrouted and with its firmware IRQ held low; the REU enable mapping `$DF00-$DFFF` reading `$FF` with no REU on
+    /// the port. The capability side (`has_uci`, `has_sampler`) stays: the trial clears no CAPS bit.
+    #[test]
+    fn absent_blocks_take_away_the_c64_side() {
+        use ue2_core::absent::Block;
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        c64.set_sampler_enabled(true);
+        assert_eq!(c64.m.peek_lens(0xDF21, "io"), sampler::VERSION, "the sampler answers first");
+        c64.set_absent(Block::Sampler);
+        c64.set_sampler_enabled(true);
+        assert_ne!(c64.m.peek_lens(0xDF21, "io"), sampler::VERSION, "no sampler on the port");
+
+        c64.set_absent(Block::Reu);
+        c64.set_reu_enabled(true);
+        assert!(!c64.reu_attached() && c64.m.reu().is_none(), "no REU, no DMA");
+        assert_eq!([0xDF00, 0xDF01, 0xDF0A, 0xDF21, 0xDFFF].map(|a| c64.m.peek_lens(a, "io")), [0xFF; 5]);
+        c64.set_reu_enabled(false);
+        assert!(c64.m.reu().is_none());
+
+        c64.uci_write(UCI_SLOT_ENABLE, 1);
+        c64.core_config_write(slot::CORE_BUS_INTERNAL, BUS_IO1 | BUS_IO2);
+        assert!(c64.m.uci().unwrap().status().enabled);
+        c64.set_absent(Block::Uci);
+        let st = c64.m.uci().unwrap().status();
+        assert!(!st.enabled && !st.routed_io1 && !st.routed_io2 && !c64.uci_irq());
+        c64.core_config_write(slot::CORE_BUS_INTERNAL, BUS_IO1 | BUS_IO2);
+        assert!(!c64.m.uci().unwrap().status().routed_io2, "the route stays off");
+        assert_eq!(c64.uci_take_events(), UciEvents::default());
+        assert!(c64.has_uci() && c64.has_sampler());
     }
 
     /// S40 §0: on TRX64-Ultimate's bitstream (`main`, no T29) the menu's strobe changes nothing, `$D030`/`$D031` read

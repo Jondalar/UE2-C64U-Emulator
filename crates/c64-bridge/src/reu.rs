@@ -18,7 +18,7 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
-use trx64_core::expansion::ExpansionRam;
+use trx64_core::expansion::{Access, ExpansionDevice, ExpansionRam};
 
 use crate::hwlog::{HwLog, Space};
 
@@ -127,6 +127,23 @@ impl ExpansionRam for ReuRam {
 
     // `clone_ram` and `is_owned` keep their defaults: the bytes are the host's, so a cloned machine gets no copy and a
     // snapshot writes `ram: null` (854 D7).
+}
+
+/// S41: what IO2 answers on a bitstream built without the REU while C64_REU_ENABLE is set (c64_top.v `NO_REU`:
+/// `reu_dout` is `$FF`; c64_bus_arbiter.v selects it for `$DF00-$DFFF`). Writes go nowhere; no DMA, no IRQ. A
+/// cartridge's own IO2 answer stands, as it does before the real REU's.
+pub struct AbsentReu;
+
+impl ExpansionDevice for AbsentReu {
+    fn read(&mut self, a: Access, cart: Option<u8>) -> Option<u8> {
+        self.peek(a.addr, cart)
+    }
+
+    fn peek(&self, addr: u16, cart: Option<u8>) -> Option<u8> {
+        (addr >> 8 == 0xDF && cart.is_none()).then_some(0xFF)
+    }
+
+    fn write(&mut self, _a: Access, _value: u8) {}
 }
 
 #[cfg(test)]
