@@ -94,8 +94,9 @@ decoupler does it (T79.1; RTL in dfx-trial a75c356, ultimate_sys.vhd and top.v; 
 the debug register `core_decouple` is JTAG 0x100029 bit 0, read back in the same register). A swap is `core_decouple` = 1, the partial bitstream loaded, `core_decouple` = 0. The
 board PoC 3 (46afe1f) did that over JTAG in 2.8 s with REST answering 200 throughout. `PUT /v1/machine:reset`
 afterwards did not bring BASIC back on the screen (the FW session's correction, from Alex's photo; an earlier note
-here had it booting to BASIC V2): the new core's ROMs are blank. Only an app restart, whose init writes the ROMs,
-brought READY back.
+here had it booting to BASIC V2): the new core's ROMs are blank. The BASIC V2 banner the FW session read over REST
+after `machine:reset` was the new core's RAM, not the old one (FW correction, 2026-10-12). `PUT /v1/machine:reboot`,
+which writes the ROMs, is the recovery step; the FW session uses it on the board too.
 - **On the rise** (`core absent`), once: the latches behind pages 0 and 3 go back to their power-up values, with the
   C64's reset held (`c64_reset_i` = 1), and a 64-cycle sweep rewrites the palette to Colodore and holds `sidcv_we` at
   0. The held reset is the reset sense: `c64_reset_req`, top.v's `core_reset_req` (top.v:1225, 1257), `rst_sense_s`,
@@ -117,9 +118,11 @@ brought READY back.
 - **On the fall** (`core present`): nothing is raised. The new core comes up with the host's latches as they stand
   (not the read-back bytes): its C64 stays in reset until the firmware releases it through C64_MODE, as at power-up;
   the REU, the sampler, MEMONLY and the joystick outputs are at power-up unless written since the rise.
-- **The new core's ROMs are blank.** BASIC, KERNAL and CHAR live in the core's block RAM (c64_mem.v `rom_lo`/`rom_hi`,
-  dfx-trial a75c356), which only a simulation build initialises (`TRX_SIM_ROMS`, `$readmemh`); a bitstream's block RAM
-  without an init reads 0. They stay 0 until the firmware writes them through the ROM window (`r_rom`,
+- **The new core's memories are blank.** BASIC, KERNAL and CHAR live in the core's block RAM (c64_mem.v
+  `rom_lo`/`rom_hi`, dfx-trial 1e7838e), which only a simulation build initialises (`TRX_SIM_ROMS`, `$readmemh`); a
+  bitstream's block RAM without an init reads 0. So do the 64K of C64 RAM (c64_mem.v `ram_lo`/`ram_hi`, no init at
+  all) and the colour RAM (c64_top.v `color_mem`, block RAM, no init): the new core starts with them at 0, not with
+  the old core's contents. The ROMs They stay 0 until the firmware writes them through the ROM window (`r_rom`,
   0x10188000-0x1018FFFF), which the app does in `C64::init_system_roms` (c64.cc): at its init, on a ROM setting
   change (`set_rom_config`), and in `start_cartridge`, which `PUT /v1/machine:reboot` and the menu's Reboot run. A
   release alone runs the C64 on blank ROMs. The recovery is the app writing the ROMs, then releasing C64_MODE; later
@@ -187,7 +190,7 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
     `restore_pristine_rom_image` finds the KERNAL and BASIC windows different from its snapshot and writes those two
     back ("C64: ROM image differed from the loaded one; restoring"), but not CHAR: the C64 reaches READY in screen
     RAM while the picture shows no glyph, the character ROM still 0 (the smoke checks the picture). That is the
-    board's photo; the FW session's "REST showed the old screen RAM" does not follow from it here and is open.
+    board's photo; the banner the FW session read over REST was this new screen RAM (resolved, FW correction).
     `PUT /v1/machine:reboot` runs `start_cartridge`, which writes all three ROMs: CHAR reads its glyphs again and the
     picture shows READY.
   - With the decoupler and `--absent core` from power-on the app runs its whole init ("All Init functions called")
@@ -222,10 +225,12 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
   clear. The read-back of REU_ENABLE and
   C64_SAMPLER_ENABLE in UE2 is bit 0 only (`CART_REGS`), where the page RAM keeps the whole byte; unchanged here. top.v's half (DDR2, handshakes, pins, IRQ masks) needs no
   model: an absent core in UE2 runs nothing.
-- **The new core's ROMs** are blanked by the core factory (`Trx64Backend::blank_roms`); the first core of a run
-  still starts with the ROMs from `--roms`, as since S14 §5.5, although the board's full bitstream has blank ROM
-  block RAM too until the app's init writes them. The new core's C64 RAM is TRX64's power-on pattern, not the block
-  RAM's 0; open, with the FW session's note on the screen RAM.
+- **The new core's block RAM** (ROMs, C64 RAM, colour RAM) is blanked by the core factory
+  (`Trx64Backend::blank_block_ram`): all 0, as the block RAM comes out of the partial bitstream. The first core of a
+  run still starts with the ROMs from `--roms` and TRX64's power-on RAM pattern, as since S14 §5.5, although the
+  board's full bitstream has the same blank block RAM until the app's init writes the ROMs.
+- **CHAR after `machine:reset`:** the app's `restore_pristine_rom_image` heals BASIC and KERNAL only. For T81 it
+  should cover CHAR too; that is app side and recorded here only.
 - **Host scaler relock** (dfx-trial a5f8252): not applicable. UE2's TRX output has no frame lock: the TRX block
   takes the VIC frame count at every sync (`TrxLink::frames`, overwritten by the new core's first sync) and the
   block itself is reset on `core present`; the window and the renderer follow each frame as it comes.
@@ -276,8 +281,8 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
   `crates/ue2emu/src/monitor/mod.rs`: `fw m ADDR [END]` (the firmware's IO read without side effects, also while the
   core is absent, for the swap smoke's page checks); the monitor says the core is absent instead of asking for
   `--c64 trx64`. `crates/ue2emu/src/monitor/run.rs`: `c64 reset` (reset and release through C64_MODE).
-  `crates/c64-bridge/src/lib.rs`: `take_uci`/`insert_uci` and `UciBlock`, `blank_roms`; `crates/ue2emu/src/runner.rs`:
-  `CoreFactory::build` moves the UCI block and the slot cartridge and blanks the new core's ROMs.
+  `crates/c64-bridge/src/lib.rs`: `take_uci`/`insert_uci` and `UciBlock`, `blank_block_ram`; `crates/ue2emu/src/runner.rs`:
+  `CoreFactory::build` moves the UCI block and the slot cartridge and blanks the new core's block RAM.
 - Tests: `absent::tests`, `bus::tests::absent_windows_reach_no_device`,
   `machine::tests::{a_noack_access_halts_on_its_instruction, core_absent_and_present_swap_the_c64}`,
   `devices::trx::tests::{without_apply_caps2_b5_is_clear_and_no_job_starts,

@@ -278,8 +278,9 @@ impl CoreFactory {
             })
             .unwrap_or((None, None));
         let mut c64 = new_trx64(&self.rom_dir, self.sink.clone(), self.armsid, self.sid_thread, self.ring);
-        // The partial bitstream brings no ROM contents: the firmware has to write them (c64_mem.v).
-        c64.blank_roms();
+        // The partial bitstream brings no memory contents: ROMs, C64 RAM and colour RAM read 0, and the firmware has to
+        // write the ROMs (c64_mem.v, c64_top.v).
+        c64.blank_block_ram();
         if let Some(uci) = uci {
             c64.insert_uci(uci);
         }
