@@ -44,7 +44,8 @@ Today UE2 cannot do that, for two reasons:
 - **`ack0`:** reads return 0 and writes are dropped.
 - **CAPS:** the trial clears no capability bits; UE2 copies that. The only exception is `apply`, which clears
   CAPS2 b5. The ITU word stays as it is, unless `--caps` is also given.
-- **Defaults** (dfx-trial 0a130e1): sampler `ack0` (bd16bee is in the branch), uci `ack0`, core `noack`. reu, turbo,
+- **Defaults** (dfx-trial 0a130e1): sampler `ack0` (bd16bee is in the branch), uci `ack0`, core `ack0`
+  (the host's decoupler, §5). reu, turbo,
   jtag, apply and streams have no app window, so no mode; `--absent-mode` refuses one for them. The UDP streams'
   sent counters are on the JTAG map only, so UE2 has nothing to model for `streams`: it is accepted as a no-op.
 
@@ -88,16 +89,35 @@ page 0, 0x10040000), the core config (page 3, 0x10180000), the palette (`r_pal`)
 IEC processor's idle constants (`r_iec`) and UE2's drive B (0x10024000, `r_none`). UE2 keeps serving them from its own
 register models while the C64 stands still.
 
-On the board, bc97bbe times out a request into `r_drive`, `r_gcr`, `r_cw` and `r_dma` after 65,536 clocks and acks
-it with 0. UE2 keeps the choice between `noack` (the board before bc97bbe) and `ack0` (close to bc97bbe, without the
-wait).
+**A swap is a full cold boot** (Alex, 2026-10-12): nothing of the old core survives. On the board the host's DFX
+decoupler does it (FW session, T79.1, being built on dfx-trial): a debug register `core_decouple`, planned at
+0x100025 bit 0 and written over JTAG today; a swap is `core_decouple` = 1, the partial bitstream loaded,
+`core_decouple` = 0. While it is 1:
+- the host takes no DDR2 request from the core, both ends of the toggle handshakes are held in reset, slot and IEC
+  sit idle at the I/O buffers, the core's IRQs are masked;
+- `r_drive`, `r_gcr`, `r_cw`, `r_dma` and `r_rom` are answered by the host at once, ack and data 0;
+- the cart registers (page 0), the core config (page 3), the palette and the SID curves are held at their power-up
+  values (reset OR'd in): they read those, and writes do not stick;
+- pages 1, 2, 4 and 5 of `r_page` (MATRIX_KEYB 0x10100300, the U64 board IO 0x10100400, C64_PLD_ACC 0x10181000,
+  U64_DEBUG_REGISTER 0x10181800) are not touched.
+
+`core absent` is `core_decouple` = 1, `core present` is `core_decouple` = 0. The core's mode:
+- **`ack0`, the default:** the decoupler answering.
+- **`noack`:** a host without the decoupler, where a request into the core never completes: the board before
+  bc97bbe, or the case the host timeout is the backstop for (bc97bbe, 70bd378: `r_drive`, `r_gcr`, `r_cw`, `r_dma`
+  and from 70bd378 `r_rom`, acked with 0 after 65,536 clocks).
+
+Whether the app can write `core_decouple` itself (for a swap from the menu) is open on the FW side; UE2 maps nothing
+for it.
 
 The host side keeps running: RISC-V, USB, SD, flash, Ethernet/UDP, overlay, HDMI.
 
 - **Mode:** `noack`/`ack0` work as in §1.
 - **While absent:** the C64 stops (no clock, no audio, no picture). The TRX output shows the overlay over black.
 - **At run time:** the control commands `core absent` and `core present` swap the core while the app runs.
-  `core present` brings the core back from power-up (a fresh core image), as a reconfiguration would.
+  `core present` brings the core back from power-up (a fresh core image), as a reconfiguration would: a new TRX64
+  backend, a fresh TRX block and GCR codec, the cart registers and the core config clean; the host's pages 1, 2, 4
+  and 5 as they were.
   `--absent core` at start is the same as `core absent` before the first instruction.
 - **Ring:** goes with the core. A swap ends the ring (S38).
 - **Check:** `smoke-core-swap.sh` swaps the core while the RC1 app runs. The app's swap handling is logged.
@@ -127,7 +147,7 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
   bytes 0x10048000-0x100480E0) 1.45 s after boot, console "Speed regs: 00 80". With `ack0` the app boots to the
   parked UI; with `--absent-continue` those eight writes are the only stalls of a boot. All seven blocks absent in
   their default modes: the app boots, CAPS2 reads $9D.
-- `smoke-core-swap.sh`: all four runs pass. With the core's default `noack`, the unmodified app halts on its first
+- `smoke-core-swap.sh`: all four runs pass. With the core in `noack`, the unmodified app halts on its first
   access after `core absent`: drive A's 0x10020000 (`C1541::task()+0x28`). With `--absent core` from power-on it
   halts in init on the trx_io ID 0x101A0000 (`trx_io_caps()+0x20`, called from `rtc_seconds()` through
   `Rtc::get_fat_time()` while `f_mkfs` formats the RAM disk; console "----> Initializing RAM Disk (1)..."). With
@@ -135,7 +155,16 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
   (`trx_io_read32/write32`).
   Before the windows followed ultimate_sys's decode (6a3b4a4) the power-on halt was CORE_VERSION 0x10180010
   (`getProductVersionString()+0x1c`), which the host acks itself.
-  `core present` brings a C64 to READY on its own, twice in a row.
+  `core present` brings a C64 to READY on its own, twice in a row; right after it the cart registers read their
+  power-up values (`00 00 00 01 00 00 00 00 00 07 00 00 01 00 00 00`, where the app had STOP_MODE 2 and REU_SIZE 4)
+  and pages 1, 2, 4 and 5 read as before the swap.
+- With the decoupler (`ack0`, the default) the unmodified app runs on through a swap. With `--absent core` from
+  power-on it does not halt but spins in `C64::hard_stop()+0x34` after "The C64 should be stopped at this time for
+  the SID Detection to work!": C64_STOP is held at its power-up 0, so the stop it waits for (`C64_STOP` b1) never
+  reads back.
+- After `core present` the app runs its C64 reset handler ("U64 reset handler. Resetting Settings") and writes the
+  core config again: the new TRX64 backend's UCI block reports a C64 reset. On the board the UCI is the host's
+  (`ultimate_sys`) and whether a swap raises the reset sense (ITU low bit 7) is not known (open below).
 
 ### Deviations from the draft
 
@@ -145,17 +174,21 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
   for the app; the FW session, 2026-10-12). UE2's TRX model has no turbo engine (S40 §0: `main` has no T29), so "the engine
   never engages" holds already; UE2 has no JTAG debug master, and the switch has no bus effect. All three are
   accepted and say so in one line.
-- **`r_rom` is a core window**, though the approved list (2026-10-12) had it host-acked: ultimate_sys hands a ROM
-  byte to the core as a DMA request (`dma_rom`, `dma_req_tgl`) and acks it on the core's `dma_done_tgl`, or, after
-  2^25 clocks (335 ms), with $FF from its DMA watchdog (`dma_wd`); bc97bbe's 65,536-clock timeout does not cover it.
-  UE2 treats it as the other core windows (`noack` or `ack0`); the 335 ms wait and the $FF are not modelled. The
-  same watchdog also ends an `r_dma` byte before bc97bbe (335 ms, $FF).
-- **Host registers read their latches, not 0.** The approved wording was "ack0, data 0" for the host-acked windows;
-  ultimate_sys reads the cart registers and the core config from its own registers and constants (`page_data`:
-  CORE_VERSION reads $01, C64_STOP the stop bit), and only a few bits come from the core (the cartridge's active
-  bit, the voice levels). UE2 leaves them to its register models, which is that answer.
-- **A swap resets the host's registers.** On the board the cart registers and the core config are the host's and
-  outlive a reconfiguration; `core present` here powers up the whole C64 port. Open point.
+- **`r_rom` is a core window**: ultimate_sys hands a ROM byte to the core as a DMA request (`dma_rom`,
+  `dma_req_tgl`) and acks it on the core's `dma_done_tgl`. 70bd378 added it to the host timeout ("found by ue2emu
+  S41"), and the decoupler answers it. Without either, the DMA watchdog (`dma_wd`) acks it after 2^25 clocks
+  (335 ms) with $FF; UE2 does not model that wait (`noack` halts).
+- **The decoupler is not in the RTL yet.** `core_decouple` is in neither dfx-trial (70bd378) nor the dfx worktree;
+  UE2 follows the FW session's description above. To check against the RTL once it lands: what the held
+  pages read (UE2: its register models' power-up values — CORE_VERSION $01, CLOCK_DETECT $01, REU_SIZE $07,
+  PHI2_EDGE_RECOVER $01, JOY SWOUT $FF, the rest 0; ultimate_sys's `page_data` gives constants for some offsets), and
+  whether a DMA read of `$D400-$D7FF` still reads $FF from the host's `dma_stub` (UE2: yes) or 0 from the decoupler.
+- **Host registers outside a swap read their latches, not 0**: ultimate_sys reads the cart registers and the core
+  config from its own registers and constants (`page_data`), and UE2's register models give that answer.
+- **The UCI goes with UE2's core.** UE2's UCI is TRX64's block inside the C64 backend, so a swap gives a fresh one
+  (and its C64-reset event, see Results); on the board it is the host's and keeps its state. Open point.
+- **Palette and SID curves** need no hold in UE2: both are write-only (they read 0 at any time); a write while the
+  core is absent is dropped.
 - **One stall line per site.** `--absent-continue` logs the first stall of each (address, direction, PC) and counts
   every one; a polling loop does not flood the log.
 - **The backtrace is a stack scan.** The firmware keeps no frame pointer, so the report lists the words above `sp`
@@ -176,7 +209,9 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
   continue: log and count); `noack_report` (§3), `absent_summary`; `core_absent`, `core_present`,
   `take_c64_backend` (§5); `display` and `picture_counter` without a core.
 - `crates/ue2-core/src/devices/c64.rs`: `C64Port::set_core_absent` (no sync, no tick, no frame, drives' WD177x IRQs
-  low), `power_up` (a fresh port, the host's lines kept), `set_absent`.
+  low, cart registers and core config held at power-up: `write8` drops cart, core config and palette writes while
+  absent), `power_up` (a fresh port with MATRIX_KEYB kept and driven into the new C64, the host's lines kept),
+  `set_absent`. U64 board IO, C64_PLD_ACC and U64_DEBUG_REGISTER are devices of their own and are not touched.
 - `crates/ue2-core/src/devices/trx.rs`: `CAPS2_APPLY`, `Trx::set_apply_absent` (AP_* ignored, CAPS2 b5 clear, kept
   over a reset), `Trx::set_core_absent` (IRQ 2 low, no polling).
 - `crates/ue2-core/src/c64host.rs`: `C64Backend::set_absent`.
@@ -188,6 +223,8 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
   `audio::SharedSink`; the old one dropped first, its rings with it; the monitor session reset);
   `report` prints the absent summary. `crates/ue2emu/src/control.rs`: `core absent` / `core present` (S08).
   `crates/ue2emu/src/monitor/devices.rs`: `monitor trx` shows CAPS and CAPS2 as the app reads them.
+  `crates/ue2emu/src/monitor/mod.rs`: `fw m ADDR [END]` (the firmware's IO read without side effects, for the swap
+  smoke's page checks); the monitor says the core is absent instead of asking for `--c64 trx64`.
 - Tests: `absent::tests`, `bus::tests::absent_windows_reach_no_device`,
   `machine::tests::{a_noack_access_halts_on_its_instruction, core_absent_and_present_swap_the_c64}`,
   `devices::trx::tests::{without_apply_caps2_b5_is_clear_and_no_job_starts,

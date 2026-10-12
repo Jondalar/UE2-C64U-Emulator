@@ -73,6 +73,24 @@ impl State {
     }
 }
 
+/// `fw m ADDR [END]`: firmware bytes from ADDR to END (hex, inclusive, at most 256), 16 a line, read the way the GDB
+/// stub reads them: DDR as it is, IO through `IoDevice::peek8`, so no register sees a read (S41: the host's pages
+/// around a core swap).
+fn fw_memory(m: &Machine, from: &str, to: Option<&&str>) -> Result<String, String> {
+    let hex = |s: &str| u32::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|_| format!("fw m: '{s}' is not a hex address"));
+    let start = hex(from)?;
+    let end = to.map_or(Ok(start), |t| hex(t))?;
+    if end < start || end - start >= 0x100 {
+        return Err("fw m: END must follow ADDR, at most 256 bytes".into());
+    }
+    let mut out = String::new();
+    for line in (start..=end).step_by(16) {
+        let bytes: Vec<String> = (line..=end.min(line + 15)).map(|a| format!("{:02x}", peek8(&m.bus, a))).collect();
+        out.push_str(&format!("  {line:08x}  {}\n", bytes.join(" ")));
+    }
+    Ok(out)
+}
+
 /// The TRX64 backend behind the firmware's C64 registers, through the downcast hook of `C64Backend`.
 fn trx64(m: &mut Machine) -> Option<&mut Trx64Backend> {
     m.bus.io.get_mut::<C64Port>()?.backend_mut()?.as_any_mut()?.downcast_mut::<Trx64Backend>()
@@ -164,6 +182,8 @@ impl Host<'_> {
                 Ok(out)
             }
             ["tasks"] => Ok(task_list(self.m)),
+            ["m", from] => fw_memory(self.m, from, None),
+            ["m", from, to] => fw_memory(self.m, from, Some(to)),
             _ => run::firmware(self, args),
         }
     }
@@ -184,6 +204,7 @@ impl Host<'_> {
         concat!(
             "\nthe Ultimate side (S23):\n",
             "  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n",
+            "  fw m ADDR [END]   the firmware's memory and IO, hex, at most 256 bytes; IO without side effects\n",
             "  fw halt | go | step [n]     run control for the firmware (the C64 stands with it)\n",
             "  c64 [halt | go | step [n]]  run control for the C64, firmware running\n",
             "  g [addr] | x | until ADDR | z | step [n] | n | next [n] | ret\n",
@@ -277,6 +298,10 @@ pub fn exec(
     // S39 §3.8: while trxmon owns run control (OWNER) the C64 is its; reading verbs work.
     if trx_owns(m) && moves_the_c64(&verb, line.split_whitespace().nth(1)) {
         return Err(TRXMON_OWNS.into());
+    }
+    // S41 §5: an absent core takes the C64 with it.
+    if m.core_is_absent() {
+        return Err("the core is absent: no C64 until `core present`".into());
     }
     let mut host = Host::new(m, state).ok_or("the monitor needs a C64: start with --c64 trx64")?;
     // S38: what the line does to the C64 decides what happens to the transport, before the verb runs (the daemon's

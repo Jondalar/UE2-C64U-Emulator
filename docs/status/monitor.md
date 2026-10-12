@@ -23,6 +23,7 @@ one-way.
 | Verb | What it answers |
 |---|---|
 | `fw [tasks]` | The firmware's RISC-V: `pc` with its symbol and the 32 ABI registers, or the FreeRTOS task list. |
+| `fw m ADDR [END]` | The firmware's memory and IO, hex, at most 256 bytes; IO read without side effects, as the GDB stub reads it (S41). |
 | `clock` | The emulator's clock, the firmware's instructions and idle skips, the C64's cycle. |
 | `config …` | The settings, in all the ways the menu has them (below). |
 | `itu` | The capability word, the FPGA version, the ms/us timers, and the interrupt controller by source name. |

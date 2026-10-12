@@ -85,13 +85,12 @@ impl Block {
         }
     }
 
-    /// The answer the trial bitstream gives today (§2): the NO_SAMPLER stub echoes every request with 0 from
-    /// TRX64-Ultimate bd16bee on (c64_core.v `smp_a_echo`); `gen_no_uci` acks with 0; a grey box drives no ack.
+    /// The answer the bitstream gives (§2, §5): the NO_SAMPLER stub echoes every request with 0 from TRX64-Ultimate
+    /// bd16bee on (c64_core.v `smp_a_echo`); `gen_no_uci` acks with 0; without a core the host's decoupler
+    /// (`core_decouple`, T79.1) answers the core's windows at once with 0. `noack` for the core stands for a host
+    /// without the decoupler.
     pub fn default_mode(self) -> Mode {
-        match self {
-            Block::Core => Mode::NoAck,
-            _ => Mode::Ack0,
-        }
+        Mode::Ack0
     }
 
     fn bit(self) -> u8 {
@@ -323,7 +322,7 @@ mod tests {
     fn parse_names_modes_and_defaults() {
         let cfg = AbsentConfig::parse(Some("sampler,uci"), Some("sampler=noack"), false).unwrap();
         assert_eq!(cfg.blocks, [Block::Sampler, Block::Uci]);
-        assert_eq!((cfg.mode(Block::Sampler), cfg.mode(Block::Uci), cfg.mode(Block::Core)), (Mode::NoAck, Mode::Ack0, Mode::NoAck));
+        assert_eq!((cfg.mode(Block::Sampler), cfg.mode(Block::Uci), cfg.mode(Block::Core)), (Mode::NoAck, Mode::Ack0, Mode::Ack0));
         let all = AbsentConfig::parse(Some("reu,sampler,uci,jtag,turbo,apply,streams"), Some("noack"), true).unwrap();
         assert_eq!(all.blocks.len(), 7);
         assert!(AbsentConfig::parse(None, Some("streams=ack0"), false).is_err(), "no window, no mode");

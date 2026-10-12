@@ -439,11 +439,16 @@ impl C64Port {
         self.backend.as_deref().filter(|_| !self.core_absent)
     }
 
-    /// S41 §5: the core goes: the C64 runs up to `now` and stops there, with no clock, no picture and no sound, and the
-    /// drives' WD177x interrupts into the ITU drop. The UCI is the host's and keeps its line.
+    /// S41 §5: the core goes (`core_decouple` = 1): the C64 runs up to `now` and stops there, with no clock, no picture
+    /// and no sound, and the drives' WD177x interrupts into the ITU drop. The decoupler holds the cart registers and the
+    /// core config at their power-up values (and the palette with them; it reads 0 anyway): they read those, and a write
+    /// does not stick until the core is back. MATRIX_KEYB (the host's page 1) and the UCI keep what they have.
     pub fn set_core_absent(&mut self, now: u64, irq: &mut crate::irq::IrqState) {
         self.sync(now);
         self.core_absent = true;
+        let fresh = C64Port::new();
+        (self.cart, self.mode, self.stop, self.core) = (fresh.cart, fresh.mode, fresh.stop, fresh.core);
+        self.apply_joysticks();
         for unit in 0..2 {
             irq.set_high(WD_IRQ_HIGH_BIT + unit, false);
         }
@@ -459,20 +464,29 @@ impl C64Port {
         self.backend.take()
     }
 
-    /// S41 §5: a core is loaded: every register of the port at its power-on value, `backend` (a fresh one) attached at
-    /// `now`. What is the host's stays: the physical joysticks and RESTORE, the lines shared with `U64Io`, the
-    /// cartridge ROM's place in DDR and the link to the TRX block.
+    /// S41 §5: a core is loaded (`core_decouple` = 0): every register of the core's side at its power-on value — the
+    /// cart registers and the core config the decoupler held there — and `backend` (a fresh one) attached at `now`.
+    /// What is the host's stays: MATRIX_KEYB (ultimate_sys page 1) with the rows, RESTORE and freeze it drives into the
+    /// new C64, the physical joysticks and RESTORE key, the lines shared with `U64Io`, the cartridge ROM's place in DDR
+    /// and the link to the TRX block.
     pub fn power_up(&mut self, backend: Option<Box<dyn C64Backend>>, now: u64) {
         let (joysticks, joy_lines, restore, keys) = (self.joysticks, self.joy_lines.clone(), self.restore, self.dma.keys);
         let (cart_detect, cart_rom, link) = (self.cart_detect.take(), self.cart_rom, self.trx.take());
+        let matrix = std::mem::replace(&mut self.matrix, RegTable::new("matrix-keyb", RAM_PAGE));
         *self = C64Port::new();
         (self.joysticks, self.joy_lines, self.restore, self.dma.keys) = (joysticks, joy_lines, restore, keys);
-        (self.cart_detect, self.cart_rom) = (cart_detect, cart_rom);
+        (self.cart_detect, self.cart_rom, self.matrix) = (cart_detect, cart_rom, matrix);
         if let Some(link) = link {
             self.set_trx_io(link);
         }
         if let Some(backend) = backend {
             self.attach(backend, now);
+        }
+        let rows = std::array::from_fn(|i| self.matrix.get(i as u32));
+        let freeze = self.matrix.get(MATRIX_FREEZE) != 0;
+        if let Some(b) = &mut self.backend {
+            b.set_matrix_keyb(rows);
+            b.set_freeze_button(freeze);
         }
         self.apply_joysticks();
         self.apply_nmi();
@@ -998,7 +1012,8 @@ impl C64Port {
     }
 
     fn cart_get(&self, off: u32) -> u8 {
-        match (off & 0x0F, &self.backend) {
+        // S41 §5: an absent core answers nothing here; the held power-up values do.
+        match (off & 0x0F, self.backend()) {
             (MODE, _) => self.mode,
             // 00 §2 C12/C17, 10 H1-H3: STOP reads req | req<<1. HAS_STOPPED follows the request at once, so
             // `hard_stop`'s `while(!(C64_STOP & 2));` (c64.cc:405) and the forced poll in `stop()`
@@ -1336,6 +1351,10 @@ impl IoDevice for C64Port {
     }
 
     fn write8(&mut self, off: u32, val: u8, ctx: &mut IoCtx) {
+        // S41 §5: the decoupler holds these at their power-up values while the core is absent.
+        if self.core_absent && matches!(off, CART..=CART_END | CORE..=CORE_END | PALETTE..=PALETTE_END) {
+            return;
+        }
         match off {
             CART..=CART_END => {
                 self.lend_ddr(ctx);

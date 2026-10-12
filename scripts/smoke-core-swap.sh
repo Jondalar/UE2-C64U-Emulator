@@ -7,15 +7,21 @@
 #
 # ROMs come from $UE2_FIRMWARE (default firmware/1541ultimate), each run has a fresh flash image.
 #
+# `core absent` is the host's decoupler (`core_decouple` = 1): by default the core's windows answer ack0 at once;
+# `--absent-mode core=noack` is a host without the decoupler, where an access into the core never completes.
+#
 # Runs:
-#   swap    --absent-continue: the app boots; `core absent`: the C64 screen is empty, the picture black, the RISC-V runs
-#           on; every access of the app into the core's windows is logged and the summary counts them (the app's
-#           reaction, printed); `core present`: a fresh C64 boots to READY on its own; a second swap works the same
-#   halt    the core's default noack: `core absent` halts the RISC-V on its first access into the core's windows, with
-#           the report (what the board did before bc97bbe's timeout, without the JTAG console)
-#   start   --absent core: absent from the first instruction; the app halts in its init on the first core window it
-#           touches; the cart registers and the core config, which ultimate_sys acks itself, are not one of them
-#   ack0    --absent-mode core=ack0: the app runs on with the core gone and the C64 comes back with `core present`
+#   swap    core=noack with --absent-continue: the app boots; `core absent`: the C64 screen is empty, the picture
+#           black, the RISC-V runs on; every access of the app into the core's windows is logged and the summary counts
+#           them (the app's reaction, printed); `core present`: the cart registers read their power-up values, the
+#           host's pages 1, 2, 4 and 5 (MATRIX_KEYB, the U64 board IO, C64_PLD_ACC, U64_DEBUG_REGISTER) read what they
+#           read before the swap, a fresh C64 boots to READY on its own; a second swap works the same
+#   halt    core=noack: `core absent` halts the RISC-V on its first access into the core's windows, with the report
+#           (the board without the decoupler and before bc97bbe's timeout, without the JTAG console)
+#   start   core=noack, --absent core: absent from the first instruction; the app halts in its init on the first core
+#           window it touches; the cart registers and the core config, which ultimate_sys acks itself, are not one of
+#           them
+#   ack0    the default, the decoupler: the app runs on with the core gone and the C64 comes back with `core present`
 
 set -euo pipefail
 
@@ -75,12 +81,19 @@ c64() {
     awk -v n="$2" '/^--- c64 ---$/ { k++; next } k == 2 * n - 1' "$1.log"
 }
 
+pages='monitor fw m 10100300 1010030f
+monitor fw m 10100400 1010040f
+monitor fw m 10181000 10181003
+monitor fw m 10181800 10181803'
 swap="$booted
+$pages
 core absent
 wait 3000
 c64screen
 png absent.png
 core present
+monitor fw m 10040000 1004000f
+$pages
 expect-c64 READY. 8000
 c64screen
 png present.png
@@ -89,7 +102,13 @@ wait 1000
 core present
 expect-c64 READY. 8000
 wait 500"
-run swap "$swap" --absent-continue || fail swap "exit code $?"
+run swap "$swap" --absent-mode core=noack --absent-continue || fail swap "exit code $?"
+grep -q "^  10040000  00 00 00 01 00 00 00 00 00 07 00 00 01 00 00 00$" swap.log ||
+    fail swap "the cart registers are not at their power-up values after core present"
+for page in 10100300 10100400 10181000 10181800; do
+    [[ $(grep -c "^  $page " swap.log) == 2 && $(grep "^  $page " swap.log | sort -u | wc -l) -eq 1 ]] ||
+        fail swap "host page $page changed over the swap"
+done
 [[ $(grep -c "^core absent (noack): " swap.err) == 2 && $(grep -c "^core present: a fresh core" swap.err) == 2 ]] ||
     fail swap "not two swaps"
 [[ -z $(c64 swap 1 | tr -d ' \n') ]] || fail swap "the C64 screen is not empty without the core"
@@ -102,14 +121,14 @@ sed -n '/^absent summary: /,$p' swap.err | grep -E "^absent summary|^  0x" | hea
 
 if run halt "$booted
 core absent
-wait 3000" ; then
+wait 3000" --absent-mode core=noack; then
     fail halt "the run did not halt"
 fi
 grep -q "^halted: absent core (noack): " halt.err || fail halt "no halt on the core's window"
 echo "PASS halt: $(sed -n 's/^halted: //p' halt.err | head -n 1)"
 grep -E "^  (pc |ra |last console line:)" halt.err | head -n 3
 
-if run start "$booted" --absent core; then
+if run start "$booted" --absent core --absent-mode core=noack; then
     fail start "the run did not halt"
 fi
 grep -q "^core absent (noack): " start.err && grep -q "^halted: absent core (noack): " start.err ||
@@ -122,7 +141,7 @@ run ack0 "$booted
 core absent
 wait 3000
 core present
-expect-c64 READY. 8000" --absent-mode core=ack0 || fail ack0 "exit code $?"
+expect-c64 READY. 8000" || fail ack0 "exit code $?"
 grep -q "^core absent (ack0): " ack0.err || fail ack0 "the core's mode is not ack0"
 echo "PASS ack0"
 
