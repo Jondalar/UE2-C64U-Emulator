@@ -206,7 +206,7 @@ impl Host<'_> {
             "  fw [tasks]        the firmware's RISC-V: registers, or its FreeRTOS tasks\n",
             "  fw m ADDR [END]   the firmware's memory and IO, hex, at most 256 bytes; IO without side effects\n",
             "  fw halt | go | step [n]     run control for the firmware (the C64 stands with it)\n",
-            "  c64 [halt | go | step [n]]  run control for the C64, firmware running\n",
+            "  c64 [halt | go | step [n] | reset]  run control for the C64, firmware running; reset through C64_MODE\n",
             "  g [addr] | x | until ADDR | z | step [n] | n | next [n] | ret\n",
             "                    the same, in TRX64's spelling: they mean the C64\n",
             "  status            where both CPUs stand\n",
@@ -299,7 +299,13 @@ pub fn exec(
     if trx_owns(m) && moves_the_c64(&verb, line.split_whitespace().nth(1)) {
         return Err(TRXMON_OWNS.into());
     }
-    // S41 §5: an absent core takes the C64 with it.
+    // S41 §5: an absent core takes the C64 with it; the firmware's memory is still there to read.
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    if let ["fw", "m", from, rest @ ..] = tokens.as_slice() {
+        if rest.len() <= 1 {
+            return fw_memory(m, from, rest.first());
+        }
+    }
     if m.core_is_absent() {
         return Err("the core is absent: no C64 until `core present`".into());
     }
@@ -335,7 +341,7 @@ fn moves_the_c64(verb: &str, arg: Option<&str>) -> bool {
     match verb {
         "g" | "x" | "z" | "n" | "next" | "step" | "ret" | "return" | "until" => true,
         "goto" | "frame" | "rewind" | "ringload" | "rstep" | "reverse" => true,
-        "c64" => matches!(arg, Some("halt" | "go" | "step")),
+        "c64" => matches!(arg, Some("halt" | "go" | "step" | "reset")),
         _ => false,
     }
 }

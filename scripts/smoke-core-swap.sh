@@ -7,21 +7,27 @@
 #
 # ROMs come from $UE2_FIRMWARE (default firmware/1541ultimate), each run has a fresh flash image.
 #
-# `core absent` is the host's decoupler (`core_decouple` = 1): by default the core's windows answer ack0 at once;
-# `--absent-mode core=noack` is a host without the decoupler, where an access into the core never completes.
+# `core absent` is the host's decoupler (`core_decouple` = 1, ultimate_sys.vhd 155353d): on its rise the cart
+# registers and the core config go back to power-up once, with the C64's reset held, and the firmware senses the reset
+# (ITU low bit 7); the core's windows answer ack0 at once. `core present` loads a fresh core that stays in reset until
+# the firmware releases it, as at power-up, and raises nothing. `--absent-mode core=noack` is a host without the
+# decoupler, where an access into the core never completes and nothing is reset.
 #
 # Runs:
-#   swap    core=noack with --absent-continue: the app boots; `core absent`: the C64 screen is empty, the picture
-#           black, the RISC-V runs on; every access of the app into the core's windows is logged and the summary counts
-#           them (the app's reaction, printed); `core present`: the cart registers read their power-up values, the
-#           host's pages 1, 2, 4 and 5 (MATRIX_KEYB, the U64 board IO, C64_PLD_ACC, U64_DEBUG_REGISTER) read what they
-#           read before the swap, a fresh C64 boots to READY on its own; a second swap works the same
+#   swap    the decoupler, twice: right after `core absent` the cart registers read power-up with the reset held
+#           (04 00 00 11 ... 07 .. 01); the app's reset handler runs (the reset sense); after `core present` the
+#           reset is still held and the host's pages 1, 2, 4 and 5 (MATRIX_KEYB, the U64 board IO, C64_PLD_ACC,
+#           U64_DEBUG_REGISTER) read what they read before the swap; `monitor c64 reset`, standing in for the app's
+#           release (it writes C64_MODE as the firmware does), boots the fresh C64 to READY
+#   log     core=noack with --absent-continue: the C64 screen is empty and the picture black without the core, every
+#           access of the app into the core's windows is logged and counted (the app's reaction, printed)
 #   halt    core=noack: `core absent` halts the RISC-V on its first access into the core's windows, with the report
 #           (the board without the decoupler and before bc97bbe's timeout, without the JTAG console)
 #   start   core=noack, --absent core: absent from the first instruction; the app halts in its init on the first core
 #           window it touches; the cart registers and the core config, which ultimate_sys acks itself, are not one of
 #           them
-#   ack0    the default, the decoupler: the app runs on with the core gone and the C64 comes back with `core present`
+#   boot    the decoupler, --absent core: absent from the first instruction; the app runs its whole init, the C64 held
+#           in reset (C64_MODE 04 in its cart init line)
 
 set -euo pipefail
 
@@ -85,39 +91,55 @@ pages='monitor fw m 10100300 1010030f
 monitor fw m 10100400 1010040f
 monitor fw m 10181000 10181003
 monitor fw m 10181800 10181803'
+cart='monitor fw m 10040000 1004000f'
 swap="$booted
 $pages
 core absent
-wait 3000
-c64screen
-png absent.png
+$cart
+expect-console \"U64 reset handler\" 2000
+wait 2000
 core present
-monitor fw m 10040000 1004000f
+$cart
 $pages
+monitor c64 reset
 expect-c64 READY. 8000
 c64screen
 png present.png
 core absent
 wait 1000
 core present
+monitor c64 reset
 expect-c64 READY. 8000
 wait 500"
-run swap "$swap" --absent-mode core=noack --absent-continue || fail swap "exit code $?"
-grep -q "^  10040000  00 00 00 01 00 00 00 00 00 07 00 00 01 00 00 00$" swap.log ||
-    fail swap "the cart registers are not at their power-up values after core present"
+run swap "$swap" || fail swap "exit code $?"
+[[ $(grep -c "^core absent (ack0): " swap.err) == 2 && $(grep -c "^core present: a fresh core" swap.err) == 2 ]] ||
+    fail swap "not two swaps"
+carts=$(grep "^  10040000 " swap.log)
+[[ $(sed -n 1p <<<"$carts") == "  10040000  04 00 00 11 00 00 00 00 00 07 00 00 01 00 00 00" ]] ||
+    fail swap "the decoupler did not reset the cart registers with the reset held: $(sed -n 1p <<<"$carts")"
+[[ $(sed -n 2p <<<"$carts" | cut -c13-14) == 04 ]] || fail swap "the fresh C64 is not held in reset after core present"
 for page in 10100300 10100400 10181000 10181800; do
     [[ $(grep -c "^  $page " swap.log) == 2 && $(grep "^  $page " swap.log | sort -u | wc -l) -eq 1 ]] ||
         fail swap "host page $page changed over the swap"
 done
-[[ $(grep -c "^core absent (noack): " swap.err) == 2 && $(grep -c "^core present: a fresh core" swap.err) == 2 ]] ||
-    fail swap "not two swaps"
-[[ -z $(c64 swap 1 | tr -d ' \n') ]] || fail swap "the C64 screen is not empty without the core"
-black absent.png || fail swap "the picture is not black without the core"
-c64 swap 2 | grep -q "READY." || fail swap "the fresh C64 did not boot"
-grep -q "^absent: core noack " swap.err || fail swap "the app touched none of the core's windows"
-grep -q "^absent summary: [1-9][0-9]* addresses stalled" swap.err || fail swap "no summary"
-echo "PASS swap: the app's accesses into the absent core:"
-sed -n '/^absent summary: /,$p' swap.err | grep -E "^absent summary|^  0x" | head -n 40
+c64 swap 1 | grep -q "READY." || fail swap "the fresh C64 did not boot after its release"
+echo "PASS swap: on entry $(sed -n 1p <<<"$carts" | cut -c13-), the app's reset handler ran; held in reset after"
+echo "     core present; pages 1, 2, 4, 5 kept; READY after the release, twice"
+
+log="$booted
+core absent
+wait 3000
+c64screen
+png absent.png
+core present
+wait 500"
+run log "$log" --absent-mode core=noack --absent-continue || fail log "exit code $?"
+[[ -z $(c64 log 1 | tr -d ' \n') ]] || fail log "the C64 screen is not empty without the core"
+black absent.png || fail log "the picture is not black without the core"
+grep -q "^absent: core noack " log.err || fail log "the app touched none of the core's windows"
+grep -q "^absent summary: [1-9][0-9]* addresses stalled" log.err || fail log "no summary"
+echo "PASS log: the app's accesses into the absent core:"
+sed -n '/^absent summary: /,$p' log.err | grep -E "^absent summary|^  0x" | head -n 40
 
 if run halt "$booted
 core absent
@@ -137,13 +159,11 @@ grep -qE "^halted: absent core \(noack\): .* of 0x(1018[0-7]|10040)" start.err &
 echo "PASS start: $(sed -n 's/^halted: //p' start.err | head -n 1)"
 grep -E "^  (pc |last console line:)" start.err | head -n 2
 
-run ack0 "$booted
-core absent
-wait 3000
-core present
-expect-c64 READY. 8000" || fail ack0 "exit code $?"
-grep -q "^core absent (ack0): " ack0.err || fail ack0 "the core's mode is not ack0"
-echo "PASS ack0"
+run boot 'expect-console "All Init functions called." 20000
+wait 3000' --absent core || fail boot "exit code $?"
+grep -q "^core absent (ack0): " boot.err || fail boot "the core was not absent from the start"
+grep -q "Mode: 04" boot.log || fail boot "the C64 is not held in reset"
+echo "PASS boot: $(grep -m1 "^End of cart init" boot.log)"
 
 cd /
 rm -rf "$rundir"

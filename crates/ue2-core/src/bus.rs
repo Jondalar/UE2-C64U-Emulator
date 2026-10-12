@@ -30,7 +30,8 @@ pub const RAM_MASK: u32 = RAM_SIZE as u32 - 1;
 pub const IO_BIT: u32 = 1 << 28;
 /// `addr >> 16` of the rvlite boot BRAM (rvlite_wrapper.vhd:21,105; bus_converter.vhd:96,118).
 pub const BOOT_BRAM_PAGE: u32 = 0x8000;
-/// S41: the DMA window's `$D400-$D7FF`, which ultimate_sys answers itself on a read without MEMONLY.
+/// S41: the DMA window's `$D400-$D7FF`, which ultimate_sys without the decoupler answers itself on a read without
+/// MEMONLY.
 const DMA_SID_START: u32 = 0x1005_D400;
 const DMA_SID_END: u32 = 0x1005_D800;
 /// Hits per distinct unmapped address that are reported one by one; later hits are only counted.
@@ -171,9 +172,15 @@ impl SystemBus {
             return Some(0);
         }
         let (block, mode) = self.absent_at(addr)?;
-        // ultimate_sys answers a DMA read of $D400-$D7FF itself with $FF unless MEMONLY is set, core or not
-        // (ultimate_sys.vhd `dma_stub`: no SID for the app's socket probe).
-        if block == Block::Core && !write && (DMA_SID_START..DMA_SID_END).contains(&addr) && !self.dma_mem_only() {
+        // Without the decoupler (`noack`) ultimate_sys answers a DMA read of $D400-$D7FF itself with $FF unless
+        // MEMONLY is set (`dma_stub`: no SID for the app's socket probe); with it (`ack0`) the read is acked with 0 like
+        // the rest of the window (`core_to`, ultimate_sys.vhd 155353d).
+        if block == Block::Core
+            && mode == Mode::NoAck
+            && !write
+            && (DMA_SID_START..DMA_SID_END).contains(&addr)
+            && !self.dma_mem_only()
+        {
             if self.trace_io {
                 self.record(false, addr, 0xFF, true, true);
             }

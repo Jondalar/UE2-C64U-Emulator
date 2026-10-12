@@ -79,6 +79,9 @@ of both and therefore hides exactly the bugs that live between the two clocks (i
 the GDB stub's; the monitor is a second door onto it, and the run loop asks before every slice whether the
 firmware is held, still serving commands while it is.
 
+`c64 reset` resets the C64 and releases it through `C64_MODE`, as the firmware does (S41: also the release of a new
+core that the firmware holds in reset after `core present`).
+
 `c64 [halt | go | step [n]]` stops the C64 and leaves the firmware running. It **is** the stop the machine already
 has: `Hold::Cpu` in TRX64 is "DMA / freeze / C64_STOP", one mechanism, which the firmware reaches by writing
 `C64_STOP` — so the monitor writes the same register with the same side effects. The last writer therefore wins

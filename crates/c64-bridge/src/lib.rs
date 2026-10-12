@@ -62,6 +62,10 @@ pub use slot::FlashDecode;
 
 /// S41 §5: the cartridge in the physical expansion port, on its way from one core to the next.
 pub struct SlotCart(PhysicalCart);
+
+/// S41 §5: the UCI block on its way from one core to the next. On the board it is the host's (ultimate_sys.vhd
+/// `gen_uci`, reset by the host's reset only), so a core swap keeps it; in UE2 it is TRX64's profile device.
+pub struct UciBlock(Box<dyn trx64_core::expansion::ExpansionDevice>);
 use video::Palette;
 
 pub use sid::AudioSink;
@@ -437,6 +441,19 @@ impl Trx64Backend {
         let cart = self.slot.with(|s| s.eject())?;
         self.install_cart();
         Some(SlotCart(cart))
+    }
+
+    /// S41 §5: the UCI block off this core, for the next one.
+    pub fn take_uci(&mut self) -> Option<UciBlock> {
+        self.m.set_port_profile_device(None).map(UciBlock)
+    }
+
+    /// S41 §5: the UCI block [`Self::take_uci`] took, in place of this core's own. The new machine's power-up reset is
+    /// handed to its own block first, which goes: the swap raises no C64-reset event (ultimate_sys.vhd 155353d: the
+    /// release of `core_decouple` raises nothing).
+    pub fn insert_uci(&mut self, uci: UciBlock) {
+        let _ = self.m.uci_mut();
+        self.m.set_port_profile_device(Some(uci.0));
     }
 
     /// S41 §5: put the cartridge [`Self::take_slot_cart`] took into this core's physical expansion port.
@@ -2151,6 +2168,25 @@ pub(crate) mod tests {
         assert!(!c64.m.uci().unwrap().status().routed_io2, "the route stays off");
         assert_eq!(c64.uci_take_events(), UciEvents::default());
         assert!(c64.has_uci() && c64.has_sampler());
+    }
+
+    /// S41 §5: the UCI block is the host's on the board, so it moves to the next core with its state, and the new
+    /// machine's power-up reset reaches the firmware as no C64-reset event.
+    #[test]
+    fn the_uci_block_moves_to_the_next_core() {
+        let mut old = Trx64Backend::new(Path::new("/nonexistent"));
+        old.uci_write(0, 0x47);
+        old.uci_write(UCI_SLOT_ENABLE, 1);
+        old.uci_write(UCI_FW_RAM + 0x10, 0xA5);
+        let _ = old.uci_take_events();
+        let uci = old.take_uci().expect("the profile's block");
+        assert!(old.m.uci().is_none());
+        let mut new = Trx64Backend::new(Path::new("/nonexistent"));
+        new.insert_uci(uci);
+        let st = new.m.uci().unwrap().status();
+        assert!(st.enabled && st.window == 0xDF18, "{st:?}");
+        assert_eq!(new.uci_read(UCI_FW_RAM + 0x10), 0xA5);
+        assert_eq!(new.uci_take_events(), UciEvents::default(), "no C64-reset event from the swap");
     }
 
     /// S40 §0: on TRX64-Ultimate's bitstream (`main`, no T29) the menu's strobe changes nothing, `$D030`/`$D031` read
