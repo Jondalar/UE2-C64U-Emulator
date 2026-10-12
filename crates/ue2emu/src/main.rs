@@ -148,8 +148,8 @@ struct RunArgs {
     /// C64 runs at 1 MHz (docs/specs/S38-trx64-ring.md)
     #[arg(long, value_enum, value_name = "MODE", num_args = 0..=1, default_missing_value = "on", default_value = "on")]
     ring: RingArg,
-    /// FPGA blocks the bitstream lacks, by their TRX_FEATURES names: reu, sampler, uci, jtag, turbo, apply, and core for
-    /// the whole swappable core; none = all present. Needs --trx-io (docs/specs/S41-core-dev-mode.md)
+    /// FPGA blocks the bitstream lacks, by their TRX_FEATURES names: reu, sampler, uci, jtag, turbo, apply, streams,
+    /// and core for the whole swappable core; none = all present. Needs --trx-io (docs/specs/S41-core-dev-mode.md)
     #[arg(long, value_name = "LIST")]
     absent: Option<String>,
     /// How an absent block's app window answers: noack (the access never completes) or ack0, for all, or per block as

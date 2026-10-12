@@ -992,7 +992,8 @@ impl C64Port {
         })
     }
 
-    fn mem_only(&self) -> bool {
+    /// C64_DMA_MEMONLY bit 0 (core config +3, a host register on the TRX bitstream).
+    pub fn mem_only(&self) -> bool {
         self.core.get(DMA_MEMONLY) & 0x01 != 0
     }
 

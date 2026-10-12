@@ -1675,7 +1675,7 @@ impl C64Backend for Trx64Backend {
                 self.parked_reu = None;
                 self.reu_off_since = None;
             }
-            Block::Turbo | Block::Jtag | Block::Apply | Block::Core => {}
+            Block::Turbo | Block::Jtag | Block::Apply | Block::Streams | Block::Core => {}
         }
     }
 

@@ -18,13 +18,13 @@ Today UE2 cannot do that, for two reasons:
 ## 1. Interface
 
 ```
---absent <list>          reu,sampler,uci,jtag,turbo,apply   (the TRX_FEATURES names; "none" = all present)
+--absent <list>          reu,sampler,uci,jtag,turbo,apply,streams   (the TRX_FEATURES names; "none" = all present)
 --absent-mode <mode>     noack | ack0, or per block: sampler=noack,uci=ack0
 --absent-continue        log every stall and go on instead of halting
 ```
 
-- The names are the build switches' names, so a build profile maps to the flag 1:1. dfx-trial's `build.tcl` has a
-  seventh switch, `streams` (NO_STREAMS, top.v), which this spec does not name and UE2 does not take (§8).
+- The names are the build switches' names, so a build profile maps to the flag 1:1 (dfx-trial's `streams`
+  included, Alex 2026-10-12).
 - `--absent` needs `--trx-io` (on or auto-detected); otherwise it is an error.
 - The default mode is the one the trial bitstream has today for each block (§2).
 
@@ -38,13 +38,15 @@ Today UE2 cannot do that, for two reasons:
 | turbo | NO_TURBO, c64_top.v | registers answer as usual | the engine never engages | none |
 | jtag | NO_JTAG_DBG, top.v | no bus effect | none | none |
 | apply | NO_APPLY, trx_engine.v + trx_io.v | AP_* writes ignored; AP_CMD never busy; CAPS2 b5 clear | none | none |
+| streams | NO_STREAMS, top.v | no bus difference: the template writes (`r_udp`) are still acked and go nowhere, the enables do nothing | none | none |
 
 - **`noack`:** the access does not complete. UE2 halts the RISC-V on that load or store and reports it (§3).
 - **`ack0`:** reads return 0 and writes are dropped.
 - **CAPS:** the trial clears no capability bits; UE2 copies that. The only exception is `apply`, which clears
   CAPS2 b5. The ITU word stays as it is, unless `--caps` is also given.
 - **Defaults** (dfx-trial 0a130e1): sampler `ack0` (bd16bee is in the branch), uci `ack0`, core `noack`. reu, turbo,
-  jtag and apply have no app window, so no mode; `--absent-mode` refuses one for them.
+  jtag, apply and streams have no app window, so no mode; `--absent-mode` refuses one for them. The UDP streams'
+  sent counters are on the JTAG map only, so UE2 has nothing to model for `streams`: it is accepted as a no-op.
 
 ## 3. Stall report
 
@@ -71,13 +73,24 @@ By default UE2 halts, as the board does. With `--absent-continue`, UE2 logs the 
 
 ## 5. Core absent: the grey box (T79 partial reconfiguration; phase B)
 
-`--absent core` makes every register window of the swappable core answer as absent:
-- C64 core
-- 1541 drive and GCR
-- trx_io/trx_sys pages
-- ring engine
-- cartridge
-- DMA window
+`--absent core` makes every register window of the swappable core answer as absent. Which windows those are is
+ultimate_sys.vhd's decode (dfx-trial bc97bbe), the regions whose ack comes from the core (Alex, 2026-10-12):
+- `r_drive`: drive A, 0x10020000-0x10023FFF;
+- `r_gcr`: the GCR codec, 0x10060500-0x100605FF;
+- `r_cw`: the cartridge's EEPROM 0x1004C000-0x1004CFFF, the sampler's bytes 0x10048000-0x100480FF, trx_io
+  0x101A0000-0x101AFFFF (the trx_sys pages, the ring engine, the pixel layer);
+- `r_dma`: the DMA window 0x10050000-0x1005FFFF, except a read of `$D400-$D7FF` without MEMONLY, which ultimate_sys
+  answers itself with $FF (`dma_stub`);
+- `r_rom`: the ROM windows 0x10188000-0x1018FFFF (see §8).
+
+ultimate_sys acks everything else itself (`ack_r`), core or not, so those never stall: the cart registers (`r_page`
+page 0, 0x10040000), the core config (page 3, 0x10180000), the palette (`r_pal`), the UltiSID curves (`r_sidcv`), the
+IEC processor's idle constants (`r_iec`) and UE2's drive B (0x10024000, `r_none`). UE2 keeps serving them from its own
+register models while the C64 stands still.
+
+On the board, bc97bbe times out a request into `r_drive`, `r_gcr`, `r_cw` and `r_dma` after 65,536 clocks and acks
+it with 0. UE2 keeps the choice between `noack` (the board before bc97bbe) and `ack0` (close to bc97bbe, without the
+wait).
 
 The host side keeps running: RISC-V, USB, SD, flash, Ethernet/UDP, overlay, HDMI.
 
@@ -112,30 +125,37 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
 - `smoke-core-dev.sh`: all five runs pass. `sampler=noack` halts at the app's first sampler access, a write in the
   UCI reset task (`CommandInterface::run_reset_task()+0x30`, 0x000a7d54: the voices cleared on a C64 reset, eight
   bytes 0x10048000-0x100480E0) 1.45 s after boot, console "Speed regs: 00 80". With `ack0` the app boots to the
-  parked UI; with `--absent-continue` those eight writes are the only stalls of a boot. All six blocks absent in
+  parked UI; with `--absent-continue` those eight writes are the only stalls of a boot. All seven blocks absent in
   their default modes: the app boots, CAPS2 reads $9D.
 - `smoke-core-swap.sh`: all four runs pass. With the core's default `noack`, the unmodified app halts on its first
   access after `core absent`: drive A's 0x10020000 (`C1541::task()+0x28`). With `--absent core` from power-on it
-  halts in init on CORE_VERSION 0x10180010 (`getProductVersionString()+0x1c`). With `--absent-continue` one swap logs
-  27 addresses: drive A, the cart register 0x10040008 (`ring_task`), the core config's LED-strip reads
-  (0x1018002F, 0x10180080-82), CAPS2 (`trx_ring_poll`) and the gate and engine pages (`trx_io_read32/write32`).
+  halts in init on the trx_io ID 0x101A0000 (`trx_io_caps()+0x20`, called from `rtc_seconds()` through
+  `Rtc::get_fat_time()` while `f_mkfs` formats the RAM disk; console "----> Initializing RAM Disk (1)..."). With
+  `--absent-continue` one swap logs 22 addresses: drive A, CAPS2 (`trx_ring_poll`) and the gate and engine pages
+  (`trx_io_read32/write32`).
+  Before the windows followed ultimate_sys's decode (6a3b4a4) the power-on halt was CORE_VERSION 0x10180010
+  (`getProductVersionString()+0x1c`), which the host acks itself.
   `core present` brings a C64 to READY on its own, twice in a row.
 
 ### Deviations from the draft
 
 - **CAPS2 with apply absent reads $9D, not $D7.** $D7 is t80-lean-ring's word ($F7 with b5 clear, trx_io.v
   `NO_APPLY`); UE2's CAPS2 is $BD (t21-p4 without b1, S40), so clearing b5 gives $9D.
-- **`streams` is not taken.** dfx-trial's `build.tcl` has a switch `streams` (NO_STREAMS: no UDP video or audio
-  stream, the app's template writes go nowhere). It is not in §1, so `--absent streams` is an error. Open: add it?
-- **turbo and jtag change nothing.** UE2's TRX model has no turbo engine (S40 §0: `main` has no T29), so "the engine
-  never engages" holds already; UE2 has no JTAG debug master, and the switch has no bus effect. Both are accepted and
-  say so in one line.
-- **The core's windows are phase B's**, as §5 says, not today's trial's: on dfx-trial `ultimate_sys` (layer 1) still
-  answers the cart registers (page 0x0400), the core config (0x1800), the palette, the UltiSID curves and the IEC
-  processor's idle constants, and drive A, the GCR codec, the `cw` port (EEPROM, trx_io, the sampler's bytes) and
-  the DMA and ROM windows (`dma_ack`) come from layer 2. UE2 takes the phase B list (`absent::CORE_WINDOWS`) minus two
-  windows that are the host's on both: the IEC processor (`r_iec`, constants in ultimate_sys) and UE2's drive B at
-  0x10024000, which the TRX bitstream does not have (`r_none`). The UCI is the host's (T79.1 §2a).
+- **turbo, jtag and streams change nothing.** UE2's UDP streams stay on with `streams` absent (no bus difference
+  for the app; the FW session, 2026-10-12). UE2's TRX model has no turbo engine (S40 §0: `main` has no T29), so "the engine
+  never engages" holds already; UE2 has no JTAG debug master, and the switch has no bus effect. All three are
+  accepted and say so in one line.
+- **`r_rom` is a core window**, though the approved list (2026-10-12) had it host-acked: ultimate_sys hands a ROM
+  byte to the core as a DMA request (`dma_rom`, `dma_req_tgl`) and acks it on the core's `dma_done_tgl`, or, after
+  2^25 clocks (335 ms), with $FF from its DMA watchdog (`dma_wd`); bc97bbe's 65,536-clock timeout does not cover it.
+  UE2 treats it as the other core windows (`noack` or `ack0`); the 335 ms wait and the $FF are not modelled. The
+  same watchdog also ends an `r_dma` byte before bc97bbe (335 ms, $FF).
+- **Host registers read their latches, not 0.** The approved wording was "ack0, data 0" for the host-acked windows;
+  ultimate_sys reads the cart registers and the core config from its own registers and constants (`page_data`:
+  CORE_VERSION reads $01, C64_STOP the stop bit), and only a few bits come from the core (the cartridge's active
+  bit, the voice levels). UE2 leaves them to its register models, which is that answer.
+- **A swap resets the host's registers.** On the board the cart registers and the core config are the host's and
+  outlive a reconfiguration; `core present` here powers up the whole C64 port. Open point.
 - **One stall line per site.** `--absent-continue` logs the first stall of each (address, direction, PC) and counts
   every one; a polling loop does not flood the log.
 - **The backtrace is a stack scan.** The firmware keeps no frame pointer, so the report lists the words above `sp`
@@ -146,11 +166,11 @@ TRX64-FW session answers of 2026-10-12, quoted above. RTL paths are in the TRX64
 
 ## In the code
 
-- `crates/ue2-core/src/absent.rs`: `Block` (names, windows, default modes), `AbsentConfig` (the three flags),
+- `crates/ue2-core/src/absent.rs`: `Block` (names, windows with `CORE_WINDOWS`, default modes), `AbsentConfig` (the three flags),
   `AbsentMap` (per 256-byte grain, the core first), the stall counts.
 - `crates/ue2-core/src/bus.rs`: `SystemBus::absent`, `absent_access` in `io_read8`/`io_write8`: an absent window
-  reaches no device; `noack` records `SystemBus::noack`, and the rest of that instruction reaches nothing. The
-  monitor's `poke_io8` refuses an absent window.
+  reaches no device; `noack` records `SystemBus::noack`, and the rest of that instruction reaches nothing; a DMA read
+  of `$D400-$D7FF` without MEMONLY reads $FF (`DMA_SID_START`). The monitor's `poke_io8` refuses an absent window.
 - `crates/ue2-core/src/machine.rs`: `MachineConfig::absent`; `Machine::new` refuses the flags without the TRX block;
   `start_absent` (§1, one line per block); `take_noack` after each step (halt: registers, PC and count put back;
   continue: log and count); `noack_report` (§3), `absent_summary`; `core_absent`, `core_present`,

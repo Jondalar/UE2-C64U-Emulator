@@ -12,9 +12,9 @@
 #           on; every access of the app into the core's windows is logged and the summary counts them (the app's
 #           reaction, printed); `core present`: a fresh C64 boots to READY on its own; a second swap works the same
 #   halt    the core's default noack: `core absent` halts the RISC-V on its first access into the core's windows, with
-#           the report (what the board does without the JTAG console)
+#           the report (what the board did before bc97bbe's timeout, without the JTAG console)
 #   start   --absent core: absent from the first instruction; the app halts in its init on the first core window it
-#           touches
+#           touches; the cart registers and the core config, which ultimate_sys acks itself, are not one of them
 #   ack0    --absent-mode core=ack0: the app runs on with the core gone and the C64 comes back with `core present`
 
 set -euo pipefail
@@ -114,6 +114,7 @@ if run start "$booted" --absent core; then
 fi
 grep -q "^core absent (noack): " start.err && grep -q "^halted: absent core (noack): " start.err ||
     fail start "the core was not absent from the start"
+grep -qE "^halted: absent core \(noack\): .* of 0x(1018[0-7]|10040)" start.err && fail start "halted on a window ultimate_sys acks itself"
 echo "PASS start: $(sed -n 's/^halted: //p' start.err | head -n 1)"
 grep -E "^  (pc |last console line:)" start.err | head -n 2
 
