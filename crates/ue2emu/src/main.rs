@@ -153,7 +153,7 @@ struct RunArgs {
     #[arg(long, value_name = "LIST")]
     absent: Option<String>,
     /// How an absent block's app window answers: noack (the access never completes) or ack0, for all, or per block as
-    /// sampler=noack,uci=ack0,core=noack [default: as the trial bitstream: sampler and uci ack0, core noack]
+    /// sampler=noack,uci=ack0,core=noack [default: ack0 for all; for the core that is the host's decoupler, noack a host without one]
     #[arg(long, value_name = "MODE")]
     absent_mode: Option<String>,
     /// A noack access is logged and completed as ack0 instead of halting; the end of the run counts the stalls per

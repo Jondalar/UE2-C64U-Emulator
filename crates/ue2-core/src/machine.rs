@@ -1808,7 +1808,7 @@ mod tests {
         use crate::c64host::mock::{Call, Mock};
         let mut config = cfg();
         config.trx_io = TrxIo::On;
-        config.absent = AbsentConfig::parse(Some("sampler"), None, true).unwrap();
+        config.absent = AbsentConfig::parse(Some("sampler"), Some("core=noack"), true).unwrap();
         let mut bus = SystemBus::new();
         devices::install_all(&mut bus.io, &config);
         let mut m = Machine::from_parts(config, bus, 0x30000, Symbols::empty());
@@ -1818,8 +1818,21 @@ mod tests {
         assert!(old.take().contains(&Call::Absent(Block::Sampler)));
         assert!(m.display().c64.is_some() && !m.core_is_absent());
         assert_eq!(m.core_present(None), Err("core present: the core is present".into()));
+        // The host's registers: REU_SIZE and JOY1_SWOUT (cart page 0, core page 3), MATRIX_KEYB row 0 (page 1),
+        // ETHSTREAM_ENA (page 2), C64_PLD_ACC (page 4), U64_DEBUG_REGISTER (page 5).
+        let pages = [(0x1004_0009, 0x02), (0x1018_0030, 0x7F), (0x1010_0300, 0x55), (0x1010_040F, 0x21), (0x1018_1000, 0x66), (0x1018_1800, 0x77)];
+        for (addr, val) in pages {
+            rv32::Bus::write8(&mut m.bus, addr, val);
+        }
+        let read = |m: &mut Machine| pages.map(|(addr, _)| rv32::Bus::read8(&mut m.bus, addr));
+        assert_eq!(read(&mut m), [0x02, 0x7F, 0x55, 0x21, 0x66, 0x77]);
 
         assert!(m.core_absent().unwrap().starts_with("core absent (noack)"));
+        assert_eq!(read(&mut m), [0x07, 0xFF, 0x55, 0x21, 0x66, 0x77], "the decoupler holds pages 0 and 3 at power-up");
+        for (addr, val) in pages {
+            rv32::Bus::write8(&mut m.bus, addr, val ^ 0x01);
+        }
+        assert_eq!(read(&mut m), [0x07, 0xFF, 0x54, 0x20, 0x67, 0x76], "writes to pages 0 and 3 do not stick");
         assert_eq!(m.core_absent(), Err("core absent: the core is already absent".into()));
         let port = m.bus.io.get::<C64Port>().unwrap();
         assert!(port.next_event().is_none() && port.backend().is_none());
@@ -1829,19 +1842,23 @@ mod tests {
         assert_eq!(m.bus.absent_at(0x1002_0000), Some((Block::Core, Mode::NoAck)));
         assert_eq!(m.bus.absent_at(0x1004_4000), None, "the UCI is the host's");
         assert_eq!(m.bus.absent_at(0x1004_0000), None, "the cart registers are the host's");
-        // ultimate_sys answers a DMA read of $D400-$D7FF itself with $FF unless MEMONLY (no SID for the app's probe).
-        rv32::Bus::write8(&mut m.bus, 0x1018_0003, 0);
+        // ultimate_sys answers a DMA read of $D400-$D7FF itself with $FF unless MEMONLY (no SID for the app's probe);
+        // MEMONLY is held at its power-up 0 while the core is absent.
+        rv32::Bus::write8(&mut m.bus, 0x1018_0003, 1);
         assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1005_D400), 0xFF);
         assert!(m.bus.noack.is_none());
-        rv32::Bus::write8(&mut m.bus, 0x1018_0003, 1);
-        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1005_D400), 0);
-        assert!(m.bus.noack.take().is_some(), "MEMONLY: the byte goes to the core, which is not there");
+        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1005_0400), 0);
+        assert!(m.bus.noack.take().is_some(), "the rest of the DMA window is the core's");
 
+        old.take();
         assert!(m.take_c64_backend().is_some());
         let new = Mock::default();
         assert!(m.core_present(Some(Box::new(new.clone()))).unwrap().starts_with("core present"));
+        assert_eq!(read(&mut m), [0x07, 0xFF, 0x54, 0x20, 0x67, 0x76], "pages 0 and 3 clean, pages 1, 2, 4, 5 kept");
+        let calls = new.take();
+        assert!(calls.contains(&Call::Matrix([0x54, 0, 0, 0, 0, 0, 0, 0])), "the new C64 sees the host's matrix");
         assert!(!m.core_is_absent() && m.bus.absent_at(0x1002_0000).is_none());
-        assert!(new.take().contains(&Call::Absent(Block::Sampler)), "the new core lacks the sampler too");
+        assert!(calls.contains(&Call::Absent(Block::Sampler)), "the new core lacks the sampler too");
         assert!(m.bus.io.get::<C64Port>().unwrap().next_event().is_some());
         assert!(m.display().c64.is_some());
         assert!(old.take().is_empty(), "the old core is gone");
