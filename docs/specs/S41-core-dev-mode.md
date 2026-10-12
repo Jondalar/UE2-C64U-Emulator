@@ -90,8 +90,8 @@ IEC processor's idle constants (`r_iec`) and UE2's drive B (0x10024000, `r_none`
 register models while the C64 stands still.
 
 **A swap is a full cold boot** (Alex, 2026-10-12): nothing of the old core survives. On the board the host's DFX
-decoupler does it (T79.1; RTL in ultimate_sys.vhd, dfx-trial 155353d; top.v is not finished, so its debug register
-`core_decouple`, now 0x100029 over JTAG, is provisional). A swap is `core_decouple` = 1, the partial bitstream
+decoupler does it (T79.1; RTL in ultimate_sys.vhd, dfx-trial 155353d; top.v in 975a728, the page sweep on the app's write
+port in 2565e6d; the debug register `core_decouple` is JTAG 0x100029 bit 0, read back in the same register). A swap is `core_decouple` = 1, the partial bitstream
 loaded, `core_decouple` = 0.
 - **On the rise** (`core absent`), once: the cart registers (page 0) and the core config (page 3) go back to their
   power-up values, with the C64's reset held (`c64_reset_i` = 1); a 512-cycle sweep clears their read-back bytes,
@@ -103,7 +103,9 @@ loaded, `core_decouple` = 0.
   toggle handshakes, slot, IEC and the core's IRQs are held (top.v, unfinished). Pages 0 and 3 take writes as always,
   so the firmware's `C64::hard_stop` sees its stop.
 - **On the fall** (`core present`): nothing is raised. The new core comes up with the host's registers as they stand,
-  so its C64 stays in reset until the firmware releases it through C64_MODE, as at power-up.
+  so its C64 stays in reset until the firmware releases it through C64_MODE, as at power-up. The FW side accepts
+  this as the cold-boot behaviour: the board PoC releases it by hand, later the T81 core selector app as its last
+  swap step.
 - Pages 1, 2, 4 and 5 of `r_page` (MATRIX_KEYB 0x10100300, the U64 board IO 0x10100400, C64_PLD_ACC 0x10181000,
   U64_DEBUG_REGISTER 0x10181800) and the UCI (`gen_uci`, reset by the host's reset only) are never touched.
 
