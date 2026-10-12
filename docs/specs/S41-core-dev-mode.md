@@ -91,8 +91,7 @@ register models while the C64 stands still.
 
 **A swap is a full cold boot** (Alex, 2026-10-12): nothing of the old core survives. On the board the host's DFX
 decoupler does it (T79.1; RTL in dfx-trial a75c356, ultimate_sys.vhd and top.v; the decoupler came in 975a728;
-the debug register `core_decouple` is JTAG 0x100029 bit 0, read back in the same register; top.v is not finished, so
-the address is provisional). A swap is `core_decouple` = 1, the partial bitstream loaded, `core_decouple` = 0. The
+the debug register `core_decouple` is JTAG 0x100029 bit 0, read back in the same register). A swap is `core_decouple` = 1, the partial bitstream loaded, `core_decouple` = 0. The
 board PoC 3 (46afe1f) did that over JTAG in 2.8 s with REST answering 200 throughout; after
 `PUT /v1/machine:reset` the new core booted to BASIC V2.
 - **On the rise** (`core absent`), once: the latches behind pages 0 and 3 go back to their power-up values, with the
