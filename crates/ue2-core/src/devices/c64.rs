@@ -357,9 +357,29 @@ pub struct C64Port {
     /// S41 §5: the swappable core is not loaded. The bus keeps the firmware out of the core's windows; here the C64
     /// stops: no sync, no tick, no frame, no backend for the monitor. The backend stays, for its physical cartridge.
     core_absent: bool,
-    /// S41 §5: the core config offsets written since power-up (or since the decoupler reset them), which a new core
-    /// is handed when it comes; the rest are at their power-up values on both sides.
+    /// S41 §5: the core config offsets written since power-up (or since the decoupler reset the latches behind
+    /// them), which a new core is handed when it comes; the rest are at their power-up values on the core's side.
     core_written: [bool; 0x100],
+    /// The latches behind registers whose read-back is a byte of the page RAM (ultimate_sys.vhd a75c356): the core
+    /// sees these, the firmware reads the RAM byte, and the decoupler resets only the latch.
+    latch: Latches,
+}
+
+/// ultimate_sys's latches behind page 0 and page 3 bytes that read back from the page RAM: REU_ENABLE, REU_SIZE and
+/// SAMPLER_ENABLE (`reu_enable_i`, `reu_size_i`, `smp_en_i`), MEMONLY (`dma_memonly`) and the two software joystick
+/// outputs (`app_joy_i`). C64_MODE, C64_STOP and C64_CARTRIDGE_TYPE read their latches themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Latches {
+    reu_enable: bool,
+    reu_size: u8,
+    sampler: bool,
+    mem_only: bool,
+    swout: [u8; 2],
+}
+
+impl Latches {
+    /// Power-up, and what the decoupler's rise sets.
+    const POWER_UP: Latches = Latches { reu_enable: false, reu_size: 0x07, sampler: false, mem_only: false, swout: [0xFF; 2] };
 }
 
 impl Default for C64Port {
@@ -401,6 +421,7 @@ impl C64Port {
             dbg_held: false,
             core_absent: false,
             core_written: [false; 0x100],
+            latch: Latches::POWER_UP,
         }
     }
 
@@ -446,16 +467,18 @@ impl C64Port {
     }
 
     /// S41 §5: the core goes: the C64 runs up to `now` and stops there, with no clock, no picture and no sound, and the
-    /// drives' WD177x interrupts into the ITU drop. With the host's decoupler (`decouple`, ultimate_sys.vhd 155353d, on
-    /// the rise of `core_decouple`) the cart registers and the core config go back to their power-up values once, with
-    /// the C64's reset held (`c64_reset_i`), which the firmware hears as the reset sense, ITU low bit 7; after that they
-    /// take writes as always. MATRIX_KEYB (the host's page 1) and the UCI keep what they have.
+    /// drives' WD177x interrupts into the ITU drop. With the host's decoupler (`decouple`, ultimate_sys.vhd a75c356, on
+    /// the rise of `core_decouple`) the latches behind pages 0 and 3 go back to power-up once: C64_MODE with the C64's
+    /// reset held (`c64_reset_i`), which the firmware hears as the reset sense, ITU low bit 7; C64_STOP and the
+    /// cartridge type, which read their latches; the REU, the sampler, MEMONLY and the joystick outputs, whose
+    /// read-back bytes in the page RAM keep what the firmware last wrote. After that they take writes as always.
+    /// MATRIX_KEYB (the host's page 1) and the UCI keep what they have.
     pub fn set_core_absent(&mut self, now: u64, irq: &mut crate::irq::IrqState, decouple: bool) {
         self.sync(now);
         self.core_absent = true;
         if decouple {
-            let fresh = C64Port::new();
-            (self.cart, self.mode, self.stop, self.core) = (fresh.cart, MODE_RESET, fresh.stop, fresh.core);
+            (self.mode, self.stop, self.latch) = (MODE_RESET, false, Latches::POWER_UP);
+            self.cart.set(CARTRIDGE_TYPE, 0);
             self.core_written = [false; 0x100];
             self.apply_joysticks();
             irq.pulse(C64_RESET_IRQ_BIT);
@@ -477,13 +500,12 @@ impl C64Port {
 
     /// S41 §5: a core is loaded (`core_decouple` = 0): `backend`, a fresh C64 from power-up, attached at `now`, and the
     /// port's own state for the core side (the session, the pause, the engine's wishes) new. The registers are the
-    /// host's and stay as they are — the cart registers and the core config (pages 0 and 3; what the decoupler reset on
-    /// entry and the firmware wrote since), MATRIX_KEYB (page 1) — and the new C64 is handed them as a core reads the
-    /// host's lines: its reset held while C64_MODE holds it (so it waits for the firmware, as at power-up), the
-    /// cartridge type, the REU and the sampler, the written core config, the keyboard rows, RESTORE and freeze. Its
-    /// UCI events of the power-up are dropped: the release raises nothing (ultimate_sys.vhd 155353d). Also kept: the
-    /// physical joysticks and RESTORE key, the lines shared with `U64Io`, the cartridge ROM's place in DDR, the link to
-    /// the TRX block.
+    /// host's and stay as they are — pages 0 and 3 with their latches and read-back bytes, MATRIX_KEYB (page 1) — and
+    /// the new C64 is handed the latches, which is what a core reads from the host: its reset held while C64_MODE holds
+    /// it (so it waits for the firmware, as at power-up), the cartridge type, the REU and the sampler, the core config
+    /// written since the decoupler's reset, the keyboard rows, RESTORE and freeze. Its UCI events of the power-up are
+    /// dropped: the release raises nothing (ultimate_sys.vhd a75c356). Also kept: the physical joysticks and RESTORE
+    /// key, the lines shared with `U64Io`, the cartridge ROM's place in DDR, the link to the TRX block.
     pub fn power_up(&mut self, backend: Option<Box<dyn C64Backend>>, now: u64, ram: &[u8]) {
         let (joysticks, joy_lines, restore, keys) = (self.joysticks, self.joy_lines.clone(), self.restore, self.dma.keys);
         let (cart_detect, rom_place, link) = (self.cart_detect.take(), self.cart_rom, self.trx.take());
@@ -491,11 +513,11 @@ impl C64Port {
         let matrix = std::mem::replace(&mut self.matrix, blank());
         let cart = std::mem::replace(&mut self.cart, RegTable::new("c64-cartregs", CART_REGS));
         let core = std::mem::replace(&mut self.core, RegTable::new("c64-core-config", CORE_CONFIG));
-        let (mode, stop, written) = (self.mode, self.stop, self.core_written);
+        let (mode, stop, written, latch) = (self.mode, self.stop, self.core_written, self.latch);
         *self = C64Port::new();
         (self.joysticks, self.joy_lines, self.restore, self.dma.keys) = (joysticks, joy_lines, restore, keys);
         (self.cart_detect, self.cart_rom, self.matrix) = (cart_detect, rom_place, matrix);
-        (self.cart, self.core, self.mode, self.stop, self.core_written) = (cart, core, mode, stop, written);
+        (self.cart, self.core, self.mode, self.stop, self.core_written, self.latch) = (cart, core, mode, stop, written, latch);
         if let Some(link) = link {
             self.set_trx_io(link);
         }
@@ -507,11 +529,7 @@ impl C64Port {
         let (cart_type, rom) = (self.cart.get(CARTRIDGE_TYPE), self.cart_rom);
         let written: Vec<(u8, u8)> =
             (0..0x100u32).filter(|&r| self.core_written[r as usize] && r != SPEED_UPDATE).map(|r| (r as u8, self.core.get(r))).collect();
-        let (size_kb, reu_on, sampler_on) = (
-            reu_size_kb(self.cart.get(REU_SIZE)),
-            self.cart.get(REU_ENABLE) & 0x01 != 0,
-            self.cart.get(SAMPLER_ENABLE) & 0x01 != 0,
-        );
+        let (size_kb, reu_on, sampler_on) = (reu_size_kb(self.latch.reu_size), self.latch.reu_enable, self.latch.sampler);
         let (mode, stop, trx) = (self.mode, self.stop, self.trx.is_some());
         if let Some(b) = &mut self.backend {
             b.set_matrix_keyb(rows);
@@ -1053,7 +1071,7 @@ impl C64Port {
 
     /// C64_DMA_MEMONLY bit 0 (core config +3, a host register on the TRX bitstream).
     pub fn mem_only(&self) -> bool {
-        self.core.get(DMA_MEMONLY) & 0x01 != 0
+        self.latch.mem_only
     }
 
     fn cart_get(&self, off: u32) -> u8 {
@@ -1148,7 +1166,8 @@ impl C64Port {
             // size first, which is the order the firmware writes them in (c64.cc:315-317, docs/status/reu.md).
             REU_SIZE => {
                 self.cart.set(reg, val);
-                let size_kb = reu_size_kb(self.cart.get(REU_SIZE));
+                self.latch.reu_size = self.cart.get(REU_SIZE);
+                let size_kb = reu_size_kb(self.latch.reu_size);
                 if let Some(b) = &mut self.backend {
                     b.set_reu_size_kb(size_kb);
                 }
@@ -1156,6 +1175,7 @@ impl C64Port {
             REU_ENABLE => {
                 self.cart.set(reg, val);
                 let on = self.cart.get(REU_ENABLE) & 0x01 != 0;
+                self.latch.reu_enable = on;
                 if let Some(b) = &mut self.backend {
                     b.set_reu_enabled(on);
                 }
@@ -1165,6 +1185,7 @@ impl C64Port {
             SAMPLER_ENABLE => {
                 self.cart.set(reg, val);
                 let on = self.cart.get(SAMPLER_ENABLE) & 0x01 != 0;
+                self.latch.sampler = on;
                 if let Some(b) = &mut self.backend {
                     b.set_sampler_enabled(on);
                 }
@@ -1192,6 +1213,11 @@ impl C64Port {
     fn core_write(&mut self, reg: u32, val: u8) {
         self.core.set(reg, val);
         self.core_written[reg as usize & 0xFF] = true;
+        match reg {
+            DMA_MEMONLY => self.latch.mem_only = val & 0x01 != 0,
+            JOY1_SWOUT | JOY2_SWOUT => self.latch.swout[(reg - JOY1_SWOUT) as usize] = self.core.get(reg),
+            _ => {}
+        }
         // W4-SID: the SID decode (SIDx/EMUSIDx BASE, MASK, EN, WAVES, SPLIT) is the backend's (S14 §W4-SID).
         if let Some(b) = &mut self.backend {
             b.core_config_write(reg as u8, val);
@@ -1218,7 +1244,7 @@ impl C64Port {
 
     /// Wired AND of the physical stick and the firmware's software output on each port (S36).
     fn apply_joysticks(&mut self) {
-        let lines = [self.core.get(JOY1_SWOUT) & self.joysticks[0], self.core.get(JOY2_SWOUT) & self.joysticks[1]];
+        let lines = [self.latch.swout[0] & self.joysticks[0], self.latch.swout[1] & self.joysticks[1]];
         for (cell, v) in self.joy_lines.iter().zip(lines) {
             cell.store(v, Ordering::Relaxed);
         }

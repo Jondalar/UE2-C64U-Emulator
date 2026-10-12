@@ -449,7 +449,7 @@ impl Trx64Backend {
     }
 
     /// S41 §5: the UCI block [`Self::take_uci`] took, in place of this core's own. The new machine's power-up reset is
-    /// handed to its own block first, which goes: the swap raises no C64-reset event (ultimate_sys.vhd 155353d: the
+    /// handed to its own block first, which goes: the swap raises no C64-reset event (ultimate_sys.vhd a75c356: the
     /// release of `core_decouple` raises nothing).
     pub fn insert_uci(&mut self, uci: UciBlock) {
         let _ = self.m.uci_mut();
