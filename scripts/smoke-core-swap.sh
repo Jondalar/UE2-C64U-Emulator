@@ -10,19 +10,23 @@
 # `core absent` is the host's decoupler (`core_decouple` = 1, ultimate_sys.vhd a75c356): on its rise the latches behind
 # the cart registers and the core config go back to power-up once, with the C64's reset held, and the firmware senses
 # the reset (ITU low bit 7); bytes that read back from the page RAM keep their values; the core's windows answer ack0
-# at once. `core present` loads a fresh core that stays in reset until
-# the firmware releases it, as at power-up, and raises nothing. `--absent-mode core=noack` is a host without the
-# decoupler, where an access into the core never completes and nothing is reset.
+# at once. `core present` loads a fresh core that stays in reset until the firmware releases it, as at power-up, and
+# raises nothing; its BASIC, KERNAL and CHAR ROMs are blank (c64_mem.v: the bitstream brings no ROM contents) until the
+# firmware writes them through the ROM window. `--absent-mode core=noack` is a host without the decoupler, where an
+# access into the core never completes and nothing is reset.
 #
 # Runs:
-#   swap    the decoupler, twice: right after `core absent` C64_MODE reads the reset held ($04), C64_STOP 0, the
-#           reset sensed ($11) and the cartridge type 0, every other cart register byte as before; the app's reset
-#           handler runs (the reset sense); after `core present` the
-#           reset is still held and the host's pages 1, 2, 4 and 5 (MATRIX_KEYB, the U64 board IO, C64_PLD_ACC,
-#           U64_DEBUG_REGISTER) read what they read before the swap; `monitor c64 reset`, standing in for the app's
-#           release (it writes C64_MODE as the firmware does), boots the fresh C64 to READY
-#   rest    the decoupler with the network: the REST API answers while the core is absent, and after
-#           `core present` `PUT /v1/machine:reset` (the app's own reset path) boots the new core to READY
+#   swap    the decoupler: right after `core absent` C64_MODE reads the reset held ($04), C64_STOP 0, the reset
+#           sensed ($11) and the cartridge type 0, every other cart register byte as before; the app's reset handler
+#           runs (the reset sense); after `core present` the reset is still held, the host's pages 1, 2, 4 and 5
+#           (MATRIX_KEYB, the U64 board IO, C64_PLD_ACC, U64_DEBUG_REGISTER) read what they read before the swap, and
+#           the ROM windows read 0; released bare through C64_MODE (`monitor c64 reset`) the C64 runs blank ROMs and
+#           does not reach READY
+#   rest    the decoupler with the network: REST answers while the core is absent. After `core present`,
+#           `PUT /v1/machine:reset` runs the app's C64::reset, which puts back BASIC and KERNAL from its own snapshot
+#           ("ROM image differed from the loaded one; restoring") but not CHAR: READY is in screen RAM, drawn with a
+#           blank character ROM. `PUT /v1/machine:reboot` (start_cartridge, init_system_roms) writes all three ROMs:
+#           CHAR reads its glyphs again and the C64 is at READY
 #   log     core=noack with --absent-continue: the C64 screen is empty and the picture black without the core, every
 #           access of the app into the core's windows is logged and counted (the app's reaction, printed)
 #   halt    core=noack: `core absent` halts the RISC-V on its first access into the core's windows, with the report
@@ -86,6 +90,42 @@ sys.exit(0 if all(b == 0 for i, b in enumerate(pixels) if i % (3 * w + 1)) else 
 EOF
 }
 
+# plain PNG: the C64's text area (the box of the colour at the centre) holds that colour only, so no glyph is drawn.
+plain() {
+    python3 - "$1" <<'EOF'
+import struct, sys, zlib
+data = open(sys.argv[1], "rb").read()
+w, h = struct.unpack(">II", data[16:24])
+raw, pos = b"", 8
+while pos < len(data):
+    n, kind = struct.unpack(">I4s", data[pos:pos + 8])
+    if kind == b"IDAT":
+        raw += data[pos + 8:pos + 8 + n]
+    pos += 12 + n
+raw = zlib.decompress(raw)
+stride, prev, rows = 3 * w, bytearray(3 * w), []
+for y in range(h):
+    f, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+    for i in range(stride):
+        a = line[i - 3] if i >= 3 else 0
+        b, c = prev[i], prev[i - 3] if i >= 3 else 0
+        if f == 1: line[i] = (line[i] + a) & 0xFF
+        elif f == 2: line[i] = (line[i] + b) & 0xFF
+        elif f == 3: line[i] = (line[i] + (a + b) // 2) & 0xFF
+        elif f == 4:
+            p = a + b - c
+            pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+            line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 0xFF
+    rows.append(bytes(line))
+    prev = line
+px = lambda x, y: rows[y][3 * x:3 * x + 3]
+bg = px(w // 2, h // 2)
+ys = [y for y in range(h) if px(w // 2, y) == bg]
+xs = [x for x in range(w) if px(x, h // 2) == bg]
+sys.exit(0 if all(px(x, y) == bg for y in range(ys[0], ys[-1] + 1) for x in range(xs[0], xs[-1] + 1)) else 1)
+EOF
+}
+
 # c64 NAME N: the Nth `c64screen` block (1-based) of NAME.log.
 c64() {
     awk -v n="$2" '/^--- c64 ---$/ { k++; next } k == 2 * n - 1' "$1.log"
@@ -96,6 +136,9 @@ monitor fw m 10100400 1010040f
 monitor fw m 10181000 10181003
 monitor fw m 10181800 10181803'
 cart='monitor fw m 10040000 1004000f'
+romwin='monitor fw m 10188000 1018800f
+monitor fw m 1018a000 1018a00f
+monitor fw m 1018c000 1018c00f'
 swap="$booted
 $pages
 $cart
@@ -106,19 +149,17 @@ wait 2000
 core present
 $cart
 $pages
+$romwin
 monitor c64 reset
-expect-c64 READY. 8000
+wait 3000
 c64screen
-png present.png
-core absent
-wait 1000
-core present
-monitor c64 reset
-expect-c64 READY. 8000
-wait 500"
+png present.png"
 run swap "$swap" || fail swap "exit code $?"
-[[ $(grep -c "^core absent (ack0): " swap.err) == 2 && $(grep -c "^core present: a fresh core" swap.err) == 2 ]] ||
-    fail swap "not two swaps"
+[[ $(grep -c "^core absent (ack0): " swap.err) == 1 && $(grep -c "^core present: a fresh core" swap.err) == 1 ]] ||
+    fail swap "not one swap"
+for rom in 10188000 1018a000 1018c000; do
+    grep -q "^  $rom  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00$" swap.log || fail swap "ROM window $rom is not blank"
+done
 carts=$(grep "^  10040000 " swap.log)
 # Before the swap, then on entry: bytes 0, 1, 3, 5 and 6 read latches (reset held, no stop, reset sensed, no
 # cartridge, not active), the rest the page RAM.
@@ -131,9 +172,9 @@ for page in 10100300 10100400 10181000 10181800; do
     [[ $(grep -c "^  $page " swap.log) == 2 && $(grep "^  $page " swap.log | sort -u | wc -l) -eq 1 ]] ||
         fail swap "host page $page changed over the swap"
 done
-c64 swap 1 | grep -q "READY." || fail swap "the fresh C64 did not boot after its release"
+! c64 swap 1 | grep -q "READY." || fail swap "the fresh C64 reached READY on blank ROMs"
 echo "PASS swap: on entry $(sed -n 2p <<<"$carts" | cut -c13-), the app's reset handler ran; held in reset after"
-echo "     core present; pages 1, 2, 4, 5 kept; READY after the release, twice"
+echo "     core present; pages 1, 2, 4, 5 kept; ROMs blank; a bare release does not reach READY"
 
 # rest: a swap with the network on, driven over the control port while the REST API is called.
 python3 - "$bin" "$elf" "$roms" "$repo/scripts" <<'PY' >rest.out 2>&1 || fail rest "$(tail -n 5 rest.out)"
@@ -172,10 +213,26 @@ try:
     mode = c.cmd('monitor fw m 10040000 10040000')
     if not mode or mode[0].split()[-1] != '04':
         sys.exit(f'not held in reset after core present: {mode}')
+    def rom(addr):
+        return c.cmd(f'monitor fw m {addr:08x} {addr + 15:08x}')[0].split()[1:]
+    blank = ['00'] * 16
+    if rom(0x1018A000) != blank or rom(0x1018C000) != blank:
+        sys.exit('the new core\'s ROMs are not blank')
     rest.request('PUT', '/v1/machine:reset', idempotent=False)
+    c.cmd('expect-console "ROM image differed from the loaded one; restoring" 3000')
     c.cmd('expect-c64 READY. 8000')
-    print(f'REST answered while the core was absent ({len(info)} bytes of /v1/info); after core present '
-          'PUT /v1/machine:reset booted the new core to READY')
+    if rom(0x1018A000) == blank or rom(0x1018C000) != blank:
+        sys.exit(f'after machine:reset: KERNAL {rom(0x1018A000)}, CHAR {rom(0x1018C000)}')
+    c.cmd('png reset.png')
+    rest.request('PUT', '/v1/machine:reboot', idempotent=False)
+    c.cmd('wait 3000')
+    c.cmd('expect-c64 READY. 8000')
+    if rom(0x1018C000) == blank:
+        sys.exit('after machine:reboot the CHAR ROM is still blank')
+    c.cmd('png reboot.png')
+    print(f'REST answered while the core was absent ({len(info)} bytes of /v1/info); after core present the ROMs read 0; '
+          'machine:reset put back BASIC and KERNAL only (READY in screen RAM, CHAR blank); machine:reboot wrote all '
+          'three (READY)')
     c.cmd('quit')
 finally:
     c.close()
@@ -184,6 +241,8 @@ finally:
     except subprocess.TimeoutExpired:
         proc.kill()
 PY
+plain reset.png || fail rest "after machine:reset the picture shows glyphs, with a blank character ROM"
+! plain reboot.png || fail rest "after machine:reboot the picture shows no text"
 echo "PASS rest: $(tail -n 1 rest.out)"
 
 log="$booted
