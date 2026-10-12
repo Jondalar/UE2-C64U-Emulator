@@ -12,7 +12,8 @@
 #   ack0    --absent sampler, the trial's ack0: runs past that PC to "[TRX UI] splash done; UI parked"
 #   cont    the noack run with --absent-continue: every stall site logged once, the summary counts per address, the app
 #           boots on
-#   all     reu,sampler,uci,jtag,turbo,apply absent in their default modes: the app boots, CAPS2 reads $9D (APPLY clear)
+#   all     reu,sampler,uci,jtag,turbo,apply,streams absent in their default modes: the app boots, CAPS2 reads $9D
+#           (APPLY clear)
 #   none    --absent none: no "absent:" line, the app boots as without the flag
 
 set -euo pipefail
@@ -75,8 +76,8 @@ grep -q "^absent summary: [1-9][0-9]* addresses stalled" cont.err || fail cont "
 echo "PASS cont ($(sed -n 's/^absent summary: //p' cont.err))"
 
 run all "$booted
-monitor trx" --absent reu,sampler,uci,jtag,turbo,apply || fail all "exit code $?"
-[[ $(grep -c "^absent: " all.err) == 6 ]] || fail all "not six absent blocks"
+monitor trx" --absent reu,sampler,uci,jtag,turbo,apply,streams || fail all "exit code $?"
+[[ $(grep -c "^absent: " all.err) == 7 ]] || fail all "not seven absent blocks"
 grep -qi "caps2 *0x9d" all.log || fail all "CAPS2 does not read \$9D"
 echo "PASS all"
 

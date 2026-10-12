@@ -964,6 +964,9 @@ impl Machine {
                 Block::Reu => "C64 $DF00-$DFFF reads $FF while REU_ENABLE is set, no DMA, IRQ 0".into(),
                 Block::Turbo => "the TRX model has no turbo engine (S40 §0), so nothing changes".into(),
                 Block::Jtag => "no bus effect".into(),
+                Block::Streams => "no UDP stream senders; the template writes are still acked and the enables do nothing, \
+                                   no bus difference"
+                    .into(),
                 Block::Apply => "AP_* writes ignored, AP_CMD never busy, CAPS2 b5 clear".into(),
                 Block::Core => continue,
             };
@@ -1823,13 +1826,21 @@ mod tests {
         let snap = m.display();
         assert_eq!((snap.c64, snap.trx), (None, Some(TrxOutput::default())));
         assert_eq!(m.picture_counter(), 0);
-        assert_eq!(m.bus.absent_at(0x1004_0000), Some((Block::Core, Mode::NoAck)));
+        assert_eq!(m.bus.absent_at(0x1002_0000), Some((Block::Core, Mode::NoAck)));
         assert_eq!(m.bus.absent_at(0x1004_4000), None, "the UCI is the host's");
+        assert_eq!(m.bus.absent_at(0x1004_0000), None, "the cart registers are the host's");
+        // ultimate_sys answers a DMA read of $D400-$D7FF itself with $FF unless MEMONLY (no SID for the app's probe).
+        rv32::Bus::write8(&mut m.bus, 0x1018_0003, 0);
+        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1005_D400), 0xFF);
+        assert!(m.bus.noack.is_none());
+        rv32::Bus::write8(&mut m.bus, 0x1018_0003, 1);
+        assert_eq!(rv32::Bus::read8(&mut m.bus, 0x1005_D400), 0);
+        assert!(m.bus.noack.take().is_some(), "MEMONLY: the byte goes to the core, which is not there");
 
         assert!(m.take_c64_backend().is_some());
         let new = Mock::default();
         assert!(m.core_present(Some(Box::new(new.clone()))).unwrap().starts_with("core present"));
-        assert!(!m.core_is_absent() && m.bus.absent_at(0x1004_0000).is_none());
+        assert!(!m.core_is_absent() && m.bus.absent_at(0x1002_0000).is_none());
         assert!(new.take().contains(&Call::Absent(Block::Sampler)), "the new core lacks the sampler too");
         assert!(m.bus.io.get::<C64Port>().unwrap().next_event().is_some());
         assert!(m.display().c64.is_some());
