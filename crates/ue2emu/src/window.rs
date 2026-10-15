@@ -4,7 +4,7 @@
 //! renders the latest `DisplaySnapshot` at 50 Hz into a 4:3 letterboxed area with integer scaling
 //! (opens at 2×), shows emulated time and MIPS in the title, feeds host keys through `keymap` as
 //! `HostInput::Key` (with `--usb-keyboard` through `usb` as `HostInput::UsbKey` instead), and maps F12 to the
-//! menu button and Page Up to the C64 RESTORE key (S14 §6), with or without `--usb-keyboard`. The C64 frame is
+//! menu button (with `--trx-io` the machine makes it the rocker's up, S42) and Page Up to the C64 RESTORE key (S14 §6), with or without `--usb-keyboard`. The C64 frame is
 //! composited under the overlay by `Renderer::render` (S14 §9). A `--script` runs on its own thread and
 //! `--control` serves TCP, both through `control`. The window closes when the emulator stops (script
 //! `quit`, fault halt) or after `--max-seconds`; closing it sends Quit, joins, and prints stats.

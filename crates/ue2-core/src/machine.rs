@@ -14,7 +14,7 @@ use crate::bus::{Access, SystemBus, IO_BIT, RAM_MASK};
 use crate::c64host::{C64Backend, C64CartSlot};
 use crate::devices::overlay::{Overlay, REG_TRANSPARENCY};
 use crate::devices::{self, c64::C64Port, itu::Itu, u64io::U64Io};
-use crate::host::{DisplaySnapshot, HostInput, TrxOutput};
+use crate::host::{DisplaySnapshot, HostInput, Rocker, TrxOutput};
 use crate::io::IoDevice;
 use crate::loader;
 use crate::symbols::Symbols;
@@ -679,10 +679,10 @@ impl Machine {
     }
 
     /// Route host input to `devices::itu::Itu` / `devices::u64io::U64Io` / `devices::usb::Usb` /
-    /// `devices::c64::C64Port`. Matrix keys reach both keyboards, the overlay scanner and the C64 (TRX64 or the T0
+    /// `devices::c64::C64Port` / `devices::wifi::Wifi` (S42: the rocker, and with `--trx-io` the menu button). Matrix keys reach both keyboards, the overlay scanner and the C64 (TRX64 or the T0
     /// stub's CIA1). Input for a device that is not installed is dropped.
     pub fn input(&mut self, ev: HostInput) {
-        let now = self.bus.now;
+        let (now, trx) = (self.bus.now, self.cfg.trx_io == TrxIo::On);
         let io = &mut self.bus.io;
         match ev {
             HostInput::Key { row, col, down } => {
@@ -706,9 +706,20 @@ impl Machine {
                     dev.set_joystick(port, lines);
                 }
             }
+            // S42: with `--trx-io` the board has no direct menu line; a press is the rocker's up.
+            HostInput::MenuButton(pressed) if trx => {
+                if let Some(dev) = io.get_mut::<devices::wifi::Wifi>().filter(|_| pressed) {
+                    dev.rocker(Rocker::Up, now);
+                }
+            }
             HostInput::MenuButton(pressed) => {
                 if let Some(dev) = io.get_mut::<Itu>() {
                     dev.set_menu_button(pressed);
+                }
+            }
+            HostInput::Rocker(gesture) => {
+                if let Some(dev) = io.get_mut::<devices::wifi::Wifi>().filter(|_| trx) {
+                    dev.rocker(gesture, now);
                 }
             }
             HostInput::UsbKey { usage, down } => {
@@ -980,6 +991,11 @@ impl Machine {
                 eprintln!("{line}");
             }
         }
+    }
+
+    /// Whether this machine has the TRX block (`--trx-io` on, or resolved on from the firmware).
+    pub fn trx_io(&self) -> bool {
+        self.cfg.trx_io == TrxIo::On
     }
 
     /// Whether the swappable core is absent (§5).
@@ -1815,6 +1831,97 @@ mod tests {
         let old = crate::c64host::mock::Mock::default();
         m.attach_c64(Box::new(old.clone()));
         (m, old)
+    }
+
+    /// S42: a machine of parts with the C64 port and the mock C64, with or without the TRX block.
+    fn rocker_machine(trx: bool) -> (Machine, crate::c64host::mock::Mock) {
+        let mut config = cfg();
+        config.trx_io = if trx { TrxIo::On } else { TrxIo::Off };
+        let mut bus = SystemBus::new();
+        devices::install_all(&mut bus.io, &config);
+        let mut m = Machine::from_parts(config, bus, 0x30000, Symbols::empty());
+        let c64 = crate::c64host::mock::Mock::default();
+        m.attach_c64(Box::new(c64.clone()));
+        (m, c64)
+    }
+
+    /// S42: let emulated time reach `ms`, ticking every device that comes due on the way.
+    fn run_to_ms(m: &mut Machine, ms: u64) {
+        let end = ms * crate::time::CLOCKS_PER_MS;
+        for _ in 0..100_000 {
+            let next = m.bus.next_deadline();
+            if next > end {
+                m.bus.now = end;
+                return;
+            }
+            m.bus.now = m.bus.now.max(next);
+            m.bus.tick_due();
+        }
+        panic!("the devices do not advance");
+    }
+
+    const ITU_BUTTONS: u32 = 0x1000_000A;
+
+    #[test]
+    fn rocker_events_hold_the_itu_buttons_200_ms() {
+        let (mut m, _) = rocker_machine(true);
+        run_to_ms(&mut m, 10);
+        m.input(HostInput::Rocker(Rocker::Down));
+        run_to_ms(&mut m, 10);
+        assert_eq!(Bus::read8(&mut m.bus, ITU_BUTTONS), 0x80, "button 2, the freeze");
+        run_to_ms(&mut m, 209);
+        assert_eq!(Bus::read8(&mut m.bus, ITU_BUTTONS), 0x80);
+        run_to_ms(&mut m, 210);
+        assert_eq!(Bus::read8(&mut m.bus, ITU_BUTTONS), 0x00);
+
+        // A second press restarts the hold; F12's press is the rocker's up and its release does nothing.
+        run_to_ms(&mut m, 1000);
+        m.input(HostInput::MenuButton(true));
+        m.input(HostInput::MenuButton(false));
+        run_to_ms(&mut m, 1150);
+        m.input(HostInput::Rocker(Rocker::Up));
+        run_to_ms(&mut m, 1349);
+        assert_eq!(Bus::read8(&mut m.bus, ITU_BUTTONS), 0x40, "button 1, the menu");
+        run_to_ms(&mut m, 1350);
+        assert_eq!(Bus::read8(&mut m.bus, ITU_BUTTONS), 0x00);
+    }
+
+    #[test]
+    fn rocker_up_long_holds_the_c64_in_reset_200_ms() {
+        use crate::c64host::mock::Call;
+        let (mut m, c64) = rocker_machine(true);
+        run_to_ms(&mut m, 10);
+        c64.take();
+        m.input(HostInput::Rocker(Rocker::UpLong));
+        run_to_ms(&mut m, 11);
+        assert!(c64.take().contains(&Call::Reset(true)));
+        assert_eq!(Bus::read8(&mut m.bus, 0x1004_0000) & 0x04, 0, "C64_MODE reads only its own reset");
+        assert_eq!(Bus::read8(&mut m.bus, 0x1004_0003) & 0x10, 0x10, "C64_CLOCK_DETECT senses it");
+        run_to_ms(&mut m, 209);
+        assert!(!c64.take().iter().any(|c| matches!(c, Call::Reset(_))));
+        run_to_ms(&mut m, 211);
+        let calls = c64.take();
+        let release = calls.iter().position(|c| *c == Call::Reset(false)).expect("released");
+        assert!(calls[..release].iter().any(|c| matches!(c, Call::Cart(..))), "the cartridge rebuilt first: {calls:?}");
+
+        // While C64_MODE holds the reset, the ESP32's hold changes nothing on the line.
+        Bus::write8(&mut m.bus, 0x1004_0000, 0x04);
+        c64.take();
+        m.input(HostInput::Rocker(Rocker::UpLong));
+        run_to_ms(&mut m, 500);
+        assert!(!c64.take().iter().any(|c| matches!(c, Call::Reset(_))));
+    }
+
+    #[test]
+    fn without_the_trx_block_the_rocker_is_dropped_and_the_button_is_direct() {
+        let (mut m, _) = rocker_machine(false);
+        m.input(HostInput::Rocker(Rocker::Down));
+        run_to_ms(&mut m, 1);
+        assert_eq!(Bus::read8(&mut m.bus, ITU_BUTTONS), 0x00);
+        m.input(HostInput::MenuButton(true));
+        assert_eq!(Bus::read8(&mut m.bus, ITU_BUTTONS), 0x40);
+        m.input(HostInput::MenuButton(false));
+        assert_eq!(Bus::read8(&mut m.bus, ITU_BUTTONS), 0x00);
     }
 
     /// The host's registers: REU_SIZE and JOY1_SWOUT (cart page 0, core page 3), MATRIX_KEYB row 0 (page 1),

@@ -7,10 +7,13 @@
 //! stand-in for `software/u64ctrl/main/rpc_dispatch.c`.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::bus::RAM_MASK;
 use crate::io::{IoCtx, IoDevice, IoMap, IO_GRAIN};
-use crate::machine::MachineConfig;
+use crate::host::Rocker;
+use crate::machine::{MachineConfig, TrxIo};
 use crate::time::CLOCKS_PER_MS;
 
 /// `WIFI_UART_BASE` (iomap.h:32).
@@ -49,6 +52,70 @@ const FLOW_RESET_VALUE: u8 = 0x10;
 const DIVISOR_RESET_VALUE: u16 = 34;
 /// tx_addr and rx_addr latch 28 bits; byte +7/+F keeps only its low nibble (uart_dma.vhd:338,362).
 const DMA_ADDR_BITS: u32 = 0x0FFF_FFFF;
+
+/// S42: how long the host top level holds a button or the C64 reset for one ESP32 event: 200 ticks of its 1 kHz
+/// counter (ultimate_sys.vhd:772-791).
+pub const ESP_EVENT_HOLD: u64 = 200 * CLOCKS_PER_MS;
+/// S42: `rx_dma` takes a packet whose first byte has bit 7 set as an event (rx_dma.vhd:83-86,97-104).
+const EVENT_BIT: u8 = 0x80;
+const EVENT_FREEZE: u8 = 0x81;
+const EVENT_MENU: u8 = 0x82;
+const EVENT_RESET: u8 = 0x83;
+
+/// S42: the three holds the `--trx-io` top level keeps for the ESP32's button events (ultimate_sys.vhd:772-795,
+/// :1320), shared by the WiFi UART that decodes them, the ITU that reads buttons 1 and 2, and the C64 port whose reset
+/// they pull. Each is the clock until which it holds; a new event reloads it. Nothing resets them, as in the top
+/// level, whose counters have no reset term.
+#[derive(Debug, Default)]
+pub struct EspButtons {
+    menu: AtomicU64,
+    freeze: AtomicU64,
+    reset_from: AtomicU64,
+    reset_until: AtomicU64,
+}
+
+impl EspButtons {
+    /// ITU button 1, the menu (EVENT_MENU).
+    pub fn menu(&self, now: u64) -> bool {
+        now < self.menu.load(Ordering::Relaxed)
+    }
+
+    /// ITU button 2, the freeze (EVENT_FREEZE).
+    pub fn freeze(&self, now: u64) -> bool {
+        now < self.freeze.load(Ordering::Relaxed)
+    }
+
+    /// The C64 reset EVENT_RESET holds, ORed with C64_MODE's.
+    pub fn reset(&self, now: u64) -> bool {
+        (self.reset_from.load(Ordering::Relaxed)..self.reset_until.load(Ordering::Relaxed)).contains(&now)
+    }
+
+    /// The clock at which [`Self::reset`] changes next, seen from a port that last applied `held` at `synced`.
+    pub fn reset_edge(&self, held: bool, synced: u64) -> Option<u64> {
+        let until = self.reset_until.load(Ordering::Relaxed);
+        if held {
+            Some(until)
+        } else {
+            (until > synced).then(|| self.reset_from.load(Ordering::Relaxed))
+        }
+    }
+
+    /// One decoded event at `now`; codes other than 0x81-0x83 do nothing (`when others => null`).
+    fn event(&self, code: u8, now: u64) {
+        let until = now + ESP_EVENT_HOLD;
+        match code {
+            EVENT_FREEZE => self.freeze.store(until, Ordering::Relaxed),
+            EVENT_MENU => self.menu.store(until, Ordering::Relaxed),
+            EVENT_RESET => {
+                if !self.reset(now) {
+                    self.reset_from.store(now, Ordering::Relaxed);
+                }
+                self.reset_until.store(until, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
 
 /// A frame the ESP32 has sent towards the Ultimate.
 struct EspFrame {
@@ -91,6 +158,10 @@ pub struct Wifi {
     ascii: Vec<u8>,
     /// The ESP32 control module behind the link.
     pub ctrl: U64Ctrl,
+    /// S42: `g_events`. With `--trx-io` (`ultimate_sys.vhd` `i_wifi`) a packet starting with bit 7 is an event for
+    /// these holds and never reaches RAM; the closed U64-II top level is unknown (doc 04 open questions 1-2), so the
+    /// normal machine has none.
+    events: Option<Arc<EspButtons>>,
 }
 
 impl Default for Wifi {
@@ -115,7 +186,25 @@ impl Wifi {
             from_esp: VecDeque::new(),
             ascii: Vec::new(),
             ctrl: U64Ctrl::default(),
+            events: None,
         }
+    }
+
+    /// S42: the holds this UART's events drive, `None` without `g_events`.
+    pub fn esp_buttons(&self) -> Option<Arc<EspButtons>> {
+        self.events.clone()
+    }
+
+    /// S42: the ESP32 sends `gesture` the way `send_button_event` does: one packet holding a bare RPC header with the
+    /// event as its command, thread 0xFF, sequence 0 (rpc_dispatch.c:389-402).
+    pub fn rocker(&mut self, gesture: Rocker, now: u64) {
+        self.from_esp.push_back(EspFrame { due: now, data: vec![gesture.code(), 0xFF, 0, 0] });
+    }
+
+    /// S42: the oldest frame has arrived and is an event `rx_dma` diverts.
+    fn event_due(&self, now: u64) -> bool {
+        self.events.is_some()
+            && self.from_esp.front().is_some_and(|f| f.due <= now && f.data.first().is_some_and(|b| b & EVENT_BIT != 0))
     }
 
     /// Module mode, flowctrl b6:4.
@@ -197,9 +286,22 @@ impl Wifi {
     /// rx_dma: take the pending address while idle (rx_dma.vhd:87-95), then write the oldest arrived frame at it
     /// and report its length (rx_dma.vhd:110-150). A reported frame that has not been popped holds the next one.
     /// Frames land in the oldest armed address, matching the ISR's `rx_bufs` FIFO (dma_uart.cc:173,211, H11).
+    ///
+    /// S42, with `g_events`: an arrived event at the head is taken first, with or without an address, as `idle`
+    /// peeks at it (rx_dma.vhd:83-86); the packet is dropped. The address is acknowledged only by the first byte of a
+    /// data frame (`first`, rx_dma.vhd:97-108), so until one has arrived it stays in the register and the status
+    /// keeps saying it has one. A data frame at the head holds the events behind it.
     fn service_rx(&mut self, ctx: &mut IoCtx) {
         loop {
-            if self.rx_active.is_none() && self.rx_addr_valid {
+            if self.event_due(ctx.now) {
+                let frame = self.from_esp.pop_front().expect("event_due saw a frame");
+                if let Some(buttons) = &self.events {
+                    buttons.event(frame.data[0], ctx.now);
+                }
+                continue;
+            }
+            let data_due = self.from_esp.front().is_some_and(|f| f.due <= ctx.now);
+            if self.rx_active.is_none() && self.rx_addr_valid && (self.events.is_none() || data_due) {
                 self.rx_active = Some(self.rx_addr);
                 self.rx_addr_valid = false;
             }
@@ -298,12 +400,14 @@ impl IoDevice for Wifi {
     }
 
     /// Only an arrived frame with a free receiver needs time to pass. A frame held by a missing or unpopped RX
-    /// buffer waits for a register write, which already triggers a deadline recompute.
+    /// buffer waits for a register write, which already triggers a deadline recompute. S42: an event at the head
+    /// needs no receiver, and with `g_events` the armed address is taken when a data frame arrives.
     fn next_event(&self) -> Option<u64> {
-        if self.rx_len_valid || self.rx_active.is_none() {
-            return None;
-        }
-        self.from_esp.front().map(|frame| frame.due)
+        let frame = self.from_esp.front()?;
+        let event = self.events.is_some() && frame.data.first().is_some_and(|b| b & EVENT_BIT != 0);
+        let take_addr = self.events.is_some() && self.rx_active.is_none() && self.rx_addr_valid;
+        let write = !self.rx_len_valid && self.rx_active.is_some();
+        (event || take_addr || write).then_some(frame.due)
     }
 
     fn tick(&mut self, ctx: &mut IoCtx) {
@@ -312,10 +416,10 @@ impl IoDevice for Wifi {
     }
 
     /// Hardware reset (uart_dma.vhd:413-425). The module's settings survive (they model ESP32 NVS); frames in
-    /// flight belonged to the firmware instance that is gone.
+    /// flight belonged to the firmware instance that is gone. `g_events` is the bitstream's and stays.
     fn reset(&mut self) {
-        let ctrl = std::mem::take(&mut self.ctrl);
-        *self = Wifi { ctrl, ..Wifi::new() };
+        let (ctrl, events) = (std::mem::take(&mut self.ctrl), self.events.take());
+        *self = Wifi { ctrl, events, ..Wifi::new() };
     }
 
     crate::impl_as_any!();
@@ -526,9 +630,14 @@ fn rom_loader_reply(req: &[u8]) -> Vec<u8> {
     vec![1, op, 4, 0, 0, 0, 0, 0, status[0], status[1], 0, 0]
 }
 
-/// Maps the register window (0x10060900-0x100609FF; the 16-byte block repeats, doc 04 open question 6).
-pub fn install(map: &mut IoMap, _cfg: &MachineConfig) {
-    map.add(WIFI_UART_BASE, IO_GRAIN, Box::new(Wifi::new()));
+/// Maps the register window (0x10060900-0x100609FF; the 16-byte block repeats, doc 04 open question 6). With
+/// `--trx-io` the UART decodes the ESP32's events (S42).
+pub fn install(map: &mut IoMap, cfg: &MachineConfig) {
+    let mut wifi = Wifi::new();
+    if cfg.trx_io == TrxIo::On {
+        wifi.events = Some(Arc::default());
+    }
+    map.add(WIFI_UART_BASE, IO_GRAIN, Box::new(wifi));
 }
 
 #[cfg(test)]
@@ -1193,5 +1302,101 @@ mod tests {
         assert_eq!(b.dev.ctrl.wake_on_wifi, 1);
         assert_eq!((b.rd(2), b.rd(3)), (0xD0, FLOW_RESET_VALUE));
         assert_eq!(b.dev.next_event(), None);
+    }
+
+    /// S42: a board whose UART has `g_events`, as with `--trx-io`.
+    fn trx_board() -> (Board, Arc<EspButtons>) {
+        let mut b = Board::new();
+        let buttons = Arc::new(EspButtons::default());
+        b.dev.events = Some(buttons.clone());
+        (b, buttons)
+    }
+
+    #[test]
+    fn event_needs_no_rx_buffer() {
+        let (mut b, buttons) = trx_board();
+        b.now = 5 * CLOCKS_PER_MS;
+        b.dev.rocker(Rocker::Up, b.now);
+        b.run(1);
+        assert!(buttons.menu(b.now) && !buttons.freeze(b.now) && !buttons.reset(b.now));
+        assert!(!buttons.menu(5 * CLOCKS_PER_MS + ESP_EVENT_HOLD), "held 200 ms");
+        assert!(b.dev.from_esp.is_empty(), "the packet is gone");
+        assert_eq!(b.rd(2) & (ST_RX_VALID | ST_RX_NEED_ADDR), ST_RX_NEED_ADDR, "no length, still no address");
+        assert!(b.ram.iter().all(|&byte| byte == 0), "nothing reached RAM");
+    }
+
+    #[test]
+    fn event_waits_behind_a_data_frame() {
+        let (mut b, buttons) = trx_board();
+        b.dev.from_esp.push_back(EspFrame { due: 0, data: vec![0x02, 0x01, 0x00, 0x00] });
+        b.dev.rocker(Rocker::Down, 0);
+        b.run(1);
+        assert!(!buttons.freeze(b.now), "the data frame at the head waits for a buffer, and the event with it");
+        b.wr32(0xC, RX_POOL);
+        assert_eq!(&b.ram[RX_POOL as usize..RX_POOL as usize + 4], [0x02, 0x01, 0x00, 0x00]);
+        assert_eq!(b.rd16(8), 4);
+        assert!(buttons.freeze(b.now), "decoded right after, the length still unpopped");
+        assert!(b.dev.from_esp.is_empty());
+    }
+
+    #[test]
+    fn the_address_waits_for_a_data_frame() {
+        let (mut b, _) = trx_board();
+        b.wr32(0xC, RX_POOL);
+        b.dev.rocker(Rocker::Up, 0);
+        b.run(1);
+        assert_eq!(b.rd(2) & ST_RX_NEED_ADDR, 0, "rx_dma latched the address in `first` but did not take it");
+        b.dev.from_esp.push_back(EspFrame { due: b.now, data: vec![0x07] });
+        b.run(1);
+        assert_eq!(b.rd(2) & (ST_RX_VALID | ST_RX_NEED_ADDR), ST_RX_VALID | ST_RX_NEED_ADDR, "the data byte took it");
+        assert_eq!(b.ram[RX_POOL as usize], 0x07);
+    }
+
+    #[test]
+    fn event_0x80_is_dropped() {
+        let (mut b, buttons) = trx_board();
+        b.dev.rocker(Rocker::DownLong, 0);
+        b.dev.from_esp.push_back(EspFrame { due: 0, data: vec![0x90, 0xFF, 0, 0] });
+        b.run(1);
+        assert!(b.dev.from_esp.is_empty());
+        assert!(!buttons.menu(0) && !buttons.freeze(0) && !buttons.reset(0));
+        assert_eq!(b.rd(2) & ST_RX_VALID, 0);
+    }
+
+    #[test]
+    fn without_events_a_bit_7_frame_is_data() {
+        let mut b = Board::new();
+        b.wr32(0xC, RX_POOL);
+        b.dev.rocker(Rocker::Up, 0);
+        b.run(1);
+        assert_eq!(b.rd16(8), 4);
+        assert_eq!(&b.ram[RX_POOL as usize..RX_POOL as usize + 4], [0x82, 0xFF, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn rpcs_still_land_in_ram_with_events() {
+        let mut b = Board::new();
+        b.dev.events = Some(Arc::default());
+        b.ctor();
+        b.scheduler_start();
+        b.command_init_registers();
+        b.take_irq();
+        let reply = b.rpc(CMD_IDENTIFY, &[]);
+        assert!(reply.windows(IDENT_STRING.len()).any(|w| w == IDENT_STRING.as_bytes()));
+    }
+
+    #[test]
+    fn a_new_event_restarts_the_hold() {
+        let buttons = EspButtons::default();
+        let ms = |n: u64| n * CLOCKS_PER_MS;
+        buttons.event(EVENT_MENU, ms(0));
+        buttons.event(EVENT_MENU, ms(150));
+        assert!(buttons.menu(ms(349)) && !buttons.menu(ms(350)));
+        buttons.event(EVENT_RESET, ms(1000));
+        assert_eq!(buttons.reset_edge(false, ms(999)), Some(ms(1000)));
+        buttons.event(EVENT_RESET, ms(1100));
+        assert!(buttons.reset(ms(1000)) && buttons.reset(ms(1299)) && !buttons.reset(ms(1300)), "one hold, extended");
+        assert_eq!(buttons.reset_edge(true, ms(1100)), Some(ms(1300)));
+        assert_eq!(buttons.reset_edge(false, ms(1300)), None);
     }
 }

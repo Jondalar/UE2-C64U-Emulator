@@ -108,6 +108,8 @@ pub enum Command {
     Monitor { line: String, done: Sender<Result<String, String>> },
     /// S41 §5: `core absent` (true) / `core present` (false), answered with a line saying what happened.
     Core { absent: bool, done: Sender<Result<String, String>> },
+    /// S42: whether the machine has the TRX block (`Machine::trx_io`), which decides what `button` and `rocker` do.
+    TrxIo { done: Sender<bool> },
     Quit,
 }
 
@@ -685,6 +687,9 @@ fn apply_commands(
                     eprintln!("{line}");
                 }
                 let _ = done.send(result);
+            }
+            Ok(Command::TrxIo { done }) => {
+                let _ = done.send(machine.trx_io());
             }
             Ok(Command::Quit) | Err(TryRecvError::Disconnected) => break true,
             Err(TryRecvError::Empty) => break false,

@@ -3,6 +3,9 @@
 //! UART, ms/LED/high-IRQ or the dummy port that reads 0 (itu.vhd:277-293, io_bus_splitter.vhd:51-53).
 //! Register behaviour: docs/hw/02-itu-uart.md T0 + T1 IRQ core. Spec: docs/specs/S03-itu-uart.md
 
+use std::sync::Arc;
+
+use crate::devices::wifi::EspButtons;
 use crate::io::{IoCtx, IoDevice, IoMap, IO_BASE};
 use crate::irq::IrqState;
 use crate::machine::MachineConfig;
@@ -58,6 +61,9 @@ const IRQ_TIMER_VAL_RESET: u16 = 0x8000;
 pub struct Itu {
     pub capabilities: u32,
     pub menu_button: bool,
+    /// S42: with `--trx-io` buttons 1 and 2 are the ESP32 events' holds and nothing else (ultimate_sys.vhd:793-795);
+    /// [`Self::menu_button`] is then not read.
+    pub esp: Option<Arc<EspButtons>>,
     /// ITU_TIMER value written last and the clock of that write (02 §Functional model).
     timer: u8,
     timer_written: u64,
@@ -77,6 +83,7 @@ impl Itu {
         Itu {
             capabilities,
             menu_button: false,
+            esp: None,
             timer: 0,
             timer_written: 0,
             irq_timer_en: false,
@@ -145,8 +152,13 @@ impl Itu {
             // Readback is the counter, not the reload value (itu.vhd:178-181).
             IRQ_TIMER_HI => (self.irq_timer_cnt(now) >> 8) as u8,
             IRQ_TIMER_LO => self.irq_timer_cnt(now) as u8,
-            // `buttons[2:0]` are not modelled; bit 6 = menu, idle 0 (itu.vhd:192-196, 02 H12).
-            BUTTONS => u8::from(self.menu_button) << 6,
+            // `buttons & "00000"` (itu.vhd:192-196, 02 H12): bit 5 button 0, bit 6 button 1 (menu), bit 7 button 2.
+            // The normal machine models the menu only; with `--trx-io` buttons 1 and 2 are the ESP32 events' and
+            // button 0 is tied to 0 (S42).
+            BUTTONS => match &self.esp {
+                Some(esp) => u8::from(esp.freeze(now)) << 7 | u8::from(esp.menu(now)) << 6,
+                None => u8::from(self.menu_button) << 6,
+            },
             FPGA_VERSION_REG => FPGA_VERSION,
             // Big-endian capability word (itu.vhd:184-191, itu.c:23-26, 02 H9-H11).
             o @ CAPABILITIES_0..=CAPABILITIES_3 => self.capabilities.to_be_bytes()[(o - CAPABILITIES_0) as usize],

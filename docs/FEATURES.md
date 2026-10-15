@@ -55,6 +55,8 @@ One line per feature, as of 0.5.1 (TRX64 v0.12.5). Details: `docs/status/`, spec
 - Core dev mode (`--trx-io`): FPGA blocks absent as the TRX bitstream's build switches leave them (`--absent`), their
   windows `noack` (halt with a report) or `ack0`, and the whole core swapped out and back while the firmware runs
   (`core absent` / `core present`) (S41).
+- The C64U rocker with `--trx-io`: the ESP32's event packets on the WiFi UART hold the menu and freeze buttons or the
+  C64 reset for 200 ms, as the TRX bitstream decodes them; F12 and `button` are the rocker's up (`rocker`) (S42).
 - REU on the firmware's DDR, preload and "Save REU"; GeoRAM.
 
 ## Cartridges
