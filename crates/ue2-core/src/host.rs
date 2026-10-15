@@ -13,8 +13,12 @@ pub enum HostInput {
     /// 3 right, 4 fire (idle 0xFF). The C64 sees them ANDed with the firmware's C64_JOYx_SWOUT; U64II_KEYB_JOY
     /// reads the same. Other ports are dropped.
     JoystickPort { port: u8, lines: u8 },
-    /// ITU menu button (0x1000000A bit 6).
+    /// ITU menu button (0x1000000A bit 6). S42: with `--trx-io` the board has no such line; a press is the rocker's
+    /// [`Rocker::Up`] and a release does nothing.
     MenuButton(bool),
+    /// S42: a gesture on the C64U's rocker, which the ESP32 sends as an event packet over the WiFi UART. Only the
+    /// `--trx-io` bitstream decodes it; dropped otherwise.
+    Rocker(Rocker),
     /// Key on the USB keyboard (`MachineConfig::usb`): HID usage ID of the Keyboard/Keypad page 0x07, modifiers
     /// 0xE0-0xE7 included (docs/hw/09-usb.md §F7). Dropped when no USB keyboard is attached.
     UsbKey { usage: u8, down: bool },
@@ -26,6 +30,43 @@ pub enum HostInput {
     UsbMouse { dx: i32, dy: i32, wheel: i32, buttons: u8 },
     /// C64 RESTORE key: NMI level while held (docs/specs/S14-c64-trx64.md §6).
     Restore(bool),
+}
+
+/// S42: the rocker gestures the ESP32 reports (u64ctrl `button_handler.h`, sent by `send_button_event`,
+/// rpc_dispatch.c:389-402).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rocker {
+    /// BUTTON_UP_SHORT → EVENT_MENU 0x82.
+    Up,
+    /// BUTTON_UP_LONG → EVENT_RESET 0x83.
+    UpLong,
+    /// BUTTON_DOWN_SHORT → EVENT_FREEZE 0x81.
+    Down,
+    /// BUTTON_DOWN_LONG → EVENT_BUTTON 0x80.
+    DownLong,
+}
+
+impl Rocker {
+    /// The event code the ESP32 puts in the command byte of the packet's RPC header (rpc_calls.h:219-222).
+    pub fn code(self) -> u8 {
+        match self {
+            Rocker::Up => 0x82,
+            Rocker::UpLong => 0x83,
+            Rocker::Down => 0x81,
+            Rocker::DownLong => 0x80,
+        }
+    }
+
+    /// The control-language name (`rocker up|up-long|down|down-long`).
+    pub fn by_name(name: &str) -> Option<Rocker> {
+        match name {
+            "up" => Some(Rocker::Up),
+            "up-long" => Some(Rocker::UpLong),
+            "down" => Some(Rocker::Down),
+            "down-long" => Some(Rocker::DownLong),
+            _ => None,
+        }
+    }
 }
 
 /// Everything a renderer needs to draw the overlay UI. Filled by `devices::overlay::Overlay::snapshot`.

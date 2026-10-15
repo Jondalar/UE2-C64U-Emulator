@@ -201,7 +201,7 @@ Events from the ESP always carry `thread=0xFF` and go to `RunModeThread` (`wifi.
 | EVENT_RESCAN | 0x44 | internal loopback only (`wifi.cc:377-386`) | state Scanning |
 | EVENT_KEEPALIVE | 0x45 | hdr | "Unexpected Event type", freed (`wifi.cc:365-368`) |
 | EVENT_DISABLED | 0x46 | hdr | state Disabled, `link_down` (`wifi.cc:311-316`) |
-| EVENT_BUTTON/FREEZE/MENU/RESET | 0x80-0x83 | hdr (`rpc_dispatch.c:389-403`, from `button_handler.c:63-65`) | no CPU handler (default case). May never reach the CPU, see Open questions. |
+| EVENT_BUTTON/FREEZE/MENU/RESET | 0x80-0x83 | hdr (`rpc_dispatch.c:389-403`, from `button_handler.c:63-65`) | no CPU handler (default case). On the TRX bitstream `uart_dma` has `g_events` and these never reach the CPU (S42); on U64-II see Open questions. |
 
 ### Features that depend on the ESP32 on U64-II
 
@@ -210,7 +210,7 @@ Events from the ESP always carry `thread=0xFF` and go to `RunModeThread` (`wifi.
 - **"Power On After Power Loss" and "Wake On Wi-Fi"** settings, stored in ESP NVS (`u64_config.cc:1462-1464,1551-1552`).
 - **Input-voltage warning** (`wifi.cc:258-260`).
 - **REST `/v1/info` `wifi_mac`** (`routes.cc:223-250`).
-- **Front-panel buttons**: owned by the ESP (`button_handler.c`), including the power rail (`pinout.h:13-14,22,27`). How presses reach the Ultimate is an open question.
+- **Front-panel buttons**: owned by the ESP (`button_handler.c`), including the power rail (`pinout.h:13-14,22,27`). On the TRX bitstream as ESP32 event packets decoded in the FPGA (S42); on U64-II an open question.
 - **Not ESP-dependent**:
   - RTC/time (no ESP reference in `rtc_dummy.cc`/`sntp_time.cc`; `CMD_GET_TIME` unused);
   - the C64 keyboard (`Keyboard_C64` on `U64II_KEYB_*`, `ultimate.cc:126`);
@@ -246,12 +246,12 @@ Events from the ESP always carry `thread=0xFF` and go to `RunModeThread` (`wifi.
 - The Ultimate runs its own lwIP DHCP on this link (`network_interface.cc:332-343`); EVENT_GOTIP is informational only.
 - Hold RX frames while no RX buffer is armed; lwIP pins buffers until `wifi_free`.
 - Host power semantics: MACHINE_OFF stops the machine; MACHINE_REBOOT does a full cold boot (FPGA and firmware reload, RAM lost).
-- Optional: host buttons → EVENT_MENU/RESET/FREEZE, pending the open question below.
+- Host buttons → EVENT_MENU/RESET/FREEZE: built for `--trx-io` (S42); for U64-II pending the open question below.
 
 ## Open questions
 
-1. OPEN QUESTION: Does the closed U64-II top level instantiate `uart_dma` for the WiFi link, and with which generics (`g_events`, `g_divisor`, mem tags)? The C driver matches this entity bit for bit (`dma_uart.h:21-44` vs `uart_dma.vhd:103-121,291-406`), which is strong evidence. If `g_events=true`, any frame whose first byte is ≥0x80 (EVENT_BUTTON 0x80 … EVENT_JOYSTICK 0x90) is diverted to the FPGA `event` port and dropped from the CPU stream (`rx_dma.vhd:83-86,97-104,152-155`). That would also explain why the CPU has no handler for these codes.
-2. OPEN QUESTION: Where do ESP button events (menu/reset/freeze) surface on U64-II: FPGA event path into ITU button register or C64 reset/freeze logic? This belongs to the ITU/C64 docs.
+1. OPEN QUESTION (U64-II; the TRX bitstream answers it with `g_events => true`, ultimate_sys.vhd, S42): Does the closed U64-II top level instantiate `uart_dma` for the WiFi link, and with which generics (`g_events`, `g_divisor`, mem tags)? The C driver matches this entity bit for bit (`dma_uart.h:21-44` vs `uart_dma.vhd:103-121,291-406`), which is strong evidence. If `g_events=true`, any frame whose first byte is ≥0x80 (EVENT_BUTTON 0x80 … EVENT_JOYSTICK 0x90) is diverted to the FPGA `event` port and dropped from the CPU stream (`rx_dma.vhd:83-86,97-104,152-155`). That would also explain why the CPU has no handler for these codes.
+2. OPEN QUESTION (U64-II; on the TRX bitstream: ITU buttons 1/2 and the C64 reset for 200 ms, S42): Where do ESP button events (menu/reset/freeze) surface on U64-II: FPGA event path into ITU button register or C64 reset/freeze logic? This belongs to the ITU/C64 docs.
 3. OPEN QUESTION: What do flowctrl bits 4-6 (boot/enable/route) drive on U64-II? The ESP_MODE encoding is inverted relative to U64 v1 (`esp32.h:21-35`: OFF=3 vs 0). The ESP owns FPGA power and JTAG (`pinout.h:12-15,22,27`), so these bits cannot power-gate it in any meaningful way; `route` may be UART passthrough (`ESP_MODE_*_UART`). This ELF only writes mode 0.
 4. OPEN QUESTION: Does the high-IRQ line 3 wiring match `ITU_IRQHIGH_WIFI` in the closed top level? It is assumed from `esp32.cc:73`.
 5. OPEN QUESTION: What is the value of `DEVELOPER` in this build? It decides whether the no-op "Disable/Enable ESP32" actions appear in the Developer menu (`u64_config.cc:1691-1697`); cosmetic only.

@@ -15,6 +15,7 @@ use crate::devices::trx::{self, Link};
 use crate::devices::trx_dbg::{self as dbg, Act};
 use crate::devices::trx_engine as engine;
 use crate::devices::trx_session::Lines;
+use crate::devices::wifi::EspButtons;
 use crate::io::{IoCtx, IoDevice, IoMap, IO_BASE};
 use crate::machine::MachineConfig;
 use crate::time;
@@ -344,6 +345,11 @@ pub struct C64Port {
     trx: Option<Link>,
     /// S37: the machine pause as last given to the backend.
     paused: bool,
+    /// S42: with `--trx-io` the ESP32's EVENT_RESET hold, ORed into the C64's reset beside C64_MODE's
+    /// (ultimate_sys.vhd:1320); C64_MODE reads only its own.
+    esp: Option<Arc<EspButtons>>,
+    /// S42: that hold as last given to the backend.
+    esp_reset: bool,
     /// S37: TRX64-Ultimate's `c64_mute` as last given to the backend.
     muted: bool,
     /// S37: a still frame for guest DDR (address, bytes), written when the access hands DDR back.
@@ -414,6 +420,8 @@ impl C64Port {
             cart_rom: CartRom::LARGE,
             trx: None,
             paused: false,
+            esp: None,
+            esp_reset: false,
             muted: false,
             still_out: None,
             engine_cfg: EngineCfg::default(),
@@ -493,6 +501,49 @@ impl C64Port {
         self.core_absent
     }
 
+    /// S42: `--trx-io`; the ESP32's events can hold the C64's reset.
+    pub fn set_esp_buttons(&mut self, buttons: Arc<EspButtons>) {
+        self.esp = Some(buttons);
+    }
+
+    /// The C64's reset line: C64_MODE's, or with `--trx-io` also the ESP32's hold (ultimate_sys.vhd:1320).
+    fn reset_held(&self) -> bool {
+        self.mode & MODE_RESET != 0 || self.esp_reset
+    }
+
+    /// The backend follows the reset line after a change of one of its sources; `before` is the line before it.
+    /// S37: a reset in a freeze session first writes the session's VIC registers for real and ends it. S14 §7: a
+    /// release rebuilds the cartridge from DDR, then warm-resets.
+    fn reset_changed(&mut self, before: bool, ram: &[u8]) {
+        let held = self.reset_held();
+        if held == before {
+            return;
+        }
+        let (cart_type, rom) = (self.cart.get(CARTRIDGE_TYPE), self.cart_rom);
+        if let (Some(link), Some(b)) = (&self.trx, self.backend.as_deref_mut()) {
+            if held {
+                trx::lock(link).session.reset(b);
+            }
+        }
+        if let Some(b) = &mut self.backend {
+            if !held {
+                b.set_cart(cart_type, cart_rom(ram, rom));
+            }
+            b.set_reset(held);
+        }
+    }
+
+    /// S42: the ESP32's reset hold as of `now`, applied after the C64 has run up to `now`.
+    fn follow_esp_reset(&mut self, now: u64, ram: &[u8]) {
+        let Some(want) = self.esp.as_ref().map(|e| e.reset(now)) else { return };
+        if want != self.esp_reset && !self.core_absent {
+            let before = self.reset_held();
+            self.esp_reset = want;
+            self.reset_changed(before, ram);
+            self.trx_update();
+        }
+    }
+
     /// S41 §5: the backend, taken off the port (the core being replaced keeps nothing but its physical cartridge).
     pub fn take_backend(&mut self) -> Option<Box<dyn C64Backend>> {
         self.backend.take()
@@ -509,6 +560,7 @@ impl C64Port {
     pub fn power_up(&mut self, backend: Option<Box<dyn C64Backend>>, now: u64, ram: &[u8]) {
         let (joysticks, joy_lines, restore, keys) = (self.joysticks, self.joy_lines.clone(), self.restore, self.dma.keys);
         let (cart_detect, rom_place, link) = (self.cart_detect.take(), self.cart_rom, self.trx.take());
+        let (esp, esp_reset) = (self.esp.take(), self.esp_reset);
         let blank = || RegTable::new("matrix-keyb", RAM_PAGE);
         let matrix = std::mem::replace(&mut self.matrix, blank());
         let cart = std::mem::replace(&mut self.cart, RegTable::new("c64-cartregs", CART_REGS));
@@ -517,6 +569,7 @@ impl C64Port {
         *self = C64Port::new();
         (self.joysticks, self.joy_lines, self.restore, self.dma.keys) = (joysticks, joy_lines, restore, keys);
         (self.cart_detect, self.cart_rom, self.matrix) = (cart_detect, rom_place, matrix);
+        (self.esp, self.esp_reset) = (esp, esp_reset);
         (self.cart, self.core, self.mode, self.stop, self.core_written, self.latch) = (cart, core, mode, stop, written, latch);
         if let Some(link) = link {
             self.set_trx_io(link);
@@ -530,7 +583,7 @@ impl C64Port {
         let written: Vec<(u8, u8)> =
             (0..0x100u32).filter(|&r| self.core_written[r as usize] && r != SPEED_UPDATE).map(|r| (r as u8, self.core.get(r))).collect();
         let (size_kb, reu_on, sampler_on) = (reu_size_kb(self.latch.reu_size), self.latch.reu_enable, self.latch.sampler);
-        let (mode, stop, trx) = (self.mode, self.stop, self.trx.is_some());
+        let (mode, stop, trx, reset) = (self.mode, self.stop, self.trx.is_some(), self.reset_held());
         if let Some(b) = &mut self.backend {
             b.set_matrix_keyb(rows);
             b.set_freeze_button(freeze);
@@ -541,7 +594,7 @@ impl C64Port {
             b.set_reu_enabled(reu_on);
             b.set_sampler_enabled(sampler_on);
             b.set_cart(cart_type, cart_rom(ram, rom));
-            b.set_reset(mode & MODE_RESET != 0);
+            b.set_reset(reset);
             b.set_ultimax(mode & MODE_ULTIMAX != 0);
             if !trx {
                 b.set_stopped(stop);
@@ -979,7 +1032,7 @@ impl C64Port {
             frz: l.frz,
             stop: self.stop,
             ultimax: self.mode & MODE_ULTIMAX != 0,
-            reset: self.mode & MODE_RESET != 0,
+            reset: self.reset_held(),
             owner: d.own,
             dbg_stop: d.holds(),
             dbg_hold: d.hold,
@@ -1081,8 +1134,9 @@ impl C64Port {
             // `hard_stop`'s `while(!(C64_STOP & 2));` (c64.cc:405) and the forced poll in `stop()`
             // (c64.cc:490-497) never spin, and a released stop reads 0 (c64.cc:1449).
             (STOP, _) => u8::from(self.stop) * 0x03,
-            // 10 H4: RESET sense follows the held reset.
-            (CLOCK_DETECT, Some(_)) if self.mode & MODE_RESET != 0 => CD_PHI2_DETECT | CD_RESET_SENSE,
+            // 10 H4: RESET sense follows the held reset; with `--trx-io` also the ESP32's hold (`core_reset_req`, top.v
+            // :562; S42).
+            (CLOCK_DETECT, Some(_)) if self.reset_held() => CD_PHI2_DETECT | CD_RESET_SENSE,
             // S41 §5: an absent core has no cartridge to be active.
             (CARTRIDGE_KILL, Some(b)) if !self.core_absent => u8::from(b.cart_active()),
             (r, _) => self.cart.get(r),
@@ -1093,7 +1147,7 @@ impl C64Port {
         match reg {
             // cart_slot_registers.vhd: bit2 asserts reset, else bit3 releases it, else bits 1/4 set ULTIMAX/NMI.
             MODE => {
-                let old = self.mode;
+                let (old, before) = (self.mode, self.reset_held());
                 if val & MODE_RESET != 0 {
                     self.mode |= MODE_RESET;
                 } else if val & MODE_UNRESET != 0 {
@@ -1102,21 +1156,8 @@ impl C64Port {
                     self.mode = (self.mode & MODE_RESET) | (val & (MODE_ULTIMAX | MODE_NMI));
                 }
                 let changed = old ^ self.mode;
-                let (cart_type, rom) = (self.cart.get(CARTRIDGE_TYPE), self.cart_rom);
-                // S37: a reset in a freeze session first writes the session's VIC registers for real and ends it.
-                if let (Some(link), Some(b)) = (&self.trx, self.backend.as_deref_mut()) {
-                    if changed & self.mode & MODE_RESET != 0 {
-                        trx::lock(link).session.reset(b);
-                    }
-                }
+                self.reset_changed(before, ram);
                 if let Some(b) = &mut self.backend {
-                    if changed & MODE_RESET != 0 {
-                        // S14 §7: a release rebuilds the cartridge from DDR, then warm-resets.
-                        if self.mode & MODE_RESET == 0 {
-                            b.set_cart(cart_type, cart_rom(ram, rom));
-                        }
-                        b.set_reset(self.mode & MODE_RESET != 0);
-                    }
                     if changed & MODE_ULTIMAX != 0 {
                         b.set_ultimax(self.mode & MODE_ULTIMAX != 0);
                     }
@@ -1158,7 +1199,8 @@ impl C64Port {
             CARTRIDGE_TYPE => {
                 self.cart.set(reg, val);
                 let rom = self.cart_rom;
-                if let Some(b) = self.backend.as_mut().filter(|_| self.mode & MODE_RESET != 0) {
+                let held = self.reset_held();
+                if let Some(b) = self.backend.as_mut().filter(|_| held) {
                     b.set_cart(val, cart_rom(ram, rom));
                 }
             }
@@ -1579,12 +1621,15 @@ impl IoDevice for C64Port {
         self.backend.as_ref().filter(|_| !self.core_absent)?;
         let periodic = self.synced + SYNC_PERIOD;
         let op = self.trx.as_ref().and_then(|l| trx::lock(l).ops.first().map(|op| op.at));
-        Some(op.map_or(periodic, |at| at.min(periodic)))
+        // S42: the ESP32's reset hold starts and ends at its clock.
+        let esp = self.esp.as_ref().and_then(|e| e.reset_edge(self.esp_reset, self.synced));
+        Some([op, esp].into_iter().flatten().fold(periodic, u64::min))
     }
 
     fn tick(&mut self, ctx: &mut IoCtx) {
         self.lend_ddr(ctx);
         self.sync(ctx.now);
+        self.follow_esp_reset(ctx.now, ctx.ram);
         self.return_ddr(ctx.ram);
         self.update_uci(ctx);
         // W4-DRIVE, S27: carry the drives' writes into DDR.
@@ -1602,7 +1647,10 @@ impl IoDevice for C64Port {
     fn reset(&mut self) {
         let (backend, synced, keys, cart_detect) = (self.backend.take(), self.synced, self.dma.keys, self.cart_detect.take());
         let (link, paused, core_absent) = (self.trx.take(), self.paused, self.core_absent);
+        let (esp, esp_reset) = (self.esp.take(), self.esp_reset);
         *self = C64Port::new();
+        // S42: the ESP32's hold is the top level's, which this reset does not touch.
+        (self.esp, self.esp_reset) = (esp, esp_reset);
         (self.backend, self.synced, self.dma.keys, self.cart_detect) = (backend, synced, keys, cart_detect);
         self.core_absent = core_absent;
         // The backend keeps a pause until the next sync takes it away (C64_STOP is 0 now).

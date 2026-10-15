@@ -523,16 +523,16 @@ Level 2 of `ue2emu`: how the host reaches the machine and what it gets back.
   every 20 ms emulated without a C64 (S26). `render::Renderer` builds the image in the output mode the firmware
   programmed: the C64 frame cropped and scaled by the VIC cropper and the scalers, the overlay on top (overlay only
   without a C64); `render::text_dump` and `render::c64_text_dump` turn the overlay and the C64 screen into text.
-- **Window:** realtime, held to the rendered image's ratio on resize, opens at 768×576. F12 = menu button, Page Up =
-  RESTORE; with `--usb-mouse` a click captures the host mouse and Page Down lets it go. Other keys go to the matrix,
+- **Window:** realtime, held to the rendered image's ratio on resize, opens at 768×576. F12 = menu button (with
+  `--trx-io` the rocker's up, S42), Page Up = RESTORE; with `--usb-mouse` a click captures the host mouse and Page Down lets it go. Other keys go to the matrix,
   or with `--usb-keyboard` to the USB keyboard. `--hold-key` holds matrix keys from power-on until `release`.
 - **Control:** `--script file` or `--control 127.0.0.1:PORT`, one command per line (S08):
-  `wait <ms>`, `button [ms]`, `key <name>[+<name>…] [ms]`, `hold <keys>`, `release <keys>`, `type <text>`,
+  `wait <ms>`, `button [ms]`, `rocker <gesture>`, `key <name>[+<name>…] [ms]`, `hold <keys>`, `release <keys>`, `type <text>`,
   `usbkey <name> [ms]`, `usbmouse <dx> <dy> [buttons]`, `joy <port> <dirs> [ms]`, `joy-hold <port> <dirs>`,
   `joy-release <port>`, `screen`, `c64screen`, `png <path>`, `expect <text> [ms]`, `expect-not <text> [ms]`,
   `expect-console <text> [ms]`, `expect-c64 <text> [ms]`, `usb-sync [--force] [port]`, `usb-replug [--discard] [port]`,
   `usb-plug <port> image <path>|keyboard|mouse`, `usb-unplug <port>`, `monitor <cmd>`, `cart-info`, `cart-save <path>`,
-  `quit`.
+  `core absent|present`, `quit`.
   - `button`, `key`, `type`, `usbkey` and `joy` reach the emulation thread as one timed sequence (`Command::Inputs`,
     `control::InputTimeline`), so holds keep their emulated length at any host speed.
   - `expect*` poll the screen text or the console; a timeout prints the screen and fails with the line number, and

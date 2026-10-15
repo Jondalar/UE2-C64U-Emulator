@@ -6,7 +6,8 @@
 //! | Command | Effect |
 //! |---|---|
 //! | `wait <ms>` | Wait `ms` emulated milliseconds. |
-//! | `button [ms]` | Hold the menu button (ITU 0x1000000A bit 6), default 100 ms. |
+//! | `button [ms]` | Hold the menu button (ITU 0x1000000A bit 6), default 100 ms. With `--trx-io` it is `rocker up` and takes no `ms` (S42). |
+//! | `rocker <gesture>` | The C64U's rocker: `up` (menu), `up-long` (C64 reset), `down` (freeze), `down-long` (nothing). The ESP32 sends it over the WiFi UART; returns after the board's 200 ms hold (docs/specs/S42-esp32-rocker-events.md; needs `--trx-io`). |
 //! | `key <name> [ms]` | Hold a key (`keymap::key_by_name`), default 80 ms, then a 40 ms release gap. |
 //! | `type <text>` | Type the text after the separating space, one key at a time (`keymap::key_for_char`). |
 //! | `usbkey <name> [ms]` | Hold a key of the USB keyboard (`usb::usage_by_name`), default 80 ms, then the release gap. |
@@ -33,7 +34,7 @@
 //! RUN/STOP still matches. `expect-console` sees the firmware console since power-on; each match moves its
 //! start past the matched text, so two `expect-console` lines need two occurrences, in order.
 //!
-//! `button`, `key`, `type`, `usbkey` and `joy` reach the emulation thread as one [`TimedInputs`] sequence that
+//! `button`, `rocker`, `key`, `type`, `usbkey` and `joy` reach the emulation thread as one [`TimedInputs`] sequence that
 //! [`InputTimeline`] applies at exact emulated times. Host speed (`--speed max`) and host scheduling can
 //! neither stretch a hold into key repeat (keyboard_c64.cc:286-293) or a long button press (docs/hw/05
 //! hazard 6), nor shorten it below a keyboard scan.
@@ -55,7 +56,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ue2_core::devices::usb::{UsbDevice, HUB_PORTS};
-use ue2_core::host::{DisplaySnapshot, HostInput};
+use ue2_core::devices::wifi::ESP_EVENT_HOLD;
+use ue2_core::host::{DisplaySnapshot, HostInput, Rocker};
 use ue2_core::render::{c64_text_dump, text_dump, Renderer};
 use ue2_core::time;
 
@@ -90,7 +92,10 @@ const ACCEPT_POLL: Duration = Duration::from_millis(20);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlCmd {
     Wait(u64),
-    Button(u64),
+    /// `button [ms]`; `None` when no `ms` was given.
+    Button(Option<u64>),
+    /// S42: `rocker <gesture>`.
+    Rocker(Rocker),
     Key(MatrixKey, u64),
     /// `key cbm+z [ms]`: the keys pressed in order, held together, released in reverse order.
     Chord(Vec<MatrixKey>, u64),
@@ -169,6 +174,8 @@ pub trait Target {
     fn monitor(&mut self, line: &str) -> Result<String>;
     /// S41 §5: take the core away (`absent`) or load a fresh one; a line saying what happened.
     fn core(&mut self, absent: bool) -> Result<String>;
+    /// S42: whether the machine has the TRX block.
+    fn trx_io(&mut self) -> Result<bool>;
     /// Ask the emulator to stop.
     fn quit(&mut self);
 }
@@ -236,7 +243,12 @@ pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
         }
         "button" => {
             arity(0, 1)?;
-            ControlCmd::Button(ms(0, BUTTON_MS)?)
+            ControlCmd::Button(if args.is_empty() { None } else { Some(ms(0, BUTTON_MS)?) })
+        }
+        "rocker" => {
+            arity(1, 1)?;
+            let gesture = Rocker::by_name(args[0]).ok_or_else(|| format!("unknown rocker gesture '{}' (up, up-long, down, down-long)", args[0]))?;
+            ControlCmd::Rocker(gesture)
         }
         "key" => {
             arity(1, 2)?;
@@ -423,14 +435,35 @@ fn parse_script(text: &str) -> Result<Vec<(usize, ControlCmd)>> {
     Ok(cmds)
 }
 
+/// S42: one rocker gesture, lasting the board's hold.
+fn rocker_inputs(gesture: Rocker) -> TimedInputs {
+    TimedInputs { events: vec![(0, HostInput::Rocker(gesture))], len_ms: ESP_EVENT_HOLD / time::CLOCKS_PER_MS }
+}
+
 /// Execute one command, writing its result lines to `out`.
 pub fn execute(t: &mut dyn Target, cmd: &ControlCmd, out: &mut dyn Write) -> Result<Flow> {
     match cmd {
         ControlCmd::Wait(ms) => t.wait_ms(*ms)?,
-        ControlCmd::Button(ms) => t.inputs(TimedInputs {
-            events: vec![(0, HostInput::MenuButton(true)), (*ms, HostInput::MenuButton(false))],
-            len_ms: *ms,
-        })?,
+        // S42: the TRX board's menu button is the rocker's up, held 200 ms by the board.
+        ControlCmd::Button(ms) if t.trx_io()? => {
+            if ms.is_some() {
+                bail!("button: with --trx-io the board holds the menu button 200 ms; give no ms");
+            }
+            t.inputs(rocker_inputs(Rocker::Up))?;
+        }
+        ControlCmd::Button(ms) => {
+            let ms = ms.unwrap_or(BUTTON_MS);
+            t.inputs(TimedInputs {
+                events: vec![(0, HostInput::MenuButton(true)), (ms, HostInput::MenuButton(false))],
+                len_ms: ms,
+            })?;
+        }
+        ControlCmd::Rocker(gesture) => {
+            if !t.trx_io()? {
+                bail!("rocker: only the TRX bitstream decodes the ESP32's events (--trx-io)");
+            }
+            t.inputs(rocker_inputs(*gesture))?;
+        }
         ControlCmd::Key(key, ms) => {
             let mut seq = TimedInputs::default();
             seq.tap(*key, *ms);
@@ -860,6 +893,12 @@ impl Target for HandleTarget {
         result.recv().map_err(|_| anyhow!("emulator stopped"))?.map_err(|e| anyhow!(e))
     }
 
+    fn trx_io(&mut self) -> Result<bool> {
+        let (done, result) = mpsc::channel();
+        self.ctl.commands.send(Command::TrxIo { done }).map_err(|_| anyhow!("emulator stopped"))?;
+        result.recv().map_err(|_| anyhow!("emulator stopped"))
+    }
+
     fn quit(&mut self) {
         // The emulation thread may already be gone; then there is nothing left to stop.
         let _ = self.ctl.commands.send(Command::Quit);
@@ -947,6 +986,8 @@ mod tests {
     use std::sync::mpsc::TryRecvError;
     use std::sync::{Arc, Mutex};
 
+    use ue2_core::host::Rocker as Gesture;
+
     /// Emulated time one `Fake::poll` advances.
     const FAKE_POLL_MS: u64 = 10;
 
@@ -979,6 +1020,8 @@ mod tests {
         /// Cartridge requests received; a save to `fail.crt` fails.
         cart: Vec<CartRequest>,
         monitor: Vec<String>,
+        /// S42: the machine has the TRX block.
+        trx: bool,
     }
 
     impl Fake {
@@ -1072,6 +1115,10 @@ mod tests {
             Ok(if absent { "core absent (noack)".into() } else { "core present".into() })
         }
 
+        fn trx_io(&mut self) -> Result<bool> {
+            Ok(self.trx)
+        }
+
         fn quit(&mut self) {
             self.quit = true;
         }
@@ -1088,8 +1135,11 @@ mod tests {
         use ControlCmd::*;
         let ok = |l: &str| parse_line(l).unwrap();
         assert_eq!(ok("wait 4000"), Some(Wait(4000)));
-        assert_eq!(ok("button"), Some(Button(100)));
-        assert_eq!(ok("button 50"), Some(Button(50)));
+        assert_eq!(ok("button"), Some(Button(None)));
+        assert_eq!(ok("button 50"), Some(Button(Some(50))));
+        assert_eq!(ok("rocker up-long"), Some(ControlCmd::Rocker(Gesture::UpLong)));
+        assert!(parse_line("rocker sideways").is_err());
+        assert!(parse_line("rocker").is_err());
         assert_eq!(ok("key down"), Some(Key(k("down"), 80)));
         assert_eq!(ok("key RETURN 30"), Some(Key(k("return"), 30)));
         assert_eq!(ok("key A"), Some(Key(MatrixKey { row: 1, col: 2, shift: true }, 80)));
@@ -1269,6 +1319,19 @@ mod tests {
             ]
         );
         assert_eq!(fake.now, 4130);
+    }
+
+    #[test]
+    fn trx_button_and_rocker_are_esp32_events() {
+        let mut fake = Fake { trx: true, ..Fake::default() };
+        let (r, _) = run(&mut fake, "button\nrocker down\n");
+        r.unwrap();
+        assert_eq!(fake.log, vec![(0, HostInput::Rocker(Gesture::Up)), (200, HostInput::Rocker(Gesture::Down))]);
+        assert_eq!(fake.now, 400, "each lasts the board's 200 ms hold");
+        let (r, _) = run(&mut fake, "button 30\n");
+        assert!(format!("{:#}", r.unwrap_err()).contains("give no ms"));
+        let (r, _) = run(&mut Fake::default(), "rocker up\n");
+        assert!(format!("{:#}", r.unwrap_err()).contains("--trx-io"));
     }
 
     #[test]
@@ -1597,6 +1660,9 @@ joy-release 2").0.unwrap();
                         }
                         Ok(Command::Core { done, .. }) => {
                             let _ = done.send(Err("no core in the fake".into()));
+                        }
+                        Ok(Command::TrxIo { done }) => {
+                            let _ = done.send(false);
                         }
                         Ok(Command::Quit) => {
                             log.push((now, None));

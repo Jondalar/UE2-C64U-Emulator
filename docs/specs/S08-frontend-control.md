@@ -34,7 +34,8 @@
 | Command | Effect |
 |---|---|
 | `wait <ms>` | Waits on emulated time via `handle.now_ms`. |
-| `button [ms]` | Default 100 ms. |
+| `button [ms]` | Default 100 ms. With `--trx-io` it is `rocker up` and refuses an `ms` (S42). |
+| `rocker <gesture>` | `up`, `up-long`, `down`, `down-long`: the ESP32 sends the gesture's event over the WiFi UART; returns after the board's 200 ms hold (S42; needs `--trx-io`). |
 | `key <name> [ms]` | Default 80 ms hold, then a 40 ms release gap. Names joined with `+` are a chord (`key cbm+z`): pressed in order 20 ms apart, held together, released at once. |
 | `hold <names>` / `release <names>` | Presses or lets go of matrix keys (`cbm`, `ctrl+c`) with no timed release; `release` also ends a `--hold-key`. |
 | `type <text>` | Types the text through the keymap. |

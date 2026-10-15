@@ -46,4 +46,13 @@ pub fn install_all(map: &mut IoMap, cfg: &MachineConfig) {
     if let (Some(lines), Some(io)) = (joy_lines, map.get_mut::<u64io::U64Io>()) {
         io.joy_lines = lines;
     }
+    // S42: with `--trx-io` the ESP32's events from the WiFi UART hold ITU buttons 1 and 2 and the C64's reset.
+    if let Some(buttons) = map.get::<wifi::Wifi>().and_then(wifi::Wifi::esp_buttons) {
+        if let Some(itu) = map.get_mut::<itu::Itu>() {
+            itu.esp = Some(buttons.clone());
+        }
+        if let Some(port) = map.get_mut::<c64::C64Port>() {
+            port.set_esp_buttons(buttons);
+        }
+    }
 }

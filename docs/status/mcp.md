@@ -250,7 +250,8 @@ Details that matter:
 | Command | Effect |
 |---|---|
 | `wait <ms>` | run `ms` emulated ms |
-| `button [ms]` | hold the menu button (default 100) |
+| `button [ms]` | hold the menu button (default 100); with `--trx-io` the rocker's up, no `ms` |
+| `rocker <gesture>` | the C64U rocker over the ESP32 (`up`, `up-long`, `down`, `down-long`; `--trx-io` only, S42) |
 | `key <name> [ms]` | hold a key (default 80), then a 40 ms release gap; SHIFT leads shifted keys by 20 ms |
 | `key <a+b> [ms]` | a chord: the keys pressed in order, held together, released |
 | `hold <keys>` / `release <keys>` | press C64 matrix keys until `release` (also the keys of `--hold-key`) |
