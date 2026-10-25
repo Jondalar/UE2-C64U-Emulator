@@ -140,6 +140,9 @@ ports. Open, and not TRX64's (2026-09-23):
   DMA, as on the device. Checked (`scripts/smoke-1581.py`): "Set as 1581 ROM" from the menu, D81s created over
   REST, a program saved and loaded on A (written back into the file), two 1581s at 8 and 9, and A back to a 1541
   beside B. INSERTED, DISKCHANGE and force ready drive the 1581's /RDY and /DISK CHANGE.
+- **With `--trx-io`** (S43) neither drive unit has multi-mode, as the TRX bitstream's `drive_registers` (no
+  `g_multi_mode`): DRIVETYPE takes no write and reads 0, so the firmware offers a 1541 only, without "Switch to"
+  and with the 1571/1581 ROMs greyed.
 - **Drive B** runs as TRX64's position B (S27). The firmware builds it only when the capability word has
   `CAPAB_DRIVE_1541_2` (bit 2, c1541.cc:1263); the default word has it since S27, as a C64 Ultimate does (its REST
   API lists drive B, disabled, bus ID 9). Checked: Drive B Settings enabled, `drive.d64` mounted over REST,

@@ -57,6 +57,9 @@ One line per feature, as of 0.5.1 (TRX64 v0.12.5). Details: `docs/status/`, spec
   (`core absent` / `core present`) (S41).
 - The C64U rocker with `--trx-io`: the ESP32's event packets on the WiFi UART hold the menu and freeze buttons or the
   C64 reset for 200 ms, as the TRX bitstream decodes them; F12 and `button` are the rocker's up (`rocker`) (S42).
+- The rest of the TRX bitstream the app sees (`--trx-io`): the reSID8 filter control (CAPS3, the menus, the bypass on
+  the reSIDs), drive A as a 1541 only, and the expansion port's slot block, so trex_crt inspects, dumps, writes and
+  verifies a `--cart-slot` cartridge on the TRX core (S43).
 - REU on the firmware's DDR, preload and "Save REU"; GeoRAM.
 
 ## Cartridges

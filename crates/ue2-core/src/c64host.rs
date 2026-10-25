@@ -316,6 +316,18 @@ pub trait C64Backend {
     /// 1 MHz whatever the firmware's menu sets, and `$D030`/`$D031` are the VIC's unused registers (read `$FF`, take no
     /// write). Ignored by default.
     fn set_trx_bitstream(&mut self, _on: bool) {}
+    /// S43: page 7 SLOT_CTRL b1, ROM_WR_EN: with it ROML/ROMH reach the expansion port in a write cycle
+    /// (slot_port.v `roml_go`). Ignored by default.
+    fn set_slot_wr_en(&mut self, _on: bool) {}
+    /// S43: page 7 SLOT_STATUS as slot_port.v reports it, b18 and b31 left to the block: b0 GAME, b1 EXROM, b2 DMA, b3 IRQ,
+    /// b4 NMI (1 = high), b5 the port's RESET low, b11:8 EXT and b15:12 INT in effect, b16 armed, b17 fault, b23:20 its
+    /// cause, b25:24 the SID socket enables, b26 a socket armed. Default: no slot, the pins high, INT 0xF.
+    fn slot_status(&self) -> u32 {
+        crate::devices::trx::SLOT_IDLE
+    }
+    /// S43: RS8 04C/04D, the filter of UltiSID 1 / 2 bypassed (reSID `enable_filter(false)` on each of its engines).
+    /// Ignored by default.
+    fn set_sid_bypass(&mut self, _ultisid: usize, _on: bool) {}
 
     /// S41: `block` is not built into this bitstream (docs/specs/S41-core-dev-mode.md §2). The bus already keeps the
     /// firmware out of its app window; this takes away the C64 side: no `$DF20-$DFFF` and no IRQ without the sampler,
@@ -674,6 +686,9 @@ pub(crate) mod mock {
         Paused(bool),
         /// S41: `set_absent`.
         Absent(crate::absent::Block),
+        /// S43: `set_slot_wr_en`, `set_sid_bypass`.
+        SlotWrEn(bool),
+        SidBypass(usize, bool),
     }
 
     /// Shared with the test after the backend moved into the device.
@@ -713,6 +728,8 @@ pub(crate) mod mock {
         /// S40: the loads `sb_load` got, and what `sb_shadow` returns.
         pub(crate) loads: Rc<RefCell<Vec<crate::devices::trx_sb::SbLoad>>>,
         pub(crate) shadow: Rc<RefCell<super::SbShadow>>,
+        /// S43: what `slot_status` returns.
+        pub(crate) slot: Rc<RefCell<u32>>,
     }
 
     impl Mock {
@@ -895,6 +912,15 @@ pub(crate) mod mock {
         }
         fn set_absent(&mut self, block: crate::absent::Block) {
             self.push(Call::Absent(block));
+        }
+        fn set_slot_wr_en(&mut self, on: bool) {
+            self.push(Call::SlotWrEn(on));
+        }
+        fn slot_status(&self) -> u32 {
+            *self.slot.borrow()
+        }
+        fn set_sid_bypass(&mut self, ultisid: usize, on: bool) {
+            self.push(Call::SidBypass(ultisid, on));
         }
         fn sb_shadow(&self) -> super::SbShadow {
             self.shadow.borrow().clone()

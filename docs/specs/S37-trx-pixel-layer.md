@@ -97,8 +97,9 @@ The interrupt is `(IRQ_EN & IRQ_CAUSE) != 0` on **ITU high IRQ 2**.
     firmware)`.
   - On installs the block and makes high IRQ 2 its line. Off leaves 0x101A0000 unmapped, as on Gideon's
     bitstream, where the app reads ID 0 and leaves the layer alone; `--trx-io=off` runs TRX firmware that way.
-- **High IRQ 2:** with `--trx-io`, drive B's WD177x does not drive it. A 1581 at drive B is refused with a message.
-  The TRX bitstream has no drive B (`trx_io.v`: "we have no drive B").
+- **High IRQ 2:** with `--trx-io`, drive B's WD177x does not drive it. The TRX bitstream has no drive B (`trx_io.v`:
+  "we have no drive B"). Since S43 neither drive unit has multi-mode (`drive_registers` without `g_multi_mode`), so
+  there is no 1581 at either position.
 - **Buffers:** the layer reads the guest DDR at `PX_FRONT`, the same memory the RISC-V writes. The fetch keeps
   address bits 26:0; a pixel past UE2's 64 MB reads 0 (black, or transparent with key 0 on). There are no
   underruns, so the count stays 0.
@@ -491,7 +492,8 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
   - a 60 Hz composite at 960 × 540 takes every second output line of the 5, 4, 5, 4 pattern.
 - **Gideon's overlay** follows `overlay.v` since B3 (see "As built (phase B3)").
 - **Drive B:** the firmware probes DRIVETYPE 2 at boot (c1541.cc:119-123). With `--trx-io` the write keeps the
-  1541, so the firmware offers drive B as a 1541 only, and the log says so once.
+  1541, so the firmware offers drive B as a 1541 only. S43 replaced this with the bitstream's rule for both drives:
+  DRIVETYPE takes no write and reads 0.
 - **Firmware smoke** (`scripts/smoke-trx.sh`, trx64/main 029da8ef): "LVGL 9.6.0 on the pixel layer" at about
   1.5 s, the splash in a 960 × 540 png, `PX_GALPHA` written 17 times (the fade), "splash done; UI parked" at
   about 4.5 s with the layer off. In the first 6 s the app touches page 0 (ID, CAPS, IRQ_EN = b7) and page 6

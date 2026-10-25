@@ -7,8 +7,9 @@
 //! Sixteen 4 KB pages, byte wide. Page 0 from 0x104 holds the gate's capture control and page 1 the state bus (S39
 //! phase A1, docs/specs/S39-trxmon.md; the model is `trx_sb.rs`); page 2 is the engine (S40,
 //! docs/specs/S40-trx-engine.md; `trx_engine.rs`); page 3 and page 0 0x118-0x13F are the debug block (S39,
-//! `trx_dbg.rs`); page 5 has the session and the lens unit. Pages 4 and 7 and every offset not listed read 0 and
-//! ignore writes.
+//! `trx_dbg.rs`); page 5 has the session and the lens unit. Page 0 0x006 and 0x040-0x04D are the reSID8 view (S43,
+//! docs/specs/S43-trx-resid8-drive-slot.md), page 7 the expansion port's slot block (S43; the slot itself is the
+//! backend's). Page 4 and every offset not listed read 0 and ignore writes.
 //!
 //! The layer's settings and a pending flip take effect at the frame start, one per VIC frame. The device sees a VIC
 //! frame through the count [`C64Port`] publishes after each sync, polled every millisecond, so the frame start comes
@@ -54,6 +55,18 @@ pub const CAPS2: u8 = 0xBD;
 pub const CAPS2_APPLY: u8 = 0x20;
 const CAPS_OFF: u32 = 0x004;
 const CAPS2_OFF: u32 = 0x005;
+/// S43: CAPS3 b0, the SID is the 8-SID reDIP with the reSID8 filter control (c64_core.v:887 `sid_resid8`, the default
+/// `SID_MULTI` build; top.v:800).
+const CAPS3_OFF: u32 = 0x006;
+pub const CAPS3: u8 = 0x01;
+/// S43: the reSID8 filter control, page 0 0x040-0x04D (trx_io.v): 040/041 filter source, 042/043 Auto bits, 044-047 and
+/// 048-04B the 6581 base and offset of UltiSID 1 and 2, 04C/04D the bypass. What each byte keeps, and its reset value.
+pub const RS8: u32 = 0x040;
+const RS8_LEN: usize = 14;
+const RS8_MASK: [u8; RS8_LEN] = [0x03, 0x03, 0x03, 0x03, 0xFF, 0x01, 0xFF, 0x07, 0xFF, 0x01, 0xFF, 0x07, 0x01, 0x01];
+const RS8_RESET: [u8; RS8_LEN] = [0, 0, 3, 3, 245, 0, 0xF4, 0x04, 245, 0, 0xF4, 0x04, 0, 0];
+/// 04C/04D: the bypass of UltiSID 1 / 2, which the C64 port gives the backend at its clock.
+pub const RS8_BYPASS: u32 = 0x04C;
 pub const IRQ_EN: u32 = 0x010;
 pub const IRQ_CAUSE: u32 = 0x014;
 /// IRQ_CAUSE b0, the machine halted (top.v `stop_tgl`: the pause or the position hold); b1, an engine job ended
@@ -108,6 +121,18 @@ pub const LK_DONE: u32 = 1 << 8;
 /// The 128 overlay bytes and their valid bits.
 pub const SH_OVERLAY: u32 = 0x080;
 pub const SH_VALID: u32 = 0x100;
+
+/// S43: page 7, the expansion port's slot block (trx_sys.v:60-72, slot_port.v): SLOT_CTRL b1 ROM_WR_EN (RW, 0 at
+/// configuration, no reset term); SLOT_STATUS as the backend's slot reports it, b18 the ROM_WR_EN it applies and b31
+/// the block. SLOT_CNT0/1 and SLOT_LAST (0x008-0x010) read 0.
+pub const PAGE7: u32 = 0x7000;
+pub const SLOT_CTRL: u32 = 0x000;
+pub const SLOT_STATUS: u32 = 0x004;
+pub const SLOT_WR_EN: u32 = 0x02;
+pub const SLOT_ST_WR_EN: u32 = 1 << 18;
+pub const SLOT_ST_BLOCK: u32 = 1 << 31;
+/// SLOT_STATUS without a C64: the pins high (GAME, EXROM, DMA, IRQ, NMI), INT 0xF and EXT 0x0 (ultimate_sys.vhd:453).
+pub const SLOT_IDLE: u32 = 0x0000_F01F;
 
 /// Page 6, the pixel layer (pix_layer.v): 32-bit registers, little endian. Writing byte 0-2 stages it, writing byte
 /// 3 commits all four; reading byte 0 latches the register for bytes 1-3.
@@ -253,6 +278,11 @@ pub struct TrxLink {
     /// S39: C64_STOP as written (STATUS b5), and the lens unit's last result.
     pub fw_stop: bool,
     pub lk_res: u32,
+    /// S43: SLOT_CTRL's ROM_WR_EN as written, and SLOT_STATUS as the port last read it from the backend.
+    pub slot_wr_en: bool,
+    pub slot_status: u32,
+    /// S43: RS8 04C/04D b0, UltiSID 1 and 2's filter bypassed.
+    pub rs8_bypass: [bool; 2],
 }
 
 impl TrxLink {
@@ -273,6 +303,9 @@ impl TrxLink {
             dbg,
             fw_stop: false,
             lk_res: 0,
+            slot_wr_en: false,
+            slot_status: SLOT_IDLE,
+            rs8_bypass: [false; 2],
         }
     }
 
@@ -409,6 +442,8 @@ pub struct Trx {
     tx_ctrl: u8,
     tx_stage: u8,
     tx_latch: u32,
+    /// S43: RS8 0x040-0x04D as written, masked.
+    rs8: [u8; RS8_LEN],
     shown: Shown,
     /// Frame starts, wrapping (PX_STATUS b31:16), and all of them.
     frames: u16,
@@ -424,6 +459,8 @@ pub struct Trx {
     /// S41: the engine has no APPLY unit (trx_engine.v `NO_APPLY`): AP_START, AP_COUNT and AP_CMD writes do nothing,
     /// AP_CMD never reads busy, CAPS2 b5 reads 0. A build switch, so a reset keeps it.
     apply_absent: bool,
+    /// S43: the two-SID reDIP (`--absent resid8`): CAPS3 reads 0 and the bypass goes to no engine. A build switch too.
+    resid8_absent: bool,
     /// S41 §5: the core is not loaded: the block neither polls nor drives its interrupt.
     core_absent: bool,
 }
@@ -453,6 +490,7 @@ impl Trx {
             tx_ctrl: 0,
             tx_stage: 0,
             tx_latch: 0,
+            rs8: RS8_RESET,
             shown: Shown::of(&Settings::DEFAULT, 0),
             frames: 0,
             starts: 0,
@@ -463,6 +501,7 @@ impl Trx {
             next_poll: POLL,
             link,
             apply_absent: false,
+            resid8_absent: false,
             core_absent: false,
         }
     }
@@ -470,6 +509,11 @@ impl Trx {
     /// S41 §2: the bitstream has no APPLY unit.
     pub fn set_apply_absent(&mut self, absent: bool) {
         self.apply_absent = absent;
+    }
+
+    /// S43: the bitstream is built with the two-SID reDIP.
+    pub fn set_resid8_absent(&mut self, absent: bool) {
+        self.resid8_absent = absent;
     }
 
     /// S41 §5: the core goes (its interrupt drops and it stops polling) or comes back; a core that comes back is a
@@ -636,6 +680,15 @@ impl Trx {
                 _ => 0,
             };
         }
+        if off & !0xFFF == PAGE7 {
+            return match off & 0xFFF {
+                SLOT_CTRL => u32::from(l.slot_wr_en) * SLOT_WR_EN,
+                SLOT_STATUS => {
+                    l.slot_status & !SLOT_ST_WR_EN | u32::from(l.slot_wr_en) * SLOT_ST_WR_EN | SLOT_ST_BLOCK
+                }
+                _ => 0,
+            };
+        }
         if off & !0xFFF != PAGE5 {
             return 0;
         }
@@ -715,6 +768,11 @@ impl Trx {
             o if o == PAGE1 + SB_STATUS => l.sb.err = false,
             o if o == PAGE1 + SB_LOAD => l.ops.push(op),
             o if o == PAGE5 + SH_CTRL => l.session.write_ctrl(v),
+            // S43: read back at once (trx_sys.v:217); the slot takes it at the C64's clock.
+            o if o == PAGE7 + SLOT_CTRL => {
+                l.slot_wr_en = v & SLOT_WR_EN != 0;
+                l.ops.push(op);
+            }
             _ => {}
         }
     }
@@ -887,6 +945,16 @@ impl IoDevice for Trx {
                 match reg {
                     IRQ_EN => self.irq_en = val,
                     IRQ_CAUSE => self.cause &= !val,
+                    r @ RS8..=0x04D => {
+                        let i = (r - RS8) as usize;
+                        self.rs8[i] = val & RS8_MASK[i];
+                        if r >= RS8_BYPASS && !self.resid8_absent {
+                            // The engines take it at the C64's clock (trx_sid.v `cfg_r`), so through the port.
+                            let mut l = lock(&self.link);
+                            l.rs8_bypass[(r - RS8_BYPASS) as usize] = val & 1 != 0;
+                            l.ops.push(SysWrite { at: ctx.now, off: r, v: u32::from(val & 1) });
+                        }
+                    }
                     _ => {}
                 }
                 self.update_irq(ctx.irq);
@@ -926,6 +994,8 @@ impl IoDevice for Trx {
                 0..=3 => ID[reg as usize],
                 CAPS_OFF => CAPS,
                 CAPS2_OFF => CAPS2 & if self.apply_absent { !CAPS2_APPLY } else { 0xFF },
+                CAPS3_OFF => if self.resid8_absent { 0 } else { CAPS3 },
+                r @ RS8..=0x04D => self.rs8[(r - RS8) as usize],
                 IRQ_EN => self.irq_en,
                 IRQ_CAUSE => self.cause,
                 // BUILD 008-00B: no bitstream, no build stamp.
@@ -961,9 +1031,9 @@ impl IoDevice for Trx {
             *dbg::lock(&d) = dbg::Dbg::default();
             *l = TrxLink::power_on(frames, clocks, paused, starts, d);
         }
-        let (link, apply_absent) = (self.link.clone(), self.apply_absent);
+        let (link, apply_absent, resid8_absent) = (self.link.clone(), self.apply_absent, self.resid8_absent);
         *self = Trx::new(link);
-        self.apply_absent = apply_absent;
+        (self.apply_absent, self.resid8_absent) = (apply_absent, resid8_absent);
     }
 
     crate::impl_as_any!();
@@ -1115,6 +1185,65 @@ mod tests {
         r.w8(0x4000, 0xFF);
         assert!((0x4000..0x4010).chain(0xF000..0xF004).chain(0x2000..0x2004).chain(0x104..0x140).all(|o| r.r8(o) == 0));
         assert!((0x140..0x1000).step_by(0x3C).all(|o| r.r8(o) == 0), "140-FFF");
+    }
+
+    /// S43 S1: CAPS3 b0 and the reSID8 filter control at its reset values (trx_io.v: 0, 3, 245, -780, no bypass).
+    #[test]
+    fn caps3_and_the_resid8_reset_values() {
+        let mut r = Rig::new();
+        assert_eq!(r.r8(0x006), 0x01, "CAPS3 b0, the 8-SID reDIP");
+        let bytes: Vec<u8> = (0x040..0x04E).map(|o| r.r8(o)).collect();
+        assert_eq!(bytes, [0, 0, 3, 3, 0xF5, 0, 0xF4, 0x04, 0xF5, 0, 0xF4, 0x04, 0, 0]);
+        assert_eq!(r.r8(0x04E), 0, "past the block");
+    }
+
+    /// S43 S2: each byte keeps its bits; the bypass goes to the C64 port as an op; an FPGA reset restores them.
+    #[test]
+    fn the_resid8_registers_read_back_masked() {
+        let mut r = Rig::new();
+        for o in 0x040..0x04E {
+            r.w8(o, 0xFF);
+        }
+        let bytes: Vec<u8> = (0x040..0x04E).map(|o| r.r8(o)).collect();
+        assert_eq!(bytes, [3, 3, 3, 3, 0xFF, 1, 0xFF, 7, 0xFF, 1, 0xFF, 7, 1, 1]);
+        {
+            let l = lock(&r.link);
+            assert_eq!(l.rs8_bypass, [true, true]);
+            let ops: Vec<(u32, u32)> = l.ops.iter().map(|op| (op.off, op.v)).collect();
+            assert_eq!(ops, [(RS8_BYPASS, 1), (RS8_BYPASS + 1, 1)], "only the bypass acts on the machine");
+        }
+        IoDevice::reset(&mut r.trx);
+        assert_eq!((r.r8(0x044), r.r8(0x04C)), (0xF5, 0));
+        assert_eq!(lock(&r.link).rs8_bypass, [false, false]);
+    }
+
+    /// S43: `--absent resid8`, the two-SID reDIP: CAPS3 0, the bytes still read and write, no bypass for the port; a
+    /// reset keeps the build switch.
+    #[test]
+    fn without_resid8_caps3_is_0_and_the_bypass_goes_nowhere() {
+        let mut r = Rig::new();
+        r.trx.set_resid8_absent(true);
+        assert_eq!(r.r8(0x006), 0);
+        r.w8(0x04C, 1);
+        assert_eq!(r.r8(0x04C), 1);
+        assert!(lock(&r.link).ops.is_empty() && lock(&r.link).rs8_bypass == [false, false]);
+        IoDevice::reset(&mut r.trx);
+        assert_eq!(r.r8(0x006), 0);
+    }
+
+    /// S43 S6: page 7, the slot block: SLOT_CTRL reads back at once and queues for the C64's clock; SLOT_STATUS is what
+    /// the port last published, with the block's b31 and b18 from ROM_WR_EN.
+    #[test]
+    fn page_7_is_the_slot_block() {
+        let mut r = Rig::new();
+        assert_eq!((r.r32(PAGE7 + SLOT_CTRL), r.r32(PAGE7 + SLOT_STATUS)), (0, 0x8000_F01F));
+        r.w32(PAGE7 + SLOT_CTRL, 0xFFFF_FFFF);
+        assert_eq!(r.r32(PAGE7 + SLOT_CTRL), SLOT_WR_EN, "b1 only");
+        assert_eq!(r.r32(PAGE7 + SLOT_STATUS), 0x8004_F01F, "b18 the ROM_WR_EN applied");
+        assert_eq!(lock(&r.link).ops.last().map(|op| (op.off, op.v)), Some((PAGE7 + SLOT_CTRL, 0xFFFF_FFFF)));
+        lock(&r.link).slot_status = 0x0001_0704;
+        assert_eq!(r.r32(PAGE7 + SLOT_STATUS), 0x8005_0704);
+        assert!((0x008..0x014).all(|o| r.r8(PAGE7 + o) == 0), "SLOT_CNT0/1, SLOT_LAST");
     }
 
     /// S41 §2: without APPLY (trx_engine.v and trx_io.v `NO_APPLY`) CAPS2 b5 reads 0, the AP_* writes take nothing and

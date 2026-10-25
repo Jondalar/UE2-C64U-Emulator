@@ -974,10 +974,30 @@ impl Trx64Backend {
     /// model takes the count at once: a land reads it on the stop position after `clear_vic_latches`' bus cycles and
     /// arms CYC_CMP with it (trx_ring.cc `land_locked`).
     fn window_cycle(&mut self) {
+        // S43: an app DMA cycle is a cycle at the port too, in the pause as well (T16 §13.4).
+        self.slot.with(Slot::trx_cycle);
         if self.stands() {
             self.tap.cycles += 1;
             self.tap.run_cycles += 1;
             self.dbg_publish();
+        }
+    }
+
+    /// S43: with `--trx-io` the port's masks follow the registers while the CPU is in reset or the machine stands, and
+    /// while it runs `armed` follows them (slot_port.v); a change of the masks in effect re-routes the bus.
+    fn slot_follow(&mut self) {
+        let stands = self.stands();
+        let take = self.reset_held || stands;
+        let changed = self.slot.with(|s| {
+            let changed = s.set_trx_take(take);
+            if !stands {
+                s.trx_cycle();
+            }
+            changed
+        });
+        if changed {
+            self.install_cart();
+            self.apply_interrupts();
         }
     }
 
@@ -1297,6 +1317,8 @@ impl C64Backend for Trx64Backend {
         if self.slot.with(Slot::take_cart_reset) {
             self.cart_generated_reset();
         }
+        // S43: a debugger's or the position's hold that came on the run takes the masks too.
+        self.slot_follow();
         self.dbg_publish();
         // S16: the voices are FPGA-clocked, so they follow the emulator's clock rather than the C64's — and they run
         // whether or not anyone is listening, because a finished voice sets the status bit `audio_detect()` polls.
@@ -1309,6 +1331,7 @@ impl C64Backend for Trx64Backend {
     fn set_reset(&mut self, held: bool) {
         self.reset_held = held;
         self.apply_hold();
+        self.slot_follow();
         self.uci_wait = None;
         if held {
             // S38: a reset replaces the machine, so its anchors go.
@@ -1367,6 +1390,7 @@ impl C64Backend for Trx64Backend {
 
     fn set_ultimax(&mut self, on: bool) {
         self.ultimax = on;
+        self.slot.with(|s| s.set_trx_ultimax(on));
         self.install_cart();
     }
 
@@ -1522,6 +1546,7 @@ impl C64Backend for Trx64Backend {
         if self.slot.with(|s| s.core_config(off, val)) {
             self.install_cart();
             self.apply_interrupts();
+            self.slot_follow();
         }
     }
 
@@ -1705,7 +1730,7 @@ impl C64Backend for Trx64Backend {
                 self.parked_reu = None;
                 self.reu_off_since = None;
             }
-            Block::Turbo | Block::Jtag | Block::Apply | Block::Streams | Block::Core => {}
+            Block::Turbo | Block::Jtag | Block::Apply | Block::Streams | Block::Resid8 | Block::Core => {}
         }
     }
 
@@ -1805,6 +1830,7 @@ impl C64Backend for Trx64Backend {
         if !self.stands() {
             self.reanchor();
         }
+        self.slot_follow();
     }
 
     fn set_muted(&mut self, muted: bool) {
@@ -1881,7 +1907,10 @@ impl C64Backend for Trx64Backend {
             2 => 0xDE00 | (addr & 0xFF),
             _ => 0xDF00 | (addr & 0xFF),
         };
-        if self.slot.with(|s| s.physical().is_some()) {
+        // S43: on the TRX core only where the port answers that class (c64_core.v:646 `pk_ext`).
+        let crt = self.cart.with(|c| c.present());
+        let port = self.slot.with(|s| s.physical().is_some() && s.trx().is_none_or(|t| t.answers(at, crt)));
+        if port {
             if !real {
                 return CartPeek::External;
             }
@@ -1921,6 +1950,28 @@ impl C64Backend for Trx64Backend {
             self.m.set_u64_turbo(self.turbo_regs_en, self.speed_prefer);
         }
         self.turbo_applied = None;
+        // S43: TRX64-Ultimate's port logic in front of the physical cartridge.
+        let ultimax = self.ultimax;
+        self.slot.with(|s| {
+            s.set_trx(on);
+            s.set_trx_ultimax(ultimax);
+        });
+        self.install_cart();
+        self.apply_interrupts();
+        self.slot_follow();
+    }
+
+    fn set_slot_wr_en(&mut self, on: bool) {
+        self.slot.with(|s| s.set_trx_wr_en(on));
+    }
+
+    /// The port's RESET line is low while the C64's reset is held: our own reset drives it (slot_port.v `p_rst_o`).
+    fn slot_status(&self) -> u32 {
+        self.slot.view().trx_status(self.reset_held)
+    }
+
+    fn set_sid_bypass(&mut self, ultisid: usize, on: bool) {
+        self.sid.set_bypass(ultisid, on, self.m.c64_core.clk);
     }
 
     fn frame_clocks(&self) -> u64 {

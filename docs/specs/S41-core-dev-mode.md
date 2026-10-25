@@ -18,7 +18,8 @@ Today UE2 cannot do that, for two reasons:
 ## 1. Interface
 
 ```
---absent <list>          reu,sampler,uci,jtag,turbo,apply,streams   (the TRX_FEATURES names; "none" = all present)
+--absent <list>          reu,sampler,uci,jtag,turbo,apply,streams   (the TRX_FEATURES names; "none" = all present),
+                         resid8 (TRX_SID=redip2, S43), core
 --absent-mode <mode>     noack | ack0, or per block: sampler=noack,uci=ack0
 --absent-continue        log every stall and go on instead of halting
 ```
@@ -67,8 +68,9 @@ By default UE2 halts, as the board does. With `--absent-continue`, UE2 logs the 
   - `sid_fhit` belongs to the turbo CPU's fast SID path on the C64 side, not to the app.
   - The level read-out (`lv_addr`/`lv_data`, behind CAPS3 b0) reads 0 on the trial; at most the level meters
     stay flat. Only the register answers matter, not the reDIP sound.
-  - UE2 follows t21-p4, which has neither CAPS3 nor the level read-out. Both already read 0 in UE2, which is
-    exactly the `redip2` answer. When UE2 follows the reSID8 RTL (T25.5), `--absent` gains `resid8`.
+  - UE2 followed t21-p4, which had neither CAPS3 nor the level read-out, so both read 0, the `redip2` answer.
+    Since S43 UE2 follows the reSID8 RTL (T25.5): CAPS3 reads 0x01, and `--absent resid8` gives the `redip2`
+    answer (CAPS3 0, the RS8 bytes kept, the bypass on no engine).
 - The 1541 drive and GCR codec sit outside `ultimate_sys`. The regions and answers stay the same, so this needs
   no change.
 

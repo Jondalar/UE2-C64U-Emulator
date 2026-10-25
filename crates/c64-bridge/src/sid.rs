@@ -342,27 +342,34 @@ impl ArmSid {
 struct Engine {
     resid: Resid,
     model: i32,
+    /// reSID's filter on (S43: off while TRX64-Ultimate's RS8 bypass of its UltiSID stands).
+    filter: bool,
     regs: [u8; 0x19],
 }
 
 impl Engine {
-    /// TRX64's `ResidConfig` is fixed at construction, so a model or rate change builds the engine again; oscillator and
-    /// envelope phase restart. A clock change does not (`Engines::set_clock`).
-    fn build(model: i32, rate: u32, clock_hz: u64, regs: [u8; 0x19]) -> Self {
+    /// TRX64's `ResidConfig` is fixed at construction, so a model, filter or rate change builds the engine again;
+    /// oscillator and envelope phase restart. A clock change does not (`Engines::set_clock`).
+    fn build(model: i32, filter: bool, rate: u32, clock_hz: u64, regs: [u8; 0x19]) -> Self {
         let rate = f64::from(rate);
         let mut resid = Resid::new(ResidConfig {
             model,
             clock_freq: clock_hz as f64,
             sample_rate: rate,
             passband: rate * 90.0 / 200.0,
-            filter: true,
+            filter,
             ..ResidConfig::default()
         });
         for (reg, &val) in regs.iter().enumerate() {
             resid.write(reg as u8, val);
         }
-        Engine { resid, model, regs }
+        Engine { resid, model, filter, regs }
     }
+}
+
+/// S43: the UltiSID (0 or 1) receiver `rx` belongs to; socket 1 none.
+fn ultisid_of(rx: usize) -> Option<usize> {
+    (rx != SOCKET1_RX).then(|| (rx - 1) / 4)
 }
 
 /// How [`Sid::drain`] clocks the engines before each queued write.
@@ -404,6 +411,8 @@ struct Engines {
     mute: bool,
     /// Emulator clocks × sample rate not yet turned into silence during the machine pause ([`Engines::gap`]).
     gap_pace: u64,
+    /// S43: TRX64-Ultimate's RS8 bypass per UltiSID: its engines run with reSID's filter off.
+    bypass: [bool; 2],
 }
 
 impl Engines {
@@ -421,6 +430,7 @@ impl Engines {
             cache: [0; RECEIVERS],
             mute: false,
             gap_pace: 0,
+            bypass: [false; 2],
         }
     }
 
@@ -428,17 +438,30 @@ impl Engines {
         self.audio.is_some() || self.stream.is_some()
     }
 
-    /// Build receiver `rx`'s engine, or rebuild it with its registers when its model changed.
+    /// Build receiver `rx`'s engine, or rebuild it with its registers when its model or its filter changed.
     fn ensure(&mut self, rx: usize, model: i32) {
-        match self.engines[rx].as_ref().map(|e| (e.model, e.regs)) {
-            Some((built, _)) if built == model => {}
-            Some((_, regs)) => self.engines[rx] = Some(Engine::build(model, self.sample_rate, self.clock_hz, regs)),
+        let filter = !ultisid_of(rx).is_some_and(|u| self.bypass[u]);
+        match self.engines[rx].as_ref().map(|e| (e.model, e.filter, e.regs)) {
+            Some((m, f, _)) if (m, f) == (model, filter) => {}
+            Some((_, _, regs)) => {
+                self.engines[rx] = Some(Engine::build(model, filter, self.sample_rate, self.clock_hz, regs))
+            }
             None => {
-                self.engines[rx] = Some(Engine::build(model, self.sample_rate, self.clock_hz, [0; 0x19]));
+                self.engines[rx] = Some(Engine::build(model, filter, self.sample_rate, self.clock_hz, [0; 0x19]));
                 self.order.push(rx);
             }
         }
         self.cache[rx] = 1 << 16;
+    }
+
+    /// S43: RS8 bypass of UltiSID `u`: its engines are built again with the filter off or on, their registers kept.
+    fn set_bypass(&mut self, u: usize, on: bool) {
+        self.bypass[u] = on;
+        for rx in (0..RECEIVERS).filter(|&rx| ultisid_of(rx) == Some(u)) {
+            if let Some(model) = self.engines[rx].as_ref().map(|e| e.model) {
+                self.ensure(rx, model);
+            }
+        }
     }
 
     fn drop_engine(&mut self, rx: usize) {
@@ -573,7 +596,7 @@ impl Engines {
         }
         self.sample_rate = sample_rate;
         for e in self.engines.iter_mut().flatten() {
-            *e = Engine::build(e.model, sample_rate, self.clock_hz, e.regs);
+            *e = Engine::build(e.model, e.filter, sample_rate, self.clock_hz, e.regs);
         }
     }
 
@@ -631,6 +654,8 @@ enum Cmd {
     Mute(bool),
     /// S37: emulator clocks of the machine pause, as muted samples.
     Gap(u64),
+    /// S43: RS8 bypass of an UltiSID.
+    Bypass(usize, bool),
     /// A firmware DMA read: the answer goes back before the emulation thread continues (S20 §3).
     Read { mask: u16, reg: u8, clk: u64, reply: SyncSender<u8> },
 }
@@ -692,6 +717,7 @@ impl Worker {
                             Cmd::ClockFreq(hz) => engines.set_clock(hz),
                             Cmd::Mute(on) => engines.set_mute(on),
                             Cmd::Gap(clocks) => engines.gap(clocks),
+                            Cmd::Bypass(u, on) => engines.set_bypass(u, on),
                             Cmd::Read { mask, reg, clk, reply } => {
                                 engines.clock_to(clk);
                                 let _ = reply.send(engines.read(mask, reg));
@@ -1032,6 +1058,20 @@ impl Sid {
         self.finish();
     }
 
+    /// S43: TRX64-Ultimate's RS8 bypass of UltiSID `ultisid` (0 or 1) at cycle `clk`: what was owed up to there is heard
+    /// with the filter as it was, then its engines run with reSID's filter off (on again with `on` false).
+    pub fn set_bypass(&mut self, ultisid: usize, on: bool, clk: u64) {
+        if ultisid > 1 {
+            return;
+        }
+        self.drain(self.clocking());
+        if self.listening {
+            self.command(Cmd::ClockTo(clk));
+        }
+        self.command(Cmd::Bypass(ultisid, on));
+        self.finish();
+    }
+
     /// S37: `clocks` emulator clocks of the machine pause, with no C64 cycle: the output carries zeros for them.
     pub fn pause_gap(&mut self, clocks: u64) {
         if self.listening && clocks > 0 {
@@ -1188,6 +1228,7 @@ impl Sid {
                 Cmd::ClockFreq(hz) => engines.set_clock(hz),
                 Cmd::Mute(on) => engines.set_mute(on),
                 Cmd::Gap(clocks) => engines.gap(clocks),
+                Cmd::Bypass(u, on) => engines.set_bypass(u, on),
                 Cmd::Read { mask, reg, clk, reply } => {
                     engines.clock_to(clk);
                     let _ = reply.send(engines.read(mask, reg));
@@ -1418,6 +1459,30 @@ mod tests {
         assert_eq!((de00.start, de00.end, de00.ahead_of_expansion), (0xDE00, 0xDE1F, true));
         assert_eq!(sid.groups[usize::from(de00.chip)], U2A);
         assert_eq!(chip_at(&sid, 0xDE20), None);
+    }
+
+    /// S43 S3: RS8 bypass of UltiSID 1 builds its engines again with reSID's filter off, registers kept; UltiSID 2's
+    /// and socket 1's keep theirs; off again turns it back on.
+    #[test]
+    fn bypass_turns_the_filter_of_one_ultisid_off() {
+        let mut sid = Sid::new();
+        sid.set_socket1(true);
+        detection_map(&mut sid);
+        for (off, val) in [(0x0A, 0x40), (0x0B, 0x40), (0x0E, 0xC0), (0x0F, 0xC0)] {
+            sid.core_config(off, val);
+        }
+        poke(&sid, 0xD418, 0x1F, 0);
+        sid.advance(1000);
+        let filters = |sid: &Sid| {
+            [SOCKET1_RX, ULTISID1_A, ultisid_rx(1, 0)].map(|rx| sid.inline().engines[rx].as_ref().map(|e| (e.filter, e.regs[0x18])))
+        };
+        assert_eq!(filters(&sid), [Some((true, 0x1F)); 3]);
+        sid.set_bypass(0, true, 1000);
+        assert_eq!(filters(&sid), [Some((true, 0x1F)), Some((false, 0x1F)), Some((true, 0x1F))]);
+        sid.set_bypass(0, false, 2000);
+        assert_eq!(filters(&sid), [Some((true, 0x1F)); 3]);
+        sid.set_bypass(2, true, 2000);
+        assert_eq!(filters(&sid), [Some((true, 0x1F)); 3], "there is no third UltiSID");
     }
 
     #[test]

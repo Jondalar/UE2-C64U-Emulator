@@ -139,17 +139,17 @@ struct RunArgs {
     /// Which label the board wears: u64ii (default) or c64u, the same hardware with the Bling Board present
     #[arg(long, value_name = "MODEL", value_parser = ["u64ii", "c64u"])]
     board: Option<String>,
-    /// TRX64-Ultimate's IO block at 0x101A0000: its ID, the interrupt (ITU high IRQ 2, so drive B cannot be a 1581)
-    /// and the RGB565 pixel layer over the C64. auto: on for TRX firmware; a bare --trx-io is on
-    /// (docs/specs/S37-trx-pixel-layer.md)
+    /// TRX64-Ultimate's IO block at 0x101A0000 and the rest of its bitstream: the ID, the interrupt, the RGB565 pixel
+    /// layer over the C64, the reSID8 control, 1541-only drives and the expansion port's slot block. auto: on for TRX
+    /// firmware; a bare --trx-io is on (docs/specs/S37-trx-pixel-layer.md, S43-trx-resid8-drive-slot.md)
     #[arg(long, value_enum, value_name = "MODE", num_args = 0..=1, default_missing_value = "on", default_value = "auto")]
     trx_io: TrxIoArg,
     /// TRX64's time-travel rings on the C64 (delta ring, CPU history, a checkpoint per frame); they record while the
     /// C64 runs at 1 MHz (docs/specs/S38-trx64-ring.md)
     #[arg(long, value_enum, value_name = "MODE", num_args = 0..=1, default_missing_value = "on", default_value = "on")]
     ring: RingArg,
-    /// FPGA blocks the bitstream lacks, by their TRX_FEATURES names: reu, sampler, uci, jtag, turbo, apply, streams,
-    /// and core for the whole swappable core; none = all present. Needs --trx-io (docs/specs/S41-core-dev-mode.md)
+    /// FPGA blocks the bitstream lacks: by their TRX_FEATURES names reu, sampler, uci, jtag, turbo, apply, streams;
+    /// resid8 for the two-SID reDIP (TRX_SID=redip2); core for the whole swappable core; none = all present. Needs --trx-io (docs/specs/S41-core-dev-mode.md)
     #[arg(long, value_name = "LIST")]
     absent: Option<String>,
     /// How an absent block's app window answers: noack (the access never completes) or ack0, for all, or per block as

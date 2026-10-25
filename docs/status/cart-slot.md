@@ -171,6 +171,29 @@ The boards answer as their hardware does; the bold rows are cartlib decisions th
 The flash writer sequences (AMD/MX autoselect, sector and chip erase, byte program with DQ7/DQ5 polling, EasyFlash
 ROMH programmed at `$E000` in ULTIMAX via `$DE02=$05`) are in `scripts/cart-flash-rest.py`; results under Acceptance.
 
+## With `--trx-io` (S43)
+
+The TRX bitstream puts its own port logic, `slot_port.v`, between the port and the C64, and the model follows it
+(`slot.rs` `TrxPort`; docs/specs/S43-trx-resid8-drive-slot.md):
+
+- **Masks in effect.** C64_BUS_INTERNAL/EXTERNAL take effect only while the CPU is in reset or the machine is paused
+  (or held by the debugger); SLOT_STATUS b15:12/b11:8 show them.
+- **Armed.** The port takes part in a cycle once one ran with a resource routed: every running cycle, also in reset,
+  and every app DMA cycle in the pause sets it from the masks (b16).
+- **Who answers.** The internal cartridge has no mask: it sees every access and answers where the port does not. The
+  port serves ROM with EXT ROM and not INT ROM (Both = Internal) and not under the app's Ultimax; IO1/IO2 strobes go
+  out with EXT, their data only when not INT and a CRT configured; its IRQ/NMI count with EXT b3. C64_BUS_BRIDGE is
+  Gideon's and does nothing here.
+- **Write lock.** ROML/ROMH reach the port in a write cycle only with SLOT_CTRL ROM_WR_EN (0 at configuration; the
+  app sets it). IO1/IO2 writes always pass.
+- **Reset.** Our own reset is stretched 32.5 µs; an EasyFlash 3 that pulls RESET resets the C64 only while a resource
+  is routed to the port.
+- **Not there:** the fault guard (no modelled cartridge pulls DMA, no transceivers), the SID socket bits, and
+  SLOT_CNT0/1 and SLOT_LAST, which read 0 (only trxdbg reads them, over JTAG on the board).
+
+`scripts/smoke-trx-s43.sh` runs the release app's trex_crt on an EasyFlash: the dump equals the CRT, a written and
+verified image is what the cartridge then holds, and the session's end resets the C64.
+
 ## A real U64 quirk and the model
 
 Reported from hardware: with Cartridge Preference Auto or External and a cartridge in the port, `init_cartridge`

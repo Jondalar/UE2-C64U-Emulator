@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::io::{IO_BASE, IO_GRAIN, IO_SIZE};
 
-/// One optional block, by its `TRX_FEATURES` name, or the whole swappable core (§5).
+/// One optional block, by its `TRX_FEATURES` name, the two-SID reDIP (S43), or the whole swappable core (§5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Block {
     Reu,
@@ -25,6 +25,9 @@ pub enum Block {
     Apply,
     /// dfx-trial's NO_STREAMS (top.v): no UDP stream senders in the host; no bus difference for the app.
     Streams,
+    /// S43: the two-SID reDIP (`TRX_SID=redip2`, no `SID_MULTI`): CAPS3 b0 clear, the RS8 bytes kept but read by no
+    /// engine (trx_sid.v `cfg_r` outside `SID_MULTI` unused).
+    Resid8,
     /// §5: every register window of the swappable core (T79 phase B, the grey box).
     Core,
 }
@@ -48,8 +51,17 @@ const CORE_WINDOWS: &[(u32, u32)] = &[
 ];
 
 impl Block {
-    pub const ALL: [Block; 8] =
-        [Block::Reu, Block::Sampler, Block::Uci, Block::Jtag, Block::Turbo, Block::Apply, Block::Streams, Block::Core];
+    pub const ALL: [Block; 9] = [
+        Block::Reu,
+        Block::Sampler,
+        Block::Uci,
+        Block::Jtag,
+        Block::Turbo,
+        Block::Apply,
+        Block::Streams,
+        Block::Resid8,
+        Block::Core,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -60,6 +72,7 @@ impl Block {
             Block::Turbo => "turbo",
             Block::Apply => "apply",
             Block::Streams => "streams",
+            Block::Resid8 => "resid8",
             Block::Core => "core",
         }
     }
@@ -73,7 +86,7 @@ impl Block {
     /// - uci: `CMD_IF_BASE` 0x10044000-0x10045FFF (ultimate_sys.vhd region `r_uci`, `gen_no_uci`);
     /// - core: [`CORE_WINDOWS`].
     ///
-    /// reu, turbo, jtag, apply and streams have none: the REU's registers are on the C64 side, the turbo engine's and
+    /// reu, turbo, jtag, apply, streams and resid8 have none: the REU's registers are on the C64 side, the turbo engine's and
     /// APPLY's sit in pages that stay (c64_top.v `NO_TURBO`, trx_engine.v `NO_APPLY`), the JTAG master is not on the
     /// app's bus, and without the streams (top.v `NO_STREAMS`) the template writes (`r_udp`) are still acked.
     pub fn windows(self) -> &'static [(u32, u32)] {
@@ -81,7 +94,7 @@ impl Block {
             Block::Sampler => &[(0x1004_8000, 0x1004_8100)],
             Block::Uci => &[(0x1004_4000, 0x1004_6000)],
             Block::Core => CORE_WINDOWS,
-            Block::Reu | Block::Jtag | Block::Turbo | Block::Apply | Block::Streams => &[],
+            Block::Reu | Block::Jtag | Block::Turbo | Block::Apply | Block::Streams | Block::Resid8 => &[],
         }
     }
 
@@ -93,7 +106,7 @@ impl Block {
         Mode::Ack0
     }
 
-    fn bit(self) -> u8 {
+    fn bit(self) -> u16 {
         1 << self as u8
     }
 }
@@ -202,9 +215,9 @@ impl AbsentConfig {
 #[derive(Clone, Debug)]
 pub struct AbsentMap {
     /// [`Block::bit`]s per grain of the IO space.
-    grains: Vec<u8>,
+    grains: Vec<u16>,
     /// Absent now.
-    on: u8,
+    on: u16,
     modes: [Mode; Block::ALL.len()],
     /// `--absent-continue`.
     pub keep_going: bool,
@@ -238,7 +251,7 @@ pub struct NoAck {
 
 impl AbsentMap {
     pub fn new(cfg: &AbsentConfig) -> Self {
-        let mut grains = vec![0u8; (IO_SIZE / IO_GRAIN) as usize];
+        let mut grains = vec![0u16; (IO_SIZE / IO_GRAIN) as usize];
         for block in Block::ALL {
             for &(start, end) in block.windows() {
                 for g in (start - IO_BASE) / IO_GRAIN..(end - IO_BASE) / IO_GRAIN {
