@@ -31,6 +31,10 @@
 //!   lines are ULTIMAX (no RAM there).
 //! - U64_CART_DETECT reads the physical cartridge's own lines, before sharing and the forced ULTIMAX (c64.cc:1514).
 //! - The C64's RESET line reaches the physical cartridge when it is asserted and again at the release.
+//! - S43, `--trx-io`: TRX64-Ultimate's `slot_port.v` stands between the port and the C64 instead ([`TrxPort`],
+//!   docs/specs/S43-trx-resid8-drive-slot.md): the masks take effect only in reset or the pause, the port drives
+//!   strobes only while armed, ROML/ROMH reach it in a write cycle only with ROM_WR_EN, and the internal cartridge has
+//!   no mask: the port's answer replaces it where the port serves.
 //! - TRX64's flash models finish erase steps at absolute C64 cycles (flash040.rs `catch_up_erase`) and TRX64's reset
 //!   restarts its cycle counter (c64_6510core.rs:677), so the flash boards count cycles on an epoch that each reset
 //!   release advances by the cycles before it.
@@ -1295,6 +1299,67 @@ fn wired(a: Option<u8>, b: Option<u8>) -> Option<u8> {
     }
 }
 
+/// S43: TRX64-Ultimate's `slot_port.v` (designs/c64_basic, c64_core.v:598-660), what decides the port's share of the
+/// bus. The fault guard has nothing to catch: no modelled cartridge pulls DMA and there are no transceivers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrxPort {
+    /// The masks in effect (`m_int`, `m_ext`): C64_BUS_INTERNAL/EXTERNAL as they stood the last time the CPU was in
+    /// reset or the machine paused (`if (cpu_reset || halted)`).
+    pub int: u8,
+    pub ext: u8,
+    /// The CPU is in reset or the machine is paused: the masks follow the registers.
+    take: bool,
+    /// `armed`: the port takes part in the C64's cycles; set from `present` at every cycle that runs, app DMA cycles
+    /// in the pause included.
+    pub armed: bool,
+    /// SLOT_CTRL ROM_WR_EN (`roml_go`, `romh_go`).
+    pub wr_en: bool,
+    /// The app's Ultimax (C64_MODE b1): the port does not serve ROM (`rom_port`).
+    ultimax: bool,
+}
+
+impl TrxPort {
+    /// The block at configuration: INT 0xF, EXT 0x0 (ultimate_sys.vhd:453-454, slot_port.v `m_int`/`m_ext`).
+    const POWER_ON: TrxPort = TrxPort { int: BUS_ALL, ext: 0, take: false, armed: false, wr_en: false, ultimax: false };
+
+    /// `rom_sel`: EXT ROM and not INT ROM (Both = Internal).
+    fn rom_sel(&self) -> bool {
+        self.ext & BUS_ROM != 0 && self.int & BUS_ROM == 0
+    }
+
+    /// `rom_port`: GAME/EXROM and ROM reads from the port.
+    fn rom_port(&self) -> bool {
+        self.rom_sel() && !self.ultimax
+    }
+
+    /// `present`: a resource is routed to the port.
+    fn present(&self) -> bool {
+        self.rom_sel() || self.ext & (BUS_IO1 | BUS_IO2) != 0
+    }
+
+    /// The port's strobe for an access at `addr`: IO1/IO2 with their EXT bit, ROM with `rom_port`, and for a write
+    /// cycle in a ROM window only with ROM_WR_EN. Only an armed port drives one.
+    fn strobe(&self, addr: u16, write: bool) -> bool {
+        self.armed
+            && match addr {
+                0xDE00..=0xDEFF => self.ext & BUS_IO1 != 0,
+                0xDF00..=0xDFFF => self.ext & BUS_IO2 != 0,
+                _ => self.rom_port() && (!write || self.wr_en),
+            }
+    }
+
+    /// Whether the port's data answers a read at `addr` (`io1_rd`, `io2_rd`, `rom_port`); `crt`: a CRT is configured
+    /// on the internal cartridge (`cart_int`).
+    pub(crate) fn answers(&self, addr: u16, crt: bool) -> bool {
+        let io = |bit: u8| self.armed && self.ext & bit != 0 && !(self.int & bit != 0 && crt);
+        match addr {
+            0xDE00..=0xDEFF => io(BUS_IO1),
+            0xDF00..=0xDFFF => io(BUS_IO2),
+            _ => self.rom_port(),
+        }
+    }
+}
+
 /// The expansion-port side of the bus: the physical cartridge and the sharing registers.
 pub struct Slot {
     physical: Option<PhysicalCart>,
@@ -1305,11 +1370,21 @@ pub struct Slot {
     shown: (u8, u8),
     /// The physical cartridge pulled the RESET line (EasyFlash 3): the bridge resets the C64 after the run.
     cart_reset: bool,
+    /// S43: with `--trx-io`, TRX64-Ultimate's port logic.
+    trx: Option<TrxPort>,
 }
 
 impl Default for Slot {
     fn default() -> Self {
-        Slot { physical: None, bus_internal: BUS_ALL, bus_external: BUS_ALL, bus_bridge: 0, shown: (1, 1), cart_reset: false }
+        Slot {
+            physical: None,
+            bus_internal: BUS_ALL,
+            bus_external: BUS_ALL,
+            bus_bridge: 0,
+            shown: (1, 1),
+            cart_reset: false,
+            trx: None,
+        }
     }
 }
 
@@ -1345,13 +1420,96 @@ impl Slot {
             CORE_BUS_EXTERNAL => (&mut self.bus_external, val & BUS_ALL),
             _ => return false,
         };
-        std::mem::replace(reg, val) != val
+        let changed = std::mem::replace(reg, val) != val;
+        if self.trx.is_some() {
+            return self.trx_take();
+        }
+        changed
+    }
+
+    /// S43: `--trx-io` on or off. On, the port starts as the block configures it, and with the bus registers' values
+    /// once the CPU is in reset or the machine paused.
+    pub fn set_trx(&mut self, on: bool) {
+        self.trx = on.then_some(TrxPort::POWER_ON);
+    }
+
+    /// S43: the port logic, with `--trx-io`.
+    pub fn trx(&self) -> Option<&TrxPort> {
+        self.trx.as_ref()
+    }
+
+    /// S43: the CPU is in reset or the machine paused (`cpu_reset || halted`), or neither; while it stands the masks
+    /// follow the registers. True when the masks in effect changed.
+    pub fn set_trx_take(&mut self, take: bool) -> bool {
+        match &mut self.trx {
+            Some(t) => {
+                t.take = take;
+                self.trx_take()
+            }
+            None => false,
+        }
+    }
+
+    /// The masks in effect take the registers while `take` stands; true when they changed.
+    fn trx_take(&mut self) -> bool {
+        let (int, ext) = (self.bus_internal, self.bus_external);
+        let Some(t) = self.trx.as_mut().filter(|t| t.take) else { return false };
+        let changed = (t.int, t.ext) != (int, ext);
+        (t.int, t.ext) = (int, ext);
+        changed
+    }
+
+    /// S43: a C64 cycle runs (the CPU's, also in reset, or an app DMA cycle in the pause): `armed` follows `present`.
+    pub fn trx_cycle(&mut self) {
+        if let Some(t) = &mut self.trx {
+            t.armed = t.present();
+        }
+    }
+
+    /// S43: SLOT_CTRL ROM_WR_EN.
+    pub fn set_trx_wr_en(&mut self, on: bool) {
+        if let Some(t) = &mut self.trx {
+            t.wr_en = on;
+        }
+    }
+
+    /// S43: the app's Ultimax (C64_MODE b1).
+    pub fn set_trx_ultimax(&mut self, on: bool) {
+        if let Some(t) = &mut self.trx {
+            t.ultimax = on;
+        }
+    }
+
+    /// S43: SLOT_STATUS (slot_port.v `status`) without b18 and b31, which the block adds; `reset_low`: the port's RESET
+    /// line is low (our own reset with its stretch drives it). DMA, IRQ and NMI read high: no modelled cartridge drives
+    /// them low on the pins. The SID sockets (b24-26) are not on the port in UE2.
+    pub fn trx_status(&self, reset_low: bool) -> u32 {
+        let Some(t) = &self.trx else { return 0 };
+        let l = self.physical.as_ref().map_or(CartLines { exrom: 1, game: 1 }, PhysicalCart::lines);
+        let (nmi, irq) = self.physical.as_ref().map_or((false, false), PhysicalCart::interrupts);
+        u32::from(t.armed) << 16
+            | u32::from(t.int) << 12
+            | u32::from(t.ext) << 8
+            | u32::from(reset_low) << 5
+            | u32::from(!nmi) << 4
+            | u32::from(!irq) << 3
+            | 1 << 2
+            | u32::from(l.exrom & 1) << 1
+            | u32::from(l.game & 1)
     }
 
     /// EXROM/GAME at the PLA: the forced ULTIMAX decode, else the wired AND of the sides that serve the ROM windows.
     pub fn lines(&self, cart: &CartHandle, forced_ultimax: bool) -> CartLines {
         if forced_ultimax {
             return CartLines { exrom: 1, game: 0 };
+        }
+        // S43: the port's pins where it serves ROM, else the internal cartridge's (c64_core.v:598).
+        if let Some(t) = &self.trx {
+            return match &self.physical {
+                Some(p) if t.rom_port() => p.lines(),
+                None if t.rom_port() => CartLines { exrom: 1, game: 1 },
+                _ => cart.with(|c| c.lines()),
+            };
         }
         let mut lines = CartLines { exrom: 1, game: 1 };
         if self.bus_internal & BUS_ROM != 0 {
@@ -1376,6 +1534,15 @@ impl Slot {
     /// NMI and IRQ at the C64: each side's lines where the sharing routes them (bit 3).
     pub fn interrupts(&self, cart: &CartHandle) -> (bool, bool) {
         let (mut nmi, mut irq) = (false, false);
+        // S43: the internal cartridge's always, the port's with EXT b3 (`irq_ext`).
+        if let Some(t) = &self.trx {
+            (nmi, irq) = cart.with(|c| (c.nmi(), c.irq()));
+            if let Some(p) = self.physical.as_ref().filter(|_| t.ext & BUS_IRQ != 0) {
+                let (n, i) = p.interrupts();
+                (nmi, irq) = (nmi || n, irq || i);
+            }
+            return (nmi, irq);
+        }
         if self.bus_internal & BUS_IRQ != 0 {
             (nmi, irq) = cart.with(|c| (c.nmi(), c.irq()));
         }
@@ -1395,6 +1562,17 @@ impl Slot {
     }
 
     pub fn read(&mut self, cart: &CartHandle, addr: u16, info: &BankInfo, clk: u64) -> Option<u8> {
+        // S43: the internal cartridge sees every access; the port's strobe goes out when it drives one, and its data
+        // replaces the internal cartridge's where it answers (`port_rd`).
+        if let Some(t) = self.trx {
+            let internal = cart.with(|c| c.bus_read(addr, clk));
+            let external = match self.physical.as_mut() {
+                Some(p) if t.strobe(addr, false) => p.read(addr, info, clk),
+                _ => None,
+            };
+            let crt = cart.with(|c| c.present());
+            return if t.answers(addr, crt) { external } else { internal };
+        }
         let internal = if serves(self.bus_internal, addr) { cart.with(|c| c.bus_read(addr, clk)) } else { None };
         let external = match self.physical.as_mut() {
             Some(p) if serves(self.bus_external, addr) => p.read(addr, info, clk),
@@ -1404,6 +1582,12 @@ impl Slot {
     }
 
     pub fn peek(&self, cart: &CartHandle, addr: u16, info: &BankInfo) -> Option<u8> {
+        if let Some(t) = self.trx {
+            if t.answers(addr, cart.with(|c| c.present())) {
+                return self.physical.as_ref().filter(|_| t.strobe(addr, false)).and_then(|p| p.peek(addr, info));
+            }
+            return cart.with(|c| c.peek(addr));
+        }
         let internal = if serves(self.bus_internal, addr) { cart.with(|c| c.peek(addr)) } else { None };
         let external = match self.physical.as_ref() {
             Some(p) if serves(self.bus_external, addr) => p.peek(addr, info),
@@ -1416,12 +1600,22 @@ impl Slot {
     /// for a ROM window when a side consumed it or the lines are ULTIMAX.
     pub fn write(&mut self, cart: &CartHandle, addr: u16, val: u8, info: &BankInfo, clk: u64, forced_ultimax: bool) -> bool {
         let io = (0xDE00..0xE000).contains(&addr);
-        let internal = serves(self.bus_internal, addr) && cart.with(|c| c.bus_write(addr, val, clk, forced_ultimax));
-        let mirrored = io && self.bus_bridge & BRIDGE_WRITES != 0;
+        // S43: no mask on the internal cartridge; the port takes the write when it drives the strobe, and C64_BUS_BRIDGE
+        // is Gideon's.
+        let trx = self.trx;
+        let internal = (trx.is_some() || serves(self.bus_internal, addr))
+            && cart.with(|c| c.bus_write(addr, val, clk, forced_ultimax));
+        let mirrored = trx.is_none() && io && self.bus_bridge & BRIDGE_WRITES != 0;
+        let to_port = match trx {
+            Some(t) => t.strobe(addr, true),
+            None => serves(self.bus_external, addr) || mirrored,
+        };
         let external = match self.physical.as_mut() {
-            Some(p) if serves(self.bus_external, addr) || mirrored => {
+            Some(p) if to_port => {
                 let taken = p.write(addr, val, info, clk);
-                self.cart_reset |= p.take_reset_request();
+                // S43: a pulled RESET resets the C64 only while a resource is routed to the port (`reset_req`).
+                let pulled = p.take_reset_request();
+                self.cart_reset |= pulled && trx.is_none_or(|t| t.present());
                 taken
             }
             _ => false,
@@ -1441,10 +1635,15 @@ impl Slot {
 
     /// A write to `$8000-$BFFF` whatever the PLA maps, for each side that takes part in ROM-window accesses (S28).
     pub fn snoop_ram_write(&mut self, cart: &CartHandle, addr: u16, val: u8) {
-        if serves(self.bus_internal, addr) {
+        // S43: an armed port carries address and data of every cycle, whatever the strobes.
+        let (int, ext) = match self.trx {
+            Some(t) => (true, t.armed),
+            None => (serves(self.bus_internal, addr), serves(self.bus_external, addr)),
+        };
+        if int {
             cart.with(|c| c.snoop_ram_write(addr, val));
         }
-        if let Some(p) = self.physical.as_mut().filter(|_| serves(self.bus_external, addr)) {
+        if let Some(p) = self.physical.as_mut().filter(|_| ext) {
             if let Device::Logic(c) = &mut p.device {
                 c.logic.snoop_ram_write(addr, val);
             }
@@ -1529,12 +1728,20 @@ impl Slot {
     }
 
     pub fn fake_ultimax(&self) -> bool {
-        self.physical.as_ref().is_some_and(|p| self.bus_external & BUS_ROM != 0 && p.fake_ultimax())
+        let rom = self.trx.map_or(self.bus_external & BUS_ROM != 0, |t| t.rom_port());
+        self.physical.as_ref().is_some_and(|p| rom && p.fake_ultimax())
     }
 
     /// The ULTIMAX ROMH window the VIC fetches from, resolved the way `read` resolves a byte: the internal cartridge
     /// first, the expansion port's when the internal side does not serve `$E000` (S14; `CartMapper::vic_romh`).
     pub fn vic_romh<'a>(&'a self, cart: &'a CartHandle) -> Option<&'a [u8]> {
+        // S43: the VIC's Ultimax fetch from the port needs it armed (`vu_now`), else the internal cartridge's.
+        if let Some(t) = self.trx {
+            if t.rom_port() {
+                return self.physical.as_ref().filter(|_| t.armed).and_then(|p| p.vic_romh());
+            }
+            return cart.view().vic_romh();
+        }
         if serves(self.bus_internal, 0xE000) {
             if let Some(window) = cart.view().vic_romh() {
                 return Some(window);
@@ -1732,6 +1939,115 @@ pub(crate) mod tests {
         assert_eq!(slot.detect(), 0x00, "CART_DETECT ignores the sharing");
         assert!(!slot.wr(&cart, 0x8123, 0, &bi, 0), "a 16K ROML write lands in RAM");
         cart.with(|c| c.set_ddr(None));
+    }
+
+    fn trx_slot(crt: &[u8]) -> Slot {
+        let mut slot = slot_with(crt, FlashDecode::Both);
+        slot.set_trx(true);
+        slot
+    }
+
+    /// The masks in effect C64_BUS_INTERNAL/EXTERNAL taken in reset or the pause, then a cycle that arms the port.
+    fn trx_route(slot: &mut Slot, int: u8, ext: u8) {
+        slot.set_trx_take(true);
+        slot.core_config(CORE_BUS_INTERNAL, int);
+        slot.core_config(CORE_BUS_EXTERNAL, ext);
+        slot.set_trx_take(false);
+        slot.trx_cycle();
+    }
+
+    /// S43 S6, S7, S8: SLOT_STATUS's bits; the masks take the registers only in reset or the pause, `armed` follows
+    /// `present` at a cycle and stands in the pause until one comes.
+    #[test]
+    fn trx_masks_take_in_reset_or_pause_and_arm_at_a_cycle() {
+        let mut slot = trx_slot(&easyflash(4));
+        assert_eq!(slot.trx_status(false), 0x0000_F01E, "INT 0xF, EXT 0x0; the EasyFlash boots ULTIMAX: GAME low");
+        assert!(!slot.core_config(CORE_BUS_EXTERNAL, 0x07) && !slot.core_config(CORE_BUS_INTERNAL, 0), "running: no take");
+        assert_eq!(slot.trx_status(true), 0x0000_F03E, "b5: the port's RESET low");
+        assert!(slot.set_trx_take(true), "reset: the masks take the registers");
+        assert_eq!(slot.trx_status(false), 0x0000_071E, "not armed before a cycle");
+        slot.trx_cycle();
+        assert_eq!(slot.trx_status(false), 0x0001_071E, "armed");
+        slot.set_trx_take(false);
+        assert!(!slot.core_config(CORE_BUS_EXTERNAL, 0));
+        assert_eq!(slot.trx_status(false) & 0x1_FF00, 0x1_0700, "running: unchanged");
+        assert!(slot.set_trx_take(true), "the pause takes EXT 0");
+        assert_eq!(slot.trx_status(false) & 0x1_FF00, 0x1_0000, "armed until a cycle comes");
+        slot.trx_cycle();
+        assert_eq!(slot.trx_status(false) & 0x1_0000, 0, "nothing routed: not armed");
+        assert_eq!(Slot::default().trx_status(false), 0, "without --trx-io no status");
+    }
+
+    /// S43 S9: ROML/ROMH reach the port in a write cycle only with ROM_WR_EN; IO1 writes always.
+    #[test]
+    fn trx_rom_writes_need_rom_wr_en() {
+        let cart = CartHandle::default();
+        let mut slot = trx_slot(&easyflash(4));
+        trx_route(&mut slot, 0, BUS_ROM | BUS_IO1 | BUS_IO2);
+        let bi = info();
+        let program = |slot: &mut Slot| {
+            for (addr, val) in [(0x8555, 0xAA), (0x82AA, 0x55), (0x8555, 0xA0), (0x8010, 0x00)] {
+                slot.wr(&cart, addr, val, &bi, 100);
+            }
+        };
+        program(&mut slot);
+        assert_eq!(slot.read(&cart, 0x8010, &bi, 1000), Some(0x10), "the flash never saw the sequence");
+        slot.wr(&cart, 0xDE00, 1, &bi, 1000);
+        assert_eq!(slot.read(&cart, 0x8000, &bi, 1000), Some(0x11), "the IO1 bank register took it");
+        slot.wr(&cart, 0xDE00, 0, &bi, 1000);
+        slot.set_trx_wr_en(true);
+        program(&mut slot);
+        assert_eq!(slot.read(&cart, 0x8010, &bi, 1000), Some(0x00), "programmed");
+        assert!(slot.physical().unwrap().dirty());
+    }
+
+    /// S43 S10: the internal cartridge has no mask; where the port serves, its pins and data replace the internal
+    /// cartridge's (Both = Internal for ROM); IO strobes go out with EXT, IO data needs not (INT and a CRT).
+    #[test]
+    fn trx_port_beside_the_internal_cartridge() {
+        let mut ddr = crate::cart::tests::ddr();
+        let cart = CartHandle::default();
+        cart.with(|c| {
+            c.set_ddr(Some(&mut ddr));
+            c.configure(0x41, true, 0);
+        });
+        let mut slot = trx_slot(&easyflash(4));
+        let bi = info();
+        trx_route(&mut slot, 0, BUS_ROM | BUS_IO1 | BUS_IO2);
+        slot.wr(&cart, 0xDE02, 7, &bi, 0);
+        slot.wr(&cart, 0xDE00, 3, &bi, 0);
+        assert_eq!((lines(&slot, &cart), slot.read(&cart, 0x8000, &bi, 0)), ((0, 0), Some(0x13)), "the port's 16K");
+        trx_route(&mut slot, 0, 0);
+        assert_eq!((lines(&slot, &cart), slot.read(&cart, 0x8000, &bi, 0)), ((0, 1), Some(0x40)), "the internal 8K, unmasked");
+        trx_route(&mut slot, BUS_ROM, BUS_ROM | BUS_IO2);
+        assert_eq!(slot.read(&cart, 0x8000, &bi, 0), Some(0x40), "Both: internal");
+        slot.wr(&cart, 0xDF10, 0x5A, &bi, 0);
+        assert_eq!(slot.read(&cart, 0xDF10, &bi, 0), Some(0x5A), "IO2 from the port");
+        assert_eq!(slot.lines(&cart, true).game, 0, "the app's Ultimax");
+        trx_route(&mut slot, BUS_IO2, BUS_IO2);
+        assert_eq!(slot.read(&cart, 0xDF10, &bi, 0), None, "INT IO2 and a CRT: the internal cartridge answers");
+        trx_route(&mut slot, 0, BUS_IO2);
+        assert_eq!(slot.read(&cart, 0xDF10, &bi, 0), Some(0x5A));
+        trx_route(&mut slot, 0, BUS_ROM);
+        slot.set_trx_ultimax(true);
+        assert_eq!(slot.read(&cart, 0x8000, &bi, 0), Some(0x40), "Ultimax: ROM stays internal");
+        cart.with(|c| c.set_ddr(None));
+    }
+
+    /// S43: an EasyFlash 3's `$DE0F` reset counts only while a resource is routed to the port (slot_port.v `reset_req`).
+    #[test]
+    fn trx_cart_reset_needs_a_routed_port() {
+        let cart = CartHandle::default();
+        let crt = crt(90, 1, 0, &[(0, 0x8000, vec![0x11; 0x2000], 2), (0, 0xE000, vec![0xEA; 0x2000], 2)]);
+        let mut slot = trx_slot(&crt);
+        let bi = info();
+        trx_route(&mut slot, 0, BUS_IO1);
+        slot.wr(&cart, 0xDE0F, 0, &bi, 0);
+        assert!(slot.take_cart_reset(), "routed: the C64 resets");
+        trx_route(&mut slot, 0xF, 0);
+        slot.trx = Some(TrxPort { armed: true, ..*slot.trx().unwrap() });
+        slot.wr(&cart, 0xDE0F, 0, &bi, 0);
+        assert!(!slot.take_cart_reset(), "nothing routed");
     }
 
     /// Sector erase and byte program through the bus, timed by the C64 cycle the accesses carry (TRX64 flash040.rs).

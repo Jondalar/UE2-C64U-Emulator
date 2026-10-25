@@ -141,6 +141,9 @@ const UNLOCK_ACK_ADDR: u16 = 0xD038;
 
 /// Clocks between periodic C64 syncs: 1 ms, about 985 C64 cycles (S14 §4).
 const SYNC_PERIOD: u64 = 100_000;
+/// S43: slot_port.v's `rcnt[10]`: the port's RESET stays low 1024 clocks of the core's dot4x clock (31.527936 MHz,
+/// PAL) after our own reset lets go, 32.5 µs (T16 §13.6).
+const PORT_RESET_STRETCH: u64 = 1024 * crate::time::CLOCK_HZ / 31_527_936;
 
 /// Cart register latches other than C64_MODE / C64_STOP / C64_CARTRIDGE_KILL (cart_slot_registers.vhd, reset per
 /// cart_slot_pkg.vhd `c_cart_control_init`). 10 H16: read-modify-write users need read-back.
@@ -350,12 +353,21 @@ pub struct C64Port {
     esp: Option<Arc<EspButtons>>,
     /// S42: that hold as last given to the backend.
     esp_reset: bool,
+    /// S43: with `--trx-io` the port's RESET stays low 32 µs after our own reset lets go (slot_port.v `rcnt`), and the
+    /// C64 with it: whether that stretch stands, until when, and whether our own reset was held at the last change.
+    /// slot_port.v is the core's: an absent core has no stretch.
+    port_reset: bool,
+    port_reset_until: u64,
+    own_reset: bool,
     /// S37: TRX64-Ultimate's `c64_mute` as last given to the backend.
     muted: bool,
     /// S37: a still frame for guest DDR (address, bytes), written when the access hands DDR back.
     still_out: Option<(u32, Vec<u8>)>,
     /// S40: what the engine last asked of the backend's run.
     engine_cfg: EngineCfg,
+    /// S43: ROM_WR_EN and the reSID8 bypasses as last given to the backend (None: not yet).
+    slot_wr_en: Option<bool>,
+    sid_bypass: [Option<bool>; 2],
     /// S39: the 6510's stop (C64_STOP without OWNER) as last given to the backend, and whether the debugger held the
     /// machine at the last look.
     cpu_stopped: bool,
@@ -422,9 +434,14 @@ impl C64Port {
             paused: false,
             esp: None,
             esp_reset: false,
+            port_reset: false,
+            port_reset_until: 0,
+            own_reset: false,
             muted: false,
             still_out: None,
             engine_cfg: EngineCfg::default(),
+            slot_wr_en: None,
+            sid_bypass: [None; 2],
             cpu_stopped: false,
             dbg_held: false,
             core_absent: false,
@@ -433,10 +450,13 @@ impl C64Port {
         }
     }
 
-    /// S37: `--trx-io`. High IRQ 2 is the TRX block's, so drive B's WD177x does not drive it and drive B cannot be a
-    /// 1581; `link` carries the pause, the session and the still between this port and the block.
+    /// S37: `--trx-io`; `link` carries the pause, the session and the still between this port and the block. S43: the
+    /// bitstream's `drive_registers` has no multi-mode (c1541_drive.vhd:308, `g_multi_mode` false), so neither drive
+    /// unit is anything but a 1541.
     pub fn set_trx_io(&mut self, link: Link) {
-        self.drives[1].refuse_1581();
+        for d in &mut self.drives {
+            d.single_mode();
+        }
         let d = trx::lock(&link).dbg.clone();
         self.trx = Some(link);
         if let Some(b) = &mut self.backend {
@@ -460,7 +480,10 @@ impl C64Port {
         backend.advance_to(now);
         self.synced = now;
         self.backend = Some(backend);
+        // S43: a new backend holds none of the block's settings yet; `trx_apply` hands them over.
+        (self.slot_wr_en, self.sid_bypass) = (None, [None; 2]);
         self.refresh_cart_detect();
+        self.trx_update();
     }
 
     /// The attached backend, for a frontend that needs more of it than [`C64Backend`] offers (S23's monitor host
@@ -484,6 +507,8 @@ impl C64Port {
     pub fn set_core_absent(&mut self, now: u64, irq: &mut crate::irq::IrqState, decouple: bool) {
         self.sync(now);
         self.core_absent = true;
+        // S43: the stretch is the core's slot_port.v; without the core nothing holds the port's RESET.
+        self.port_reset = false;
         if decouple {
             (self.mode, self.stop, self.latch) = (MODE_RESET, false, Latches::POWER_UP);
             self.cart.set(CARTRIDGE_TYPE, 0);
@@ -506,15 +531,26 @@ impl C64Port {
         self.esp = Some(buttons);
     }
 
-    /// The C64's reset line: C64_MODE's, or with `--trx-io` also the ESP32's hold (ultimate_sys.vhd:1320).
+    /// The C64's reset line: C64_MODE's, or with `--trx-io` also the ESP32's hold (ultimate_sys.vhd:1320) and the
+    /// port's stretch after them (S43).
     fn reset_held(&self) -> bool {
-        self.mode & MODE_RESET != 0 || self.esp_reset
+        self.mode & MODE_RESET != 0 || self.esp_reset || self.port_reset
     }
 
     /// The backend follows the reset line after a change of one of its sources; `before` is the line before it.
     /// S37: a reset in a freeze session first writes the session's VIC registers for real and ends it. S14 §7: a
     /// release rebuilds the cartridge from DDR, then warm-resets.
     fn reset_changed(&mut self, before: bool, ram: &[u8]) {
+        // S43: our own reset (`cpu_reset_req`) let go: the port's RESET stays low, and the C64 in reset, for the stretch;
+        // asked for again, the count reloads (slot_port.v:270-276).
+        let own = self.mode & MODE_RESET != 0 || self.esp_reset;
+        if self.trx.is_some() && self.own_reset && !own && !self.core_absent {
+            (self.port_reset, self.port_reset_until) = (true, self.synced + PORT_RESET_STRETCH);
+        }
+        if own {
+            self.port_reset = false;
+        }
+        self.own_reset = own;
         let held = self.reset_held();
         if held == before {
             return;
@@ -539,6 +575,16 @@ impl C64Port {
         if want != self.esp_reset && !self.core_absent {
             let before = self.reset_held();
             self.esp_reset = want;
+            self.reset_changed(before, ram);
+            self.trx_update();
+        }
+    }
+
+    /// S43: the port's reset stretch ends at its clock, after the C64 has run up to `now`.
+    fn follow_port_reset(&mut self, now: u64, ram: &[u8]) {
+        if self.port_reset && now >= self.port_reset_until && !self.core_absent {
+            let before = self.reset_held();
+            self.port_reset = false;
             self.reset_changed(before, ram);
             self.trx_update();
         }
@@ -742,6 +788,7 @@ impl C64Port {
         self.trx_update();
         if now <= self.synced {
             self.trx_live();
+            self.trx_slot_publish();
             return;
         }
         self.trx_advance(now);
@@ -763,6 +810,7 @@ impl C64Port {
         l.frame_clocks = b.frame_clocks();
         drop(l);
         self.trx_live();
+        self.trx_slot_publish();
     }
 
     /// Run the C64 up to `to`. A load `SB_LOAD` armed is taken first if the machine is not halted: this run's first
@@ -833,6 +881,10 @@ impl C64Port {
             }
             o if dbg::is_dbg(o) => self.trx_dbg_op(o, op.v),
             o if o == trx::PAGE5 + trx::LK_REQ => self.trx_lens(op.v),
+            // S43: `trx_apply` hands them to the backend.
+            o if o == trx::PAGE7 + trx::SLOT_CTRL || o == trx::RS8_BYPASS || o == trx::RS8_BYPASS + 1 => {
+                self.trx_update()
+            }
             _ => {}
         }
     }
@@ -1023,6 +1075,7 @@ impl C64Port {
         if !mem_only {
             self.trx_follow();
         }
+        self.trx_slot_publish();
     }
 
     /// S37 phase B: the lines as the session sees them; S39: OWNER and the debugger's stop and hold.
@@ -1088,6 +1141,25 @@ impl C64Port {
             b.set_muted(muted);
         }
         l.session.step(lines, b);
+        // S43: the block's settings the backend holds, after an FPGA reset too; then the slot as it stands now.
+        if self.slot_wr_en != Some(l.slot_wr_en) {
+            self.slot_wr_en = Some(l.slot_wr_en);
+            b.set_slot_wr_en(l.slot_wr_en);
+        }
+        for (u, &on) in l.rs8_bypass.iter().enumerate() {
+            if self.sid_bypass[u] != Some(on) {
+                self.sid_bypass[u] = Some(on);
+                b.set_sid_bypass(u, on);
+            }
+        }
+        l.slot_status = b.slot_status();
+    }
+
+    /// S43: SLOT_STATUS as the backend's slot stands now, for the block's page 7.
+    fn trx_slot_publish(&self) {
+        if let (Some(link), Some(b)) = (&self.trx, self.backend.as_deref()) {
+            trx::lock(link).slot_status = b.slot_status();
+        }
     }
 
     /// S37 phase B: a window access in a freeze session, answered by the session (`None` outside one, and for
@@ -1268,6 +1340,8 @@ impl C64Port {
             JOY1_SWOUT | JOY2_SWOUT => self.apply_joysticks(),
             _ => {}
         }
+        // S43: C64_BUS_INTERNAL/EXTERNAL take effect at once while the machine is paused or in reset.
+        self.trx_slot_publish();
     }
 
     /// Which drive a window offset belongs to (0 = A, 1 = B) and the offset in its window.
@@ -1623,13 +1697,16 @@ impl IoDevice for C64Port {
         let op = self.trx.as_ref().and_then(|l| trx::lock(l).ops.first().map(|op| op.at));
         // S42: the ESP32's reset hold starts and ends at its clock.
         let esp = self.esp.as_ref().and_then(|e| e.reset_edge(self.esp_reset, self.synced));
-        Some([op, esp].into_iter().flatten().fold(periodic, u64::min))
+        // S43: the end of the port's reset stretch.
+        let port = self.port_reset.then_some(self.port_reset_until);
+        Some([op, esp, port].into_iter().flatten().fold(periodic, u64::min))
     }
 
     fn tick(&mut self, ctx: &mut IoCtx) {
         self.lend_ddr(ctx);
         self.sync(ctx.now);
         self.follow_esp_reset(ctx.now, ctx.ram);
+        self.follow_port_reset(ctx.now, ctx.ram);
         self.return_ddr(ctx.ram);
         self.update_uci(ctx);
         // W4-DRIVE, S27: carry the drives' writes into DDR.
@@ -2477,6 +2554,62 @@ mod tests {
         assert!(*late.mock.trx_bitstream.borrow());
     }
 
+    /// S43 S3: an RS8 bypass write reaches the backend at the C64's clock, for its UltiSID; an FPGA reset's power-on
+    /// values reach it too.
+    #[test]
+    fn rs8_bypass_reaches_the_backend() {
+        let mut b = Bench::trx();
+        b.w8(TRX_ADDR + 0x04D, 1);
+        assert!(b.mock.take().is_empty(), "the block queued it");
+        b.tick_at(10);
+        let calls = b.mock.take();
+        assert!(calls.contains(&Call::SidBypass(1, true)) && !calls.contains(&Call::SidBypass(0, true)), "{calls:?}");
+        b.w8(TRX_ADDR + 0x04D, 0);
+        b.tick_at(20);
+        assert!(b.mock.take().contains(&Call::SidBypass(1, false)));
+    }
+
+    /// S43 S6: page 7 reads the backend's slot status, published after a sync and at once after a bus-mask write;
+    /// SLOT_CTRL reaches the backend at the C64's clock.
+    #[test]
+    fn the_slot_block_reports_through_page_7() {
+        use crate::devices::trx::{PAGE7, SLOT_CTRL, SLOT_STATUS};
+        let mut b = Bench::trx();
+        *b.mock.slot.borrow_mut() = 0x0001_0704;
+        b.tick_at(10);
+        assert_eq!(b.r32(TRX_ADDR + PAGE7 + SLOT_STATUS), 0x8001_0704);
+        *b.mock.slot.borrow_mut() = 0x0000_F01F;
+        b.w8(CORE_ADDR + 0x2C, 0x00);
+        assert_eq!(b.r32(TRX_ADDR + PAGE7 + SLOT_STATUS), 0x8000_F01F, "after C64_BUS_EXTERNAL, without a sync");
+        b.mock.take();
+        b.w32(TRX_ADDR + PAGE7 + SLOT_CTRL, 0x02);
+        assert_eq!(b.r32(TRX_ADDR + PAGE7 + SLOT_STATUS), 0x8004_F01F, "b18 at once");
+        b.tick_at(20);
+        assert!(b.mock.take().contains(&Call::SlotWrEn(true)));
+    }
+
+    /// S43 S11: with `--trx-io` the C64 leaves reset 32 µs after C64_MODE lets go (the port's RESET stretch), and the
+    /// reset sense sees it; without the block at once.
+    #[test]
+    fn the_port_holds_the_reset_32_us() {
+        let mut b = Bench::trx();
+        b.w8(MODE_ADDR, MODE_RESET);
+        assert!(b.mock.take().contains(&Call::Reset(true)));
+        b.w8(MODE_ADDR, MODE_UNRESET);
+        assert!(!b.mock.take().contains(&Call::Reset(false)), "the stretch holds it");
+        assert_eq!(b.r8(CLOCK_DETECT_ADDR) & CD_RESET_SENSE, CD_RESET_SENSE);
+        assert_eq!(b.r8(MODE_ADDR) & MODE_RESET, 0, "C64_MODE reads its own bit");
+        b.tick_at(PORT_RESET_STRETCH - 1);
+        assert!(!b.mock.take().contains(&Call::Reset(false)));
+        b.tick_at(PORT_RESET_STRETCH);
+        assert!(b.mock.take().contains(&Call::Reset(false)));
+        assert_eq!(b.r8(CLOCK_DETECT_ADDR) & CD_RESET_SENSE, 0);
+        let mut plain = Bench::new();
+        plain.w8(MODE_ADDR, MODE_RESET);
+        plain.w8(MODE_ADDR, MODE_UNRESET);
+        assert!(plain.mock.take().contains(&Call::Reset(false)));
+    }
+
     /// top.v:1059 `c64_mute <= c64_halted | app_s2[1]`: with `--trx-io` C64_STOP mutes, alone or as the pause, and its
     /// release unmutes; without it C64_STOP mutes as well (Alex, 2026-10-04: a stopped C64 is silent).
     #[test]
@@ -2562,6 +2695,9 @@ mod tests {
         b.w8(MODE_ADDR, MODE_RESET);
         assert!(b.mock.take().contains(&Call::Paused(false)));
         b.w8(MODE_ADDR, MODE_UNRESET);
+        // S43: the port's RESET holds the C64 32 µs longer; the pause comes when it lets go.
+        assert!(!b.mock.take().contains(&Call::Paused(true)));
+        b.tick_at(500 + PORT_RESET_STRETCH);
         assert!(b.mock.take().contains(&Call::Paused(true)));
         b.w8(STOP_ADDR, 0);
         assert!(b.mock.take().ends_with(&[Call::Stopped(false), Call::Paused(false)]));
@@ -2570,10 +2706,13 @@ mod tests {
         b.w8(STOP_ADDR, 1);
         b.w32(TRX_ADDR + GATE_CTRL, 0);
         b.mock.take();
-        b.now = 1000;
+        b.now = 10_000;
         b.w32(TRX_ADDR + GATE_CTRL, 1);
-        b.tick_at(1500);
-        assert_eq!(b.mock.take()[..4], [Call::Paused(false), Call::Advance(1000), Call::Paused(true), Call::Advance(1500)]);
+        b.tick_at(10_500);
+        assert_eq!(
+            b.mock.take()[..4],
+            [Call::Paused(false), Call::Advance(10_000), Call::Paused(true), Call::Advance(10_500)]
+        );
     }
 
     #[test]

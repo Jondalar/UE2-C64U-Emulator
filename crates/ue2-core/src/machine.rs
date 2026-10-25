@@ -960,6 +960,7 @@ impl Machine {
         self.bus.absent = Some(Box::new(map));
         if let Some(trx) = self.bus.io.get_mut::<devices::trx::Trx>() {
             trx.set_apply_absent(cfg.has(Block::Apply));
+            trx.set_resid8_absent(cfg.has(Block::Resid8));
         }
         for &block in &cfg.blocks {
             let what = match block {
@@ -979,6 +980,7 @@ impl Machine {
                                    no bus difference"
                     .into(),
                 Block::Apply => "AP_* writes ignored, AP_CMD never busy, CAPS2 b5 clear".into(),
+                Block::Resid8 => "CAPS3 b0 clear; the RS8 bytes read and write, the bypass reaches no reSID".into(),
                 Block::Core => continue,
             };
             eprintln!("absent: {}: {what}", block.name());

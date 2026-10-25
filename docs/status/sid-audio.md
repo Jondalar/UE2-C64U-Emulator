@@ -246,7 +246,10 @@ both UltiSIDs at $D400, so the jingle runs three reSIDs. Without a sink CPU writ
 - Socket 2 and the second SID of a dual chip in a socket (ARM2SID) are not built; their probes find nothing.
 - The drive and tape mixer channels have no source (no drive sound player, no tape model); the speaker mixer is not
   applied (S29 §4).
-- UltiSID filter curves, resonance and digi level have no reSID equivalent and are ignored (855 D7). C64_VOICE_ADSR
+- UltiSID filter curves, resonance and digi level have no reSID equivalent and are ignored (855 D7). With
+  `--trx-io` (S43) the TRX bitstream's reSID8 control (CAPS3 b0, page 0 0x040-0x04D) reads back for the menus; only
+  its bypass acts, reSID's filter off for every engine of that UltiSID. Filter source, 6581 base and offset,
+  resonance and digis Auto are kept and shown, nothing more (owner, 2026-10-25). C64_VOICE_ADSR
   still reads 0, so the LED strip sees no envelopes.
 - Chip 0's OSC3/ENV3 for C64 programs come from TRX64's fastsid, not reSID. Chips 1 and up read reSID only as of its
   last clocking: without an audio sink, the last DMA access.
