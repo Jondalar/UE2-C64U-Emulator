@@ -990,12 +990,15 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(outside.path().join("secret"), b"x").unwrap();
+        // A link out of the directory; Windows needs a privilege to make one, so the link cases are Unix only.
+        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
         let mut f = ring::MonitorFiles::new(dir.path().to_path_buf());
 
         assert_eq!(f.resolve("sub/../a.asm").unwrap(), dir.path().join("a.asm"));
         assert_eq!(f.resolve("/a.asm").unwrap(), dir.path().join("a.asm"));
-        for bad in ["..", "../x", "/../x", "sub/../../x", "link/secret", "link"] {
+        let links: &[&str] = if cfg!(unix) { &["link/secret", "link"] } else { &[] };
+        for &bad in ["..", "../x", "/../x", "sub/../../x"].iter().chain(links) {
             assert!(f.resolve(bad).is_err(), "{bad} is outside");
         }
         use trx64_monitor::Files;
