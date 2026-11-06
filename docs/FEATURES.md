@@ -1,6 +1,6 @@
 # Features
 
-One line per feature, as of 0.6.0 (TRX64 v0.12.5). Details: `docs/status/`, specs: `docs/specs/`. What is missing:
+One line per feature, as of 0.6.0, TRX64 v0.14.5 on `main`. Details: `docs/status/`, specs: `docs/specs/`. What is missing:
 `docs/status/gaps.md`.
 
 ## Firmware and board
@@ -70,7 +70,7 @@ One line per feature, as of 0.6.0 (TRX64 v0.12.5). Details: `docs/status/`, spec
 - Cartridge RAM takes writes while banked out (AR/RR, SS5, Pagefox).
 - SID and MUS player cartridges.
 - Physical expansion port cartridge next to the internal one (`--cart-slot`), with save and flash decode; EasyFlash 3
-  (CRT type 90) with the reset it pulls.
+  (CRT type 90) with the reset it pulls; TwoMegabyter (CRT type 89).
 
 ## Drives
 

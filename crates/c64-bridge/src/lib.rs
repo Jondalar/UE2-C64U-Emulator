@@ -966,6 +966,8 @@ impl Trx64Backend {
             cartridge_exrom: None,
             cartridge_game: None,
             phi1: 0xFF,
+            // Read only by TRX64's Action Replay, which no port model uses (slot.rs `trx64_rom_type`).
+            ram_under: 0,
         }
     }
 
@@ -2618,7 +2620,10 @@ pub(crate) mod tests {
         c64.dma_write(0x1000, 0x11, false);
         c64.dma_write(0x0400, 0x22, false);
         c64.set_ultimax(true);
-        assert_eq!(c64.dma_read(0x1000, false), 0xFF, "open bus");
+        // The open windows float: the VIC's last phi1 fetch (TRX64 full.rs `open_bus`, VICE `vicii_read_phi1`).
+        let float = c64.m.vic.last_read_phi1;
+        assert_eq!(c64.dma_read(0x1000, false), float, "open bus, not the RAM's 0x11");
+        assert_ne!(float, 0x11);
         assert_eq!(c64.dma_read(0x0400, false), 0x22, "RAM below $1000");
         c64.dma_write(0xD020, 0x05, false);
         assert_eq!(c64.dma_read(0xD020, false) & 0x0F, 0x05, "I/O");
