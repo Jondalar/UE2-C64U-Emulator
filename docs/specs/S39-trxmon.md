@@ -1,14 +1,14 @@
 # S39 — trxmon in UE2: the debug block served from TRX64
 
 **Status:** built (2026-10-05), local branch `s37-trx-pixel-layer`: phases A1-E against t21-p4 a85f741 (with the D-page
-fix df6d71c, the OWNER block rule 3302c85) and t21-p4-app, smoke-tested with the app build 165c22fe; as built: §11. Phase F waits for TRX64 (§5 T1, T2). Updated the same day from the FPGA
+fix df6d71c, the OWNER block rule 3302c85) and t21-p4-app, smoke-tested with the app build 165c22fe; as built: §11. Phase F waits for TRX64 (§5 T1, T2; T2's bitmap stop came with v0.14.5). Updated the same day from the FPGA
 session's answers (`run/trx/s39-answers.md`, t21-p4 RTL and app; they override this text where they differ) and S40.
 
 **Why:** the TRX64-Ultimate firmware session must test trxmon (the T21 monitor app) in UE2 as on the board: the
 monitor screen on the overlay (T21 §8), opened from the task menu or Ctrl-O and reopened by `trx->ui_request` when a
 stop fires, and every verb giving real data. UE2 runs the unmodified firmware and the unmodified `trxmon.u2a`. It
 presents the FPGA's register interface that trxmon uses (pages 0, 1, 3, 5) and serves it from TRX64 (`trx64-core`,
-pinned v0.12.5).
+pinned v0.14.5).
 
 **Reads** (code and RTL are the truth; comments are not evidence):
 - RTL, TRX64-Ultimate branch **`t21-p4`** (fa09f06, **not merged into main**): `designs/c64_basic/trx_sys.v`,
@@ -346,7 +346,7 @@ Nothing new is needed in UE2 for the screen itself:
 | # | Gap | Effect in UE2 until it is closed |
 |---|---|---|
 | T1 | **No stop or step at a cycle boundary** on the full machine: `run_for_full_capped_dbg` and `execute_one` run whole instructions; `on_access` halts are honoured at the next boundary. Needed: run to cycle c and stand mid-instruction, resume from there | PAUSE_CB, STEP_CYCLES (`cs`), `CYC_CMP` and load/store stops land at the next IB; `CYCLES` shows the overshoot; "mid-instruction" never appears; raster and every-edge units refused |
-| T2 | **The interrupt sequence and the handler's first instruction are one `execute`** (`c64_6510core_execute`: `do_interrupt`, then the fetch). Needed: return after the sequence (an IB at the handler's first opcode), and a predicate "the next execute takes an interrupt" | a bitmap bit at a handler's first opcode does not stop; `z` across an interrupt runs the handler's first instruction too |
+| T2 | **The interrupt sequence and the handler's first instruction are one `execute`** (`c64_6510core_execute`: `do_interrupt`, then the fetch). Since v0.14.5 (TRX64 #49) the run returns after the sequence when an exec watch is on the vector target (`stop_at_entry`), so a bitmap bit at a handler's first opcode stops (test `a_handlers_first_opcode_is_a_boundary`). TRX64's `step_entry_stop` for steps is not used yet | `z` across an interrupt runs the handler's first instruction too |
 | T3 | **No pre-write-back registers**: TRX64 has the settled registers only | word 1.0 = 1.4; a unit's A/X/Y/P qualifier at an IB sees the settled value where the RTL sees the old one (§7 Q7) |
 | T4 | **`on_access` coverage**: the RTL's read type counts operand fetches and dummy reads, not opcode fetches. To confirm in TRX64 that `on_access` sees every CPU read and write cycle | a load observer may miss a dummy read |
 | T5 | **The drive alone**: no drive hold of its own beside the C64, no drive-only run of n instructions with the C64 standing (`catch_up_to` pairs the clocks), no per-instruction drive hook (`sample_pc_change` samples), no drive write hook | `bk` under `device drive8` stops one drive instruction late at worst; `z` under `drive8` needs the pair to absorb the drive's lead; the write comparator refused |

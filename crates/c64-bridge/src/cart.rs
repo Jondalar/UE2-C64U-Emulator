@@ -1415,6 +1415,7 @@ pub(crate) mod tests {
             cartridge_exrom: None,
             cartridge_game: None,
             phi1: 0xFF,
+            ram_under: 0,
         };
         assert_eq!((lens.get_lines().exrom, lens.get_lines().game, lens.mapper_type()), (1, 0, MapperType::Ultimax));
         assert!(lens.write(0x8000, 1, &info, 0), "forced ULTIMAX: no C64 RAM");

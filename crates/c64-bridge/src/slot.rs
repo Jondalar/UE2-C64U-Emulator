@@ -4,12 +4,12 @@
 //! [`PhysicalCart`] is the cartridge, built from a CRT file and independent of the internal cartridge the firmware
 //! loads into guest DDR. Three models serve it:
 //! - `trx64`: TRX64's own mappers for the ROM families (Normal 8K/16K/ULTIMAX, Ocean, Magic Desk (16), GMod4);
-//! - `trx64-flash`: the flash families (EasyFlash (XL), GMod2, MegaByter, C64MegaCart) as bridge-side boards whose
-//!   register logic follows TRX64's mappers (TRX64 cart.rs `EasyFlashMapper`, `Gmod2Mapper`, `MegabyterMapper`,
-//!   `C64MegaCartMapper`) on TRX64's chip models (flash040.rs, m93c86.rs). They exist so that the flash holds exactly
-//!   the CRT's bytes (TRX64's EasyFlash swaps an `eapi` block for its own, cart.rs `with_geometry`; a physical board
-//!   keeps its own), the command decode can be chosen ([`FlashDecode`]), and bank numbers wrap at the chip size as the
-//!   address lines do;
+//! - `trx64-flash`: the flash families (EasyFlash (XL), GMod2, MegaByter, C64MegaCart, TwoMegabyter) as bridge-side
+//!   boards whose register logic follows TRX64's mappers (TRX64 cart.rs `EasyFlashMapper`, `Gmod2Mapper`,
+//!   `MegabyterMapper`, `C64MegaCartMapper`, `TwoMegabyterMapper`) on TRX64's chip models (flash040.rs, m93c86.rs).
+//!   They exist so that the flash holds exactly the CRT's bytes (TRX64's EasyFlash swaps an `eapi` block for its own,
+//!   cart.rs `with_geometry`; a physical board keeps its own), the command decode can be chosen ([`FlashDecode`]), and
+//!   bank numbers wrap at the chip size as the address lines do;
 //! - `u64-logic`: for CRT types TRX64 has no mapper for, the ported U64 cartridge logic ([`CartLogic`]) serving the CRT
 //!   from the cartridge's own memory, laid out as the firmware's CRT loader lays it out.
 //!
@@ -47,6 +47,7 @@ use trx64_core::c64re_snapshot::{capture_cart_state, restore_cart_state, CartSta
 use trx64_core::cart::{self as tcart, BankInfo, CartLines, CartMapper, CartState, FlashCartState, MapperType};
 use trx64_core::flash040::{
     Flash040, Flash040SnapState, Flash040Type, FLASH040B, FLASH040B_XL, FLASH040_160, FLASH040_NORMAL, FLASH800_CB,
+    FLASH_MX29F016,
 };
 use trx64_core::m93c86::M93c86;
 use ue2_core::c64host::{CartSlotInfo, CART_DETECT_NONE};
@@ -185,16 +186,17 @@ fn parse(crt: &[u8]) -> Result<Crt, String> {
     Ok(Crt { hw_type: be16(crt, 0x16), name, chips })
 }
 
-/// CRT hardware types TRX64's own mappers serve (TRX64 cart.rs `infer_mapper_type`). TRX64's numbering is used as it
-/// is: 87 is GMod4 there, where the firmware has TwoMegabyter; 90 is EasyFlash 3 (TRX64 ef3.rs, its flash in the
-/// chip's own layout).
+/// CRT hardware types TRX64's own mappers serve (TRX64 cart.rs `infer_mapper_type`), the shared ids as TRX64 and the
+/// firmware number them (c64_crt.cc:95-102): 87 is GMod4, 90 EasyFlash 3 (TRX64 ef3.rs, its flash in the chip's own
+/// layout). TRX64's Action Replay (1) is left to the U64 cartridge logic, as the firmware serves it.
 fn trx64_rom_type(hw: u16) -> bool {
     matches!(hw, 0 | 5 | 19 | 85 | 87 | 90)
 }
 
-/// The flash families served by the boards below (TRX64's numbering: 88 is C64MegaCart, 232 EasyFlash XL).
+/// The flash families served by the boards below (shared ids: 88 is C64MegaCart, 89 TwoMegabyter; TRX64's own 232
+/// EasyFlash XL).
 fn flash_type(hw: u16) -> bool {
-    matches!(hw, 32 | 60 | 86 | 88 | 232)
+    matches!(hw, 32 | 60 | 86 | 88 | 89 | 232)
 }
 
 /// C64_CARTRIDGE_TYPE and name for the CRT types the U64 cartridge logic serves and TRX64 does not, as
@@ -239,9 +241,11 @@ fn family(t: MapperType) -> &'static str {
         MapperType::Gmod2 => "GMod2",
         MapperType::MegaByter => "MegaByter",
         MapperType::C64MegaCart => "C64MegaCart",
+        MapperType::TwoMegabyter => "TwoMegabyter",
         MapperType::Gmod4 => "GMod4",
         MapperType::EasyFlash3 => "EasyFlash 3",
-        MapperType::SelfConfig | MapperType::Unsupported => "unsupported",
+        MapperType::ActionReplay => "Action Replay",
+        MapperType::SelfConfig => "unsupported",
     }
 }
 
@@ -413,6 +417,7 @@ impl CartMapper for EasyFlash {
             current_bank: u16::from(self.bank),
             control_register: Some(self.register02),
             flash: flash_state(&self.lo, Some(&self.hi), None, &self.io_ram),
+            freezer: None,
         }
     }
     fn set_state(&mut self, st: CartState) {
@@ -540,6 +545,7 @@ impl CartMapper for Gmod2 {
             current_bank: self.bank,
             control_register: Some(self.mode | (self.cs << 2)),
             flash: flash_state(&self.flash, None, Some(&self.eeprom), &[]),
+            freezer: None,
         }
     }
     fn set_state(&mut self, st: CartState) {
@@ -639,6 +645,7 @@ impl CartMapper for MegaByter {
             current_bank: u16::from(self.register00),
             control_register: Some(self.register02),
             flash: flash_state(&self.flash, None, None, &[]),
+            freezer: None,
         }
     }
     fn set_state(&mut self, st: CartState) {
@@ -739,11 +746,118 @@ impl CartMapper for C64MegaCart {
             current_bank: self.bank,
             control_register: Some(self.mode),
             flash: flash_state(&self.flash, None, None, &[]),
+            freezer: None,
         }
     }
     fn set_state(&mut self, st: CartState) {
         self.bank = st.current_bank & 0x3FFF;
         self.mode = st.control_register.unwrap_or(0).min(2);
+        if let Some(s) = st.flash.as_ref().and_then(|f| f.flash_lo.as_ref()) {
+            self.flash.restore_state(s);
+        }
+    }
+    fn clone_box(&self) -> Box<dyn CartMapper> {
+        Box::new(self.clone())
+    }
+    fn is_writable_dirty(&self) -> bool {
+        self.flash.is_dirty()
+    }
+    fn writable_generation(&self) -> u64 {
+        self.flash.writable_generation()
+    }
+    fn persists_writable_state(&self) -> bool {
+        true
+    }
+    fn writable_image(&mut self, clk: u64) -> Option<Vec<u8>> {
+        Some(self.flash.get_data(clk).to_vec())
+    }
+    fn set_writable_image(&mut self, bytes: &[u8]) {
+        self.flash.load_data(bytes);
+    }
+}
+
+/// Banks of the TwoMegabyter's chip.
+const TWOMEGABYTER_BANKS: usize = 128;
+
+/// Protovision TwoMegabyter (TRX64 cart.rs `TwoMegabyterMapper`): $DE00 (A1 clear) bank bits 6:0, $DE02 (A1 set) mode
+/// bits 1:0, bit 0 the EXROM and bit 1 the GAME level (0 16 K, 1 ULTIMAX, 2 8 K, 3 off); the registers are write-only.
+/// One MX29F016, bank b's ROML at b × 16 K and its ROMH 8 K above, read at $8000, $A000 and $E000, programmed in
+/// ULTIMAX through $8000 and $E000.
+#[derive(Clone)]
+struct TwoMegabyter {
+    bank: u8,
+    mode: u8,
+    flash: Flash040,
+}
+
+impl TwoMegabyter {
+    fn new(crt: &[u8], chips: &[Chip], decode: FlashDecode) -> TwoMegabyter {
+        let (lo, hi) = crt_windows(crt, chips, TWOMEGABYTER_BANKS);
+        let data = lo.chunks_exact(BANK_8K).zip(hi.chunks_exact(BANK_8K)).flat_map(|(l, h)| [l, h].concat()).collect();
+        TwoMegabyter { bank: 0, mode: 0, flash: Flash040::new(data, "twomegabyter", decode.apply(FLASH_MX29F016)) }
+    }
+
+    fn offset(&self, addr: u16) -> u32 {
+        let romh = if addr >= 0xA000 { 0x2000 } else { 0 };
+        (u32::from(self.bank) << 14) | romh | window_offset(addr)
+    }
+
+    /// The image's ROML and ROMH halves as two arrays of 8 K banks.
+    fn split(image: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let (mut lo, mut hi) = (Vec::with_capacity(image.len() / 2), Vec::with_capacity(image.len() / 2));
+        for bank in image.chunks(BANK_16K) {
+            let (l, h) = bank.split_at(bank.len().min(BANK_8K));
+            lo.extend_from_slice(l);
+            hi.extend_from_slice(h);
+        }
+        (lo, hi)
+    }
+}
+
+impl CartMapper for TwoMegabyter {
+    fn mapper_type(&self) -> MapperType {
+        MapperType::TwoMegabyter
+    }
+    fn get_lines(&self) -> CartLines {
+        CartLines { exrom: self.mode & 1, game: self.mode >> 1 & 1 }
+    }
+    fn vic_romh(&self) -> Option<&[u8]> {
+        let at = self.offset(0xE000) as usize;
+        self.flash.data.get(at..at + BANK_8K)
+    }
+    fn read(&mut self, addr: u16, _: &BankInfo, clk: u64) -> Option<u8> {
+        matches!(addr, 0x8000..=0xBFFF | 0xE000..=0xFFFF).then(|| self.flash.read(self.offset(addr), clk))
+    }
+    fn peek(&self, addr: u16, _: &BankInfo) -> Option<u8> {
+        matches!(addr, 0x8000..=0xBFFF | 0xE000..=0xFFFF).then(|| self.flash.peek(self.offset(addr)))
+    }
+    fn write(&mut self, addr: u16, val: u8, _: &BankInfo, clk: u64) -> bool {
+        match addr {
+            0xDE00..=0xDEFF if addr & 2 != 0 => self.mode = val & 3,
+            0xDE00..=0xDEFF => self.bank = val & 0x7F,
+            0x8000..=0x9FFF | 0xE000..=0xFFFF if self.mode == 1 => self.flash.store(self.offset(addr), val, clk),
+            _ => return false,
+        }
+        true
+    }
+    fn reset(&mut self) {
+        (self.bank, self.mode) = (0, 0);
+    }
+    fn active_bank(&self, _: u16) -> u16 {
+        u16::from(self.bank)
+    }
+    /// S38: both registers and the chip's command state.
+    fn get_state(&self) -> CartState {
+        CartState {
+            current_bank: u16::from(self.bank),
+            control_register: Some(self.mode),
+            flash: flash_state(&self.flash, None, None, &[]),
+            freezer: None,
+        }
+    }
+    fn set_state(&mut self, st: CartState) {
+        self.bank = st.current_bank as u8 & 0x7F;
+        self.mode = st.control_register.unwrap_or(0) & 3;
         if let Some(s) = st.flash.as_ref().and_then(|f| f.flash_lo.as_ref()) {
             self.flash.restore_state(s);
         }
@@ -897,12 +1011,16 @@ impl PhysicalCart {
                     32 | 232 => Box::new(EasyFlash::new(crt, chips, top, hw == 232, decode)),
                     60 => Box::new(Gmod2::new(crt, chips, top, decode)),
                     86 => Box::new(MegaByter::new(crt, chips, top, decode)),
+                    89 if top >= TWOMEGABYTER_BANKS => {
+                        return Err(format!("CRT bank {top} is beyond the TwoMegabyter's {TWOMEGABYTER_BANKS} banks"));
+                    }
+                    89 => Box::new(TwoMegabyter::new(crt, chips, decode)),
                     _ => Box::new(C64MegaCart::new(crt, chips, top, decode)),
                 };
                 let kind = mapper.mapper_type();
                 let banks = match kind {
                     MapperType::EasyFlash | MapperType::Gmod2 => 64,
-                    MapperType::MegaByter => 128,
+                    MapperType::MegaByter | MapperType::TwoMegabyter => 128,
                     _ => 256,
                 }
                 .max(top + 1);
@@ -922,7 +1040,7 @@ impl PhysicalCart {
                 let Some((type_variant, name)) = logic_type(hw, rom_bytes) else {
                     return Err(format!(
                         "CRT hardware type {hw} has no physical cartridge model: TRX64 serves 0, 5, 19, 85, 87 and 90, \
-                         the flash boards 32, 60, 86, 88 and 232, the U64 cartridge logic 1-4, 8-11, 13, 15, 18, 20, \
+                         the flash boards 32, 60, 86, 88, 89 and 232, the U64 cartridge logic 1-4, 8-11, 13, 15, 18, 20, \
                          21, 36, 53, 54, 64-66 and 71"
                     ));
                 };
@@ -1203,7 +1321,7 @@ impl PhysicalCart {
 
     /// The cartridge as a CRT at C64 cycle `clk` (a pending flash erase completes first): the inserted header and chip
     /// packets with the data the cartridge holds now, then a packet for every flash bank the inserted CRT lacks that
-    /// is not erased (ROML at $8000, EasyFlash ROMH at $A000, chip type 2) and the GMod2 EEPROM if the CRT had none.
+    /// is not erased (ROML at $8000, EasyFlash and TwoMegabyter ROMH at $A000, chip type 2) and the GMod2 EEPROM if the CRT had none.
     pub fn crt_image(&mut self, clk: u64) -> Vec<u8> {
         let mut out = self.crt.clone();
         let Device::Mapper(m) = &mut self.device else {
@@ -1217,10 +1335,15 @@ impl PhysicalCart {
         let Some(image) = m.writable_image(clk + self.epoch) else {
             return out;
         };
+        let halves;
         let (lo, hi, eeprom) = match kind {
             MapperType::EasyFlash | MapperType::EasyFlashXl => {
                 let (lo, hi) = image.split_at(image.len() / 2);
                 (lo, hi, &[][..])
+            }
+            MapperType::TwoMegabyter => {
+                halves = TwoMegabyter::split(&image);
+                (&halves.0[..], &halves.1[..], &[][..])
             }
             MapperType::Gmod2 => {
                 let (flash, eeprom) = image.split_at(image.len() - EEPROM_SIZE);
@@ -1848,6 +1971,7 @@ pub(crate) mod tests {
             cartridge_exrom: None,
             cartridge_game: None,
             phi1: 0xFF,
+            ram_under: 0,
         }
     }
 
@@ -2171,6 +2295,58 @@ pub(crate) mod tests {
             slot.wr(&cart, 0xDE00, low, &bi, 0);
             assert_eq!(slot.read(&cart, 0x8000, &bi, 0), Some(want), "bank {}", (u16::from(high) << 8) | u16::from(low));
         }
+    }
+
+    /// The TwoMegabyter (hw 89): A1-decoded registers, the mode bits as EXROM and GAME levels, one 16 K bank across
+    /// ROML and ROMH, programming in ULTIMAX through $8000 and $E000 only, and a CRT image with both halves.
+    #[test]
+    fn twomegabyter_banks_modes_flash_and_crt_image() {
+        let cart = CartHandle::default();
+        let bi = info();
+        let mut bank1 = fill(1, 0x10);
+        bank1.extend(fill(1, 0x90));
+        let tmb = crt(89, 0, 0, &[(0, 0x8000, fill(0, 0x10), 2), (0, 0xA000, fill(0, 0x90), 2), (1, 0x8000, bank1, 2)]);
+        let mut slot = slot_with(&tmb, FlashDecode::Both);
+        let p = slot.physical().unwrap();
+        assert_eq!((p.family(), p.model(), p.banks()), ("TwoMegabyter", "trx64-flash", 128));
+        assert_eq!(lines(&slot, &cart), (0, 0), "mode 0 after power-on: 16 K");
+        // fill(bank, base) starts with base + bank.
+        assert_eq!((slot.read(&cart, 0x8000, &bi, 0), slot.read(&cart, 0xA000, &bi, 0)), (Some(0x10), Some(0x90)));
+        slot.wr(&cart, 0xDE05, 0x81, &bi, 0);
+        assert_eq!((slot.read(&cart, 0x8000, &bi, 0), slot.read(&cart, 0xA000, &bi, 0)), (Some(0x11), Some(0x91)),
+            "A1 clear: the bank register, 7 bits; a 16 K packet's second half is ROMH");
+        for (addr, mode, want) in [(0xDE02, 0xFE, (0, 1)), (0xDEFF, 3, (1, 1)), (0xDE06, 1, (1, 0))] {
+            slot.wr(&cart, addr, mode, &bi, 0);
+            assert_eq!(lines(&slot, &cart), want, "mode {} at ${addr:04X}", mode & 3);
+        }
+        assert_eq!(slot.read(&cart, 0xE000, &bi, 0), Some(0x91), "ULTIMAX: ROMH at $E000");
+        slot.wr(&cart, 0xDE00, 5, &bi, 0);
+        for (addr, val) in [(0x8555, 0xAA), (0x82AA, 0x55), (0x8555, 0xA0), (0x8010, 0x42)] {
+            assert!(slot.wr(&cart, addr, val, &bi, 10), "ULTIMAX: the board takes the write");
+        }
+        for (addr, val) in [(0xE555, 0xAA), (0xE2AA, 0x55), (0xE555, 0xA0), (0xE020, 0x24)] {
+            slot.wr(&cart, addr, val, &bi, 10);
+        }
+        slot.wr(&cart, 0xDE02, 0, &bi, 0);
+        assert_eq!((slot.read(&cart, 0x8010, &bi, 20), slot.read(&cart, 0xA020, &bi, 20)), (Some(0x42), Some(0x24)));
+        for (addr, val) in [(0x8555, 0xAA), (0x82AA, 0x55), (0x8555, 0xA0), (0x8011, 0x00)] {
+            slot.wr(&cart, addr, val, &bi, 30);
+        }
+        assert_eq!(slot.read(&cart, 0x8011, &bi, 40), Some(0xFF), "16 K: no programming");
+
+        let image = slot.crt_image(50).unwrap();
+        let chips = parse(&image).unwrap().chips;
+        let at = |bank: u16, load: u16| chips.iter().find(|c| (c.bank, c.load) == (bank, load)).map(|c| (c.kind, &image[c.data..c.data + c.size]));
+        let (kind, roml) = at(5, 0x8000).unwrap();
+        assert_eq!((kind, roml[0x10], roml[0x11]), (CHIP_FLASH, 0x42, 0xFF));
+        assert_eq!(at(5, 0xA000).unwrap().1[0x20], 0x24, "ROMH as its own packet at $A000");
+        assert_eq!(chips.len(), 5);
+        let mut again = slot_with(&image, FlashDecode::Both);
+        again.wr(&cart, 0xDE00, 5, &bi, 0);
+        assert_eq!((again.read(&cart, 0x8010, &bi, 0), again.read(&cart, 0xA020, &bi, 0)), (Some(0x42), Some(0x24)));
+
+        let beyond = crt(89, 0, 0, &[(128, 0x8000, fill(0, 0x10), 2)]);
+        assert!(PhysicalCart::from_crt(&beyond, FlashDecode::Both).is_err(), "bank 128 is beyond the chip");
     }
 
     #[test]

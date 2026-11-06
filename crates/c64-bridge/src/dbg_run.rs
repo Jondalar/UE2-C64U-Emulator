@@ -721,20 +721,17 @@ mod tests {
         assert_eq!((r.rec().reason, r.pc(), r.c64.m.ram[0x0400], r.model().stops), (td::R_BITMAP, 0xC001, 1, 2));
     }
 
-    /// S39 §5 T2: the interrupt sequence and the handler's first instruction are one TRX64 `execute`, so a bitmap bit
-    /// at the KERNAL IRQ handler's first opcode (`$FF48`) never sees an IB; one at its second (`$FF49`) does.
+    /// S39 §5 T2: with an exec watch on the vector target TRX64 ends the run after the interrupt sequence (TRX64
+    /// #49, `stop_at_entry`), so a bitmap bit at the KERNAL IRQ handler's first opcode (`$FF48`) stops before it runs,
+    /// as the IB there does on the board.
     #[test]
-    fn a_handlers_first_opcode_is_no_boundary_in_trx64() {
+    fn a_handlers_first_opcode_is_a_boundary() {
         let Some(mut r) = Rig::new() else { return };
         r.w(td::PAGE3 + td::BMP_IDX, 0xFF48 >> 5);
         r.w(td::PAGE3 + td::BMP_DATA, 1 << (0xFF48 & 31));
         r.w(td::PAGE3 + td::DBG_CTRL, 1);
         r.run(60);
-        assert!(!r.held(), "T2: no stop at $FF48");
-        r.w(td::PAGE3 + td::BMP_IDX, 0xFF48 >> 5);
-        r.w(td::PAGE3 + td::BMP_DATA, 1 << (0xFF49 & 31));
-        r.run(60);
-        assert_eq!((r.held(), r.pc()), (true, 0xFF49));
+        assert_eq!((r.held(), r.pc(), r.rec().reason), (true, 0xFF48, td::R_BITMAP));
     }
 
     /// trxmon's `until`, `n` and `ret` (mach.c:505-531) and a store observer (S39 §9): IB units with a one-shot, the S

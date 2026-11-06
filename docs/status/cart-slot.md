@@ -65,12 +65,13 @@ Test tools:
 | 0 (by EXROM/GAME) | Normal 8K, 16K, ULTIMAX | `trx64` (`NormalMapper`) |
 | 5 | Ocean type 1 (512 K: 8 K mode, else 16 K) | `trx64` |
 | 19, 85 | Magic Desk, Magic Desk 16 | `trx64` |
-| 87 | GMod4 (TRX64's numbering) | `trx64` |
+| 87 | GMod4 (the id TRX64 and the firmware share, c64_crt.cc:95-102) | `trx64` |
 | 90 | EasyFlash 3 (MX29LV640EB, eight slots of 64 banks, the `$DE0F` mode register and the reset it pulls; TRX64 `ef3.rs`) | `trx64` |
 | 32, 232 | EasyFlash (2 × AM29F040B), EasyFlash XL (TRX64 development type) | `trx64-flash` |
 | 60 | GMod2 (AM29F040 + M93C86 EEPROM from the CRT's EEPROM chip) | `trx64-flash` |
 | 88 | C64MegaCart (M29F160FT, 14-bit bank register; the id TRX64, TRX_CRT_cli and C64RE share since TRX64 0.12.4, was 61) | `trx64-flash` |
 | 86 | MegaByter (MX29F800CB, byte mode) | `trx64-flash` |
+| 89 | TwoMegabyter (Protovision; one MX29F016, 128 banks of 16 K across ROML and ROMH, `$DE02` bit 0 EXROM and bit 1 GAME, programmed in ULTIMAX at `$8000` and `$E000`; shared id since TRX64 0.14.5) | `trx64-flash` |
 | 1-4, 8-11, 13, 15, 18, 20, 21, 36, 53, 54, 64-66, 71 | Action Replay, KCS, FC III, Simons, Super Games, Atomic Power, Epyx, Westermann, FC I, C64 Game System, Zaxxon, SS5, COMAL 80, Retro Replay, Pagefox, Business Basic, Blackbox V3/V4/V8/V9 | `u64-logic` (`cart::CartLogic`, all_carts_v5.vhd) with the cartridge's own 4 MB ROM and 64 K RAM, laid out as `C64_CRT::read_crt` does (c64_crt.cc:291-358, `configure_cart` 466-651) |
 
 Any other type (and any C128 CRT) is refused at start with the list above.
@@ -273,10 +274,12 @@ unchanged.
 - **MCP:** `emu_start` with `cart_slot {mode: "save", flash_decode: "15"}`, `emu_cart_info` (`flash_decode: 15`,
   `persist: save=…`), `emu_cart_save` (`PASS`, content equals the source), `emu_stop` graceful; the `save=` file is
   written at exit.
-- **Real tools:** the TREX CRT Tool dump above.
+- **Real tools:** the TREX CRT Tool dump above. The TwoMegabyter has no tool run yet: trex_crt gets its dump and write after TRX64
+  0.14.5, and the U64 firmware's dumper has no TwoMegabyter.
 - **Unit tests:** `c64-bridge` slot tests (types and models, EasyFlash registers and CART_DETECT, bus sharing and
   bridge mirroring, flash erase/program and CRT image, reset keeps flash time, flash decode, EAPI and C64MegaCart
-  banks, new packets and EEPROM round trip, u64-logic memory, DMA while stopped), `ue2emu` spec parsing, CRT write with
+  banks, new packets and EEPROM round trip, TwoMegabyter banks, modes, flash and CRT image, u64-logic memory, DMA
+  while stopped), `ue2emu` spec parsing, CRT write with
   backup, control `cart-info`/`cart-save`, C64 port CART_DETECT.
 
 ## Limits
