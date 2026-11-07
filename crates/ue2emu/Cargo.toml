@@ -28,6 +28,9 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # run --config FILE.toml (config.rs).
 toml = "1"
+# S44 phase B: the .cor manifests and the SHA-256 that finds a core.
+serde_json = "1"
+sha2 = "0.10"
 # Proven pairing from TRX64 trx64-cli (winit owns the main thread on macOS).
 winit = "0.30"
 softbuffer = "0.4"

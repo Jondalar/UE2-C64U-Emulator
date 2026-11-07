@@ -96,6 +96,8 @@ pub enum ControlCmd {
     Button(Option<u64>),
     /// S42: `rocker <gesture>`.
     Rocker(Rocker),
+    /// S44: `restore [ms]`: the RESTORE key held (the C64's NMI, U64_RESTORE_REG), default the key's hold time.
+    Restore(u64),
     Key(MatrixKey, u64),
     /// `key cbm+z [ms]`: the keys pressed in order, held together, released in reverse order.
     Chord(Vec<MatrixKey>, u64),
@@ -249,6 +251,10 @@ pub fn parse_line(line: &str) -> Result<Option<ControlCmd>, String> {
             arity(1, 1)?;
             let gesture = Rocker::by_name(args[0]).ok_or_else(|| format!("unknown rocker gesture '{}' (up, up-long, down, down-long)", args[0]))?;
             ControlCmd::Rocker(gesture)
+        }
+        "restore" => {
+            arity(0, 1)?;
+            ControlCmd::Restore(ms(0, KEY_MS)?)
         }
         "key" => {
             arity(1, 2)?;
@@ -478,6 +484,10 @@ pub fn execute(t: &mut dyn Target, cmd: &ControlCmd, out: &mut dyn Write) -> Res
             let down = matches!(cmd, ControlCmd::Hold(_));
             t.inputs(TimedInputs { events: key_events(keys, down), len_ms: 0 })?;
         }
+        ControlCmd::Restore(ms) => t.inputs(TimedInputs {
+            events: vec![(0, HostInput::Restore(true)), (*ms, HostInput::Restore(false))],
+            len_ms: *ms + RELEASE_MS,
+        })?,
         ControlCmd::Type(keys) => {
             let mut seq = TimedInputs::default();
             for key in keys {
@@ -1157,6 +1167,8 @@ mod tests {
         assert!(parse_line("usb-unplug 9").is_err());
         assert_eq!(ok("usbmouse 0 0 1"), Some(UsbMouse(0, 0, 1)));
         assert_eq!(ok("release ctrl+c"), Some(Release(vec![k("ctrl"), k("c")])));
+        assert_eq!(ok("restore"), Some(Restore(KEY_MS)));
+        assert_eq!(ok("restore 250"), Some(Restore(250)));
         assert!(parse_line("key cbm+nope").is_err());
         assert_eq!(ok("type Hi 1"), Some(Type(vec![k("H"), k("i"), k("space"), k("1")])));
         assert_eq!(ok("type  x"), Some(Type(vec![k("space"), k("x")])), "one separator, rest verbatim");

@@ -1,6 +1,6 @@
 # Features
 
-One line per feature, as of 0.6.0, TRX64 v0.14.5 on `main`. Details: `docs/status/`, specs: `docs/specs/`. What is missing:
+One line per feature, as of 0.6.0 (TRX64 v0.14.5). Details: `docs/status/`, specs: `docs/specs/`. What is missing:
 `docs/status/gaps.md`.
 
 ## Firmware and board
@@ -60,6 +60,11 @@ One line per feature, as of 0.6.0, TRX64 v0.14.5 on `main`. Details: `docs/statu
 - The rest of the TRX bitstream the app sees (`--trx-io`): the reSID8 filter control (CAPS3, the menus, the bypass on
   the reSIDs), drive A as a 1541 only, and the expansion port's slot block, so trex_crt inspects, dumps, writes and
   verifies a `--cart-slot` cartridge on the TRX core (S43).
+- MultiCore cores (`--core`, `--icap`, `--handover`): the MultiCore core application runs as any core of
+  TRX64U-MultiCore. A profile gives the core's ID word, CAPS and register file in the TRX block. The host's ICAP loader
+  answers 0x7A for the multicore board profile, and the hand-over page is written as the host app writes it
+  (S44 phase A). With `--icap`, `--cor-dir` and `--core-dir` the host app starts a .cor through the ICAP loader
+  (a partial, or a large core by IPROG and the boot magic) and coreapp's way back reboots the host (S44 phase B). The control language holds RESTORE with `restore`, the cores' menu hotkey.
 - REU on the firmware's DDR, preload and "Save REU"; GeoRAM.
 
 ## Cartridges

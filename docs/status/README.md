@@ -28,6 +28,10 @@ What works, by milestone. Details are in the linked files.
   flash; the Commodore 1.1.0 application boots and opens its menu. Its network services ship disabled.
 - **Speed** (60 s emulated at `--speed max`, upstream ELF, no flash, Apple M4): 6.0 s wall with `--c64 trx64`,
   0.74 s with `--c64 none`. Realtime headless with TRX64 takes about 19 % of one core.
+- **MultiCore** (`docs/specs/S44-multicore-cores.md`): the MultiCore core application starts as any core from a
+  profile (`--core`): the A1200 is identified with the multicore board profile and a valid hand-over page. The host
+  app starts a DFX .cor (VIC-20) and a large one (A1200) through the ICAP loader, and coreapp's "Return to host menu"
+  boots the host again (phase B, `scripts/smoke-s44-host.sh` with MultiCore's kit).
 - **Debugging** (`docs/status/gdb.md`): GDB on the firmware's RISC-V (`--gdb`) with symbols, software
   breakpoints and the FreeRTOS task list; the C64 side is served by the VICE binary monitor port
   (`docs/status/monitor.md`).

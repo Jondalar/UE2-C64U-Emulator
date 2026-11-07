@@ -11,6 +11,10 @@
 //! docs/specs/S43-trx-resid8-drive-slot.md), page 7 the expansion port's slot block (S43; the slot itself is the
 //! backend's). Page 4 and every offset not listed read 0 and ignore writes.
 //!
+//! With a MultiCore core profile (`--core`, S44, docs/specs/S44-multicore-cores.md) the ID word and CAPS are the
+//! core's, and every offset but ID, CAPS, IRQ_EN, IRQ_CAUSE and page 6 is the core's register file; none of the C64
+//! pages is there then.
+//!
 //! The layer's settings and a pending flip take effect at the frame start, one per VIC frame. The device sees a VIC
 //! frame through the count [`C64Port`] publishes after each sync, polled every millisecond, so the frame start comes
 //! up to 1 ms after the VIC finished the frame. While the machine pause stands the VIC count stands too, and a frame
@@ -23,6 +27,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::c64host::{C64Charset, C64Rom};
+use crate::coreprof::CoreProfile;
 use crate::devices::c64::C64Port;
 use crate::devices::trx_dbg::{self as dbg, DbgLink};
 use crate::devices::trx_engine::{self as engine, Engine};
@@ -412,6 +417,32 @@ fn far(off: u32) -> bool {
     }
 }
 
+/// S44: a MultiCore core's part of the block: every byte the core owns ([`CoreProfile::owns`]) is a register that
+/// reads back what was written, from the profile's reset values; the read-only ones read their value whatever is
+/// written. The C64 parts (the far pages, reSID8, CAPS2, CAPS3, BUILD) are not there.
+struct CoreRegs {
+    id: [u8; 4],
+    caps: u8,
+    bytes: Vec<u8>,
+    reset: Vec<u8>,
+    ro: Vec<bool>,
+}
+
+impl CoreRegs {
+    fn new(p: &CoreProfile) -> Self {
+        let mut reset = vec![0u8; SIZE as usize];
+        let mut ro = vec![false; SIZE as usize];
+        for (&off, &v) in &p.regs {
+            reset[off as usize] = v;
+        }
+        for (&off, &v) in &p.ro {
+            reset[off as usize] = v;
+            ro[off as usize] = true;
+        }
+        CoreRegs { id: p.id, caps: p.caps, bytes: reset.clone(), reset, ro }
+    }
+}
+
 /// TX_CTRL and TX_STATUS, c64_text.v's two registers (`sel`, 0C0-0C7).
 fn tx_sel(reg: u32) -> bool {
     reg & !7 == TX_CTRL
@@ -463,6 +494,8 @@ pub struct Trx {
     resid8_absent: bool,
     /// S41 §5: the core is not loaded: the block neither polls nor drives its interrupt.
     core_absent: bool,
+    /// S44: a MultiCore core in place of the C64 core.
+    core: Option<CoreRegs>,
 }
 
 impl Trx {
@@ -503,7 +536,25 @@ impl Trx {
             apply_absent: false,
             resid8_absent: false,
             core_absent: false,
+            core: None,
         }
+    }
+
+    /// S44: the block answers for `p`'s core instead of the C64 core.
+    pub fn set_core(&mut self, p: &CoreProfile) {
+        self.core = Some(CoreRegs::new(p));
+    }
+
+    /// S44: the C64 core again ("TRX2" and its pages).
+    pub fn clear_core(&mut self) {
+        self.core = None;
+    }
+
+    /// S44: the core register at block offset `off` as the app reads it, None without a core profile or for one of
+    /// the host's offsets.
+    pub fn core_reg(&self, off: u32) -> Option<u8> {
+        let c = self.core.as_ref()?;
+        CoreProfile::owns(off).then(|| c.bytes[off as usize])
     }
 
     /// S41 §2: the bitstream has no APPLY unit.
@@ -904,6 +955,9 @@ impl IoDevice for Trx {
     fn read8(&mut self, off: u32, ctx: &mut IoCtx) -> u8 {
         self.poll(ctx.now, ctx.irq);
         let reg = off & 0xFFF;
+        if self.core.is_some() && CoreProfile::owns(off) {
+            return self.peek8(off);
+        }
         if off & 3 == 0 {
             if far(off) {
                 self.far_latch = self.sys_read(off);
@@ -925,6 +979,12 @@ impl IoDevice for Trx {
     fn write8(&mut self, off: u32, val: u8, ctx: &mut IoCtx) {
         self.poll(ctx.now, ctx.irq);
         let reg = off & 0xFFF;
+        if let Some(c) = self.core.as_mut().filter(|_| CoreProfile::owns(off)) {
+            if !c.ro[off as usize] {
+                c.bytes[off as usize] = val;
+            }
+            return;
+        }
         if far(off) {
             match off & 3 {
                 // trx_sys.v: a write answers 0, which is what the latch then holds.
@@ -983,6 +1043,14 @@ impl IoDevice for Trx {
     fn peek8(&self, off: u32) -> u8 {
         let reg = off & 0xFFF;
         let byte = 8 * (off & 3);
+        if let Some(c) = &self.core {
+            match off {
+                0..=3 => return c.id[off as usize],
+                CAPS_OFF => return c.caps,
+                o if CoreProfile::owns(o) => return c.bytes[o as usize],
+                _ => {}
+            }
+        }
         if far(off) {
             return match off & 3 {
                 0 => self.sys_reg(off) as u8,
@@ -1032,8 +1100,12 @@ impl IoDevice for Trx {
             *l = TrxLink::power_on(frames, clocks, paused, starts, d);
         }
         let (link, apply_absent, resid8_absent) = (self.link.clone(), self.apply_absent, self.resid8_absent);
+        let core = self.core.take().map(|mut c| {
+            c.bytes.copy_from_slice(&c.reset);
+            c
+        });
         *self = Trx::new(link);
-        (self.apply_absent, self.resid8_absent) = (apply_absent, resid8_absent);
+        (self.apply_absent, self.resid8_absent, self.core) = (apply_absent, resid8_absent, core);
     }
 
     crate::impl_as_any!();
@@ -1048,7 +1120,11 @@ pub fn install(map: &mut IoMap, cfg: &MachineConfig) {
     if let Some(port) = map.get_mut::<C64Port>() {
         port.set_trx_io(link.clone());
     }
-    map.add(BASE, SIZE, Box::new(Trx::new(link)));
+    let mut trx = Trx::new(link);
+    if let Some(p) = &cfg.core {
+        trx.set_core(p);
+    }
+    map.add(BASE, SIZE, Box::new(trx));
 }
 
 /// The text layer's pixels as c64_text.v fetches them, from the C64's RAM, char ROM and colour RAM with the session's
@@ -1185,6 +1261,36 @@ mod tests {
         r.w8(0x4000, 0xFF);
         assert!((0x4000..0x4010).chain(0xF000..0xF004).chain(0x2000..0x2004).chain(0x104..0x140).all(|o| r.r8(o) == 0));
         assert!((0x140..0x1000).step_by(0x3C).all(|o| r.r8(o) == 0), "140-FFF");
+    }
+
+    /// S44: an A1200 profile: its ID, CAPS, the read-only feature register, registers that read back across the
+    /// window, a reset back to the profile's values; IRQ_EN and the pixel layer stay the host's; no C64 page answers.
+    #[test]
+    fn a_core_profile_answers_for_its_core() {
+        let mut p = CoreProfile::new("amiga1200", *b"AMIG");
+        p.ro.insert(0x00C, 0x18);
+        p.regs.insert(0x0A0, 0x01);
+        let mut r = Rig::new();
+        r.trx.set_core(&p);
+        assert_eq!([r.r8(0), r.r8(1), r.r8(2), r.r8(3)], *b"AMIG");
+        assert_eq!(r.r8(4), 0xC0, "the pixel layer and RGB565 only");
+        assert_eq!((r.r8(5), r.r8(6)), (0, 0), "no CAPS2, no CAPS3");
+        r.w8(0x00C, 0);
+        assert_eq!(r.r8(0x00C), 0x18, "AM_FEAT is read-only");
+        assert_eq!(r.r8(0x0A0), 0x01, "AM_CTRL's reset value: HOLD");
+        r.w8(0x0A0, 0x00);
+        r.w32(0x1A4, 0x1234_5678);
+        r.w8(0xE021, 0x01);
+        assert_eq!((r.r8(0x0A0), r.r32(0x1A4), r.r8(0xE021)), (0, 0x1234_5678, 1));
+        r.w8(GATE_CTRL, 1);
+        assert!(!lock(&r.link).frz && lock(&r.link).ops.is_empty(), "GATE_CTRL is a core register now, not the gate");
+        r.w8(IRQ_EN, CAUSE_VSYNC);
+        assert_eq!(r.r8(IRQ_EN), CAUSE_VSYNC, "IRQ_EN stays the host's");
+        r.w32(PAGE6 + PX_GALPHA, 0x80);
+        assert_eq!(r.trx.reg(PX_GALPHA), 0x80, "page 6 stays the pixel layer");
+        r.trx.reset();
+        assert_eq!((r.r8(0x0A0), r.r32(0x1A4), r.r8(0x00C)), (1, 0, 0x18));
+        assert_eq!(r.r8(0), b'A', "a reset keeps the core");
     }
 
     /// S43 S1: CAPS3 b0 and the reSID8 filter control at its reset values (trx_io.v: 0, 3, 245, -780, no bypass).

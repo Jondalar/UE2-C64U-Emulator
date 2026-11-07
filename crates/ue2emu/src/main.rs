@@ -5,6 +5,8 @@ mod c64roms;
 mod cartslot;
 mod config;
 mod control;
+mod coreprofile;
+mod multicore;
 mod gdb;
 mod install;
 mod keymap;
@@ -160,6 +162,25 @@ struct RunArgs {
     /// address
     #[arg(long)]
     absent_continue: bool,
+    /// A MultiCore core in place of the C64 core, from a profile: its ID word, CAPS, its register file in the TRX
+    /// block and the hand-over page; a multicore profile brings the ICAP loader. Needs --trx-io
+    /// (docs/specs/S44-multicore-cores.md)
+    #[arg(long, value_name = "FILE.toml")]
+    core: Option<PathBuf>,
+    /// The MultiCore host's ICAP loader at 0x10060600: ID 0x7A, decouple, the bitstream port (S44)
+    #[arg(long)]
+    icap: bool,
+    /// The hand-over page at 0x03EFF000 as the host app writes it, over the profile's: path=,core=,id=,version=,
+    /// host=<8 hex>,video=[pal50|ntsc60|pal60|ntsc50:]480p|720p|1080p|... (S44)
+    #[arg(long, value_name = "SPEC")]
+    handover: Option<String>,
+    /// The .cor bundles the host app's core starts are found among, by the SHA-256 of what reaches the ICAP loader or
+    /// the flash at an IPROG (S44 phase B)
+    #[arg(long, value_name = "DIR")]
+    cor_dir: Option<PathBuf>,
+    /// The profiles of those cores, <core id or manifest name>.toml as for --core; ID "TRX2" is the C64 core (S44 phase B)
+    #[arg(long, value_name = "DIR")]
+    core_dir: Option<PathBuf>,
     /// The directory the monitor's file verbs (asm-file, ringdump, ringload, ls, cd) are confined to [default: the
     /// current directory]
     #[arg(long, value_name = "DIR")]
@@ -266,6 +287,7 @@ fn run(a: RunArgs) -> Result<()> {
     };
     cfg.absent = ue2_core::absent::AbsentConfig::parse(a.absent.as_deref(), a.absent_mode.as_deref(), a.absent_continue)
         .map_err(|e| anyhow::anyhow!(e))?;
+    (cfg.core, cfg.icap, cfg.handover) = coreprofile::configure(a.core.as_deref(), a.icap, a.handover.as_deref())?;
     cfg.halt_on_fault = !a.no_halt;
     cfg.trace = a.trace || a.gdb.is_some();
     cfg.idle_skip = !a.no_idle_skip;
@@ -309,6 +331,8 @@ fn run(a: RunArgs) -> Result<()> {
         cart_slot: a.cart_slot,
         hold_keys: a.hold_key.unwrap_or_default(),
         ring: matches!(a.ring, RingArg::On),
+        cor_dir: a.cor_dir,
+        core_dir: a.core_dir,
         monitor_dir: match a.monitor_dir {
             Some(dir) => {
                 if !dir.is_dir() {

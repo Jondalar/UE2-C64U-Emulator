@@ -71,6 +71,14 @@ pub struct MachineConfig {
     /// S41: the blocks this bitstream lacks, how their windows answer, and whether a stall halts
     /// (docs/specs/S41-core-dev-mode.md). Needs the TRX block.
     pub absent: AbsentConfig,
+    /// S44: a MultiCore core in place of the C64 core: the ID word, CAPS and the core's register file in the TRX block
+    /// (docs/specs/S44-multicore-cores.md). Needs the TRX block.
+    pub core: Option<crate::coreprof::CoreProfile>,
+    /// S44: the MultiCore host's ICAP loader at 0x10060600 (ID 0x7A, decouple, the bitstream port); off, the region
+    /// reads 0 as on Gideon's and the TRX bitstream.
+    pub icap: bool,
+    /// S44: the hand-over page the host app writes before it starts a core, written into DDR after the image loads.
+    pub handover: Option<crate::coreprof::Handover>,
 }
 
 /// S37: whether the board carries the TRX bitstream's IO block (`--trx-io[=auto|on|off]`).
@@ -132,6 +140,9 @@ impl MachineConfig {
             settings: Vec::new(),
             trx_io: TrxIo::Auto,
             absent: AbsentConfig::default(),
+            core: None,
+            icap: false,
+            handover: None,
         }
     }
 }
@@ -293,6 +304,9 @@ pub struct Machine {
     noack_x: [u32; 32],
     /// S41: the end of the console output drained so far, for the last line in a stall report.
     console_tail: Vec<u8>,
+    /// S44 phase B: the ICAP loader's event flag; set, the run slice ends after the access that raised it.
+    icap_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    slice_end: bool,
 }
 
 /// Console bytes [`Machine`] keeps for the last line of a stall report.
@@ -342,7 +356,24 @@ impl Machine {
         if cfg.absent.is_set() && trx_io != TrxIo::On {
             anyhow::bail!("--absent, --absent-mode and --absent-continue need the TRX block (--trx-io, or TRX firmware with auto)");
         }
+        // S44: the core sits in the TRX block.
+        if cfg.core.is_some() && trx_io != TrxIo::On {
+            anyhow::bail!("--core needs the TRX block (--trx-io, or TRX firmware with auto)");
+        }
+        // S44 phase B: a core start through the loader swaps the core in the TRX block.
+        if cfg.icap && trx_io != TrxIo::On {
+            anyhow::bail!("--icap needs the TRX block (--trx-io, or TRX firmware with auto)");
+        }
         devices::install_all(&mut bus.io, &cfg);
+        if let Some(core) = &cfg.core {
+            let id = String::from_utf8_lossy(&core.id);
+            eprintln!("core: {} (ID {id}, CAPS {:02X}, {} register(s) set, {} read-only)", core.name, core.caps, core.regs.len(), core.ro.len());
+        }
+        // S44: the host app writes the page just before its jump (coreboot.cc core_jump); here the image is in place.
+        if let Some(h) = &cfg.handover {
+            h.write(&mut bus.ram);
+            eprintln!("handover: {:#010x}: core \"{}\", id \"{}\", path \"{}\", video {:#010x}", crate::coreprof::HANDOVER_ADDR, h.core_name, h.core_id, h.path, h.video);
+        }
         // The FPGA reads the cartridge ROM where this firmware puts it (docs/status/carts.md, "Cartridge ROM in DDR").
         let cart_rom = crate::fwlayout::cart_rom(&bus.ram, &fw.segments).unwrap_or_else(|| {
             eprintln!("c64: the cartridge ROM address is not in the firmware image; assuming 3.15's 0x03C00000");
@@ -373,7 +404,8 @@ impl Machine {
         bus.log_unmapped = cfg.log.unmapped;
         let hooks = if cfg.halt_on_fault { FaultHooks::resolve(&symbols, &bus.ram) } else { FaultHooks::NONE };
         let next_deadline = bus.next_deadline();
-        Machine {
+        let icap_stop = bus.io.get::<devices::misc::Icap>().map(devices::misc::Icap::stop_flag);
+        let mut machine = Machine {
             cpu: rv32::Cpu::new(entry),
             bus,
             symbols,
@@ -391,7 +423,11 @@ impl Machine {
             streaming_audio: false,
             noack_x: [0; 32],
             console_tail: Vec::new(),
-        }
+            icap_stop: None,
+            slice_end: false,
+        };
+        machine.icap_stop = icap_stop;
+        machine
     }
 
     /// Run at most `max_insns` instructions (an interrupt entry uses one step of the budget). Instructions the idle
@@ -431,6 +467,11 @@ impl Machine {
             self.pre_step();
             let exit = self.cpu.step(&mut self.bus);
             self.post_step();
+            if self.slice_end {
+                // S44 phase B: the ICAP loader has events; the caller acts on them before the next instruction.
+                self.slice_end = false;
+                return RunExit::Budget;
+            }
             if self.bus.noack.is_some() {
                 if let Some(exit) = self.take_noack(pc_before, noack_halts) {
                     return exit;
@@ -516,6 +557,9 @@ impl Machine {
         if self.bus.io_touched {
             self.bus.io_touched = false;
             self.next_deadline = self.bus.next_deadline();
+            if let Some(stop) = &self.icap_stop {
+                self.slice_end = stop.load(std::sync::atomic::Ordering::Relaxed);
+            }
         }
         if !self.bus.accesses.is_empty() {
             self.flush_accesses();
@@ -728,6 +772,9 @@ impl Machine {
                 }
             }
             HostInput::Restore(held) => {
+                if let Some(dev) = io.get_mut::<U64Io>() {
+                    dev.restore = held;
+                }
                 if let Some(dev) = io.get_mut::<C64Port>() {
                     dev.set_restore(held);
                 }
@@ -993,6 +1040,90 @@ impl Machine {
                 eprintln!("{line}");
             }
         }
+    }
+
+    /// S44 phase B: what the ICAP loader saw since the last call (none without `--icap`).
+    pub fn take_icap_events(&mut self) -> Vec<devices::misc::IcapEvent> {
+        self.bus.io.get_mut::<devices::misc::Icap>().map_or_else(Vec::new, devices::misc::Icap::take_events)
+    }
+
+    /// S44: the core the TRX block answers for from now on: a profile, or None for the C64 core ("TRX2", its pages).
+    /// The registers start at the profile's reset values.
+    pub fn set_core(&mut self, core: Option<&crate::coreprof::CoreProfile>) {
+        if let Some(trx) = self.bus.io.get_mut::<devices::trx::Trx>() {
+            trx.clear_core();
+            if let Some(p) = core {
+                trx.set_core(p);
+            }
+        }
+        self.cfg.core = core.cloned();
+    }
+
+    /// S44 phase B: another program runs now (a core's application after a core start, or the host's again): its
+    /// symbols, and the fault hooks resolved from them. The get_mem PANIC loop is found only in the image `Machine::new`
+    /// loaded (its code is not in place yet when the core starts).
+    pub fn set_symbols(&mut self, symbols: Symbols) {
+        self.hooks = if self.cfg.halt_on_fault {
+            let addr = |name| symbols.addr_of(name).unwrap_or(NO_HOOK);
+            FaultHooks {
+                assert: addr("vAssertCalled"),
+                exception: addr("C_exception_handler"),
+                early_trap: addr("__crt0_dummy_trap_handler"),
+                panic_loop: NO_HOOK,
+                panic_ra_slot: 0,
+            }
+        } else {
+            FaultHooks::NONE
+        };
+        self.symbols = symbols;
+        self.resume_pc = None;
+    }
+
+    /// S44 phase B: the SPI flash's array, as the FPGA's configuration logic reads it at an IPROG.
+    pub fn flash_array(&self) -> Option<&[u8]> {
+        self.bus.io.get::<devices::flash::SpiFlash>().map(devices::flash::SpiFlash::array)
+    }
+
+    /// S44 phase B, an IPROG: the FPGA is configured anew. Every device goes to its power-on state (the flash array, the
+    /// SD card and the USB devices keep their contents, DDR is not touched), the CPU starts at `entry` with its
+    /// registers 0, and the idle skip and the stops start over.
+    pub fn reconfigure(&mut self, entry: u32) {
+        for dev in self.bus.io.devices.iter_mut() {
+            dev.reset();
+        }
+        self.bus.irq = crate::irq::IrqState::new();
+        let insns = self.cpu.insns;
+        self.cpu = rv32::Cpu::new(entry);
+        self.cpu.insns = insns;
+        self.resume_pc = None;
+        self.idle = IdleSlot { head: u32::MAX, ..IdleSlot::default() };
+        self.bus.idle_dirty = true;
+        self.next_deadline = self.bus.next_deadline();
+    }
+
+    /// S44 phase B, an IPROG back to the host: the boot ROM loads the host application again (`--firmware`), over DDR
+    /// that keeps the rest of its contents. Returns the entry.
+    pub fn reload_firmware(&mut self) -> anyhow::Result<u32> {
+        let fw = loader::load_firmware(&self.cfg.elf, &mut self.bus.ram)?;
+        self.segments = fw.segments;
+        Ok(fw.entry)
+    }
+
+    /// S44 phase B: DDR as a core with the `gideon_bl4` address map sees it (`into`), or back as the host sees it.
+    /// The two maps differ only in CPU address bits 6:3 (host-app cfw.cc `cfw_map_off`: ours[3] = theirs[6], ours[6:4] =
+    /// theirs[5:3]), so each 128-byte line is permuted in its 8-byte units.
+    pub fn remap_ddr(&mut self, into: bool) {
+        let ours = |theirs: usize| (theirs >> 6 & 1) << 3 | (theirs >> 3 & 7) << 4;
+        let mut line = [0u8; 128];
+        for chunk in self.bus.ram.chunks_exact_mut(128) {
+            line.copy_from_slice(chunk);
+            for unit in 0..16 {
+                let theirs = unit * 8;
+                let (from, to) = if into { (ours(theirs), theirs) } else { (theirs, ours(theirs)) };
+                chunk[to..to + 8].copy_from_slice(&line[from..from + 8]);
+            }
+        }
+        self.bus.idle_dirty = true;
     }
 
     /// Whether this machine has the TRX block (`--trx-io` on, or resolved on from the firmware).
@@ -1835,6 +1966,42 @@ mod tests {
         (m, old)
     }
 
+    /// S44 phase B: a store to the ICAP loader that raises an event ends the slice right after it; `reconfigure`
+    /// resets the devices and starts the CPU at the entry; the gideon_bl4 remap is a permutation of each 128-byte line
+    /// that keeps the boot magic's two words in place.
+    #[test]
+    fn icap_events_end_the_slice_and_an_iprog_reconfigures() {
+        let mut config = cfg();
+        config.icap = true;
+        let mut bus = SystemBus::new();
+        devices::install_all(&mut bus.io, &config);
+        // lui t1, 0x10060; li t2, 1; sb t2, 0x620(t1); j .
+        for (i, w) in [0x1006_0337u32, 0x0010_0393, 0x6273_0023, JUMP_TO_SELF].into_iter().enumerate() {
+            bus.ram[0x30000 + 4 * i..][..4].copy_from_slice(&w.to_le_bytes());
+        }
+        let mut m = Machine::from_parts(config, bus, 0x30000, Symbols::empty());
+        m.cfg.idle_skip = false;
+        assert_eq!(m.run(1000), RunExit::Budget);
+        assert_eq!(m.cpu.insns, 3, "the slice ended after the store");
+        assert_eq!(m.take_icap_events(), vec![devices::misc::IcapEvent::Decouple(true)]);
+        m.run(10);
+        assert_eq!(m.cpu.insns, 13, "no event, the whole budget");
+        m.reconfigure(0x40000);
+        assert_eq!((m.cpu.pc, m.cpu.x[6]), (0x40000, 0));
+        assert_eq!(m.bus.io.get::<devices::misc::Icap>().map(|i| i.decoupled()), Some(false), "the loader is reset");
+
+        let before: Vec<u8> = (0..256u32).map(|i| (i * 7) as u8).collect();
+        m.bus.ram[0xFF00..0x10000].copy_from_slice(&before);
+        m.remap_ddr(true);
+        let after = m.bus.ram[0xFF00..0x10000].to_vec();
+        assert_ne!(after, before);
+        assert_eq!(after[0xF8..0x100], before[0xF8..0x100], "0xFFF8-0xFFFF map to themselves (cfw.h)");
+        // cfw_map_off: the core's bits 5:3 are the host's 6:4 and its bit 6 the host's bit 3.
+        assert_eq!((after[0x08], after[0x40]), (before[0x10], before[0x08]));
+        m.remap_ddr(false);
+        assert_eq!(m.bus.ram[0xFF00..0x10000], before[..]);
+    }
+
     /// S42: a machine of parts with the C64 port and the mock C64, with or without the TRX block.
     fn rocker_machine(trx: bool) -> (Machine, crate::c64host::mock::Mock) {
         let mut config = cfg();
@@ -1945,6 +2112,25 @@ mod tests {
     /// reset held and raises the reset sense, while the read-back bytes keep their values; then pages 0 and 3 take
     /// writes, the core's windows ack 0, the DMA window's SID range too. `core present` attaches a fresh backend that is
     /// handed the latches as they stand, with no reset event; pages 1, 2, 4 and 5 are never touched.
+    /// S44 phase B: a core without a C64 leaves no VIC frame count behind, so the TRX block times its frame starts
+    /// itself and the pixel layer flips.
+    #[test]
+    fn a_core_without_the_c64_clears_the_vic_frame_count() {
+        let (mut m, _old) = swap_machine("sampler", None);
+        let link = m.bus.io.get::<C64Port>().and_then(C64Port::trx_link).unwrap();
+        devices::trx::lock(&link).frames = 1234;
+        m.core_absent().unwrap();
+        m.core_present(None).unwrap();
+        assert_eq!(devices::trx::lock(&link).frames, 0);
+        let starts = m.bus.io.get::<devices::trx::Trx>().unwrap().frame_starts();
+        let end = m.bus.now + 50 * crate::time::CLOCKS_PER_MS;
+        while m.bus.now < end {
+            m.bus.now = m.bus.now.max(m.bus.next_deadline()).min(end);
+            m.bus.tick_due();
+        }
+        assert!(m.bus.io.get::<devices::trx::Trx>().unwrap().frame_starts() >= starts + 2, "PAL frame starts of its own");
+    }
+
     #[test]
     fn core_absent_and_present_swap_the_c64() {
         use crate::c64host::mock::Call;
