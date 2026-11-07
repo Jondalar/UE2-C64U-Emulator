@@ -1,0 +1,18 @@
+# S44: the A1200 core of TRX64U-MultiCore as the core application sees it (docs/specs/S44-multicore-cores.md).
+#   ue2emu run --trx-io --c64 none --core docs/examples/core-amiga1200.toml --firmware coreapp.elf ...
+# Registers from TRX64U-MultiCore coreapp/cores/amiga_regs.h; the MultiCore repo keeps the profiles of its cores.
+name = "amiga1200"
+id = "AMIG"                  # amiga.cc: the gateware's one ID word, shared with the A500
+board = "multicore"          # the ICAP loader answers 0x7A: the multicore profile, "Return to host menu"
+
+[ro]
+0x00C = 0x19                 # AM_FEAT: b0 HDF_SECT, b3 FBWIN (the A1200, not the A500), b4 RAWKEY
+
+[regs]
+0x0A0 = 0x01                 # AM_CTRL: b0 HOLD, the machine in reset after power-up
+
+[handover]
+core = "Amiga 1200 (AGA, 68020)"   # the manifest's name
+id = "amiga1200"                   # core.toml id: start.cc decides by it before the name
+path = "/Usb0/cores/amiga1200.cor"  # the core folder is next to it (roms/): give --usb-dir, or /SD/... with --sd
+video = "1080p"

@@ -418,6 +418,12 @@ impl SpiFlash {
     }
 
     /// The image file behind this chip, or `None` for a volatile one (S23, the monitor's `flash`).
+    /// The array as the chip holds it (16 MiB), for a reader outside the SPI port: the FPGA's configuration logic at an
+    /// IPROG (S44 phase B).
+    pub fn array(&self) -> &[u8] {
+        &self.chip.mem
+    }
+
     pub fn image(&self) -> Option<&Path> {
         self.image.as_ref().map(|i| i.path.as_path())
     }

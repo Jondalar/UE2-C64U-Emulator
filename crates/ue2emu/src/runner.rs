@@ -91,6 +91,9 @@ pub struct RunOptions {
     pub ring: bool,
     /// S38 `--monitor-dir`: the directory the monitor's file verbs are confined to.
     pub monitor_dir: PathBuf,
+    /// S44 phase B `--cor-dir`, `--core-dir`: the bundles an ICAP start is found among, and their profiles.
+    pub cor_dir: Option<PathBuf>,
+    pub core_dir: Option<PathBuf>,
 }
 
 pub enum Command {
@@ -184,6 +187,7 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
     let sid_thread = !opts.audio.no_sid_thread;
     let (usb_dirs, usb_dir_work, cart_slot) = (opts.usb_dirs.clone(), opts.usb_dir_work.clone(), opts.cart_slot.clone());
     let hold = control::key_events(&opts.hold_keys, true);
+    let (cor_dir, core_dir) = (opts.cor_dir.clone(), opts.core_dir.clone());
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
 
     let join = thread::Builder::new()
@@ -195,8 +199,21 @@ pub fn spawn(cfg: MachineConfig, opts: &RunOptions) -> Result<EmuHandle> {
                     for (_, ev) in hold {
                         machine.input(ev);
                     }
+                    // S44 phase B: with the ICAP loader the host app may start cores.
+                    let multicore = if machine.cfg.icap {
+                        match crate::multicore::MultiCore::new(cor_dir.as_deref(), core_dir.as_deref(), machine.cfg.core.clone()) {
+                            Ok(mc) => Some(mc),
+                            Err(e) => {
+                                let msg = format!("{e:#}");
+                                let _ = ready_tx.send(Err(e));
+                                return Err(anyhow!(msg));
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let _ = ready_tx.send(Ok(()));
-                    emu.run(machine, net, dirs, cart, core, &command_rx, gdb.map(GdbServer::new), vice)
+                    emu.run(machine, net, dirs, cart, core, multicore, &command_rx, gdb.map(GdbServer::new), vice)
                 }
                 Err(e) => {
                     let msg = format!("{e:#}");
@@ -463,6 +480,7 @@ impl EmuThread {
         mut usb_dirs: UsbDirs,
         mut cart: CartSlot,
         core: Option<CoreFactory>,
+        mut multicore: Option<crate::multicore::MultiCore>,
         commands: &Receiver<Command>,
         mut gdb: Option<GdbServer>,
         #[allow(unused_mut, unused_variables)] mut vice: Option<ViceServer>,
@@ -513,6 +531,23 @@ impl EmuThread {
                     exit
                 }
             };
+            if let Some(mc) = multicore.as_mut() {
+                // S44 phase B: the host app's core starts and IPROGs, before the next instruction.
+                let polled = mc.poll(&mut machine, |m, c64| {
+                    let result = core_present(m, if c64 { core.as_ref() } else { None });
+                    if result.is_ok() {
+                        monitor.core_swapped();
+                    }
+                    result
+                });
+                if let Err(e) = polled {
+                    eprintln!("halted: {e:#}");
+                    eprint!("{}", machine.trace_report());
+                    usb_dirs.finish(&mut machine, false);
+                    report(&machine);
+                    bail!("halted: {e:#}");
+                }
+            }
             if let Some(net) = &mut net {
                 net::pump(&mut machine, net);
             }

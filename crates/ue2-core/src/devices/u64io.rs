@@ -8,7 +8,7 @@
 //! |---|---|---|---|
 //! | 0x00 | U64_HDMI_REG | 0x04 = HPD_CURRENT (05 #3; 00 §2 C20, C35; §3 C10) | 0x20/0x10/0x08 DDC/HPD reset, no effect (no hot-plug IRQ modelled) |
 //! | 0x01 | U64_POWER_REG | 0 | ignored (U64 mk1 only) |
-//! | 0x02 | U64_RESTORE_REG | 0x00, no safe mode (05 #7; 00 §2 C8) | — |
+//! | 0x02 | U64_RESTORE_REG | 1 while RESTORE is held, else 0 (the firmware's safe mode at boot, 05 #7; 00 §2 C8; the MultiCore host's hotkeys, S44: TRX64U-MultiCore ultimate_sys.vhd:143) | — |
 //! | 0x03 | U64_CART_DETECT | GAME (bit 0) / EXROM (bit 1) of the physical expansion port: [`U64Io::cart_detect`], 0x03 = no external cart (c64.cc:1514) | — |
 //! | 0x04 | U64_HDMI_PLL_RESET | 0 | latched |
 //! | 0x05 | U64_USERPORT_EN | latch (u64_config.cc:1071-1074) | latched |
@@ -44,7 +44,6 @@ const ETHSTREAM_ENA: u32 = 0x0F;
 
 /// HPD_CURRENT set, HPD_WASLOW clear (u64.h:96-97): the overlay UI needs bit 2 (ultimate.cc:183-187).
 const HDMI_REG_VALUE: u8 = 0x04;
-const RESTORE_VALUE: u8 = 0x00;
 const BLACKBOARD_VALUE: u8 = 0x01;
 
 pub struct U64Io {
@@ -58,6 +57,8 @@ pub struct U64Io {
     /// U64_CART_DETECT: GAME (bit 0) and EXROM (bit 1) of the physical expansion port. `Machine::attach_c64` shares
     /// it with the C64 port, which stores the backend's `cart_detect` after every access; 0x03 without a cartridge.
     pub cart_detect: Arc<AtomicU8>,
+    /// The RESTORE key is held (`HostInput::Restore`).
+    pub restore: bool,
 }
 
 impl Default for U64Io {
@@ -76,6 +77,7 @@ impl U64Io {
             latch,
             matrix: [0; 8],
             cart_detect: Arc::new(AtomicU8::new(CART_DETECT_NONE)),
+            restore: false,
         }
     }
 
@@ -143,7 +145,7 @@ impl IoDevice for U64Io {
     fn peek8(&self, off: u32) -> u8 {
         match off {
             HDMI_REG => HDMI_REG_VALUE,
-            RESTORE_REG => RESTORE_VALUE,
+            RESTORE_REG => u8::from(self.restore),
             CART_DETECT => self.cart_detect.load(Ordering::Relaxed),
             KEYB_JOY => self.joy_value(),
             BLACKBOARD => BLACKBOARD_VALUE,

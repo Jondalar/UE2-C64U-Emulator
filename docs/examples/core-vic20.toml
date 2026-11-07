@@ -1,0 +1,10 @@
+# S44: the VIC-20 core of TRX64U-MultiCore as the core application sees it (docs/specs/S44-multicore-cores.md).
+# Registers from TRX64U-MultiCore coreapp/cores/vc20_regs.h; for --core-dir the file is named after the manifest's name, VIC-20.toml.
+name = "vc20"
+id = "VC20"
+symbols = "coreapp.elf"      # phase B: the program the core runs, beside this file
+
+[regs]
+0x0C6 = 0xD0                 # VC20_FB_BASE 0x01D00000 (its reset value)
+0x0C7 = 0x01
+0x0CA = 0x10                 # VC20_FB_STRIDE 0x00100000

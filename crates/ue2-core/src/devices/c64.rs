@@ -618,6 +618,12 @@ impl C64Port {
         (self.esp, self.esp_reset) = (esp, esp_reset);
         (self.cart, self.core, self.mode, self.stop, self.core_written, self.latch) = (cart, core, mode, stop, written, latch);
         if let Some(link) = link {
+            if backend.is_none() {
+                // No C64 in the new core (S44: another machine): no VIC counts frames, so the TRX block times its
+                // frame starts on its own again, as without a C64.
+                let mut l = trx::lock(&link);
+                (l.frames, l.frame_clocks) = (0, 0);
+            }
             self.set_trx_io(link);
         }
         if let Some(backend) = backend {

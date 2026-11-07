@@ -3,6 +3,7 @@
 pub mod absent;
 pub mod bus;
 pub mod c64host;
+pub mod coreprof;
 pub mod devices;
 pub mod fwlayout;
 pub mod host;
