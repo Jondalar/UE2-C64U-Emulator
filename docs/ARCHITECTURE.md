@@ -287,6 +287,14 @@ flowchart LR
 | [S34](specs/S34-udp-ntsc.md) | UDP streams under NTSC | — |
 | [S35](specs/S35-release-gate.md) | Release gate: every smoke in one run | — |
 | [S36](specs/S36-joystick.md) | Physical joysticks on both control ports | — |
+| [S37](specs/S37-trx-pixel-layer.md) | TRX64-Ultimate's IO block: the pixel layer, still capture and C64 text layer | — |
+| [S38](specs/S38-trx64-ring.md) | TRX64's rings on the C64 (time travel) | — |
+| [S39](specs/S39-trxmon.md) | trxmon: the debug block and state bus served from TRX64 | — |
+| [S40](specs/S40-trx-engine.md) | The board's engine: frame ring and Timewarp for the firmware | — |
+| [S41](specs/S41-core-dev-mode.md) | Core dev mode: FPGA blocks absent, the core swapped while the firmware runs | — |
+| [S42](specs/S42-esp32-rocker-events.md) | The ESP32's rocker events over the WiFi UART | — |
+| [S43](specs/S43-trx-resid8-drive-slot.md) | The TRX bitstream's reSID8 control, 1541-only drives, the slot block | — |
+| [S44](specs/S44-multicore-cores.md) | MultiCore: the core application as any core, the host app's core starts | — |
 
 ## 5. Building Block View
 
@@ -319,11 +327,11 @@ flowchart TD
 | Crate | Content |
 |---|---|
 | `crates/rv32` | CPU interpreter, `Bus` trait. No dependencies. Verified with the official riscv-tests. |
-| `crates/ue2-core` | `SystemBus` (RAM + IO decode), `IoMap`/`IoDevice`, `IrqState` (ITU interrupt core), loader (ELF, `.app`, `.ue2`, updater records), symbolizer, settings (`.cfg` against the image's config definitions, S21), the firmware's cartridge ROM layout (`fwlayout`, [carts.md](status/carts.md)), `Machine` run loop, device models (`devices/*`, USB in `devices/usb/`), the C64 backend trait (`c64host`), overlay and C64 renderer (`render`), host types (`host`). No emulator dependency. |
+| `crates/ue2-core` | `SystemBus` (RAM + IO decode), `IoMap`/`IoDevice`, `IrqState` (ITU interrupt core), loader (ELF, `.app`, `.ue2`, updater records), symbolizer, settings (`.cfg` against the image's config definitions, S21), the firmware's cartridge ROM layout (`fwlayout`, [carts.md](status/carts.md)), `Machine` run loop, device models (`devices/*`, USB in `devices/usb/`), the C64 backend trait (`c64host`), overlay and C64 renderer (`render`), host types (`host`), MultiCore core profiles and the hand-over page (`coreprof`, S44). No emulator dependency. |
 | `crates/ue2-net` | Host network backends behind `host::NetBackend`: libslirp user-mode networking (hand-written FFI, links the system libslirp: `SLIRP_LIB_DIR`, else /opt/homebrew/lib when it exists, else the linker's default paths; build.rs), vmnet.framework bridged mode (`vmnet`, block2 FFI), a client of lima's socket_vmnet daemon (`socket_vmnet`), the web UI proxy (`web_proxy`). |
 | `crates/ue2-vfat` | `--usb-dir`: FAT32 volume built from a host directory (fatfs crate), snapshot parser with a structure check, guest-to-host sync with its safety rules, host watcher (notify/FSEvents), worker thread ([usb-dir.md](status/usb-dir.md)). No emulator dependency beyond `usb::block::BlockBackend`. |
 | `crates/c64-bridge` | `Trx64Backend`: TRX64 (`trx64-core`, git dependency on https://github.com/Jondalar/TRX64 pinned by tag `v0.14.5`) as a `c64host::C64Backend`: `sid` (SID decode, ARMSID identity, one reSID per written receiver, stereo sample stream), `sampler` (Ultimate Audio, S16), `cart` and `cart_eeprom` (all_carts_v5.vhd, freezer.vhd and the GMOD2 EEPROM on guest DDR), `slot` (a cartridge in the physical expansion port: TRX64's mappers, flash boards on TRX64's flash and EEPROM chips, or `cart::CartLogic` fed from the CRT; bus sharing, bridge and CART_DETECT), `drive` (drives A and B on TRX64's drive positions as `c64host::C64Drive`s, 1541 or 1581), `wd177x` (the FPGA's WD177x for the 1581), `iec_proc` (the IEC processor on TRX64's IEC bus), `reu` (TRX64's REU store over guest DDR), `keys`, `video`, `clock`. The tag is pinned in `crates/c64-bridge/Cargo.toml`; re-run the tests and the C64 smokes before moving it. |
-| `crates/ue2emu` | Binary, `ue2emu run`, `ue2emu install` and `ue2emu settings`: CLI, `--config` TOML (`config`), emulation thread + pacing (`runner`), window (`window`, `keymap`), scripted/TCP control (`control`), network wiring (`net`), USB options (`usb`), `--usb-dir` controller (`usbdir`), SID audio out (`audio`: cpal and WAV), updater install (`install`), C64 ROMs into the flash image (`c64roms`, `--c64-roms`), physical cartridge write-back and `cart-info`/`cart-save` (`cartslot`, `--cart-slot`), GDB stub (`gdb`), the monitor (`monitor`, S23) and its VICE binary monitor port (`vice`, `--vice-monitor`). Cargo feature `trx64` (default) links c64-bridge. |
+| `crates/ue2emu` | Binary, `ue2emu run`, `ue2emu install` and `ue2emu settings`: CLI, `--config` TOML (`config`), emulation thread + pacing (`runner`), window (`window`, `keymap`), scripted/TCP control (`control`), network wiring (`net`), USB options (`usb`), `--usb-dir` controller (`usbdir`), SID audio out (`audio`: cpal and WAV), updater install (`install`), C64 ROMs into the flash image (`c64roms`, `--c64-roms`), physical cartridge write-back and `cart-info`/`cart-save` (`cartslot`, `--cart-slot`), GDB stub (`gdb`), the monitor (`monitor`, S23) and its VICE binary monitor port (`vice`, `--vice-monitor`), `--core` profile files (`coreprofile`) and the host app's core starts through the ICAP loader (`multicore`, S44). Cargo feature `trx64` (default) links c64-bridge. |
 | `crates/ue2-mcp` | Binary `ue2-mcp`: stdio MCP server that starts `ue2emu` instances and drives them through the TCP control protocol ([mcp.md](status/mcp.md)). No crate dependency on the emulator. |
 
 ### Level 2: ue2-core
@@ -365,11 +373,12 @@ The devices, by module:
 | `itu.rs` | `0x10000000-0x100000FF` | ITU register view on `IrqState`, ITU_TIMER, IRQ timer, ms timer, capability word, menu button, UART to the console | [S03](specs/S03-itu-uart.md), [fixes.md](status/fixes.md) §4 |
 | `board.rs` | U2PIO `0x10100000` (with the MDIO PHY), DDR2 PHY, CLOCKMEAS, audio mixer `0x10100500`, LED strip, Blingboard, MMCM `0x10200000` | T0 latches and constants, BOARDREV 0xB8. The mixer window moves to `C64Port` with S17 | [S04](specs/S04-board-t0.md), [S17](specs/S17-ultisid.md) §2.5 |
 | `i2c.rs` | `0x10100700` | I2C master; an EDID EEPROM on channel 0 (1080p60 HDMI); other addresses ACK and read 0xFF | [fixes.md](status/fixes.md) §5 |
-| `u64io.rs` | `0x10100400` | Keyboard matrix scan, U64II_KEYB_JOY (the selected port's lines, S36), HDMI HPD, CART_DETECT | [S07](specs/S07-overlay-u64io-render.md), [S36](specs/S36-joystick.md) |
+| `u64io.rs` | `0x10100400` | Keyboard matrix scan, U64II_KEYB_JOY (the selected port's lines, S36), HDMI HPD, CART_DETECT, U64_RESTORE_REG (RESTORE held, S44) | [S07](specs/S07-overlay-u64io-render.md), [S36](specs/S36-joystick.md) |
 | `overlay.rs` | `0x10140000-0x1014FFFF` | Chargen registers, screen and colour RAM, palette, `snapshot` | [S07](specs/S07-overlay-u64io-render.md) |
 | `flash.rs` | `0x10060200` | S25FL128L SPI NOR, 16 MiB, persistent image, overlay-UI seed, `--settings` records (S21), replaceable unique ID | [S06](specs/S06-spi-flash.md), [storage.md](status/storage.md) |
 | `sdcard.rs` | `0x10060000` | SDHC in SPI mode on an image | [S09](specs/S09-sd-card.md), [storage.md](status/storage.md) |
-| `misc.rs` | RTC `0x10060100`, TRACE, RTC timer `0x10060400` (host UTC), GCR codec `0x10060500`, ICAP, audio select `0x10060700` | T0 | [S04](specs/S04-board-t0.md) |
+| `misc.rs` | RTC `0x10060100`, TRACE, RTC timer `0x10060400` (host UTC), GCR codec `0x10060500`, ICAP `0x10060600`, audio select `0x10060700` | T0; with `--icap` the ICAP loader: ID 0x7A, the core-swap port, Xilinx packets read for decouple, partial streams and IPROG (`IcapEvent`) | [S04](specs/S04-board-t0.md), [S44](specs/S44-multicore-cores.md) |
+| `trx.rs` (`trx_sb.rs`, `trx_engine.rs`, `trx_dbg.rs`, `trx_session.rs`) | `0x101A0000-0x101AFFFF` (`--trx-io`) | TRX64-Ultimate's IO block: ID and IRQ, the gate, state bus, engine, debug block, freeze session and lens unit, the pixel layer and C64 text layer, reSID8 view, slot block; with `--core` a MultiCore core's ID, CAPS and register file | [S37](specs/S37-trx-pixel-layer.md)-[S44](specs/S44-multicore-cores.md) |
 | `wifi.rs` | `0x10060900` | DMA UART with a u64ctrl stub, the ESP32 ROM loader for updaters, power requests (`U64Ctrl::power_event`) | [S05](specs/S05-wifi-u64ctrl.md), [install.md](status/install.md) §5 |
 | `rmii.rs` | `0x10060800` | RMII MAC: RX filter, TX, free queue, level IRQ bit 5, DMA buffers | [S12](specs/S11-S14-later.md), [network.md](status/network.md) |
 | `usb/` | `0x10080000-0x10080FFF` | Nano USB CPU protocol HLE, USB2513 hub, mass storage, HID keyboard and mouse, plugging in and out while running | [S13](specs/S11-S14-later.md), [S32](specs/S32-usb-mouse.md), [S33](specs/S33-usb-plug.md), [usb.md](status/usb.md) |
@@ -532,7 +541,7 @@ Level 2 of `ue2emu`: how the host reaches the machine and what it gets back.
   `joy-release <port>`, `screen`, `c64screen`, `png <path>`, `expect <text> [ms]`, `expect-not <text> [ms]`,
   `expect-console <text> [ms]`, `expect-c64 <text> [ms]`, `usb-sync [--force] [port]`, `usb-replug [--discard] [port]`,
   `usb-plug <port> image <path>|keyboard|mouse`, `usb-unplug <port>`, `monitor <cmd>`, `cart-info`, `cart-save <path>`,
-  `core absent|present`, `quit`.
+  `core absent|present`, `restore [ms]`, `quit`.
   - `button`, `key`, `type`, `usbkey` and `joy` reach the emulation thread as one timed sequence (`Command::Inputs`,
     `control::InputTimeline`), so holds keep their emulated length at any host speed.
   - `expect*` poll the screen text or the console; a timeout prints the screen and fails with the line number, and
