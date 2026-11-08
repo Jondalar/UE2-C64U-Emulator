@@ -8,7 +8,7 @@ session's answers (`run/trx/s39-answers.md`, t21-p4 RTL and app; they override t
 monitor screen on the overlay (T21 §8), opened from the task menu or Ctrl-O and reopened by `trx->ui_request` when a
 stop fires, and every verb giving real data. UE2 runs the unmodified firmware and the unmodified `trxmon.u2a`. It
 presents the FPGA's register interface that trxmon uses (pages 0, 1, 3, 5) and serves it from TRX64 (`trx64-core`,
-pinned v0.14.5).
+pinned v0.14.6).
 
 **Reads** (code and RTL are the truth; comments are not evidence):
 - RTL, TRX64-Ultimate branch **`t21-p4`** (fa09f06, **not merged into main**): `designs/c64_basic/trx_sys.v`,

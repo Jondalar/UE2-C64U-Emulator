@@ -2643,8 +2643,8 @@ dependencies = [
 
 [[package]]
 name = "trx64-core"
-version = "0.14.5"
-source = "git+https://github.com/Jondalar/TRX64?tag=v0.14.5#528f271975833681cb3ae1bb810ab3e601e48d63"
+version = "0.14.6"
+source = "git+https://github.com/Jondalar/TRX64?tag=v0.14.6#0ec5779128b18cc854c7ef81ee674e8603a23550"
 dependencies = [
  "base64",
  "cc",
@@ -2658,8 +2658,8 @@ dependencies = [
 
 [[package]]
 name = "trx64-monitor"
-version = "0.14.5"
-source = "git+https://github.com/Jondalar/TRX64?tag=v0.14.5#528f271975833681cb3ae1bb810ab3e601e48d63"
+version = "0.14.6"
+source = "git+https://github.com/Jondalar/TRX64?tag=v0.14.6#0ec5779128b18cc854c7ef81ee674e8603a23550"
 dependencies = [
  "serde",
  "serde_json",
@@ -2669,8 +2669,8 @@ dependencies = [
 
 [[package]]
 name = "trx64-static"
-version = "0.14.5"
-source = "git+https://github.com/Jondalar/TRX64?tag=v0.14.5#528f271975833681cb3ae1bb810ab3e601e48d63"
+version = "0.14.6"
+source = "git+https://github.com/Jondalar/TRX64?tag=v0.14.6#0ec5779128b18cc854c7ef81ee674e8603a23550"
 dependencies = [
  "trx64-core",
 ]
