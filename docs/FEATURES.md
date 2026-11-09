@@ -1,6 +1,6 @@
 # Features
 
-One line per feature, as of 0.7.1 (TRX64 v0.14.7). Details: `docs/status/`, specs: `docs/specs/`. What is missing:
+One line per feature, as of 0.7.2 (TRX64 v0.14.7). Details: `docs/status/`, specs: `docs/specs/`. What is missing:
 `docs/status/gaps.md`.
 
 ## Firmware and board
