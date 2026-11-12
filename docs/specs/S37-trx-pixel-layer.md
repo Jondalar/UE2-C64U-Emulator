@@ -107,7 +107,8 @@ The interrupt is `(IRQ_EN & IRQ_CAUSE) != 0` on **ITU high IRQ 2**.
   scaled to the window as today: the bitstream has no other output, so the picture keeps one shape whether the layer
   is on or off (with it off: the C64 at 4× between the bars). Without the block the picture path is unchanged.
   - When S = 2, x0 and y0 are even (LVGL's case) and `overlay.v`'s box is off, the composite is built at
-    960 × 540. Each 50 Hz C64 pixel is then exactly 2 × 2. The box's scale is 1 to 4 per axis and its corner is
+    960 × 540. Each 50 Hz C64 pixel is then exactly 2 × 2. Since S45 a `png` is still 1920 × 1080: the half-size
+    build is doubled, which is exact; before S45 such a `png` was 960 × 540. The box's scale is 1 to 4 per axis and its corner is
     centred to the pixel (§5.10), so with the box on the composite stays at 1920 × 1080.
   - Otherwise it is built at 1920 × 1080.
 - **Not changed:** the UDP video stream (S24) carries the VIC picture, as before.
@@ -423,7 +424,7 @@ registers and the VIC frame count.
 | `wait 6000`, `c64screen`, `png run/before.png` | READY.; LVGL parked |
 | `button`, `wait 1500` | console `[TRX] pixel layer: 2 buffer(s) of 864000 bytes`, `[C64] goUltimax() — C64_MODE = ULTIMAX`, `Init IO.`; no `[TRX] pixel layer: no flip` |
 | `monitor trx` | `GATE_CTRL` `0x301`, `SH_STATUS` `0x0001_0001`, `TX_CTRL` `0x0100_0001`, `TX_STATUS` b0 1, `PX_CTRL` `0x23`, `PX_SIZE` `540 << 16 \| 800`, `PX_STRIDE` 1600, `PX_POS` 160, `STILL_STATUS` b0 1, the VIC frame count |
-| `c64screen`, `png run/frozen.png` | the freeze menu, no `READY.` (`--board c64u` gives the Commodore interface); a 960 × 540 png, columns 0-79 and 880-959 black |
+| `c64screen`, `png run/frozen.png` | the freeze menu, no `READY.` (`--board c64u` gives the Commodore interface); a 1920 × 1080 png (960 × 540 before S45), columns 0-159 and 1760-1919 black |
 | `wait 1000`, `monitor trx`, `png run/frozen2.png` | the same VIC frame count; frozen2 equals frozen |
 | `key down`, `wait 300`, `button`, `wait 1500` | the menu closes |
 | `monitor trx`, `c64screen`, `png run/after.png` | `GATE_CTRL` 0, `SH_STATUS` `0x0001_0000`, `TX_CTRL` `0x0100_0000`, `PX_CTRL` `0x22`; the screen equals the first dump; after.png is not 960 × 540; the VIC frame count moves again |
@@ -495,7 +496,7 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
   1541, so the firmware offers drive B as a 1541 only. S43 replaced this with the bitstream's rule for both drives:
   DRIVETYPE takes no write and reads 0.
 - **Firmware smoke** (`scripts/smoke-trx.sh`, trx64/main 029da8ef): "LVGL 9.6.0 on the pixel layer" at about
-  1.5 s, the splash in a 960 × 540 png, `PX_GALPHA` written 17 times (the fade), "splash done; UI parked" at
+  1.5 s, the splash in a 960 × 540 png (1920 × 1080 since S45), `PX_GALPHA` written 17 times (the fade), "splash done; UI parked" at
   about 4.5 s with the layer off. In the first 6 s the app touches page 0 (ID, CAPS, IRQ_EN = b7) and page 6
   (`PX_CTRL`, `PX_FRONT`, `PX_SIZE`, `PX_STRIDE`, `PX_POS`, `PX_GALPHA`, `PX_KEY`); no other page, no unmapped
   access, no hang. It never writes `PX_BACK`, so no flip. With `--trx-io=off` it reads ID byte 0 once, gets 0 and
@@ -520,7 +521,7 @@ Pages 1 (state bus), 2 (engine, frame ring, APPLY), 3 (debug), 4 (cartridge writ
 - **Firmware smoke** (`scripts/smoke-trx-freeze.sh`, trx64/main 029da8ef): the console says `CAPS E1` and `, commit
   list`; frozen, `monitor trx` reads `GATE_CTRL` `0x301`, `SH_STATUS` `0x0001_0001`, `TX_CTRL` `0x0100_0001`, the
   layer 800 × 540 at (160, 0), the still valid; frozen.png is the menu text over the dimmed still, 960 × 540 with black
-  bars, and frozen2.png 1 s later is the same file with the same VIC frame count. After the unfreeze the screen is the
+  bars (1920 × 1080 since S45), and frozen2.png 1 s later is the same file with the same VIC frame count. After the unfreeze the screen is the
   one before, the list wrote nothing (every listed register was put back by `restore_io()`), and `print 6*7` gives 42.
 
 ## As built (phase B3)

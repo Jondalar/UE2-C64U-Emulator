@@ -173,10 +173,10 @@ handover: 0x03eff000: core "amiga1200", id "amiga1200", path "/Usb0/cores/amiga1
 
 ## §6 Screen and modes
 
-The menu draws into the pixel layer (S37), which is placed in the host's 1920 × 1080 frame
-(`video_frame_size`) whatever the HDMI mode. A run "at 480p, 720p or 1080p" is the hand-over's `video` word, which
-coreapp takes for its own mode logic and layout. The `png` is the composite of the 1920 × 1080 frame, as the
-scaler's input; the board's output scaling to 480p or 720p is not modelled.
+The menu draws into the pixel layer (S37). A run "at 480p, 720p or 1080p" is the hand-over's `video` word, which
+coreapp takes for its own mode logic and layout. Since S45 the MultiCore host's video is modelled
+(docs/specs/S45-multicore-video.md): the run starts in the word's HDMI mode, the `png` is that mode's active area,
+and the layer is shown at its PX_OSIZE output size. Until S45 the frame was 1920 × 1080 whatever the mode.
 
 ## §7 Phase B: the host app starts a core and takes it back
 

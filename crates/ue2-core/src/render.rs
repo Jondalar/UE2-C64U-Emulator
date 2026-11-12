@@ -18,7 +18,7 @@ use crate::devices::overlay::{
     REG_ACTIVE_LINES, REG_CHARS_PER_LINE, REG_CHAR_HEIGHT, REG_CHAR_WIDTH, REG_POINTER_HI, REG_POINTER_LO,
     REG_TRANSPARENCY, REG_X_ON_HI, REG_X_ON_LO, REG_Y_ON_HI, REG_Y_ON_LO, TEXT_RAM_SIZE,
 };
-use crate::host::{DisplaySnapshot, TrxLayer, TrxOutput, TrxText};
+use crate::host::{DisplaySnapshot, TrxLayer, TrxMode, TrxOutput, TrxText};
 
 /// Colour of transparent pixels and of the whole image while the overlay is hidden, where no C64 frame shows
 /// through.
@@ -247,6 +247,16 @@ impl Renderer {
         }
     }
 
+    /// The size of the output picture: the TRX output frame (1920 × 1080, or the MultiCore host's active area, S45),
+    /// even where [`Renderer::canvas`] builds it at half size; else the canvas. `png` writes this size, so a picture of
+    /// the output always has the output's size.
+    pub fn output_size(snap: &DisplaySnapshot) -> (usize, usize) {
+        match &snap.trx {
+            Some(trx) => trx_frame(trx),
+            None => Self::output_canvas(snap),
+        }
+    }
+
     /// [`Renderer::canvas`] without the TRX layer: the canvas the overlay window is placed on.
     fn output_canvas(snap: &DisplaySnapshot) -> (usize, usize) {
         let geo = Geometry::new(&snap.regs);
@@ -288,21 +298,24 @@ impl Renderer {
     /// before as its picture below).
     fn render_trx(&mut self, snap: &DisplaySnapshot, trx: &TrxOutput, out: &mut Vec<u32>, size: (usize, usize)) {
         let canvas = trx_canvas(snap, trx);
+        let frame_size = trx_frame(trx);
         let (cw, ch) = canvas;
         let (tw, th) = size;
         let direct = canvas == size;
         let mut comp = if direct { std::mem::take(out) } else { std::mem::take(&mut self.composite) };
         comp.clear();
         comp.resize(cw * ch, 0);
-        if let Some(frame) = snap.c64.as_ref().filter(|_| !trx.paused) {
+        // S45 §5: vic_scaler draws the C64 on the 1080p rows only.
+        let c64_shown = trx.mode.is_none_or(|m| m.c64);
+        if let Some(frame) = snap.c64.as_ref().filter(|_| !trx.paused && c64_shown) {
             draw_c64_trx(frame, &mut comp, canvas);
         }
-        self.draw_overlay_trx(snap, &mut comp, canvas);
+        self.draw_overlay_trx(snap, trx, &mut comp, canvas);
         if let Some(layer) = &trx.layer {
-            draw_layer(layer, &mut comp, canvas);
+            draw_layer(layer, &mut comp, canvas, frame_size);
         }
         if let Some(text) = &trx.text {
-            draw_text_trx(text, &mut comp, canvas);
+            draw_text_trx(text, &mut comp, canvas, frame_size);
         }
         if direct {
             *out = comp;
@@ -322,19 +335,20 @@ impl Renderer {
         self.composite = comp;
     }
 
-    /// S37 B3: the menu box as overlay.v draws it over `out`, a `canvas` of the 1920 × 1080 output or of half its size
-    /// (output pixel (x·k, y·k) for canvas pixel (x, y)). X_ON/Y_ON are not read; the box is centred and scaled
-    /// ([`TrxBox`]). A pixel of the transparent colour index shows the C64 at half brightness, every other one is the
-    /// overlay palette's colour; outside the box the picture stays (overlay.v:255-277). The line and pixel counters
-    /// run as overlay.v's do, so every register combination ends where the RTL's does.
-    fn draw_overlay_trx(&self, snap: &DisplaySnapshot, out: &mut [u32], canvas: (usize, usize)) {
+    /// S37 B3: the menu box as overlay.v draws it over `out`, a `canvas` of the output (1920 × 1080, or the MultiCore
+    /// host's active area, S45 §5) or of half its size (output pixel (x·k, y·k) for canvas pixel (x, y)). X_ON/Y_ON are
+    /// not read; the box is centred and scaled ([`TrxBox`]). A pixel of the transparent colour index shows the C64 at
+    /// half brightness, every other one is the overlay palette's colour; outside the box the picture stays
+    /// (overlay.v:255-277). The line and pixel counters run as overlay.v's do, so every register combination ends where
+    /// the RTL's does.
+    fn draw_overlay_trx(&self, snap: &DisplaySnapshot, trx: &TrxOutput, out: &mut [u32], canvas: (usize, usize)) {
         let geo = Geometry::new(&snap.regs);
-        let bx = TrxBox::new(&snap.regs);
+        let bx = TrxBox::new(&snap.regs, trx.mode.as_ref());
         let (cw, ch) = canvas;
         if cw == 0 || ch == 0 || !bx.on || bx.w == 0 {
             return;
         }
-        let k = TRX_W / cw;
+        let k = trx_frame(trx).0 / cw;
         let palette: [u32; 16] = std::array::from_fn(|i| {
             let c = |n: usize| snap.palette.get(i * 4 + n).copied().unwrap_or(0) as u32;
             (c(0) << 16) | (c(1) << 8) | c(2)
@@ -347,7 +361,7 @@ impl Renderer {
                 break;
             }
             // Stage A: pixel n of the run is sh = n mod sx of bit cw - 1 - (n / sx) mod cw of character n / (sx·cw).
-            for x in (bx.x0.div_ceil(k)..cw).take_while(|&x| x * k < bx.x0 + bx.ws) {
+            for x in (bx.x0.div_ceil(k)..cw).take_while(|&x| x * k < bx.x0 + bx.ws && x * k < bx.aw) {
                 let n = x * k - bx.x0;
                 let (char_x, bit) = (n / bx.sx / bx.cw, bx.cw - 1 - n / bx.sx % bx.cw);
                 let i = (row_ptr + char_x) % TEXT_RAM_SIZE;
@@ -519,19 +533,33 @@ fn axis(target: usize, canvas: usize, (off, len, span): (usize, usize, usize), h
         .collect()
 }
 
-/// S37: the size the TRX composite is made at. 960 × 540 when every layer pixel is a 2 × 2 block on even output
-/// coordinates (S = 2, x0 and y0 even, LVGL's case) or the layer is off, and overlay.v's box is off; 1920 × 1080
-/// otherwise. The box's scale per axis is 1 to 4 and its corner is centred to the pixel (SD settings: 4 × 3 from line
-/// 202), so it does not halve. The text layer's 4 × 4 pixels from (320, 140) halve exactly.
+/// S37, S45 §5: the output frame: TRX64's host is always 1920 × 1080, the MultiCore host's is the running mode's
+/// active area.
+fn trx_frame(trx: &TrxOutput) -> (usize, usize) {
+    trx.mode.map_or((TRX_W, TRX_H), |m| (m.hact, m.vact))
+}
+
+/// S37: the size the TRX composite is made at: the output frame ([`trx_frame`]), or half of it when every picture in
+/// it halves exactly: overlay.v's box is off (its scale per axis is 1 to 4 and its corner is centred to the pixel, so
+/// it does not halve), the pixel layer is off or each of its pixels is a 2 × 2 block on even output coordinates
+/// (nearest, OW = 2 W, OH = 2 H, x0 and y0 even: LVGL's case), and the text layer's pixels are an even number of
+/// output pixels from an even corner (TRX64's 4 × 4 from (320, 140)).
 fn trx_canvas(snap: &DisplaySnapshot, trx: &TrxOutput) -> (usize, usize) {
-    let bx = TrxBox::new(&snap.regs);
+    let (fw, fh) = trx_frame(trx);
+    let bx = TrxBox::new(&snap.regs, trx.mode.as_ref());
     // overlay.v:176: no line is drawn without `on`, a non-zero width and a row.
     let overlay = bx.on && bx.w != 0 && bx.nl != 0;
-    let even = trx.layer.as_ref().is_none_or(|l| l.scale == 2 && l.x0 % 2 == 0 && l.y0 % 2 == 0);
-    if even && !overlay {
-        (TRX_W / 2, TRX_H / 2)
+    let layer = trx.layer.as_ref().is_none_or(|l| {
+        !l.smooth_h && !l.smooth_v && l.ow == 2 * l.w && l.oh == 2 * l.h && l.x0 % 2 == 0 && l.y0 % 2 == 0
+    });
+    let text = trx.text.is_none() || {
+        let t = TextArea::new((fw, fh));
+        t.st.is_multiple_of(2) && t.x.is_multiple_of(2) && t.y.is_multiple_of(2)
+    };
+    if fw % 2 == 0 && fh % 2 == 0 && layer && text && !overlay {
+        (fw / 2, fh / 2)
     } else {
-        (TRX_W, TRX_H)
+        (fw, fh)
     }
 }
 
@@ -552,19 +580,22 @@ struct TrxBox {
     w: usize,
     h: usize,
     /// Output pixels per character pixel, each the largest of 4, 3, 2, 1 that keeps the box inside 1280 × 800
-    /// (overlay.v:138-139).
+    /// (overlay.v:138-139). S45 §5, the MultiCore host: inside the active area, SX at most 2 · SY.
     sx: usize,
     sy: usize,
-    /// The box in output pixels, and its first pixel and line in the 1920 × 1080 frame: centred, 0 when it does not
-    /// fit (overlay.v:140-143; the first pixel is cx xs_m1 + 1, cx 768 the frame's first).
+    /// The box in output pixels, and its first pixel and line in the output frame: centred, 0 when it does not fit
+    /// (overlay.v:140-143; the first pixel is cx xs_m1 + 1, cx 768 the frame's first).
     ws: usize,
     hs: usize,
     x0: usize,
     y0: usize,
+    /// The output frame: the box is drawn inside it only (cut at its right and bottom).
+    aw: usize,
+    ah: usize,
 }
 
 impl TrxBox {
-    fn new(regs: &[u8; 16]) -> Self {
+    fn new(regs: &[u8; 16], mode: Option<&TrxMode>) -> Self {
         let cw = usize::from(regs[REG_CHAR_WIDTH] & 0x0F);
         let ch = usize::from(regs[REG_CHAR_HEIGHT] & 0x1F);
         let big = regs[REG_CHAR_HEIGHT] & 0x40 != 0;
@@ -574,7 +605,14 @@ impl TrxBox {
         let lpr = if big { ch - (ch >> 2) } else { ch };
         let (w, h) = (cpl * cw, nl * lpr);
         let scale = |len: usize, room: usize| (1..=4).rev().find(|s| s * len <= room).unwrap_or(1);
-        let (sx, sy) = (scale(w, 1280), scale(h, 800));
+        let (aw, ah) = mode.map_or((TRX_W, TRX_H), |m| (m.hact, m.vact));
+        let (sx, sy) = match mode {
+            None => (scale(w, 1280), scale(h, 800)),
+            Some(_) => {
+                let sy = scale(h, ah);
+                (scale(w, aw).min(2 * sy), sy)
+            }
+        };
         let (ws, hs) = (w * sx, h * sy);
         Self {
             on: regs[REG_TRANSPARENCY] & 0x80 != 0,
@@ -591,19 +629,21 @@ impl TrxBox {
             sy,
             ws,
             hs,
-            x0: TRX_W.saturating_sub(ws) / 2,
-            y0: TRX_H.saturating_sub(hs) / 2,
+            x0: aw.saturating_sub(ws) / 2,
+            y0: ah.saturating_sub(hs) / 2,
+            aw,
+            ah,
         }
     }
 
-    /// For each of the 1080 output lines, the screen RAM row and character line drawn there, or None: overlay.v's line
+    /// For each of the frame's output lines, the screen RAM row and character line drawn there, or None: overlay.v's line
     /// counters (:153-179). Each character line repeats sy times, the big font skips every fourth, a row ends at
     /// line ch - 1 (5 bits), and the box starts at line y0 and ends after nl rows.
     fn lines(&self) -> Vec<Option<(usize, usize)>> {
         let (mut row_ptr, mut char_y, mut sv, mut rows_left) = (self.ptr, 0usize, 0usize, self.nl);
         let (mut started, mut line_on) = (false, false);
         let last = self.ch.wrapping_sub(1) & 0x1F;
-        (0..TRX_H)
+        (0..self.ah)
             .map(|vy| {
                 // cx 16: the previous line's line_on moves the counters on.
                 if line_on {
@@ -695,49 +735,112 @@ fn draw_c64_trx(frame: &C64Frame, out: &mut [u32], canvas: (usize, usize)) {
     }
 }
 
-/// S37: the pixel layer over `out`, a `canvas` of the 1920 × 1080 output or of half its size (pix_layer.v): source
-/// pixel (p, m) covers output pixels x0 + S·p .. + S, y0 + S·m .. + S, clipped at the frame's edge. A pixel equal to the
-/// key is transparent, every other one is blended with the global alpha.
-fn draw_layer(layer: &TrxLayer, out: &mut [u32], canvas: (usize, usize)) {
+/// S37, S45 §6: the pixel layer over `out`, a `canvas` of the output `frame` or of half its size (pix_layer.v): output
+/// pixel x0 + x of the picture's ow × oh shows source pixel ⌊x · w / ow⌋, line y0 + y source line ⌊y · h / oh⌋, clipped
+/// at the frame's edge; with smoothing an axis blends the two samples its position falls between ([`smooth_pixel`]). A
+/// pixel equal to the key is transparent, every other one is blended with the global alpha.
+fn draw_layer(layer: &TrxLayer, out: &mut [u32], canvas: (usize, usize), frame: (usize, usize)) {
     let (cw, ch) = canvas;
-    let k = TRX_W / cw;
-    let s = layer.scale.max(1);
+    let k = frame.0 / cw;
+    let (w, h, ow, oh) = (layer.w, layer.h, layer.ow.max(1), layer.oh.max(1));
+    let colour = |v: u32| if layer.wide { v & 0xFF_FFFF } else { widen_565(v as u16) };
+    let (sv, sh) = (layer.smooth_v, layer.smooth_h);
     for y in layer.y0.div_ceil(k)..ch {
-        let m = (y * k - layer.y0) / s;
-        if m >= layer.h {
+        let oy = y * k - layer.y0;
+        if oy >= oh {
             break;
         }
-        let src = &layer.pixels[m * layer.w..][..layer.w];
+        let (m, qv) = (oy * h / oh, (oy * h % oh) * 1024 / oh);
+        if m >= h {
+            break;
+        }
+        let src = &layer.pixels[m * w..][..w];
+        let below = &layer.pixels[(m + 1).min(h - 1) * w..][..w];
         for x in layer.x0.div_ceil(k)..cw {
-            let p = (x * k - layer.x0) / s;
-            if p >= layer.w {
+            let ox = x * k - layer.x0;
+            if ox >= ow {
                 break;
             }
-            if layer.key != Some(src[p]) {
-                let px = &mut out[y * cw + x];
-                *px = trx_blend(widen_565(src[p]), *px, layer.alpha);
+            let (i, qh) = (ox * w / ow, (ox * w % ow) * 1024 / ow);
+            if i >= w {
+                break;
             }
+            if !layer.wide && layer.key == Some(src[i] as u16) {
+                continue;
+            }
+            let fg = if sv || sh {
+                let col = |j: usize| {
+                    let j = j.min(w - 1);
+                    [colour(src[j]), colour(if sv { below[j] } else { src[j] })]
+                };
+                let a = col(i);
+                let b = if sh { col(i + 1) } else { a };
+                smooth_pixel(a, b, if sv { qv } else { 0 }, if sh { qh } else { 0 })
+            } else {
+                colour(src[i])
+            };
+            let px = &mut out[y * cw + x];
+            *px = trx_blend(fg, *px, layer.alpha);
         }
     }
 }
 
-/// c64_text.v's text area: its top left in the 1920 × 1080 output (`XS`, `YS` less the active area's start, cx 768,
-/// cy 45) and its size, 320 × 200 C64 pixels at 4 × 4.
-const TRX_TEXT_X: usize = 320;
-const TRX_TEXT_Y: usize = 140;
-const TRX_TEXT_W: usize = 1280;
-const TRX_TEXT_H: usize = 800;
+/// S45 §6: pix_layer.v's bilinear pixel. `a` and `b` are the two source columns, [top, bottom] each, and `qv`, `qh`
+/// the vertical and horizontal weights in 1/1024 (0 on an axis that is not smoothed, whose second sample is then the
+/// first). Per channel the vertical blend V = (T · 2048 + (B − T)(2 qv + 1)) >> 5 keeps 6 fractional bits; the
+/// horizontal one rounds (A · 2048 + (B − A)(2 qh + 1) + 65536) >> 17 to 8 bits (pix_layer.v edges 6-12).
+pub fn smooth_pixel(a: [u32; 2], b: [u32; 2], qv: usize, qh: usize) -> u32 {
+    let (wv, wh) = (2 * qv as i64 + 1, 2 * qh as i64 + 1);
+    let mut out = 0;
+    for shift in [16, 8, 0] {
+        let ch = |c: u32| i64::from((c >> shift) & 0xFF);
+        let v = |[t, bt]: [u32; 2]| (ch(t) * 2048 + (ch(bt) - ch(t)) * wv) >> 5;
+        let (va, vb) = (v(a), v(b));
+        let tot = va * 2048 + (vb - va) * wh + 65536;
+        out |= (((tot >> 17) & 0xFF) as u32) << shift;
+    }
+    out
+}
 
-/// S37: the C64 text layer over `out`, a `canvas` of the 1920 × 1080 output or of half its size (c64_text.v:281-297): a
+/// c64_text.v's text area in an output `frame` (S45 §5): each C64 pixel is ST × ST output pixels, ST = min(st_h, st_v)
+/// of the frame's size, and the 320 ST × 200 ST area is centred (`XS`, `YS` less the active area's start). At 1080p:
+/// 4 × 4 from (320, 140), TRX64's fixed place.
+struct TextArea {
+    st: usize,
+    x: usize,
+    y: usize,
+}
+
+impl TextArea {
+    fn new((fw, fh): (usize, usize)) -> Self {
+        let st_h = match fw {
+            1280.. => 4,
+            960.. => 3,
+            640.. => 2,
+            _ => 1,
+        };
+        let st_v = match fh {
+            800.. => 4,
+            600.. => 3,
+            400.. => 2,
+            _ => 1,
+        };
+        let st: usize = st_h.min(st_v);
+        TextArea { st, x: fw.saturating_sub(320 * st) / 2, y: fh.saturating_sub(200 * st) / 2 }
+    }
+}
+
+/// S37: the C64 text layer over `out`, a `canvas` of the output `frame` or of half its size (c64_text.v:281-297): a
 /// set glyph bit is its cell's colour RAM colour, a clear one `$D021` when opaque and the picture below otherwise, in
 /// vic_scaler.v's palette.
-fn draw_text_trx(text: &TrxText, out: &mut [u32], canvas: (usize, usize)) {
+fn draw_text_trx(text: &TrxText, out: &mut [u32], canvas: (usize, usize), frame: (usize, usize)) {
     let (cw, ch) = canvas;
-    let k = TRX_W / cw;
-    for y in TRX_TEXT_Y / k..((TRX_TEXT_Y + TRX_TEXT_H) / k).min(ch) {
-        let line = (y * k - TRX_TEXT_Y) / 4;
-        for x in TRX_TEXT_X / k..((TRX_TEXT_X + TRX_TEXT_W) / k).min(cw) {
-            let p = (x * k - TRX_TEXT_X) / 4;
+    let k = frame.0 / cw;
+    let t = TextArea::new(frame);
+    for y in t.y.div_ceil(k)..((t.y + 200 * t.st) / k).min(ch) {
+        let line = (y * k - t.y) / t.st;
+        for x in t.x.div_ceil(k)..((t.x + 320 * t.st) / k).min(cw) {
+            let p = (x * k - t.x) / t.st;
             let (col, bit) = (p / 8, p % 8);
             let glyph = text.glyphs.get(line * 40 + col).copied().unwrap_or(0);
             let px = &mut out[y * cw + x];
@@ -1249,8 +1352,10 @@ mod tests {
         DisplaySnapshot { trx: Some(TrxOutput { layer: Some(layer), ..TrxOutput::default() }), ..DisplaySnapshot::default() }
     }
 
+    /// TRX64's layer: S · w by S · h output pixels, nearest.
     fn trx_layer(x0: usize, y0: usize, w: usize, h: usize, scale: usize, pixels: Vec<u16>) -> TrxLayer {
-        TrxLayer { x0, y0, w, h, scale, alpha: 256, key: None, pixels }
+        let pixels = pixels.into_iter().map(u32::from).collect();
+        TrxLayer { x0, y0, w, h, ow: scale * w, oh: scale * h, alpha: 256, pixels, ..TrxLayer::default() }
     }
 
     const RED: u32 = 0xFF_0000;
@@ -1378,9 +1483,13 @@ mod tests {
         assert!(out.iter().all(|&p| p == 0), "the window is black while paused");
         // The text over the layer: 4 x 4 per C64 pixel from (320, 140), glyph bit 7 leftmost.
         let layer = trx_layer(160, 0, 1, 1, 2, vec![0x001F]);
-        let mut big = TrxLayer { w: 800, h: 540, pixels: vec![0x001F; 800 * 540], ..layer };
-        big.scale = 2;
-        s.trx = Some(TrxOutput { layer: Some(big), paused: true, text: Some(one_cell([0x81, 0, 0, 0, 0, 0, 0, 0x40], 2, false)) });
+        let big = TrxLayer { w: 800, h: 540, ow: 1600, oh: 1080, pixels: vec![0x001F; 800 * 540], ..layer };
+        s.trx = Some(TrxOutput {
+            layer: Some(big),
+            paused: true,
+            text: Some(one_cell([0x81, 0, 0, 0, 0, 0, 0, 0x40], 2, false)),
+            mode: None,
+        });
         let mut full = Vec::new();
         r.render_scaled(&s, &mut full, (1920, 1080));
         let px = |x: usize, y: usize| full[y * 1920 + x];
@@ -1411,28 +1520,28 @@ mod tests {
     fn the_trx_box_is_scaled_into_1280_x_800_and_centred() {
         let geo = |b: &TrxBox| (b.w, b.h, b.sx, b.sy, b.ws, b.hs, b.x0, b.y0);
         // The firmware's SD settings: 40 x 25 of 8 x 9.
-        assert_eq!(geo(&TrxBox::new(&trx_regs(40, 25, 8, 9, 0xC0))), (320, 225, 4, 3, 1280, 675, 320, 202));
+        assert_eq!(geo(&TrxBox::new(&trx_regs(40, 25, 8, 9, 0xC0), None)), (320, 225, 4, 3, 1280, 675, 320, 202));
         // 1080p settings: 40 x 25 of 12 x 23, big font: 18 of the 23 lines are drawn (23 - 23 / 4).
-        assert_eq!(geo(&TrxBox::new(&trx_regs(40, 25, 12, 0x40 | 23, 0x80))), (480, 450, 2, 1, 960, 450, 480, 315));
+        assert_eq!(geo(&TrxBox::new(&trx_regs(40, 25, 12, 0x40 | 23, 0x80), None)), (480, 450, 2, 1, 960, 450, 480, 315));
         // 80 x 30 of 8 x 9 and 60 x 30 of 8 x 9 (the register reset values).
-        assert_eq!(geo(&TrxBox::new(&trx_regs(80, 30, 8, 9, 0x80))), (640, 270, 2, 2, 1280, 540, 320, 270));
-        assert_eq!(geo(&TrxBox::new(&trx_regs(60, 30, 8, 9, 0x80))), (480, 270, 2, 2, 960, 540, 480, 270));
+        assert_eq!(geo(&TrxBox::new(&trx_regs(80, 30, 8, 9, 0x80), None)), (640, 270, 2, 2, 1280, 540, 320, 270));
+        assert_eq!(geo(&TrxBox::new(&trx_regs(60, 30, 8, 9, 0x80), None)), (480, 270, 2, 2, 960, 540, 480, 270));
         // Too big for the frame: scale 1 from the corner.
-        assert_eq!(geo(&TrxBox::new(&trx_regs(255, 63, 15, 31, 0x80))), (3825, 1953, 1, 1, 3825, 1953, 0, 0));
+        assert_eq!(geo(&TrxBox::new(&trx_regs(255, 63, 15, 31, 0x80), None)), (3825, 1953, 1, 1, 3825, 1953, 0, 0));
         // Odd room: the first pixel is rounded down.
-        assert_eq!(geo(&TrxBox::new(&trx_regs(3, 1, 7, 7, 0x80))), (21, 7, 4, 4, 84, 28, 918, 526));
+        assert_eq!(geo(&TrxBox::new(&trx_regs(3, 1, 7, 7, 0x80), None)), (21, 7, 4, 4, 84, 28, 918, 526));
         // X_ON/Y_ON and the pointer's top bits change nothing but the pointer's 12 bits.
         let mut regs = trx_regs(40, 25, 8, 9, 0xC0);
         (regs[REG_X_ON_HI], regs[REG_X_ON_LO], regs[REG_Y_ON_HI], regs[REG_Y_ON_LO]) = (5, 0x9E, 0, 0x2D);
         (regs[REG_POINTER_HI], regs[REG_POINTER_LO]) = (0x7F, 0xFF);
-        let b = TrxBox::new(&regs);
+        let b = TrxBox::new(&regs, None);
         assert_eq!((geo(&b), b.ptr), ((320, 225, 4, 3, 1280, 675, 320, 202), 0xFFF));
     }
 
     #[test]
     fn the_trx_box_lines_follow_overlay_v_counters() {
         // 2 rows of 3 lines at 4 x 4 (h 6): from line 528, each character line 4 times, then the next row.
-        let b = TrxBox::new(&trx_regs(2, 2, 8, 3, 0x80));
+        let b = TrxBox::new(&trx_regs(2, 2, 8, 3, 0x80), None);
         let lines = b.lines();
         assert_eq!((b.sy, b.y0), (4, 528));
         assert_eq!(lines[527], None);
@@ -1440,17 +1549,17 @@ mod tests {
         assert_eq!(lines[528..552], want[..]);
         assert_eq!(lines[552], None);
         // The big font skips every fourth line: 7 lines of 0, 1, 2, 4, 5, 6 ... at sy 4 from y0.
-        let b = TrxBox::new(&trx_regs(1, 1, 12, 0x40 | 7, 0x80));
+        let b = TrxBox::new(&trx_regs(1, 1, 12, 0x40 | 7, 0x80), None);
         let drawn: Vec<usize> = b.lines().into_iter().flatten().map(|(_, y)| y).step_by(b.sy).collect();
         assert_eq!(drawn, [0, 1, 2, 4, 5, 6]);
         // The pointer and its rows wrap at 4 K.
         let mut regs = trx_regs(40, 2, 8, 1, 0x80);
         (regs[REG_POINTER_HI], regs[REG_POINTER_LO]) = (0x0F, 0xF0);
-        let rows: Vec<usize> = TrxBox::new(&regs).lines().into_iter().flatten().map(|(p, _)| p).collect();
+        let rows: Vec<usize> = TrxBox::new(&regs, None).lines().into_iter().flatten().map(|(p, _)| p).collect();
         assert_eq!((rows[0], rows[rows.len() - 1]), (0xFF0, 0x018));
         // Off, or no width: no line.
-        assert!(TrxBox::new(&trx_regs(40, 25, 8, 9, 0x40)).lines().iter().all(Option::is_none));
-        assert!(TrxBox::new(&trx_regs(40, 25, 0, 9, 0x80)).lines().iter().all(Option::is_none));
+        assert!(TrxBox::new(&trx_regs(40, 25, 8, 9, 0x40), None).lines().iter().all(Option::is_none));
+        assert!(TrxBox::new(&trx_regs(40, 25, 0, 9, 0x80), None).lines().iter().all(Option::is_none));
     }
 
     /// A TRX snapshot with the layer off, a C64 frame of index `c64` everywhere and chargen registers `regs`; palette
@@ -1510,5 +1619,124 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(r.render(&s, &mut out), (320, 225));
         assert_eq!((out[0], out[1], out[320 * 225 - 1]), (over(1, BACKDROP), over(2, BACKDROP), over(0, BACKDROP)));
+    }
+
+    /// S45: the MultiCore host's mode `m` as the picture takes it.
+    fn mode(m: u8) -> TrxMode {
+        let r = crate::devices::hdmi_mode::row_of(m).unwrap();
+        TrxMode { hact: r.hact as usize, vact: r.vact as usize, c64: r.locked }
+    }
+
+    fn mc_snap(layer: Option<TrxLayer>, m: u8) -> DisplaySnapshot {
+        let trx = TrxOutput { layer, mode: Some(mode(m)), ..TrxOutput::default() };
+        DisplaySnapshot { trx: Some(trx), ..DisplaySnapshot::default() }
+    }
+
+    /// S45 T4: the picture is the mode's active area; output pixel x of the layer shows source pixel ⌊x · w / ow⌋,
+    /// line y source line ⌊y · h / oh⌋, clipped at the active area.
+    #[test]
+    fn s45_t4_the_layer_is_shown_at_its_output_size() {
+        let mut r = Renderer::new(&font());
+        let mut out = Vec::new();
+        assert_eq!(r.render(&mc_snap(None, 6), &mut out), (320, 240), "480p, nothing to show: half size");
+        assert_eq!(Renderer::output_size(&mc_snap(None, 6)), (640, 480), "S45 T9: a png is the output's size");
+        let trx64 = DisplaySnapshot { trx: Some(TrxOutput::default()), ..DisplaySnapshot::default() };
+        assert_eq!(Renderer::output_size(&trx64), (1920, 1080));
+        assert_eq!(r.render(&mc_snap(None, 0), &mut out), (360, 288), "576p");
+        assert_eq!(r.render(&mc_snap(None, 7), &mut out), (640, 360), "720p");
+        let pixels = vec![0xF800, 0x07E0, 0x001F, 0xFFFF, 0x0000, 0xF81F];
+        let layer = TrxLayer { x0: 10, y0: 20, w: 3, h: 2, ow: 7, oh: 5, alpha: 256, pixels, ..TrxLayer::default() };
+        assert_eq!(r.render(&mc_snap(Some(layer.clone()), 6), &mut out), (640, 480));
+        for (y, x) in (0..5).flat_map(|y| (0..7).map(move |x| (y, x))) {
+            let want = widen_565(layer.pixels[y * 2 / 5 * 3 + x * 3 / 7] as u16);
+            assert_eq!(out[(20 + y) * 640 + 10 + x], want, "({x}, {y})");
+        }
+        assert_eq!((out[20 * 640 + 17], out[25 * 640 + 10], out[19 * 640 + 10]), (0, 0, 0), "outside the picture");
+        // Cut at the right and bottom edges of the active area.
+        let edge = TrxLayer { x0: 636, y0: 477, ..layer.clone() };
+        r.render(&mc_snap(Some(edge), 6), &mut out);
+        assert_eq!(out[479 * 640 + 639], widen_565(0x07E0), "x 3 shows source 1, y 2 source line 0");
+        // 2 x 2 blocks on even coordinates halve; TRX64's S = 2 is the same layer.
+        let lvgl = TrxLayer { x0: 0, y0: 0, w: 320, h: 240, ow: 640, oh: 480, pixels: vec![0x001F; 320 * 240], ..layer };
+        assert_eq!(r.render(&mc_snap(Some(lvgl.clone()), 6), &mut out), (320, 240));
+        assert!(out.iter().all(|&p| p == widen_565(0x001F)));
+        let smooth = TrxLayer { smooth_h: true, ..lvgl };
+        assert_eq!(r.render(&mc_snap(Some(smooth), 6), &mut out), (640, 480), "smoothing does not halve");
+    }
+
+    /// S45 T5: pix_layer.v's bilinear arithmetic, and the edge pixel paired with itself.
+    #[test]
+    fn s45_t5_smoothing_follows_pix_layer_v() {
+        let (k, red) = (0x00_0000, 0xFF_0000);
+        assert_eq!(smooth_pixel([k, k], [red, red], 0, 512), 0x80_0000, "half way: 16320 · 1025 + 65536 >> 17 = 128");
+        assert_eq!(smooth_pixel([k, red], [k, red], 512, 0), 0x80_0000, "vertical: 261375 >> 5 = 8167, rounded 128");
+        assert_eq!(smooth_pixel([k, k], [red, red], 0, 0), 0, "weight 1/2048");
+        assert_eq!(smooth_pixel([k, k], [red, red], 0, 1023), red, "weight 2047/2048");
+        assert_eq!(smooth_pixel([0x12_3456, 0x12_3456], [0x12_3456, 0x12_3456], 300, 700), 0x12_3456, "flat stays flat");
+        // A 2 × 1 picture (black, white; format 2) four pixels wide: 0, half, then the last pixel with itself.
+        let mut r = Renderer::new(&font());
+        let mut out = Vec::new();
+        let layer = TrxLayer {
+            w: 2,
+            h: 1,
+            ow: 4,
+            oh: 1,
+            smooth_h: true,
+            wide: true,
+            alpha: 256,
+            pixels: vec![0, 0xFF_FFFF],
+            ..TrxLayer::default()
+        };
+        r.render(&mc_snap(Some(layer), 6), &mut out);
+        assert_eq!(out[..4], [0, 0x80_8080, 0xFF_FFFF, 0xFF_FFFF]);
+    }
+
+    /// S45 T6: the box, the text area and the C64 follow the mode: the box inside the active area with SX ≤ 2 · SY,
+    /// the text at ST = min(st_h, st_v) centred, the C64 on the 1080p rows only.
+    #[test]
+    fn s45_t6_box_text_and_c64_per_mode() {
+        let geo = |b: &TrxBox| (b.sx, b.sy, b.ws, b.hs, b.x0, b.y0);
+        let sd = trx_regs(40, 25, 8, 9, 0xC0);
+        assert_eq!(geo(&TrxBox::new(&sd, Some(&mode(6)))), (2, 2, 640, 450, 0, 15));
+        assert_eq!(geo(&TrxBox::new(&sd, Some(&mode(7)))), (4, 3, 1280, 675, 0, 22));
+        assert_eq!(geo(&TrxBox::new(&sd, Some(&mode(2)))), (4, 4, 1280, 900, 320, 90), "1080p: the whole area");
+        let big = trx_regs(40, 25, 12, 0x40 | 23, 0x80);
+        assert_eq!(geo(&TrxBox::new(&big, Some(&mode(6)))), (1, 1, 480, 450, 80, 15));
+        assert_eq!(geo(&TrxBox::new(&trx_regs(3, 25, 7, 23, 0x80), Some(&mode(6)))), (2, 1, 42, 575, 299, 0), "SX ≤ 2 SY");
+        assert_eq!(TrxBox::new(&sd, Some(&mode(6))).lines().len(), 480);
+        let area = |f| {
+            let t = TextArea::new(f);
+            (t.st, t.x, t.y)
+        };
+        assert_eq!(area((1920, 1080)), (4, 320, 140), "TRX64's place");
+        assert_eq!(area((640, 480)), (2, 0, 40));
+        assert_eq!(area((720, 576)), (2, 40, 88));
+        assert_eq!(area((1280, 720)), (3, 160, 60));
+        assert_eq!(area((800, 600)), (2, 80, 100));
+        // The text at 480p: 2 × 2 per C64 pixel from (0, 40).
+        let mut r = Renderer::new(&font());
+        let mut out = Vec::new();
+        let mut s = mc_snap(None, 6);
+        s.trx.as_mut().unwrap().text = Some(one_cell([0x80, 0, 0, 0, 0, 0, 0, 0], 2, false));
+        assert_eq!(r.render(&s, &mut out), (320, 240), "ST 2 from (0, 40) halves");
+        r.render_scaled(&s, &mut out, (640, 480));
+        let red = TRX_PALETTE[2];
+        assert!((0..2).all(|x| (40..42).all(|y| out[y * 640 + x] == red)), "bit 7 of line 0");
+        assert_eq!((out[40 * 640 + 2], out[39 * 640], out[42 * 640]), (0, 0, 0));
+        // The C64: black at 480p, as TRX64's host at 1080p.
+        let mut frame = c64_frame(384, 272);
+        frame.indices.fill(1);
+        (frame.text_x, frame.first_line, frame.raster_lines) = (32, 16, 312);
+        let mut s = mc_snap(None, 6);
+        s.c64 = Some(frame.clone());
+        r.render(&s, &mut out);
+        assert!(out.iter().all(|&p| p == 0), "no C64 off the 1080p rows");
+        let mut s = mc_snap(None, 2);
+        s.c64 = Some(frame.clone());
+        let mut on_mc = Vec::new();
+        r.render(&s, &mut on_mc);
+        s.trx.as_mut().unwrap().mode = None;
+        r.render(&s, &mut out);
+        assert!(on_mc == out && out.contains(&TRX_PALETTE[1]), "1080p 50: vic_scaler's picture");
     }
 }

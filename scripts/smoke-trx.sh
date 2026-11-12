@@ -9,7 +9,7 @@
 # firmware/1541ultimate) and a fresh flash image.
 #
 # Runs:
-#   on    smoke-trx.ctl  --board c64u, trx-io auto: "trx-io: on", the splash png 960x540, then PX_CTRL off
+#   on    smoke-trx.ctl  --board c64u, trx-io auto: "trx-io: on", the splash png 1920x1080, then PX_CTRL off
 #   off   --trx-io=off: no LVGL line, the C64 reaches READY.
 
 set -euo pipefail
@@ -46,7 +46,7 @@ png_size() {
 "$bin" run --headless --speed max --board c64u --firmware "$elf" --roms "$roms" --flash run/flash.bin --c64-roms \
     --script "$repo/scripts/smoke-trx.ctl" >run/on.log 2>run/on.err || fail on "exit code $?"
 grep -q "trx-io: on (TRX firmware: trx_lv_open)" run/on.err || fail on "auto did not find the TRX firmware"
-[[ $(png_size run/trx-splash.png) == "960 540" ]] || fail on "the splash png is $(png_size run/trx-splash.png)"
+[[ $(png_size run/trx-splash.png) == "1920 1080" ]] || fail on "the splash png is $(png_size run/trx-splash.png)"
 # The TRX output is always the 1920 x 1080 frame; whether the layer is on is PX_CTRL b0 in the second `monitor trx`.
 [[ $(grep -c "^  px_ctrl       0x23" run/on.log) == 1 && $(grep -c "^  px_ctrl       0x22" run/on.log) == 1 ]] ||
     fail on "the layer is not on during the splash and off after it"

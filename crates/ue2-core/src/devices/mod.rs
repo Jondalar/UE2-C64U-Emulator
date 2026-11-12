@@ -4,6 +4,7 @@ pub mod board;
 pub mod c64;
 pub mod drives;
 pub mod flash;
+pub mod hdmi_mode;
 pub mod i2c;
 pub mod iec;
 pub mod itu;

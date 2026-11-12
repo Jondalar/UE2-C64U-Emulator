@@ -116,7 +116,8 @@ fn joy(host: &mut Host) -> String {
 
 /// `trx` — the TRX64-Ultimate block of `--trx-io` (S37): page 0's ID, CAPS, interrupt and gate, the pause, page 5's
 /// freeze session, page 6's layer, still and text registers as the app last committed them, whether the last frame
-/// start showed the layer, and TRX64's VIC frame count.
+/// start showed the layer, and TRX64's VIC frame count. In the MultiCore host also PX_OSIZE and the running HDMI mode
+/// (S45).
 fn trx(host: &mut Host) -> Result<String, String> {
     let t = host.m.bus.io.get::<Trx>().ok_or("this machine has no TRX block (--trx-io)")?;
     let id: String = (0..4).map(|off| char::from(t.peek8(off))).collect();
@@ -128,11 +129,16 @@ fn trx(host: &mut Host) -> Result<String, String> {
     out.push_str(&format!("  id            {id}  caps {:#04x}  caps2 {:#04x}\n", t.peek8(4), t.peek8(5)));
     out.push_str(&format!("  irq enabled   {}\n", bits(t.irq_en(), &TRX_CAUSES)));
     out.push_str(&format!("  irq cause     {}\n", bits(t.cause(), &TRX_CAUSES)));
+    // S45: the MultiCore host sizes the picture by PX_OSIZE and may smooth it; TRX64's scales by b5:4.
+    let row = t.mode_row();
+    let sizing = match row {
+        Some(_) => format!("smoothing {}", on(ctrl & 0x40 != 0)),
+        None => format!("scale {}", (ctrl >> 4 & 3).max(1)),
+    };
     out.push_str(&format!(
-        "  px_ctrl       {ctrl:#04x}  {}, format {}, scale {}  (shown: {})\n",
+        "  px_ctrl       {ctrl:#04x}  {}, format {}, {sizing}  (shown: {})\n",
         on(ctrl & 1 != 0),
         ctrl >> 1 & 7,
-        (ctrl >> 4 & 3).max(1),
         yes(t.shown()),
     ));
     out.push_str(&format!(
@@ -143,6 +149,11 @@ fn trx(host: &mut Host) -> Result<String, String> {
     ));
     out.push_str(&format!("  px_size       {} x {}  stride {}\n", size & 0xFFFF, size >> 16, reg(trx::PX_STRIDE)));
     out.push_str(&format!("  px_pos        x0 {} y0 {}\n", pos & 0xFFFF, pos >> 16));
+    if let Some(r) = row {
+        let osize = reg(trx::PX_OSIZE);
+        out.push_str(&format!("  px_osize      {} x {}\n", osize & 0xFFFF, osize >> 16));
+        out.push_str(&format!("  hdmi mode     {} x {} at {} Hz pixel clock\n", r.hact, r.vact, r.rate));
+    }
     out.push_str(&format!(
         "  px_galpha     {}  px_key {:#06x} {}\n",
         reg(trx::PX_GALPHA),

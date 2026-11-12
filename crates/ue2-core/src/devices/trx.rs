@@ -29,11 +29,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::c64host::{C64Charset, C64Rom};
 use crate::coreprof::CoreProfile;
 use crate::devices::c64::C64Port;
+use crate::devices::hdmi_mode::{self, ModeReq, Row};
 use crate::devices::trx_dbg::{self as dbg, DbgLink};
 use crate::devices::trx_engine::{self as engine, Engine};
 use crate::devices::trx_sb::StateBus;
 use crate::devices::trx_session::{Chips, Session, VicView};
-use crate::host::{TrxLayer, TrxText};
+use crate::host::{TrxLayer, TrxMode, TrxText};
 use crate::io::{IoCtx, IoDevice, IoMap};
 use crate::irq::IrqState;
 use crate::machine::{MachineConfig, TrxIo};
@@ -154,6 +155,8 @@ pub const PX_POS: u32 = 0x098;
 pub const PX_GALPHA: u32 = 0x09C;
 pub const PX_KEY: u32 = 0x0A0;
 pub const PX_STATUS: u32 = 0x0A4;
+/// S45: the MultiCore host's output size of the picture, {height 16, width 16} (pix_layer.v; TRX64's host has none).
+pub const PX_OSIZE: u32 = 0x0A8;
 /// c64_text.v in page 6: TX_CTRL b0 show, b1 opaque, reads b31:24 = 1; TX_STATUS b0 shown now, b15:8 late lines.
 pub const TX_CTRL: u32 = 0x0C0;
 pub const TX_STATUS: u32 = 0x0C4;
@@ -168,11 +171,18 @@ const PAL_FRAME: u64 = 312 * 63 * CLOCK_HZ / 985_248;
 const VBLANK: u64 = 45 * 2688 * CLOCK_HZ / 151_580_000;
 /// The DDR byte address the layer's fetch and the still capture take: bits 26:0 (pix_layer.v `rd_a`, `st_a`).
 pub const DDR_ADDR_MASK: u32 = 0x07FF_FFFF;
-/// Output frame size the layer is placed in.
+/// Output frame size the layer is placed in on TRX64's host (S45: the MultiCore host's is the running mode's active
+/// area).
 pub const OUT_W: usize = 1920;
 pub const OUT_H: usize = 1080;
 /// Source width limit: the line buffer holds 960 pixels (pix_layer.v `f_w`).
 const MAX_W: u16 = 960;
+/// Source height limit (pix_layer.v `f_hc`).
+const MAX_H: u16 = 1080;
+/// S45: PX_OSIZE's two sizes must each stay below this (pix_layer.v `en_new`).
+const OSIZE_LIMIT: u16 = 2048;
+/// S45: vertical smoothing of a 32-bit picture needs its line in 128 words (pix_layer.v `vsm_new`).
+const SMOOTH_V_WIDE_W: u16 = 512;
 
 /// The still capture's 50 Hz window (pix_layer.v `X0S`, `Y0S`, 400 × 270): VIC raster columns 96-495, lines 16-285,
 /// two pixels a byte, the first in the low nibble. Slot n is at `STILL_BASE` + n × 64 KB.
@@ -288,6 +298,8 @@ pub struct TrxLink {
     pub slot_status: u32,
     /// S43: RS8 04C/04D b0, UltiSID 1 and 2's filter bypassed.
     pub rs8_bypass: [bool; 2],
+    /// S45: the MultiCore host's mode request and running row (`--icap` or `--core`); None on TRX64's host.
+    pub mode: Option<ModeReq>,
 }
 
 impl TrxLink {
@@ -311,6 +323,7 @@ impl TrxLink {
             slot_wr_en: false,
             slot_status: SLOT_IDLE,
             rs8_bypass: [false; 2],
+            mode: None,
         }
     }
 
@@ -344,10 +357,14 @@ struct Settings {
     galpha: u8,
     /// b15:0 the RGB565 key, b16 key on.
     key: u32,
+    /// S45: PX_OSIZE (the MultiCore host only).
+    ow: u16,
+    oh: u16,
 }
 
 impl Settings {
-    const DEFAULT: Settings = Settings { ctrl: 0x22, w: 960, h: 540, stride: 1920, x0: 0, y0: 0, galpha: 255, key: 0 };
+    const DEFAULT: Settings =
+        Settings { ctrl: 0x22, w: 960, h: 540, stride: 1920, x0: 0, y0: 0, galpha: 255, key: 0, ow: 1920, oh: 1080 };
 }
 
 /// What one frame shows, taken at its frame start (pix_layer.v `f_*`).
@@ -360,35 +377,84 @@ struct Shown {
     stride: u16,
     x0: u16,
     y0: u16,
-    scale: u8,
+    /// The output size: S · w by S · h on TRX64's host, PX_OSIZE on the MultiCore host (S45 §6).
+    ow: u16,
+    oh: u16,
+    smooth_h: bool,
+    smooth_v: bool,
+    /// Format 2, 32 bits a pixel.
+    wide: bool,
     alpha: u16,
     key: Option<u16>,
 }
 
 impl Shown {
-    /// The frame-start copy of `s` (pix_layer.v `en_new`, `s_new`, the `f_*` assignments): on with b0, format 1 and a
-    /// size and position inside the frame; width at most 960, height at most 1080; scale 0 counts as 1.
-    fn of(s: &Settings, front: u32) -> Shown {
+    /// The frame-start copy of `s` (pix_layer.v `en_new`, `s_new`, the `f_*` assignments) on TRX64's host (`row`
+    /// None): on with b0, format 1 and a position inside the 1080p frame; width at most 960, height at most 1080;
+    /// the scale S of b5:4, 0 counting as 1.
+    ///
+    /// S45 §6, the MultiCore host (`row` the running mode): on with b0, format 1 or 2, sizes and output sizes not 0,
+    /// output sizes below 2048 and a position inside the active area; b5:4 is not read, b6 smooths each axis where the
+    /// source is not larger than the output (vertically in format 2 only up to 512 pixels a line).
+    fn of(s: &Settings, front: u32, row: Option<&Row>) -> Shown {
+        let (w, h) = (s.w.min(MAX_W), s.h.min(MAX_H));
+        let fmt = (s.ctrl >> 1) & 0x07;
+        let alpha = u16::from(s.galpha) + u16::from(s.galpha >> 7);
+        let Some(row) = row else {
+            let scale = u16::from(match (s.ctrl >> 4) & 0x03 {
+                0 => 1,
+                n => n,
+            });
+            let on = s.ctrl & 0x01 != 0
+                && fmt == 1
+                && s.w != 0
+                && s.h != 0
+                && usize::from(s.x0) < OUT_W
+                && usize::from(s.y0) < OUT_H;
+            return Shown {
+                on,
+                front,
+                w,
+                h,
+                stride: s.stride,
+                x0: s.x0,
+                y0: s.y0,
+                ow: w * scale,
+                oh: h * scale,
+                smooth_h: false,
+                smooth_v: false,
+                wide: false,
+                alpha,
+                key: (s.key & 0x1_0000 != 0).then_some(s.key as u16),
+            };
+        };
+        let wide = fmt == 2;
         let on = s.ctrl & 0x01 != 0
-            && (s.ctrl >> 1) & 0x07 == 1
+            && (fmt == 1 || wide)
             && s.w != 0
             && s.h != 0
-            && usize::from(s.x0) < OUT_W
-            && usize::from(s.y0) < OUT_H;
+            && s.ow != 0
+            && s.oh != 0
+            && s.ow < OSIZE_LIMIT
+            && s.oh < OSIZE_LIMIT
+            && u32::from(s.x0) < row.hact
+            && u32::from(s.y0) < row.vact;
+        let smooth = s.ctrl & 0x40 != 0;
         Shown {
             on,
             front,
-            w: s.w.min(MAX_W),
-            h: s.h.min(OUT_H as u16),
+            w,
+            h,
             stride: s.stride,
             x0: s.x0,
             y0: s.y0,
-            scale: match (s.ctrl >> 4) & 0x03 {
-                0 => 1,
-                n => n,
-            },
-            alpha: u16::from(s.galpha) + u16::from(s.galpha >> 7),
-            key: (s.key & 0x1_0000 != 0).then_some(s.key as u16),
+            ow: s.ow,
+            oh: s.oh,
+            smooth_h: smooth && w <= s.ow,
+            smooth_v: smooth && h <= s.oh && (!wide || w <= SMOOTH_V_WIDE_W),
+            wide,
+            alpha,
+            key: (s.key & 0x1_0000 != 0 && !wide).then_some(s.key as u16),
         }
     }
 }
@@ -496,6 +562,8 @@ pub struct Trx {
     core_absent: bool,
     /// S44: a MultiCore core in place of the C64 core.
     core: Option<CoreRegs>,
+    /// S45: the MultiCore host's mode request as the run starts it (§4), set again by a reset; None on TRX64's host.
+    mode_start: Option<ModeReq>,
 }
 
 impl Trx {
@@ -524,7 +592,7 @@ impl Trx {
             tx_stage: 0,
             tx_latch: 0,
             rs8: RS8_RESET,
-            shown: Shown::of(&Settings::DEFAULT, 0),
+            shown: Shown::of(&Settings::DEFAULT, 0, None),
             frames: 0,
             starts: 0,
             frame_at: 0,
@@ -537,7 +605,20 @@ impl Trx {
             resid8_absent: false,
             core_absent: false,
             core: None,
+            mode_start: None,
         }
+    }
+
+    /// S45: the block sits in the MultiCore host, whose mode request starts at `row` (§4).
+    pub fn set_multicore(&mut self, row: u8) {
+        self.mode_start = Some(ModeReq::new(row));
+        lock(&self.link).mode = self.mode_start;
+        self.shown = Shown::of(&self.set, self.front, self.mode_row().as_ref());
+    }
+
+    /// S45: the block sits in the MultiCore host (its mode request and pixel layer).
+    fn multicore(&self) -> bool {
+        lock(&self.link).mode.is_some()
     }
 
     /// S44: the block answers for `p`'s core instead of the C64 core.
@@ -665,9 +746,10 @@ impl Trx {
             PX_POS => u32::from(s.y0) << 16 | u32::from(s.x0),
             PX_GALPHA => u32::from(s.galpha),
             PX_KEY => s.key,
+            PX_OSIZE => u32::from(s.oh) << 16 | u32::from(s.ow),
             // b15:8, the underruns, stay 0: the emulated fetch is never late.
             PX_STATUS => {
-                let vblank = self.now < self.frame_at + VBLANK;
+                let vblank = self.now < self.frame_at + self.mode_row().map_or(VBLANK, |r| r.lines_clocks(r.yact0()));
                 u32::from(self.frames) << 16 | u32::from(vblank) << 1 | u32::from(self.flip)
             }
             _ => 0,
@@ -836,12 +918,19 @@ impl Trx {
             return None;
         }
         let (w, h) = (usize::from(s.w), usize::from(s.h));
+        let bytes = if s.wide { 4 } else { 2 };
         let mut pixels = Vec::with_capacity(w * h);
         for m in 0..h as u32 {
             let line = s.front.wrapping_add(m * u32::from(s.stride));
             pixels.extend((0..w as u32).map(|p| {
-                let at = (line.wrapping_add(2 * p) & DDR_ADDR_MASK) as usize;
-                ram.get(at..at + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]]))
+                let at = (line.wrapping_add(bytes * p) & DDR_ADDR_MASK) as usize;
+                ram.get(at..at + bytes as usize).map_or(0, |b| {
+                    if s.wide {
+                        u32::from_le_bytes([b[0], b[1], b[2], 0])
+                    } else {
+                        u32::from(u16::from_le_bytes([b[0], b[1]]))
+                    }
+                })
             }));
         }
         Some(TrxLayer {
@@ -849,11 +938,25 @@ impl Trx {
             y0: usize::from(s.y0),
             w,
             h,
-            scale: usize::from(s.scale),
+            ow: usize::from(s.ow),
+            oh: usize::from(s.oh),
+            smooth_h: s.smooth_h,
+            smooth_v: s.smooth_v,
             alpha: s.alpha,
             key: s.key,
+            wide: s.wide,
             pixels,
         })
+    }
+
+    /// S45: the MultiCore host's running row, None on TRX64's host.
+    pub fn mode_row(&self) -> Option<Row> {
+        lock(&self.link).mode.map(|m| m.current())
+    }
+
+    /// S45: the MultiCore host's running mode for the picture, None on TRX64's host (always 1080p).
+    pub fn mode(&self) -> Option<TrxMode> {
+        self.mode_row().map(|r| TrxMode { hact: r.hact as usize, vact: r.vact as usize, c64: r.locked })
     }
 
     /// The frame start (pix_layer.v, cy 0): a pending flip shows PX_BACK and raises b7, the committed settings take
@@ -864,7 +967,7 @@ impl Trx {
             self.flip = false;
             self.cause |= CAUSE_FLIP;
         }
-        self.shown = Shown::of(&self.set, self.front);
+        self.shown = Shown::of(&self.set, self.front, self.mode_row().as_ref());
         self.cause |= CAUSE_VSYNC;
         self.frames = self.frames.wrapping_add(1);
         self.starts += 1;
@@ -903,11 +1006,18 @@ impl Trx {
             self.cause |= CAUSE_ENGINE;
             self.update_irq(irq);
         }
-        if vic != 0 && vic != self.vic_seen {
+        // S45 §5: the MultiCore host follows the VIC only on a locked (1080p) row while the C64 core counts frames;
+        // every other row runs free at its own rate.
+        let free = self.mode_row().filter(|r| !(r.locked && vic != 0 && self.core.is_none()));
+        if free.is_none() && vic != 0 && vic != self.vic_seen {
             self.vic_seen = vic;
             self.frame_start(now, irq);
-        } else if vic == 0 || paused {
-            let period = if vic != 0 && period != 0 { period } else { PAL_FRAME };
+        } else if free.is_some() || vic == 0 || paused {
+            let period = match free {
+                Some(r) => r.frame_clocks(),
+                None if vic != 0 && period != 0 => period,
+                None => PAL_FRAME,
+            };
             let due = self.frame_at + period;
             if now >= due {
                 self.frame_start(now, irq);
@@ -926,11 +1036,13 @@ impl Trx {
 
     /// Byte 3 of page 6 register `reg` with the staged bytes: the commit (pix_layer.v, the `default` branch).
     fn commit(&mut self, reg: u32, v: u32) {
+        let mc = self.multicore();
         let s = &mut self.set;
         match reg {
             STILL_CTRL => lock(&self.link).still.on = v & 1 != 0,
             STILL_BASE => lock(&self.link).still.base = v & !0x0F,
-            PX_CTRL => s.ctrl = (v & 0x3F) as u8,
+            // S45: the MultiCore host keeps b6 (smoothing).
+            PX_CTRL => s.ctrl = (v & if mc { 0x7F } else { 0x3F }) as u8,
             // Shown from the next frame start, without a flip and without b7 (the fetch takes `c_front` there).
             PX_FRONT => self.front = v & !0x0F,
             PX_BACK => {
@@ -942,6 +1054,7 @@ impl Trx {
             PX_POS => (s.x0, s.y0) = (v as u16, (v >> 16) as u16),
             PX_GALPHA => s.galpha = v as u8,
             PX_KEY => s.key = v & 0x1_FFFF,
+            PX_OSIZE if mc => (s.ow, s.oh) = (v as u16, (v >> 16) as u16),
             _ => {}
         }
     }
@@ -1100,12 +1213,16 @@ impl IoDevice for Trx {
             *l = TrxLink::power_on(frames, clocks, paused, starts, d);
         }
         let (link, apply_absent, resid8_absent) = (self.link.clone(), self.apply_absent, self.resid8_absent);
+        let mode = self.mode_start;
         let core = self.core.take().map(|mut c| {
             c.bytes.copy_from_slice(&c.reset);
             c
         });
         *self = Trx::new(link);
         (self.apply_absent, self.resid8_absent, self.core) = (apply_absent, resid8_absent, core);
+        if let Some(m) = mode {
+            self.set_multicore(m.row);
+        }
     }
 
     crate::impl_as_any!();
@@ -1120,9 +1237,22 @@ pub fn install(map: &mut IoMap, cfg: &MachineConfig) {
     if let Some(port) = map.get_mut::<C64Port>() {
         port.set_trx_io(link.clone());
     }
+    // S45 §2: a MultiCore run sits in the MultiCore host: its mode request answers in the overlay window, from the
+    // row the hand-over page names (§4).
+    let mode_row = cfg.multicore_host().then(|| {
+        cfg.handover.as_ref().and_then(|h| hdmi_mode::row_of_video(h.video)).unwrap_or(hdmi_mode::ROW_POWER_ON)
+    });
+    if mode_row.is_some() {
+        if let Some(ov) = map.get_mut::<crate::devices::overlay::Overlay>() {
+            ov.mode_link = Some(link.clone());
+        }
+    }
     let mut trx = Trx::new(link);
     if let Some(p) = &cfg.core {
         trx.set_core(p);
+    }
+    if let Some(row) = mode_row {
+        trx.set_multicore(row);
     }
     map.add(BASE, SIZE, Box::new(trx));
 }
@@ -1623,7 +1753,18 @@ mod tests {
         let layer = r.trx.layer(&r.ram).expect("on");
         assert_eq!(
             layer,
-            TrxLayer { x0: 7, y0: 5, w: 3, h: 2, scale: 1, alpha: 129, key: Some(0xF81F), pixels: vec![1, 2, 3, 11, 12, 13] }
+            TrxLayer {
+                x0: 7,
+                y0: 5,
+                w: 3,
+                h: 2,
+                ow: 3,
+                oh: 2,
+                alpha: 129,
+                key: Some(0xF81F),
+                pixels: vec![1, 2, 3, 11, 12, 13],
+                ..TrxLayer::default()
+            }
         );
         // Past the end of DDR: 0. The address keeps bits 26:0.
         r.w32(PAGE6 + PX_FRONT, 0x0800_1000 + (1 << 20) - 2);
@@ -1637,16 +1778,17 @@ mod tests {
     #[test]
     fn the_layer_is_off_unless_on_format_1_and_inside_the_frame() {
         let on = |ctrl: u8, w: u16, h: u16, x0: u16, y0: u16| {
-            Shown::of(&Settings { ctrl, w, h, x0, y0, ..Settings::DEFAULT }, 0).on
+            Shown::of(&Settings { ctrl, w, h, x0, y0, ..Settings::DEFAULT }, 0, None).on
         };
         assert!(on(0x23, 960, 540, 1919, 1079));
         assert!(!on(0x22, 960, 540, 0, 0), "b0");
         assert!(!on(0x25, 960, 540, 0, 0), "format 2");
         assert!(!on(0x23, 0, 540, 0, 0) && !on(0x23, 960, 0, 0, 0), "empty");
         assert!(!on(0x23, 960, 540, 1920, 0) && !on(0x23, 960, 540, 0, 1080), "outside");
-        let s = Shown::of(&Settings { ctrl: 0x03, w: 2000, h: 2000, galpha: 0, ..Settings::DEFAULT }, 0);
-        assert_eq!((s.w, s.h, s.scale, s.alpha), (960, 1080, 1, 0), "clamped, scale 0 is 1");
-        assert_eq!(Shown::of(&Settings { ctrl: 0x33, ..Settings::DEFAULT }, 0).scale, 3);
+        let s = Shown::of(&Settings { ctrl: 0x03, w: 2000, h: 2000, galpha: 0, ..Settings::DEFAULT }, 0, None);
+        assert_eq!((s.w, s.h, s.ow, s.oh, s.alpha), (960, 1080, 960, 1080, 0), "clamped, scale 0 is 1");
+        let s = Shown::of(&Settings { ctrl: 0x33, ..Settings::DEFAULT }, 0, None);
+        assert_eq!((s.ow, s.oh), (2880, 1620), "scale 3: S · w by S · h");
     }
 
     #[test]
@@ -1730,5 +1872,112 @@ mod tests {
         crate::devices::c64::install(&mut map, &cfg);
         install(&mut map, &cfg);
         assert_eq!(map.resolve(BASE + 0xFFFF).map(|(_, off)| off), Some(0xFFFF));
+    }
+
+    impl Rig {
+        /// S45: the block in the MultiCore host, at `row`.
+        fn multicore(row: u8) -> Self {
+            let mut r = Rig::new();
+            r.trx.set_multicore(row);
+            r
+        }
+
+        fn request(&mut self, row: u8) {
+            lock(&self.link).mode.as_mut().unwrap().write(hdmi_mode::REQ, row);
+        }
+    }
+
+    /// S45 T3: off the 1080p rows the frame runs free at the row's rate, vertical blank for its first Bv lines; on a
+    /// 1080p row the C64's frames start it, as on TRX64's host.
+    #[test]
+    fn t3_the_multicore_frame_follows_the_row() {
+        let mut r = Rig::multicore(6);
+        let row = hdmi_mode::row_of(6).unwrap();
+        let (period, blank) = (row.frame_clocks(), row.lines_clocks(45));
+        assert_eq!(row.yact0(), 45);
+        r.tick_at(period);
+        assert_eq!(r.trx.frame_starts(), 1);
+        assert_eq!(r.trx.reg(PX_STATUS) & 2, 2, "in the vertical blank");
+        r.tick_at(period + blank);
+        assert_eq!(r.trx.reg(PX_STATUS) & 2, 0, "after Bv lines");
+        // The VIC's frames do not start a 480p frame.
+        lock(&r.link).frames = 5;
+        r.tick_at(period + blank + POLL);
+        assert_eq!(r.trx.frame_starts(), 1);
+        r.tick_at(2 * period);
+        assert_eq!(r.trx.frame_starts(), 2);
+        // 1080p 50: the VIC's.
+        r.request(2);
+        r.frame();
+        assert_eq!(r.trx.frame_starts(), 3);
+        r.frame();
+        assert_eq!(r.trx.frame_starts(), 4);
+        // A core from a profile counts no VIC frames: 1080p runs free too.
+        let mut r = Rig::multicore(2);
+        r.tick_at(hdmi_mode::row_of(2).unwrap().frame_clocks());
+        assert_eq!(r.trx.frame_starts(), 1);
+    }
+
+    /// S45 §6: PX_OSIZE and b6 are the MultiCore host's; the layer is on inside the active area, in format 1 or 2, and
+    /// smooths an axis only where the source is not larger than the output.
+    #[test]
+    fn s45_the_multicore_layer_takes_osize_format_2_and_smoothing() {
+        let mut r = Rig::multicore(6);
+        r.w32(PAGE6 + PX_CTRL, 0x45); // on, format 2, smoothing
+        r.w32(PAGE6 + PX_SIZE, 2 << 16 | 3);
+        r.w32(PAGE6 + PX_STRIDE, 16);
+        r.w32(PAGE6 + PX_POS, 479 << 16 | 639);
+        r.w32(PAGE6 + PX_OSIZE, 4 << 16 | 6);
+        r.w32(PAGE6 + PX_KEY, 0x1_0000);
+        r.w32(PAGE6 + PX_FRONT, 0x1000);
+        for (i, px) in [0x0011_2233u32, 0xFF44_5566, 0x0077_8899].into_iter().enumerate() {
+            r.ram[0x1000 + 4 * i..][..4].copy_from_slice(&px.to_le_bytes());
+        }
+        assert_eq!(r.trx.reg(PX_OSIZE), 4 << 16 | 6);
+        assert_eq!(r.trx.reg(PX_CTRL), 0x45);
+        r.tick_at(hdmi_mode::row_of(6).unwrap().frame_clocks());
+        let l = r.trx.layer(&r.ram).expect("on");
+        assert_eq!((l.x0, l.y0, l.w, l.h, l.ow, l.oh, l.wide, l.key), (639, 479, 3, 2, 6, 4, true, None));
+        assert_eq!((l.smooth_h, l.smooth_v), (true, true));
+        assert_eq!(l.pixels[..3], [0x11_2233, 0x44_5566, 0x77_8899], "bits 31:24 dropped");
+        let shown = |s: Settings, m: u8| Shown::of(&s, 0, hdmi_mode::row_of(m).as_ref());
+        let d = Settings { ctrl: 0x43, w: 600, h: 400, ow: 640, oh: 480, ..Settings::DEFAULT };
+        assert!(shown(d, 6).on && shown(d, 6).smooth_h && shown(d, 6).smooth_v);
+        assert!(!shown(Settings { x0: 640, ..d }, 6).on && shown(Settings { x0: 640, ..d }, 7).on, "x0 < hact");
+        assert!(!shown(Settings { ow: 2048, ..d }, 6).on && !shown(Settings { oh: 0, ..d }, 6).on);
+        assert!(!shown(Settings { ow: 500, ..d }, 6).smooth_h, "a source wider than its output: nearest");
+        let wide = Settings { ctrl: 0x45, w: 600, ..d };
+        assert!(shown(wide, 6).smooth_h && !shown(wide, 6).smooth_v, "format 2 over 512 pixels: no vertical smoothing");
+        assert!(!shown(Settings { ctrl: 0x07, ..d }, 6).on, "format 3");
+        // TRX64's host has neither PX_OSIZE nor b6.
+        let mut t = Rig::new();
+        t.w32(PAGE6 + PX_OSIZE, 4 << 16 | 6);
+        t.w32(PAGE6 + PX_CTRL, 0x63);
+        assert_eq!((t.trx.reg(PX_OSIZE), t.trx.reg(PX_CTRL)), (1080 << 16 | 1920, 0x23));
+    }
+
+    /// S45 §4: the mode request answers in the overlay window, from the hand-over page's row; a reset keeps the host.
+    #[test]
+    fn s45_install_puts_the_mode_request_into_the_overlay_window() {
+        let mut cfg = crate::devices::board::rig::cfg();
+        (cfg.trx_io, cfg.icap) = (TrxIo::On, true);
+        cfg.handover = Some(crate::coreprof::Handover { video: 0x8000_0101, ..Default::default() });
+        let mut map = IoMap::new();
+        crate::devices::overlay::install(&mut map, &cfg);
+        install(&mut map, &cfg);
+        let ov = map.get::<crate::devices::overlay::Overlay>().unwrap();
+        assert_eq!((ov.peek8(0x4F04), ov.peek8(0x4F07)), (0x48, 7), "720p 60 from the hand-over word");
+        let trx = map.get_mut::<Trx>().unwrap();
+        assert_eq!(trx.mode().map(|m| (m.hact, m.vact, m.c64)), Some((1280, 720, false)));
+        trx.reset();
+        assert_eq!(trx.mode_row().map(|r| r.hact), Some(1280));
+        // Not a MultiCore run: no mode request, TRX64's 1080p.
+        let mut cfg = crate::devices::board::rig::cfg();
+        cfg.trx_io = TrxIo::On;
+        let mut map = IoMap::new();
+        crate::devices::overlay::install(&mut map, &cfg);
+        install(&mut map, &cfg);
+        assert_eq!(map.get::<crate::devices::overlay::Overlay>().unwrap().peek8(0x4F04), 0);
+        assert_eq!(map.get::<Trx>().unwrap().mode(), None);
     }
 }

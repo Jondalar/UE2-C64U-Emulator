@@ -65,7 +65,7 @@ for y in range(h):
         p = a + b - c
         pred = [0, a, b, (a + b) // 2, a if abs(p - a) <= abs(p - b) and abs(p - a) <= abs(p - c) else b if abs(p - b) <= abs(p - c) else c][f]
         line[i] = (line[i] + pred) & 0xFF
-    ok &= not any(line[:240]) and not any(line[2640:])
+    ok &= not any(line[:480]) and not any(line[5280:])
     prev = line
 sys.exit(0 if ok else 1)
 PY
@@ -102,7 +102,7 @@ for want in "gate_ctrl     0x00000301" "sh_status     0x00010001" "tx_ctrl      
 done
 block 2 $log | grep -q "DISK FILE BROWSER" || fail "frozen: the menu is not on the C64 text screen"
 ! block 2 $log | grep -q "READY." || fail "frozen: READY. on the text screen"
-[[ $(png_size run/frozen.png) == "960 540" ]] || fail "frozen.png is $(png_size run/frozen.png)"
+[[ $(png_size run/frozen.png) == "1920 1080" ]] || fail "frozen.png is $(png_size run/frozen.png)"
 black_bars run/frozen.png || fail "frozen.png: the bars are not black"
 frames1=$(awk '/^  vic frames/ {print $3}' $log | sed -n 1p)
 frames2=$(awk '/^  vic frames/ {print $3}' $log | sed -n 2p)

@@ -1,7 +1,9 @@
 //! HW I2C master 0x10100700 (never busy) with the HDMI monitor's EDID EEPROM on bus 0.
-//! Spec: docs/specs/S04-board-t0.md. Registers: docs/hw/03-board-init.md §HW I2C master (i2c_master.vhd); transfers
+//! Spec: docs/specs/S04-board-t0.md; the monitor `--screen` chooses: docs/specs/S45-multicore-video.md §7.
+//! Registers: docs/hw/03-board-init.md §HW I2C master (i2c_master.vhd); transfers
 //! and the EDID EEPROM: 03 §Functional model "HW I2C master (T1)" and "HPD / EDID".
 
+use crate::devices::hdmi_mode::{self, Row};
 use crate::io::{IoCtx, IoDevice, IoMap};
 use crate::machine::MachineConfig;
 
@@ -91,6 +93,140 @@ const fn edid(base: &[u8; 127], cea: &[u8]) -> [u8; 256] {
     out
 }
 
+/// S45 §7: the monitor on the HDMI port (`--screen`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Screen {
+    /// The 1920 × 1080@60 HDMI monitor of S04 ([`EDID`]).
+    #[default]
+    Hdmi1080p60,
+    /// An HDMI monitor that offers the MultiCore host's row only ([`screen_edid`]).
+    Row(u8),
+    /// No monitor: the hot-plug line is low and nobody answers at 0xA0.
+    None,
+}
+
+impl Screen {
+    /// `--screen` names: 576p50, 480p60, 720p50, 720p60, 1080p50, 1080p60, 800x600, 1024x768, 1280x1024, none.
+    pub fn parse(s: &str) -> Result<Screen, String> {
+        let row = match s {
+            "none" => return Ok(Screen::None),
+            "576p50" => 0,
+            "720p50" => 1,
+            "1080p50" => 2,
+            "480p60" => 6,
+            "720p60" => 7,
+            "1080p60" => 8,
+            "800x600" => 9,
+            "1024x768" => 10,
+            "1280x1024" => 11,
+            other => {
+                return Err(format!(
+                    "--screen '{other}': 576p50, 480p60, 720p50, 720p60, 1080p50, 1080p60, 800x600, 1024x768, \
+                     1280x1024 or none"
+                ))
+            }
+        };
+        Ok(Screen::Row(row))
+    }
+
+    /// The monitor's EDID (both blocks), None without one.
+    pub fn edid(self) -> Option<[u8; 256]> {
+        match self {
+            Screen::Hdmi1080p60 => Some(EDID),
+            Screen::Row(m) => hdmi_mode::row_of(m).map(|r| screen_edid(&r)),
+            Screen::None => None,
+        }
+    }
+
+    /// The hot-plug line (U64_HDMI_REG HPD_CURRENT): high with a monitor.
+    pub fn plugged(self) -> bool {
+        self != Screen::None
+    }
+}
+
+/// S45 §7: the EDID of an HDMI monitor that offers `row` only. The base block holds the row's detailed timing (its
+/// raster, the pixel clock rounded to 10 kHz) as the preferred one and no established or standard timings; the CEA
+/// block names the row's VIC as native (none for a PC row) and carries the HDMI VSDB (225 MHz), which Gideon's
+/// `IsMonitorHDMI` wants. edid.cc's `row_of_timing` maps the timing to the row (same active area, the frame rate
+/// within 1 Hz, the clock within 5 %).
+pub fn screen_edid(row: &Row) -> [u8; 256] {
+    let mut b = [0u8; 256];
+    // Header; vendor "UEM", product 2, serial 0, week 0 of 2026; EDID 1.3; digital input.
+    b[..21].copy_from_slice(&[
+        0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x54, 0xAD, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2E,
+        0x01, 0x03, 0x80,
+    ]);
+    // Size in cm and mm by the aspect: 16:9 53 × 30, 5:4 37.5 × 30, 4:3 40 × 30.
+    let (wmm, hmm): (u32, u32) = match (row.hact * 9 == row.vact * 16, row.hact * 4 == row.vact * 5) {
+        (true, _) => (531, 299),
+        (_, true) => (375, 300),
+        _ => (400, 300),
+    };
+    // Size; gamma 2.2; RGB colour, preferred timing in the first descriptor; sRGB primaries.
+    b[21..35].copy_from_slice(&[
+        (wmm / 10) as u8,
+        (hmm / 10) as u8,
+        0x78,
+        0x0A,
+        0xEE,
+        0x91,
+        0xA3,
+        0x54,
+        0x4C,
+        0x99,
+        0x26,
+        0x0F,
+        0x50,
+        0x54,
+    ]);
+    // Established timings 35-37 none; standard timings 38-53 unused (01 01).
+    b[38..54].fill(0x01);
+    // The detailed timing.
+    let (hbl, vbl) = (row.xact0(), row.yact0());
+    let clk = (row.rate + 5_000) / 10_000;
+    b[54..72].copy_from_slice(&[
+        clk as u8,
+        (clk >> 8) as u8,
+        row.hact as u8,
+        hbl as u8,
+        ((row.hact >> 8) << 4 | hbl >> 8) as u8,
+        row.vact as u8,
+        vbl as u8,
+        ((row.vact >> 8) << 4 | vbl >> 8) as u8,
+        row.hfp as u8,
+        row.hsync as u8,
+        ((row.vfp & 0x0F) << 4 | row.vsync & 0x0F) as u8,
+        ((row.hfp >> 8) << 6 | (row.hsync >> 8) << 4 | (row.vfp >> 4) << 2 | row.vsync >> 4) as u8,
+        wmm as u8,
+        hmm as u8,
+        ((wmm >> 8) << 4 | hmm >> 8) as u8,
+        0,
+        0,
+        0x18 | if row.pos_sync { 0x06 } else { 0 },
+    ]);
+    // Monitor name "UE2EMU SCREEN".
+    b[72..90].copy_from_slice(&[
+        0x00, 0x00, 0x00, 0xFC, 0x00, 0x55, 0x45, 0x32, 0x45, 0x4D, 0x55, 0x20, 0x53, 0x43, 0x52, 0x45, 0x45, 0x4E,
+    ]);
+    // Two dummy descriptors.
+    b[93] = 0x10;
+    b[111] = 0x10;
+    b[126] = 1;
+    // CEA-861 revision 3: the VIC (native), basic audio, speakers, HDMI VSDB; no detailed timings of its own.
+    let mut blocks = Vec::new();
+    if row.vic != 0 {
+        blocks.extend([0x41, 0x80 | row.vic]);
+    }
+    blocks.extend([0x23, 0x09, 0x07, 0x07, 0x83, 0x01, 0x00, 0x00, 0x67, 0x03, 0x0C, 0x00, 0x10, 0x00, 0x00, 0x2D]);
+    b[128..132].copy_from_slice(&[0x02, 0x03, 4 + blocks.len() as u8, 0x40]);
+    b[132..132 + blocks.len()].copy_from_slice(&blocks);
+    for block in [0, 128] {
+        let sum = b[block..block + 127].iter().fold(0u8, |a, &x| a.wrapping_add(x));
+        b[block + 127] = sum.wrapping_neg();
+    }
+    b
+}
+
 /// Slave selected by the last address byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Target {
@@ -117,8 +253,8 @@ struct Ddc {
 }
 
 impl Ddc {
-    fn read(&mut self) -> u8 {
-        let byte = EDID.get(usize::from(self.segment) * 256 + usize::from(self.pointer)).copied().unwrap_or(0xFF);
+    fn read(&mut self, edid: &[u8; 256]) -> u8 {
+        let byte = edid.get(usize::from(self.segment) * 256 + usize::from(self.pointer)).copied().unwrap_or(0xFF);
         self.pointer = self.pointer.wrapping_add(1);
         byte
     }
@@ -137,6 +273,8 @@ pub struct HwI2c {
     /// The next transmitted byte is an address byte: after a START or a repeated start (vhd:267-274).
     addressing: bool,
     target: Target,
+    /// S45 §7: the monitor's EDID, None without a monitor (nobody answers at 0xA0). The monitor stays through resets.
+    edid: Option<[u8; 256]>,
     /// `data_out` shift register: 0xFF after TX, which shifts in '1's (vhd:216), the received byte after RX
     /// (vhd:237-241, 300-301).
     data_out: u8,
@@ -157,9 +295,15 @@ impl HwI2c {
             started: false,
             addressing: false,
             target: Target::Unmodelled,
+            edid: Some(EDID),
             data_out: 0xFF,
             ddc: Ddc::default(),
         }
+    }
+
+    /// S45 §7: the monitor `screen` on the HDMI port.
+    pub fn with_screen(screen: Screen) -> Self {
+        HwI2c { edid: screen.edid(), ..HwI2c::new() }
     }
 
     fn get(&self, off: u32) -> u8 {
@@ -183,6 +327,7 @@ impl HwI2c {
         if self.addressing {
             self.addressing = false;
             self.target = match (self.channel, byte) {
+                _ if self.edid.is_none() => Target::Unmodelled,
                 (CHANNEL_HDMI, EDID_WRITE) => Target::EdidWrite { pointer_loaded: false },
                 (CHANNEL_HDMI, EDID_READ) => Target::EdidRead,
                 (CHANNEL_HDMI, SEGMENT_WRITE) => Target::Segment,
@@ -203,8 +348,8 @@ impl HwI2c {
 
     /// RECEIVE/RECEIVE_ACK strobe: the addressed slave drives the next byte; with none, SDA stays high (vhd:237-241).
     fn receive(&mut self) {
-        self.data_out = match self.target {
-            Target::EdidRead => self.ddc.read(),
+        self.data_out = match (self.target, &self.edid) {
+            (Target::EdidRead, Some(edid)) => self.ddc.read(edid),
             _ => 0xFF,
         };
     }
@@ -233,7 +378,7 @@ impl IoDevice for HwI2c {
             RECEIVE | RECEIVE_ACK => self.receive(),
             CHANNEL => self.channel = val & 0x03,
             // bit0 resets the master: channel 0, scanner off, no transfer (vhd:136, 282-283). The monitor is untouched.
-            SOFT_RESET if val & 1 != 0 => *self = HwI2c { ddc: self.ddc, ..HwI2c::new() },
+            SOFT_RESET if val & 1 != 0 => *self = HwI2c { ddc: self.ddc, edid: self.edid, ..HwI2c::new() },
             SCAN_ENABLE => self.scan_enable = val & 1 != 0,
             _ => {}
         }
@@ -244,14 +389,14 @@ impl IoDevice for HwI2c {
     }
 
     fn reset(&mut self) {
-        *self = HwI2c::new();
+        *self = HwI2c { edid: self.edid, ..HwI2c::new() };
     }
 
     crate::impl_as_any!();
 }
 
-pub fn install(map: &mut IoMap, _cfg: &MachineConfig) {
-    map.add(0x1010_0700, 0x100, Box::new(HwI2c::new()));
+pub fn install(map: &mut IoMap, cfg: &MachineConfig) {
+    map.add(0x1010_0700, 0x100, Box::new(HwI2c::with_screen(cfg.screen)));
 }
 
 #[cfg(test)]
@@ -375,5 +520,70 @@ mod tests {
         assert_eq!(rig.r8(0x1010_0701), 0);
         rig.w8(0x1010_0700, 0xA1);
         assert_eq!(rx(&mut rig, false), EDID[10]);
+    }
+
+    /// edid.cc `row_of_timing` for one detailed timing: the rows with its active area, a frame rate within 1 Hz and a
+    /// clock within 5 %.
+    fn rows_of_dtd(d: &[u8]) -> Vec<u8> {
+        let clk = (u64::from(d[0]) | u64::from(d[1]) << 8) * 10_000;
+        let hact = u32::from(d[2]) | u32::from(d[4] & 0xF0) << 4;
+        let hbl = u32::from(d[3]) | u32::from(d[4] & 0x0F) << 8;
+        let vact = u32::from(d[5]) | u32::from(d[7] & 0xF0) << 4;
+        let vbl = u32::from(d[6]) | u32::from(d[7] & 0x0F) << 8;
+        let mhz = |c: u64, h: u32, v: u32| c * 1000 / u64::from(h * v);
+        (0..12u8)
+            .filter(|&m| {
+                hdmi_mode::row_of(m).is_some_and(|r| {
+                    let d = mhz(clk, hact + hbl, vact + vbl).abs_diff(mhz(u64::from(r.rate), r.htot(), r.vtot()));
+                    let near = clk.abs_diff(u64::from(r.rate)) * 100 <= u64::from(r.rate) * 5;
+                    r.hact == hact && r.vact == vact && d <= 1000 && near
+                })
+            })
+            .collect()
+    }
+
+    /// S45 T7: each `--screen` EDID: valid blocks, the base block's timing is its row and nothing else, the CEA block
+    /// names the row's VIC as native and holds the HDMI VSDB.
+    #[test]
+    fn s45_t7_screen_edids_offer_their_row_only() {
+        for name in ["576p50", "480p60", "720p50", "720p60", "1080p50", "1080p60", "800x600", "1024x768", "1280x1024"] {
+            let Screen::Row(m) = Screen::parse(name).unwrap() else { panic!() };
+            let e = Screen::Row(m).edid().unwrap();
+            assert_eq!(e[..8], [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+            assert!(e.chunks(128).all(|b| b.iter().fold(0u8, |a, &x| a.wrapping_add(x)) == 0), "{name}: checksums");
+            assert_eq!((e[35], e[36], e[126]), (0, 0, 1));
+            assert!(e[38..54].iter().all(|&b| b == 1), "{name}: no standard timings");
+            assert_eq!(rows_of_dtd(&e[54..72]), vec![m], "{name}: the timing is the row");
+            assert!([72, 90, 108].iter().all(|&q| e[q] == 0 && e[q + 1] == 0), "{name}: one detailed timing");
+            let r = hdmi_mode::row_of(m).unwrap();
+            let cea = &e[128..];
+            assert_eq!((cea[0], cea[1]), (0x02, 0x03));
+            let blocks = &cea[4..usize::from(cea[2])];
+            if r.vic != 0 {
+                assert_eq!(blocks[..2], [0x41, 0x80 | r.vic], "{name}: native VIC");
+            }
+            assert!(blocks.windows(4).any(|w| w == [0x67, 0x03, 0x0C, 0x00]), "{name}: HDMI VSDB");
+        }
+        assert_eq!(Screen::parse("none"), Ok(Screen::None));
+        assert!(Screen::parse("480p").is_err());
+        assert_eq!(Screen::default().edid(), Some(EDID));
+        assert!(!Screen::None.plugged() && Screen::Row(6).plugged());
+    }
+
+    /// S45 §7: without a monitor nobody answers on the HDMI bus, through a reset too.
+    #[test]
+    fn s45_no_screen_reads_ff() {
+        let rig_with = |screen| {
+            let mut cfg = crate::devices::board::rig::cfg();
+            cfg.screen = screen;
+            Rig::with_cfg(install, &cfg)
+        };
+        let mut rig = rig_with(Screen::None);
+        assert_eq!(read_block(&mut rig, 0xA0, 0x00, 2), Some(vec![0xFF, 0xFF]));
+        rig.w8(0x1010_0707, 1);
+        assert_eq!(read_block(&mut rig, 0xA0, 0x00, 1), Some(vec![0xFF]), "a soft reset keeps the screen");
+        let mut rig = rig_with(Screen::Row(6));
+        let want = Screen::Row(6).edid().unwrap();
+        assert_eq!(read_block(&mut rig, 0xA0, 0x36, 4).as_deref(), Some(&want[0x36..0x3A]));
     }
 }
