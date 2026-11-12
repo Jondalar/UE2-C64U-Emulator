@@ -79,6 +79,16 @@ pub struct MachineConfig {
     pub icap: bool,
     /// S44: the hand-over page the host app writes before it starts a core, written into DDR after the image loads.
     pub handover: Option<crate::coreprof::Handover>,
+    /// S45 §7: the monitor on the HDMI port (`--screen`): its EDID and the hot-plug line.
+    pub screen: crate::devices::i2c::Screen,
+}
+
+impl MachineConfig {
+    /// S45 §2: the run is a MultiCore one (`--icap`, the host app, or `--core`, a core app), so the TRX block sits in
+    /// the MultiCore host, with its HDMI modes, mode request and scaled pixel layer.
+    pub fn multicore_host(&self) -> bool {
+        self.icap || self.core.is_some()
+    }
 }
 
 /// S37: whether the board carries the TRX bitstream's IO block (`--trx-io[=auto|on|off]`).
@@ -143,6 +153,7 @@ impl MachineConfig {
             core: None,
             icap: false,
             handover: None,
+            screen: crate::devices::i2c::Screen::Hdmi1080p60,
         }
     }
 }
@@ -866,12 +877,12 @@ impl Machine {
             let (layer, paused) = (trx.layer(&self.bus.ram), trx.paused());
             let backend = self.bus.io.get::<C64Port>().and_then(C64Port::backend);
             let text = trx.text().zip(backend).map(|((view, opaque), c64)| devices::trx::text_layer(view, opaque, c64));
-            // The TRX bitstream always outputs its 1920 × 1080 frame, layer or not, so the picture keeps one shape.
-            Some(TrxOutput { layer, paused, text })
+            // The TRX bitstream always outputs its frame (1080p, or the MultiCore host's mode), layer or not.
+            Some(TrxOutput { layer, paused, text, mode: trx.mode() })
         });
         // S41 §5: without a core the TRX output is the overlay over black.
         if self.core_is_absent() {
-            snap.trx = snap.trx.as_ref().map(|_| TrxOutput::default());
+            snap.trx = snap.trx.as_ref().map(|t| TrxOutput { mode: t.mode, ..TrxOutput::default() });
         }
         // The text dump shows what the text layer draws while it is shown, not what the paused VIC points at.
         if let (Some(frame), Some(text)) = (snap.c64.as_mut(), snap.trx.as_ref().and_then(|t| t.text.as_ref())) {

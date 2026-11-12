@@ -868,7 +868,9 @@ impl Target for HandleTarget {
         };
         let snap = self.snapshot();
         let mut pixels = Vec::new();
-        let (w, h) = self.renderer.insert(renderer).render(&snap, &mut pixels);
+        // S45: the output's size, also where the composite is built at half size (2 × 2 blocks, exact).
+        let (w, h) = Renderer::output_size(&snap);
+        self.renderer.insert(renderer).render_scaled(&snap, &mut pixels, (w, h));
         Ok((pixels, w, h))
     }
 

@@ -42,7 +42,8 @@ const KEYB_ROW: u32 = 0x0B;
 const LEDSTRIP_EN: u32 = 0x0C;
 const ETHSTREAM_ENA: u32 = 0x0F;
 
-/// HPD_CURRENT set, HPD_WASLOW clear (u64.h:96-97): the overlay UI needs bit 2 (ultimate.cc:183-187).
+/// HPD_CURRENT set, HPD_WASLOW clear (u64.h:96-97): the overlay UI needs bit 2 (ultimate.cc:183-187). S45 §7:
+/// `--screen none` reads 0, no monitor.
 const HDMI_REG_VALUE: u8 = 0x04;
 const BLACKBOARD_VALUE: u8 = 0x01;
 
@@ -59,6 +60,8 @@ pub struct U64Io {
     pub cart_detect: Arc<AtomicU8>,
     /// The RESTORE key is held (`HostInput::Restore`).
     pub restore: bool,
+    /// S45 §7: a monitor is on the HDMI port (HPD_CURRENT).
+    pub hpd: bool,
 }
 
 impl Default for U64Io {
@@ -78,6 +81,7 @@ impl U64Io {
             matrix: [0; 8],
             cart_detect: Arc::new(AtomicU8::new(CART_DETECT_NONE)),
             restore: false,
+            hpd: true,
         }
     }
 
@@ -144,7 +148,7 @@ impl IoDevice for U64Io {
     /// Reads have no side effects.
     fn peek8(&self, off: u32) -> u8 {
         match off {
-            HDMI_REG => HDMI_REG_VALUE,
+            HDMI_REG => if self.hpd { HDMI_REG_VALUE } else { 0 },
             RESTORE_REG => u8::from(self.restore),
             CART_DETECT => self.cart_detect.load(Ordering::Relaxed),
             KEYB_JOY => self.joy_value(),
@@ -158,8 +162,8 @@ impl IoDevice for U64Io {
     crate::impl_as_any!();
 }
 
-pub fn install(map: &mut IoMap, _cfg: &MachineConfig) {
-    map.add(BASE, SIZE, Box::new(U64Io::new()));
+pub fn install(map: &mut IoMap, cfg: &MachineConfig) {
+    map.add(BASE, SIZE, Box::new(U64Io { hpd: cfg.screen.plugged(), ..U64Io::new() }));
 }
 
 #[cfg(test)]

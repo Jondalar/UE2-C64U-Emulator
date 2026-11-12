@@ -171,9 +171,15 @@ struct RunArgs {
     #[arg(long)]
     icap: bool,
     /// The hand-over page at 0x03EFF000 as the host app writes it, over the profile's: path=,core=,id=,version=,
-    /// host=<8 hex>,video=[pal50|ntsc60|pal60|ntsc50:]480p|720p|1080p|... (S44)
+    /// host=<8 hex>,video=[pal50|ntsc60|pal60|ntsc50:]480p|720p|1080p|... (S44). In a MultiCore run the HDMI
+    /// mode starts as video names it (S45)
     #[arg(long, value_name = "SPEC")]
     handover: Option<String>,
+    /// The monitor on the HDMI port: an HDMI screen that offers only 576p50, 480p60, 720p50, 720p60, 1080p50,
+    /// 1080p60, 800x600, 1024x768 or 1280x1024 (the MultiCore host app puts that mode up), or none (no hot-plug,
+    /// no EDID) [default: a 1920x1080@60 HDMI monitor] (docs/specs/S45-multicore-video.md)
+    #[arg(long, value_name = "MODE")]
+    screen: Option<String>,
     /// The .cor bundles the host app's core starts are found among, by the SHA-256 of what reaches the ICAP loader or
     /// the flash at an IPROG (S44 phase B)
     #[arg(long, value_name = "DIR")]
@@ -288,6 +294,9 @@ fn run(a: RunArgs) -> Result<()> {
     cfg.absent = ue2_core::absent::AbsentConfig::parse(a.absent.as_deref(), a.absent_mode.as_deref(), a.absent_continue)
         .map_err(|e| anyhow::anyhow!(e))?;
     (cfg.core, cfg.icap, cfg.handover) = coreprofile::configure(a.core.as_deref(), a.icap, a.handover.as_deref())?;
+    if let Some(screen) = &a.screen {
+        cfg.screen = ue2_core::devices::i2c::Screen::parse(screen).map_err(|e| anyhow::anyhow!(e))?;
+    }
     cfg.halt_on_fault = !a.no_halt;
     cfg.trace = a.trace || a.gdb.is_some();
     cfg.idle_skip = !a.no_idle_skip;

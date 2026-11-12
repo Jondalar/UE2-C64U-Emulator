@@ -90,8 +90,9 @@ pub struct DisplaySnapshot {
     pub now_ms: u64,
     /// C64 frame under the overlay; None without an attached C64 (docs/specs/S14-c64-trx64.md §9).
     pub c64: Option<C64Frame>,
-    /// S37: the TRX output picture (1920 × 1080, the C64 at 4× between bars, the pixel layer and the text layer),
-    /// always with `--trx-io`, as the bitstream has no other output. None without it. Filled by `Machine::display`.
+    /// S37: the TRX output picture (the C64 at 4× between bars, the pixel layer and the text layer; 1920 × 1080, or
+    /// with the MultiCore host the running HDMI mode's active area, S45), always with `--trx-io`, as the bitstream has
+    /// no other output. None without it. Filled by `Machine::display`.
     pub trx: Option<TrxOutput>,
 }
 
@@ -105,10 +106,23 @@ pub struct TrxOutput {
     pub paused: bool,
     /// The C64 text layer (c64_text.v), None while it is not shown.
     pub text: Option<TrxText>,
+    /// S45: the MultiCore host's running HDMI mode; None for TRX64-Ultimate's host, whose output is always 1080p.
+    pub mode: Option<TrxMode>,
 }
 
-/// S37 phase B: the freeze menu's text as c64_text.v draws it: 40 × 25 cells of 8 × 8, each C64 pixel 4 × 4 output
-/// pixels from output (320, 140), over everything else.
+/// S45: the MultiCore host's running mode as the picture needs it (hdmi_timing.v `hact`, `vact`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrxMode {
+    /// The active area: the size of the output picture.
+    pub hact: usize,
+    pub vact: usize,
+    /// vic_scaler.v `en`: the row is a 1080p one, the only rows the C64 is drawn on.
+    pub c64: bool,
+}
+
+/// S37 phase B: the freeze menu's text as c64_text.v draws it: 40 × 25 cells of 8 × 8, each C64 pixel ST × ST output
+/// pixels, centred in the active area (4 × 4 from output (320, 140) at 1080p; S45 §5 for the other modes), over
+/// everything else.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrxText {
     /// Glyph byte of cell `col` on text line `line` (0-199) at `40 line + col`, bit 7 the leftmost pixel.
@@ -123,23 +137,30 @@ pub struct TrxText {
     pub charset: crate::c64host::C64Charset,
 }
 
-/// S37: what the pixel layer shows in one frame (pix_layer.v, the `f_*` values of its frame start).
+/// S37, S45 §6: what the pixel layer shows in one frame (pix_layer.v, the `f_*` values of its frame start).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TrxLayer {
-    /// Output pixel of the top left in the 1920 × 1080 frame; x0 < 1920, y0 < 1080.
+    /// Output pixel of the top left in the active area; inside it.
     pub x0: usize,
     pub y0: usize,
     /// Source pixels, w ≤ 960, h ≤ 1080, both at least 1.
     pub w: usize,
     pub h: usize,
-    /// Output pixels per source pixel in both directions, 1-3.
-    pub scale: usize,
+    /// Output pixels the picture covers (PX_OSIZE; TRX64's host: S · w by S · h), each 1-2047, with w ≤ 2 · ow and
+    /// h ≤ 2 · oh in use. Output pixel x shows source pixel ⌊x · w / ow⌋, line y source line ⌊y · h / oh⌋.
+    pub ow: usize,
+    pub oh: usize,
+    /// Bilinear smoothing per axis (PX_CTRL b6 where the source is not larger than the output, S45 §6).
+    pub smooth_h: bool,
+    pub smooth_v: bool,
     /// Blend factor 0-256: the global alpha G plus G bit 7.
     pub alpha: u16,
-    /// RGB565 colour key, when on.
+    /// RGB565 colour key, when on (format 1 only).
     pub key: Option<u16>,
-    /// `w × h` RGB565 pixels, row by row.
-    pub pixels: Vec<u16>,
+    /// Format 2 (PX_CTRL b3:1 = 2): `pixels` are 0x00RRGGBB; format 1: RGB565 in the low 16 bits.
+    pub wide: bool,
+    /// `w × h` pixels, row by row.
+    pub pixels: Vec<u32>,
 }
 
 /// Host end of the wired Ethernet segment behind the RMII MAC (docs/hw/08-network-rmii.md T1 §8). Frames are

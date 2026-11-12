@@ -309,6 +309,15 @@ pub fn exec(
     if m.core_is_absent() {
         return Err("the core is absent: no C64 until `core present`".into());
     }
+    // S45: the device views read the machine only, so they answer without a C64 too (a MultiCore run is --c64 none).
+    if trx64(m).is_none() {
+        let args = words(line.trim_start().strip_prefix(&verb).unwrap_or(""));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut bare = Host { m, state };
+        return devices::verb(&mut bare, &verb, &args)
+            .unwrap_or(Err("the monitor needs a C64: start with --c64 trx64 (without one: itu, cart, joy, flash, sd, usb, net, audio, trx, dir)".into()))
+            .map(|a| addr_spans::plain(&a));
+    }
     let mut host = Host::new(m, state).ok_or("the monitor needs a C64: start with --c64 trx64")?;
     // S38: what the line does to the C64 decides what happens to the transport, before the verb runs (the daemon's
     // order: a verb that appends anchors must not have them cut afterwards).
@@ -780,6 +789,24 @@ mod tests {
         assert!(out.contains("tx_ctrl       0x01000000"), "{out}");
         assert!(out.contains("px_ctrl       0x22  off, format 1, scale 2  (shown: no)"), "{out}");
         assert!(out.contains("px_size       960 x 540  stride 1920"), "{out}");
+    }
+
+    /// S45: without a C64 (a MultiCore run, `--c64 none`) the device views answer; the C64's verbs say why they do not.
+    /// The MultiCore host shows PX_OSIZE and the running mode.
+    #[test]
+    fn device_views_answer_without_a_c64() {
+        let mut cfg = MachineConfig::new(PathBuf::new(), PathBuf::new());
+        (cfg.trx_io, cfg.icap) = (ue2_core::TrxIo::On, true);
+        let mut bus = SystemBus::new();
+        ue2_core::devices::overlay::install(&mut bus.io, &cfg);
+        ue2_core::devices::trx::install(&mut bus.io, &cfg);
+        let mut m = Machine::from_parts(cfg, bus, 0x30000, Symbols::empty());
+        let out = exec(&mut m, &mut MonitorSession::new(), &mut State::default(), "trx").expect("trx");
+        assert!(out.contains("px_ctrl       0x22  off, format 1, smoothing off  (shown: no)"), "{out}");
+        assert!(out.contains("px_osize      1920 x 1080"), "{out}");
+        assert!(out.contains("hdmi mode     1920 x 1080 at 148869143 Hz pixel clock"), "{out}");
+        let err = exec(&mut m, &mut MonitorSession::new(), &mut State::default(), "r").unwrap_err();
+        assert!(err.contains("needs a C64") && err.contains("trx"), "{err}");
     }
 
     /// S39 §3.8: while trxmon owns run control (OWNER) UE2's monitor refuses the verbs that run, step, halt or move

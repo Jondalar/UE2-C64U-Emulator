@@ -295,6 +295,7 @@ flowchart LR
 | [S42](specs/S42-esp32-rocker-events.md) | The ESP32's rocker events over the WiFi UART | — |
 | [S43](specs/S43-trx-resid8-drive-slot.md) | The TRX bitstream's reSID8 control, 1541-only drives, the slot block | — |
 | [S44](specs/S44-multicore-cores.md) | MultiCore: the core application as any core, the host app's core starts | — |
+| [S45](specs/S45-multicore-video.md) | The MultiCore host's video: HDMI modes, the mode request, the scaled pixel layer, `--screen` | — |
 
 ## 5. Building Block View
 
@@ -372,13 +373,14 @@ The devices, by module:
 |---|---|---|---|
 | `itu.rs` | `0x10000000-0x100000FF` | ITU register view on `IrqState`, ITU_TIMER, IRQ timer, ms timer, capability word, menu button, UART to the console | [S03](specs/S03-itu-uart.md), [fixes.md](status/fixes.md) §4 |
 | `board.rs` | U2PIO `0x10100000` (with the MDIO PHY), DDR2 PHY, CLOCKMEAS, audio mixer `0x10100500`, LED strip, Blingboard, MMCM `0x10200000` | T0 latches and constants, BOARDREV 0xB8. The mixer window moves to `C64Port` with S17 | [S04](specs/S04-board-t0.md), [S17](specs/S17-ultisid.md) §2.5 |
-| `i2c.rs` | `0x10100700` | I2C master; an EDID EEPROM on channel 0 (1080p60 HDMI); other addresses ACK and read 0xFF | [fixes.md](status/fixes.md) §5 |
-| `u64io.rs` | `0x10100400` | Keyboard matrix scan, U64II_KEYB_JOY (the selected port's lines, S36), HDMI HPD, CART_DETECT, U64_RESTORE_REG (RESTORE held, S44) | [S07](specs/S07-overlay-u64io-render.md), [S36](specs/S36-joystick.md) |
-| `overlay.rs` | `0x10140000-0x1014FFFF` | Chargen registers, screen and colour RAM, palette, `snapshot` | [S07](specs/S07-overlay-u64io-render.md) |
+| `i2c.rs` | `0x10100700` | I2C master; an EDID EEPROM on channel 0 (1080p60 HDMI, or with `--screen` a monitor offering one mode, or none); other addresses ACK and read 0xFF | [fixes.md](status/fixes.md) §5, [S45](specs/S45-multicore-video.md) |
+| `u64io.rs` | `0x10100400` | Keyboard matrix scan, U64II_KEYB_JOY (the selected port's lines, S36), HDMI HPD (low with `--screen none`, S45), CART_DETECT, U64_RESTORE_REG (RESTORE held, S44) | [S07](specs/S07-overlay-u64io-render.md), [S36](specs/S36-joystick.md) |
+| `overlay.rs` | `0x10140000-0x1014FFFF` | Chargen registers, screen and colour RAM, palette, `snapshot`; in a MultiCore run the mode request at 0x4F00-0x4F09 | [S07](specs/S07-overlay-u64io-render.md), [S45](specs/S45-multicore-video.md) |
+| `hdmi_mode.rs` | — | The MultiCore host's HDMI rows (hdmi_modes.vh) and its mode request (mode_req.v), kept in the TRX block's link | [S45](specs/S45-multicore-video.md) |
 | `flash.rs` | `0x10060200` | S25FL128L SPI NOR, 16 MiB, persistent image, overlay-UI seed, `--settings` records (S21), replaceable unique ID | [S06](specs/S06-spi-flash.md), [storage.md](status/storage.md) |
 | `sdcard.rs` | `0x10060000` | SDHC in SPI mode on an image | [S09](specs/S09-sd-card.md), [storage.md](status/storage.md) |
 | `misc.rs` | RTC `0x10060100`, TRACE, RTC timer `0x10060400` (host UTC), GCR codec `0x10060500`, ICAP `0x10060600`, audio select `0x10060700` | T0; with `--icap` the ICAP loader: ID 0x7A, the core-swap port, Xilinx packets read for decouple, partial streams and IPROG (`IcapEvent`) | [S04](specs/S04-board-t0.md), [S44](specs/S44-multicore-cores.md) |
-| `trx.rs` (`trx_sb.rs`, `trx_engine.rs`, `trx_dbg.rs`, `trx_session.rs`) | `0x101A0000-0x101AFFFF` (`--trx-io`) | TRX64-Ultimate's IO block: ID and IRQ, the gate, state bus, engine, debug block, freeze session and lens unit, the pixel layer and C64 text layer, reSID8 view, slot block; with `--core` a MultiCore core's ID, CAPS and register file | [S37](specs/S37-trx-pixel-layer.md)-[S44](specs/S44-multicore-cores.md) |
+| `trx.rs` (`trx_sb.rs`, `trx_engine.rs`, `trx_dbg.rs`, `trx_session.rs`) | `0x101A0000-0x101AFFFF` (`--trx-io`) | TRX64-Ultimate's IO block: ID and IRQ, the gate, state bus, engine, debug block, freeze session and lens unit, the pixel layer and C64 text layer, reSID8 view, slot block; with `--core` a MultiCore core's ID, CAPS and register file; in a MultiCore run (`--icap` or `--core`) the MultiCore host's pixel layer (PX_OSIZE, smoothing, 32-bit pixels) and frame per HDMI mode | [S37](specs/S37-trx-pixel-layer.md)-[S45](specs/S45-multicore-video.md) |
 | `wifi.rs` | `0x10060900` | DMA UART with a u64ctrl stub, the ESP32 ROM loader for updaters, power requests (`U64Ctrl::power_event`) | [S05](specs/S05-wifi-u64ctrl.md), [install.md](status/install.md) §5 |
 | `rmii.rs` | `0x10060800` | RMII MAC: RX filter, TX, free queue, level IRQ bit 5, DMA buffers | [S12](specs/S11-S14-later.md), [network.md](status/network.md) |
 | `usb/` | `0x10080000-0x10080FFF` | Nano USB CPU protocol HLE, USB2513 hub, mass storage, HID keyboard and mouse, plugging in and out while running | [S13](specs/S11-S14-later.md), [S32](specs/S32-usb-mouse.md), [S33](specs/S33-usb-plug.md), [usb.md](status/usb.md) |

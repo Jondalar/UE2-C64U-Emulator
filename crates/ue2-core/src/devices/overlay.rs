@@ -11,11 +11,13 @@
 //! | 0x4000-0x401D | HDMI timing `t_video_timing_regs` (u64.h:172-203) | stored, reads 0 (write-only in firmware, hdmi_scan.cc:6-30) |
 //! | 0x5000-0x503F | HDMI palette 16 × {R,G,B,pad} | RAM (u64_config.cc:2733-2739, :2752-2755) |
 //! | 0x8000-0x8003 | VIC cropper offset_x, offset_y, size_x/2, size_y/2 | stored, reads 0 (hdmi_scan.cc:45-60) |
+//! | 0x4F00-0x4F09 | S45: the MultiCore host's mode request (mode_req.v) | with `--icap` or `--core` only |
 //!
 //! Everything else in the window reads 0 and ignores writes. No interrupts (05 §Interrupts).
 
 use crate::host::DisplaySnapshot;
 use crate::io::{IoCtx, IoDevice, IoMap};
+use crate::devices::trx;
 use crate::machine::MachineConfig;
 
 pub const BASE: u32 = 0x1014_0000;
@@ -65,6 +67,9 @@ pub struct Overlay {
     pub hdmi: [u8; HDMI_REGS],
     /// VIC cropper 0x10148000..
     pub cropper: [u8; CROPPER_REGS],
+    /// S45: the MultiCore host's mode request at 0x4F00-0x4F09, kept in the TRX block's link; None on Gideon's and
+    /// TRX64's.
+    pub mode_link: Option<trx::Link>,
 }
 
 impl Default for Overlay {
@@ -82,6 +87,7 @@ impl Overlay {
             palette: vec![0; PALETTE_SIZE],
             hdmi: [0; HDMI_REGS],
             cropper: [0; CROPPER_REGS],
+            mode_link: None,
         }
     }
 
@@ -110,6 +116,13 @@ impl IoDevice for Overlay {
     }
 
     fn write8(&mut self, off: u32, val: u8, _ctx: &mut IoCtx) {
+        if let Some(link) = &self.mode_link {
+            if let Some(m) = trx::lock(link).mode.as_mut() {
+                if m.write(off, val) {
+                    return;
+                }
+            }
+        }
         match off {
             0..=REGS_END => {
                 let reg = (off & 0xF) as usize;
@@ -128,6 +141,9 @@ impl IoDevice for Overlay {
 
     /// Reads have no side effects; chargen registers read 0 (char_generator_regs.vhd:79-80).
     fn peek8(&self, off: u32) -> u8 {
+        if let Some(v) = self.mode_link.as_ref().and_then(|l| trx::lock(l).mode.and_then(|m| m.read(off))) {
+            return v;
+        }
         match off {
             SCREEN..=SCREEN_END => self.screen[(off - SCREEN) as usize],
             COLOR..=COLOR_END => self.color[(off - COLOR) as usize],

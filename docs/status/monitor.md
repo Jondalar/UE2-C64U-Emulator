@@ -16,6 +16,9 @@ its second host. Design and the division of labour: `docs/specs/S23-monitor.md`.
 
 **Surfaces.** `monitor <cmd>` on the control port (S08), and `emu_monitor` over MCP on top of it.
 
+**Without a C64** (`--c64 none`, e.g. a MultiCore run): only the device views answer (`itu`, `cart`, `joy`, `flash`,
+`sd`, `usb`, `net`, `audio`, `trx`, `dir`); every other verb says it needs `--c64 trx64` (S45 §7a).
+
 **M2 is done.** The library sees every line first and returns `None` for what it does not own; our dispatch takes
 it from there and appends its own section to `help`. TRX64 gains no notion of this emulator — the dependency stays
 one-way.

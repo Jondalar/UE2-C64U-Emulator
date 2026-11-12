@@ -65,6 +65,11 @@ One line per feature, as of 0.7.2 (TRX64 v0.14.7). Details: `docs/status/`, spec
   answers 0x7A for the multicore board profile, and the hand-over page is written as the host app writes it
   (S44 phase A). With `--icap`, `--cor-dir` and `--core-dir` the host app starts a .cor through the ICAP loader
   (a partial, or a large core by IPROG and the boot magic) and coreapp's way back reboots the host (S44 phase B). The control language holds RESTORE with `restore`, the cores' menu hotkey.
+- The MultiCore host's video in those runs: the nine HDMI modes (576p, 480p, 720p, 1080p, 800x600, 1024x768,
+  1280x1024) with the picture the mode's size, the mode request at 0x10144F00, the hand-over's video as the starting
+  mode, the pixel layer at its PX_OSIZE output size (nearest or bilinear, 16 or 32 bits a pixel), and the box, the text
+  layer and the C64 placed per mode. `--screen MODE` puts a monitor that offers only that mode on the HDMI port, or
+  none (S45).
 - REU on the firmware's DDR, preload and "Save REU"; GeoRAM.
 
 ## Cartridges

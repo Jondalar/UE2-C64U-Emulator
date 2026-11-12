@@ -31,7 +31,9 @@ What works, by milestone. Details are in the linked files.
 - **MultiCore** (`docs/specs/S44-multicore-cores.md`): the MultiCore core application starts as any core from a
   profile (`--core`): the A1200 is identified with the multicore board profile and a valid hand-over page. The host
   app starts a DFX .cor (VIC-20) and a large one (A1200) through the ICAP loader, and coreapp's "Return to host menu"
-  boots the host again (phase B, `scripts/smoke-s44-host.sh` with MultiCore's kit).
+  boots the host again (phase B, `scripts/smoke-s44-host.sh` with MultiCore's kit). The picture follows the
+  MultiCore host's HDMI mode (`docs/specs/S45-multicore-video.md`): the hand-over's video, the apps' mode requests,
+  `--screen` for the monitor the host app reads.
 - **Debugging** (`docs/status/gdb.md`): GDB on the firmware's RISC-V (`--gdb`) with symbols, software
   breakpoints and the FreeRTOS task list; the C64 side is served by the VICE binary monitor port
   (`docs/status/monitor.md`).
