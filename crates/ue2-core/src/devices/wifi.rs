@@ -278,8 +278,9 @@ impl Wifi {
             ESP_MODE_BOOT => Some(rom_loader_reply(&frame)),
             _ => self.ctrl.handle(&frame),
         };
-        if let Some(reply) = reply {
-            self.from_esp.push_back(EspFrame { due: ctx.now + REPLY_DELAY, data: reply });
+        // The reply first, then the events the request raised, in order.
+        for data in reply.into_iter().chain(self.ctrl.events.drain(..)) {
+            self.from_esp.push_back(EspFrame { due: ctx.now + REPLY_DELAY, data });
         }
     }
 
@@ -447,6 +448,9 @@ const CMD_SET_WAKE_ON_WIFI: u8 = 0x18;
 const CMD_GET_WAKE_ON_WIFI: u8 = 0x19;
 
 // esp_err_t values (ESP-IDF).
+/// `EVENT_DISCONNECTED`, `EVENT_DISABLED` (rpc_calls.h:213,217).
+const EVENT_DISCONNECTED: u8 = 0x42;
+const EVENT_DISABLED: u8 = 0x46;
 const ESP_OK: i32 = 0;
 const ESP_ERR_INVALID_ARG: i32 = 0x102;
 const ESP_ERR_NOT_SUPPORTED: i32 = 0x106;
@@ -489,6 +493,11 @@ pub struct U64Ctrl {
     pub wake_on_wifi: u8,
     /// The last power request answered, until the host takes it.
     pub power_event: Option<PowerEvent>,
+    /// `disabled_g`: the radio is stopped (WIFI_DISABLE) until WIFI_ENABLE, a scan or an autoconnect starts it again
+    /// (wifi_modem.c:731-789).
+    pub radio_off: bool,
+    /// Events the last request raised, sent after its reply (`send_event`, wifi_modem.c:241-262).
+    pub events: Vec<Vec<u8>>,
 }
 
 impl Default for U64Ctrl {
@@ -500,6 +509,8 @@ impl Default for U64Ctrl {
             last_state: 1,
             wake_on_wifi: 0,
             power_event: None,
+            radio_off: false,
+            events: Vec::new(),
         }
     }
 }
@@ -527,11 +538,32 @@ impl U64Ctrl {
             CMD_WIFI_GETMAC => esp_reply(hdr, ESP_OK, &self.mac, 16),
             // `wifi_scan` copies `rec` from the reply whatever `esp_err` says (wifi_cmd.cc:219-229), so the error
             // uses the ESP's own layout with num_records = 0, reserved = 0, size 10 (wifi_modem.c:795-803).
-            CMD_WIFI_SCAN => esp_reply(hdr, ESP_ERR_NOT_SUPPORTED, &[0, 0], 10),
-            // rpc_get_connection_resp, status 0 = not connected, 12 bytes (rpc_calls.h:57-61). No
-            // EVENT_CONNECTED/EVENT_DISABLED follows (wifi_modem.c:264-271), so the task settles in NotConnected
-            // (wifi.cc:275-283).
-            CMD_WIFI_IS_CONNECTED => esp_reply(hdr, ESP_OK, &[0], 12),
+            CMD_WIFI_SCAN => {
+                self.radio_start();
+                esp_reply(hdr, ESP_ERR_NOT_SUPPORTED, &[0, 0], 10)
+            }
+            // rpc_get_connection_resp, status 0 = not connected, 12 bytes (rpc_calls.h:57-61). EVENT_DISABLED follows
+            // while the radio is off, nothing otherwise (wifi_modem.c:264-271), so the task settles in Disabled or
+            // NotConnected (wifi.cc:275-283).
+            CMD_WIFI_IS_CONNECTED => {
+                if self.radio_off {
+                    self.events.push(event_frame(EVENT_DISABLED));
+                }
+                esp_reply(hdr, ESP_OK, &[0], 12)
+            }
+            // The radio stops with EVENT_DISABLED (wifi_modem.c:754-775); WIFI_ENABLE, a scan and an autoconnect
+            // start a stopped one with EVENT_DISCONNECTED (wifi_modem.c:731-745,776-789,794,811). The reply comes
+            // first (rpc_dispatch.c:205-225); the scan's event comes before its reply on the module, which leaves
+            // the driver in the same state.
+            CMD_WIFI_DISABLE => {
+                self.radio_off = true;
+                self.events.push(event_frame(EVENT_DISABLED));
+                esp_reply(hdr, ESP_OK, &[], 8)
+            }
+            CMD_WIFI_ENABLE | CMD_WIFI_AUTOCONNECT => {
+                self.radio_start();
+                esp_reply(hdr, ESP_OK, &[], 8)
+            }
             // rpc_get_voltages_resp, 24 bytes (rpc_calls.h:39-49, rpc_dispatch.c:227-237, H7).
             CMD_GET_VOLTAGES => {
                 let body: Vec<u8> = VOLTAGES_MV.iter().flat_map(|mv| mv.to_le_bytes()).collect();
@@ -559,13 +591,26 @@ impl U64Ctrl {
                 esp_reply(hdr, ESP_OK, &[], 8)
             }
             // The quiet set keeps the UI flows free of error messages (doc 04 T0 §3).
-            CMD_WIFI_DISCONNECT | CMD_MODEM_ON | CMD_MODEM_OFF | CMD_WIFI_ENABLE | CMD_WIFI_DISABLE | CMD_CLEAR_APS
-            | CMD_WIFI_AUTOCONNECT => esp_reply(hdr, ESP_OK, &[], 8),
+            CMD_WIFI_DISCONNECT | CMD_MODEM_ON | CMD_MODEM_OFF | CMD_CLEAR_APS => esp_reply(hdr, ESP_OK, &[], 8),
             // `cmd_not_implemented` (rpc_dispatch.c:366-372).
             _ => esp_reply(hdr, ESP_ERR_NOT_SUPPORTED, &[], 8),
         };
         Some(reply)
     }
+}
+
+impl U64Ctrl {
+    /// `enable_wifi_if_needed`: a stopped radio starts and the module sends EVENT_DISCONNECTED (wifi_modem.c:731-745).
+    fn radio_start(&mut self) {
+        if std::mem::take(&mut self.radio_off) {
+            self.events.push(event_frame(EVENT_DISCONNECTED));
+        }
+    }
+}
+
+/// An event frame: the code, thread 0xFF, sequence 0, header only (`send_event`, wifi_modem.c:241-249).
+fn event_frame(code: u8) -> Vec<u8> {
+    vec![code, 0xFF, 0, 0]
 }
 
 /// Reply that starts like `rpc_espcmd_resp`: echoed header, `esp_err i32 @4`, then `body` @8, zero-padded to the
@@ -1046,6 +1091,29 @@ mod tests {
         assert_eq!((reply.len(), le32(&reply, 4)), (8, ESP_OK), "quiet set answers 0");
         let reply = b.rpc(CMD_WIFI_IS_CONNECTED, &[]);
         assert_eq!((reply.len(), le32(&reply, 4), reply[8]), (12, ESP_OK, 0));
+    }
+
+    /// T210: WIFI_DISABLE stops the radio with EVENT_DISABLED, a connection query repeats it while the radio is off,
+    /// WIFI_ENABLE starts it again with EVENT_DISCONNECTED; each event follows its reply.
+    #[test]
+    fn wifi_radio_off_and_on_send_the_module_events() {
+        let mut b = Board::booted();
+        let mut event = |b: &mut Board| {
+            let buf = b.wait_reply(100);
+            let frame = b.frame(&buf).to_vec();
+            b.free_buffer(buf);
+            frame
+        };
+        assert_eq!(le32(&b.rpc(CMD_WIFI_DISABLE, &[]), 4), ESP_OK);
+        assert_eq!(event(&mut b), [EVENT_DISABLED, 0xFF, 0, 0]);
+        assert_eq!(b.rpc(CMD_WIFI_IS_CONNECTED, &[])[8], 0);
+        assert_eq!(event(&mut b), [EVENT_DISABLED, 0xFF, 0, 0]);
+        assert_eq!(le32(&b.rpc(CMD_WIFI_ENABLE, &[]), 4), ESP_OK);
+        assert_eq!(event(&mut b), [EVENT_DISCONNECTED, 0xFF, 0, 0]);
+        b.rpc(CMD_WIFI_ENABLE, &[]);
+        b.rpc(CMD_WIFI_IS_CONNECTED, &[]);
+        b.run(10 * CLOCKS_PER_MS);
+        assert!(b.received.is_empty(), "a running radio raises no event");
     }
 
     #[test]
