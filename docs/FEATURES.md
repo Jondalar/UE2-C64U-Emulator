@@ -14,7 +14,7 @@ One line per feature, as of 0.7.2 (TRX64 v0.14.7). Details: `docs/status/`, spec
 - SPI flash image persists the configuration (`--flash`).
 - Menu overlay with the menu button and cursor keys; window or `--headless`.
 - UART console, logged (`--log`).
-- WiFi module as a stub: identified, voltages and power settings, "Link Down". Network is Ethernet.
+- WiFi module as a stub: identified, voltages and power settings, radio off and on, "Link Down". Network is Ethernet.
 
 ## Storage
 

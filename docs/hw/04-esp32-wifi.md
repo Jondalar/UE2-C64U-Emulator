@@ -228,11 +228,13 @@ Events from the ESP always carry `thread=0xFF` and go to `RunModeThread` (`wifi.
    - 0x0C GET_VOLTAGES: `vbus=12000, vaux=12000, v50=5000, v33=3300, v18=1800, v10=1000, vusb=5000`.
    - 0x17/0x16 and 0x19/0x18: stored state, defaults `mode=0, last_state=1, enabled=0`.
    - 0x07 GETMAC: esp_err 0 and a fixed locally-administered MAC, e.g. `02:15:41:00:00:01`.
-   - 0x0B IS_CONNECTED: `status=0`, then EVENT_DISABLED or nothing.
+   - 0x0B IS_CONNECTED: `status=0`, then EVENT_DISABLED while the radio is off, else nothing.
+   - 0x0E WIFI_DISABLE: esp_err 0, then EVENT_DISABLED. 0x0D WIFI_ENABLE, 0x04 and 0x12 on a stopped radio: then
+     EVENT_DISCONNECTED (`wifi_modem.c:731-791`). Without these the driver never leaves NotConnected.
    - 0x0F/0x13: esp_err 0; optionally signal host power-off / cold reset after 1 s / 3 s.
    - 0x04 WIFI_SCAN: `esp_err` plus `num_records = 0`, 10 bytes; never a bare 8-byte espcmd (see the table).
    - 0x08: consume silently.
-   - Everything else: espcmd with `esp_err=0x106` (or 0 for 0x06/0x09/0x0A/0x0D/0x0E/0x11/0x12 to keep UI flows quiet).
+   - Everything else: espcmd with `esp_err=0x106` (or 0 for 0x06/0x09/0x0A/0x11 to keep UI flows quiet).
 
    Result: `AppDetected` → `NotConnected` (`wifi.cc:269-285`), power settings enabled, no blocked tasks.
 

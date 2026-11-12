@@ -23,6 +23,10 @@
   - Implement the listed commands with the listed payloads (IDENTIFY "ESP32 WiFi Bridge V1.14", voltages,
     MAC 02:15:41:00:00:01, IS_CONNECTED = 0, …).
   - 0x08 is consumed silently. Everything else gets `esp_err 0x106`, or 0 for the quiet set.
+  - The radio switch (2026-11-12, MultiCore T210): WIFI_DISABLE stops the radio and sends `EVENT_DISABLED`;
+    IS_CONNECTED repeats `EVENT_DISABLED` while it is off; WIFI_ENABLE, WIFI_SCAN and WIFI_AUTOCONNECT start a stopped
+    radio with `EVENT_DISCONNECTED` (`wifi_modem.c:731-791`). Each event follows the reply. The driver then shows
+    Disabled, and NotConnected again after the radio is on.
 - Structure the command handler so S12 can later add a real L2 bridge (0x08 packets, EVENT_RECV_PACKET).
 
 ## Tests
@@ -33,6 +37,7 @@
   - arming an RX buffer;
   - sending IDENTIFY in a TX buffer → IRQ → the RX buffer holds a well-formed reply → ack drops the IRQ.
 - GETMAC reply; unknown command → 0x106; no IRQ storm (level low after ack).
+- Radio off and on: the events after DISABLE, IS_CONNECTED and ENABLE; none while the radio runs.
 
 ## Acceptance
 
