@@ -150,21 +150,35 @@ pub fn set_marker(marker: &Path, unsynced: bool) -> io::Result<()> {
     }
 }
 
+/// `fs::canonicalize`, or for a path that exists but cannot be canonicalized the absolute path. Windows answers
+/// "Incorrect function" (os error 1) on drives whose driver does not know the final path of a handle, such as RAM
+/// disks (issue #44); symlinks and `..` then stay as given.
+fn real_path(path: &Path) -> io::Result<PathBuf> {
+    real_path_with(path, |p| fs::canonicalize(p))
+}
+
+fn real_path_with(path: &Path, canonicalize: impl Fn(&Path) -> io::Result<PathBuf>) -> io::Result<PathBuf> {
+    match canonicalize(path) {
+        Err(e) if path.exists() => std::path::absolute(path).map_err(|_| e),
+        r => r,
+    }
+}
+
 impl DirVolume {
     /// Check `spec.path`, lock it and create and lock its work directory under `work_root`. Refused: a missing path
     /// or not a directory, `/`, the home directory or a directory containing it, a work directory inside the shared
     /// one (or the reverse), and a directory another stick shares ([`DirLock::acquire`]).
     pub fn open(spec: &DirSpec, work_root: &Path) -> Result<DirVolume> {
-        let root = fs::canonicalize(&spec.path).with_context(|| format!("--usb-dir {}", spec.path.display()))?;
+        let root = real_path(&spec.path).with_context(|| format!("--usb-dir {}", spec.path.display()))?;
         if !root.is_dir() {
             bail!("--usb-dir {}: not a directory", spec.path.display());
         }
-        let home = std::env::home_dir().and_then(|h| fs::canonicalize(h).ok());
+        let home = std::env::home_dir().and_then(|h| real_path(&h).ok());
         if let Some(why) = refused_root(&root, home.as_deref()) {
             bail!("--usb-dir: {why}");
         }
         fs::create_dir_all(work_root).with_context(|| format!("creating {}", work_root.display()))?;
-        let work_root = fs::canonicalize(work_root)?;
+        let work_root = real_path(work_root).with_context(|| format!("--usb-dir-work {}", work_root.display()))?;
         if work_root.starts_with(&root) || root.starts_with(&work_root) {
             bail!("--usb-dir {}: the work directory {} must not be inside it or contain it", root.display(), work_root.display());
         }
@@ -408,6 +422,19 @@ impl DirVolume {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #44: a path that exists but cannot be canonicalized (a Windows RAM disk) is used as an absolute path;
+    /// a missing path keeps its error.
+    #[test]
+    fn real_path_falls_back_to_the_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unsupported = |_: &Path| -> io::Result<PathBuf> { Err(io::Error::other("Incorrect function. (os error 1)")) };
+        assert_eq!(real_path(tmp.path()).unwrap(), fs::canonicalize(tmp.path()).unwrap());
+        assert_eq!(real_path_with(tmp.path(), unsupported).unwrap(), std::path::absolute(tmp.path()).unwrap());
+        let missing = tmp.path().join("missing");
+        assert!(real_path_with(&missing, unsupported).unwrap_err().to_string().contains("os error 1"));
+        assert_eq!(real_path(&missing).unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn the_root_and_directories_holding_home_are_refused() {

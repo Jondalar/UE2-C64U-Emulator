@@ -47,7 +47,9 @@ target/release/ue2emu run --flash run/flash.bin --usb-dir /path/to/share,size=2G
 
 ### At start (emulation thread, before the machine runs)
 
-1. `DirVolume::open` checks the path, takes the lock and creates the work subdirectory.
+1. `DirVolume::open` checks the path, takes the lock and creates the work subdirectory. Both paths are canonicalized;
+   on a drive that cannot do that (Windows RAM disks answer "Incorrect function", issue #44) the absolute path is
+   used, with symlinks and `..` as given.
 2. `DirVolume::prepare` either resumes or builds:
    - **Resume:** if the previous run left the `unsynced` marker, its image is attached again and synced like any image
      with guest writes.
@@ -206,6 +208,7 @@ target/release/ue2emu run --flash run/flash.bin --usb-dir /path/to/share,size=2G
   its fingerprint is taken, waits for the next host change, guest sync or `usb-replug`.
 - **Replug latency:** FSEvents, 500 ms debounce, guest quiet time (2 s emulated and wall), rebuild, 500 ms replug gap,
   then enumeration. The whole smoke run, with its automatic replug, takes about 5 s wall.
+- **Symlinks in the shared directory** on a drive that cannot canonicalize (issue #44) are skipped as broken.
 - **The watcher** cannot watch a directory FSEvents does not cover (some network mounts). ue2emu then logs it, and host
   changes need `usb-replug`.
 - **`ue2-mcp`:** `emu_stop` waits up to 120 s (default) for an instance with `usb_dirs`. A server killed without
