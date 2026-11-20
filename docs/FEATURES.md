@@ -6,8 +6,12 @@ One line per feature, as of 0.7.3 (TRX64 v0.14.7). Details: `docs/status/`, spec
 ## Firmware and board
 
 - Runs the unmodified firmware application: `ultimate.elf` or the application inside a `.ue2` update.
-- Ultimate 64 Elite II and C64 Ultimate (`--board u64ii|c64u`); Commodore C64U firmware 1.1.0 boots.
-- `ue2emu install`: runs a `.ue2` updater into a flash image, as on the device.
+- Ultimate 64 Elite II and C64 Ultimate (`--board u64ii|c64u`); Commodore C64U firmware 1.1.0 boots. `c64u` is the
+  measured C64U: XC7A50T and the W25Q128 flash (S47).
+- SPI flash chip S25FL128L or W25Q128JV (`--flash-chip`), the W25Q with its status registers and block protection; a
+  100T with either chip (S47).
+- `ue2emu install`: runs a `.ue2` updater into a flash image, as on the device, on the machine `--board`, `--caps` and
+  `--flash-chip` give.
 - `ue2emu settings` / `run --settings`: print and preset every firmware setting as a `.cfg`.
 - `--config FILE.toml`: all run options in one file.
 - RV32 CPU with idle skip; `--speed realtime|max`.
@@ -70,6 +74,8 @@ One line per feature, as of 0.7.3 (TRX64 v0.14.7). Details: `docs/status/`, spec
   mode, the pixel layer at its PX_OSIZE output size (nearest or bilinear, 16 or 32 bits a pixel), and the box, the text
   layer and the C64 placed per mode. `--screen MODE` puts a monitor that offers only that mode on the HDMI port, or
   none (S45).
+- MultiCore update packages (`.txu`, S46): `run --firmware X.txu` runs the host app inside, `install --update X.txu`
+  checks and writes the parts as the host app does.
 - REU on the firmware's DDR, preload and "Save REU"; GeoRAM.
 
 ## Cartridges

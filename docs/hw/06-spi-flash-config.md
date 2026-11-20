@@ -86,6 +86,7 @@ Reset state: `force_ss=0`, `level_ss=1`, so CS is idle high (`spi_peripheral_io.
 - The U64-II layout tables reserve `CONFIG = 0xFE8000, len 0x18000` (`w25q_flash.cc:55,62`). That is exactly 24 x 4 KiB, which equals `S25FLXXXL_NUM_CONFIG_PAGES = 24` (`s25fl_l_flash.h:9`) on a 4096-sector chip (`s25fl_l_flash.cc:79-83`).
 - With this identity, `get_type_string()` returns "Infineon S25FL128L" (`s25fl_l_flash.cc:97-109`).
 - Alternative: Winbond W25Q128, `EF 40 18` (`w25q_flash.cc:172-176`). It works too, but it has only 16 config pages, so config lives at 0xFF0000..0xFFFFFF (`w25q_flash.h:8`, `w25q_flash.cc:256-267`). The firmware does not care which; a flash image made for one identity will not show its config under the other.
+- **The C64U carries the W25Q128JV** (measured, S47 §1), so ue2emu models both: `--flash-chip`, or the board model (`--board c64u` gives the W25Q, `u64ii` the S25FL128L). The W25Q personality adds its status registers SR1-SR3, the `50` volatile write and the BP/TB/SEC/CMP block protection (`docs/specs/S47-c64u-flash-install.md` §3).
 - **Do not emulate `01 40 xx`** (S25FL K). `S25FL_Flash` declares its own private `sector_size/sector_count/total_size` (`s25fl_flash.h:31-33`). The inherited W25Q code (config pages, erase) keeps the W25Q defaults of 512 sectors / 8192 pages (`w25q_flash.cc:65-70`), which puts config pages at 0x1F0000, inside the FAT area.
 
 Geometry for the S25FL128L identity: page = 256 B (`s25fl_l_flash.h:11`), sector = 16 pages = 4096 B, `sector_count=4096`, `total_size=65536` pages (`s25fl_l_flash.cc:79-83`, `w25q_flash.cc:200-208`). `get_number_of_pages()` = 65536 (`w25q_flash.h:61`).
@@ -241,7 +242,7 @@ None. The SPI flash controller has no interrupt output. The flash instance leave
 - A CTRL write that changes effective CS from low to high ends the open frame. A change from high to low begins a new frame.
 - RATE reads 0x01; CTRL reads `0x04|level<<1|force`; CRC reads 0x00.
 
-### Chip (S25FL128L personality; add W25Q128 as an option)
+### Chip (S25FL128L personality; the W25Q128JV is the second one, S47 §3)
 
 - Backing store: 16 MiB, erased = 0xFF, persisted to a host file.
 - Frame parser: the first byte is the opcode.
@@ -259,7 +260,7 @@ None. The SPI flash controller has no interrupt output. The flash instance leave
 | `21` (W25Q: `20`) | 4 (3) addr bytes | if WEL: fill `addr & ~0xFFF`, 4 KiB with 0xFF. Clear WEL. |
 | `66`, `99` | single bytes | reset enable / reset: clear WEL and BUSY. A frame containing `66 99` together (`s25fl_l_flash.cc:35-38`) is a no-op. |
 | `FF` | single byte | no-op |
-| `65`, `01`, `31`, `11` | — | not used by this ELF; optional |
+| `65`, `01`, `31`, `11` | — | not used by this ELF; the W25Q personality has `01`/`31`/`11`, `35`/`15` and `50` (S47 §3) |
 
 - Address mode: the firmware uses explicit 4-byte opcodes, so the chip stays in 3-byte default mode. Do not switch modes.
 - Timing: the firmware accepts BUSY=0 immediately. Real limits it tolerates: page program ≤15 ms, 4 KiB erase ≤1000 ms, WRSR ≤50 ms (`w25q_flash.cc:335,357,409`).
@@ -303,7 +304,7 @@ The emulator should map this to a full system reset (restart the ELF). If nothin
 
 ## Open questions
 
-1. **Physical part on U64-II boards.** S25FL128L (24 config pages at 0xFE8000) or W25Q128 (16 pages at 0xFF0000)? The layout table suggests S25FL-L. A real flash dump settles it: look for page ids such as `43 34 36 55` at `0xFE8000 + n*0x1000`.
+1. **Physical part on U64-II boards.** S25FL128L (24 config pages at 0xFE8000) or W25Q128 (16 pages at 0xFF0000)? The layout table suggests S25FL-L. A real flash dump settles it: look for page ids such as `43 34 36 55` at `0xFE8000 + n*0x1000`. **Answered for the C64U:** a W25Q128JV, `EF 40 18`, with 16 config pages (a dump of Alex's board, S47 §1). The Ultimate 64 Elite II is still open.
 2. **U64-II top is closed.** Is the flash controller the same `spi_peripheral_io` (fixed rate, no CRC) at 0x10060200? Does the U64-II CPU bus bridge split 32-bit IO accesses LSB-first like `rvlite/bus_converter.vhd`? The firmware's use of `DATA_32` (and `bootloader_u64ii.c:184-186`) is consistent with it. Register aliasing within 0x10060200-0x100602FF and the CTRL readback tie-offs are unverified (both are unused by the firmware).
 3. **FPGA type values.** Which CAPABILITIES bits 29:28 does a real U64-II 50T vs 100T report? Only `==3` / `>=3` is visible in the code (`w25q_flash.cc:83`, `bootloader_u64ii.c:176`, `u64ii_programmer.cc`). Owned by the ITU/capabilities doc.
 4. **ICAP on U64-II (7-series).** The open `icap-spartan.vhd` is Spartan-3A. Offsets +4/+8 are taken from `icap.h:6-8`. What exactly triggers the reconfiguration, and should the emulator reset on the final `ICAP_PULSE`?

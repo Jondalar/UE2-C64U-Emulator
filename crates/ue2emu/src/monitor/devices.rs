@@ -8,7 +8,7 @@
 
 use trx64_monitor::MonitorHost;
 use ue2_core::devices::c64::C64Port;
-use ue2_core::devices::flash::SpiFlash;
+use ue2_core::devices::flash::{FlashChip, SpiFlash};
 use ue2_core::devices::rmii::Rmii;
 use ue2_core::devices::sdcard::SdCard;
 use ue2_core::devices::trx::{self, Trx};
@@ -83,7 +83,7 @@ pub(super) const HELP: &str = concat!(
     "  itu               the interrupt controller, the timers and the capability word\n",
     "  cart              what the firmware programmed for the C64: mode, cartridge, REU, the command interface\n",
     "  joy               the control ports as the firmware drives them: joysticks, paddles, the mouse\n",
-    "  flash             the SPI flash: its image, what is not written out yet, the config pages\n",
+    "  flash             the SPI flash: its chip, its image, what is not written out yet, the config pages\n",
     "  sd                the SD card\n",
     "  usb               the hub ports and what is on them\n",
     "  net               the Ethernet MAC: the address, the filter and the queues\n",
@@ -397,7 +397,15 @@ fn flash(host: &mut Host) -> Result<String, String> {
     let flash = host.m.bus.io.get::<SpiFlash>().ok_or("this machine has no flash")?;
     let (dirty, writing) = flash.pending();
     let pages = flash.config_pages().len();
-    let mut out = String::new();
+    let chip = flash.chip();
+    let id = chip.jedec_id().map(|b| format!("{b:02X}")).join(" ");
+    let mut out = match chip {
+        FlashChip::S25fl128l => format!("  chip          {} (JEDEC {id})\n", chip.name()),
+        FlashChip::W25q128 => {
+            let [sr1, sr2, sr3] = flash.status();
+            format!("  chip          {} (JEDEC {id}), status registers {sr1:02X} {sr2:02X} {sr3:02X}\n", chip.name())
+        }
+    };
     match flash.image() {
         Some(path) => out.push_str(&format!("  image         {}\n", path.display())),
         None => out.push_str("  image         none: volatile, this run only\n"),
@@ -406,7 +414,10 @@ fn flash(host: &mut Host) -> Result<String, String> {
         "  not written   {dirty} sector(s) of 4 KiB{}\n",
         if writing { ", a write-out is pending" } else { "" },
     ));
-    out.push_str(&format!("  config pages  {pages} in use  (`config flash` lists them)\n"));
+    out.push_str(&format!(
+        "  config pages  {pages} of {} in use  (`config flash` lists them)\n",
+        chip.config_pages()
+    ));
     Ok(out)
 }
 

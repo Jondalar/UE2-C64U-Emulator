@@ -31,7 +31,7 @@ one-way.
 | `config …` | The settings, in all the ways the menu has them (below). |
 | `itu` | The capability word, the FPGA version, the ms/us timers, and the interrupt controller by source name. |
 | `cart` | What the firmware programmed for the C64: mode, stop, cartridge type and variant, the cart ROM window, KERNAL, REU and its size, the sampler, serve-while-stopped, the clock-detect lines, and the command interface. |
-| `flash` | The image behind the chip, sectors not written out yet, config pages in use. |
+| `flash` | The chip and its JEDEC ID (the W25Q128 with its status registers), the image behind it, sectors not written out yet, config pages in use of the chip's count. |
 | `sd` | The card: sectors, size, write protect. |
 | `usb` | The hub ports and what is on each. |
 | `dir [path]` | What is on a medium — `/`, `/flash`, `/Usb0`, `/Temp`, the SD card — read by the firmware itself. |

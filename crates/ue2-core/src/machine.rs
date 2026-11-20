@@ -32,7 +32,8 @@ pub struct LogFlags {
 
 #[derive(Clone, Debug)]
 pub struct MachineConfig {
-    /// Firmware image: `ultimate.elf` (with symbols), `ultimate.app` or a `.ue2` update file (loader.rs).
+    /// Firmware image: `ultimate.elf` (with symbols), `ultimate.app`, a `.ue2` update file or a MultiCore `.txu`
+    /// (loader.rs).
     pub elf: PathBuf,
     /// Firmware roms directory (chars.bin etc.), usually firmware/1541ultimate/roms.
     pub rom_dir: PathBuf,
@@ -46,6 +47,8 @@ pub struct MachineConfig {
     pub clocks_per_insn: u64,
     /// Persistent SPI flash image (created erased if missing). None = volatile flash.
     pub flash_image: Option<PathBuf>,
+    /// The SPI flash chip (S47 §2): `--flash-chip`, else the board model's. Default the S25FL128L.
+    pub flash_chip: devices::flash::FlashChip,
     /// SD card image. None = no card inserted.
     pub sd_image: Option<PathBuf>,
     /// Devices on the USB hub ports (`devices::usb`). Advertising them needs `devices::usb::CAPAB_USB_HOST2`.
@@ -139,6 +142,7 @@ impl MachineConfig {
             capabilities_explicit: false,
             clocks_per_insn: time::DEFAULT_CLOCKS_PER_INSN,
             flash_image: None,
+            flash_chip: devices::flash::FlashChip::default(),
             sd_image: None,
             usb: devices::usb::UsbConfig::default(),
             board: devices::board::Board::default(),
@@ -358,6 +362,9 @@ impl Machine {
                 Symbols::empty()
             }
         };
+        for note in &fw.notes {
+            eprintln!("{note}");
+        }
         let (trx_io, why) = resolve_trx_io(cfg.trx_io, trx_firmware(&symbols, &bus.ram, &fw.segments));
         if let Some(why) = why {
             eprintln!("{why}");

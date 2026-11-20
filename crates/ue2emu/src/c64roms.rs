@@ -27,7 +27,7 @@ use std::time::SystemTime;
 use anyhow::{bail, ensure, Context, Result};
 use clap::Args;
 use fatfs::{FileSystem, FsOptions};
-use ue2_core::devices::flash::FLASH_SIZE;
+use ue2_core::devices::flash::{FlashChip, FLASH_SIZE};
 
 #[derive(Args)]
 pub struct C64RomsArgs {
@@ -42,12 +42,12 @@ pub struct C64RomsArgs {
 
 impl C64RomsArgs {
     /// [`write_roms`] into `flash` when `--c64-roms` was given; `roms` (the firmware roms directory) is the default DIR.
-    pub fn apply(&self, flash: Option<&Path>, capabilities: u32, roms: &Path) -> Result<()> {
+    pub fn apply(&self, flash: Option<&Path>, capabilities: u32, chip: FlashChip, roms: &Path) -> Result<()> {
         let Some(dir) = &self.c64_roms else {
             return Ok(());
         };
         let flash = flash.context("--c64-roms needs --flash: the ROMs are written into the flash image file")?;
-        let report = write_roms(flash, capabilities, dir.as_deref().unwrap_or(roms), self.c64_roms_force)
+        let report = write_roms(flash, capabilities, chip, dir.as_deref().unwrap_or(roms), self.c64_roms_force)
             .context("--c64-roms")?;
         for line in &report.lines {
             eprintln!("c64-roms: {line}");
@@ -58,9 +58,6 @@ impl C64RomsArgs {
 
 /// Flash sector = FAT sector of the flash disk (s25fl_l_flash.cc:79-83, blockdev_flash.cc:14-41).
 const SECTOR: usize = 0x1000;
-/// Config page `p` is the sector at 0xFE8000 + p × 4 KiB, 24 pages (w25q_flash.cc:261-267, s25fl_l_flash.h:9).
-const CONFIG_BASE: usize = 0xFE_8000;
-const CONFIG_PAGES: usize = 24;
 /// Logical config page (w25q_flash.cc:251-254).
 const CONFIG_PAGE_SIZE: usize = 512;
 /// "C64 and Cartridge Settings" (c64.cc:132).
@@ -143,9 +140,9 @@ pub struct Report {
 
 /// Put the KERNAL, BASIC and CHAR ROMs from `dir` into /flash/roms of the flash image at `flash` (created erased when
 /// missing), formatting an erased flash disk first. `capabilities` selects the flash layout, unless the other layout's
-/// region already holds the volume ([`locate_flash_disk`]). A file with other
+/// region already holds the volume ([`locate_flash_disk`]); `chip` where the config pages are. A file with other
 /// content is kept unless `force`. Only changed sectors are written, so a second call changes nothing.
-pub fn write_roms(flash: &Path, capabilities: u32, dir: &Path, force: bool) -> Result<Report> {
+pub fn write_roms(flash: &Path, capabilities: u32, chip: FlashChip, dir: &Path, force: bool) -> Result<Report> {
     let sources = ROMS.iter().map(|rom| source(dir, rom)).collect::<Result<Vec<_>>>()?;
     let mut lines = Vec::new();
     for (rom, (path, data)) in ROMS.iter().zip(&sources) {
@@ -160,7 +157,7 @@ pub fn write_roms(flash: &Path, capabilities: u32, dir: &Path, force: bool) -> R
     }
     let (mut image, full_size) = read_image(flash)?;
     let original = image.clone();
-    let store = store_page(&image).map(<[u8]>::to_vec);
+    let store = store_page(&image, chip).map(<[u8]>::to_vec);
     let (base, sectors) = locate_flash_disk(&image, capabilities);
     let region = &mut image[base..base + sectors * SECTOR];
     let formatted = if FileSystem::new(Cursor::new(&mut *region), FsOptions::new()).is_ok() {
@@ -182,32 +179,41 @@ pub fn write_roms(flash: &Path, capabilities: u32, dir: &Path, force: bool) -> R
     };
     let outcomes = update_volume(region, store, &sources, force, &mut lines)?;
 
+    let changed = write_image(flash, &image, &original, full_size)?;
+    if changed == 0 && full_size {
+        lines.push(format!("flash image {} unchanged", flash.display()));
+    } else {
+        lines.push(format!("flash image {}: {changed} changed 4 KiB sector(s) written", flash.display()));
+    }
+    Ok(Report { formatted, outcomes, sectors_written: changed, lines })
+}
+
+/// Write `image`, read by [`read_image`] as `original`, back to `flash`: the changed 4 KiB sectors, or the whole image
+/// when the file was missing or short (as `SpiFlash::open` pads it). Returns the number of changed sectors.
+pub(crate) fn write_image(flash: &Path, image: &[u8], original: &[u8], full_size: bool) -> Result<usize> {
     let changed: Vec<usize> = (0..FLASH_SIZE / SECTOR)
         .filter(|&s| image[s * SECTOR..(s + 1) * SECTOR] != original[s * SECTOR..(s + 1) * SECTOR])
         .collect();
     if changed.is_empty() && full_size {
-        lines.push(format!("flash image {} unchanged", flash.display()));
-    } else {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(flash)
-            .with_context(|| format!("opening flash image {}", flash.display()))?;
-        let mut write_at = |data: &[u8], at: usize| {
-            file.seek(SeekFrom::Start(at as u64))?;
-            file.write_all(data)
-        };
-        let written = if full_size {
-            changed.iter().try_for_each(|&s| write_at(&image[s * SECTOR..(s + 1) * SECTOR], s * SECTOR))
-        } else {
-            // Missing or short: the whole image, erased where nothing is stored, as `SpiFlash::open` pads it.
-            write_at(&image, 0)
-        };
-        written.with_context(|| format!("writing flash image {}", flash.display()))?;
-        lines.push(format!("flash image {}: {} changed 4 KiB sector(s) written", flash.display(), changed.len()));
+        return Ok(0);
     }
-    Ok(Report { formatted, outcomes, sectors_written: changed.len(), lines })
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(flash)
+        .with_context(|| format!("opening flash image {}", flash.display()))?;
+    let mut write_at = |data: &[u8], at: usize| {
+        file.seek(SeekFrom::Start(at as u64))?;
+        file.write_all(data)
+    };
+    let written = if full_size {
+        changed.iter().try_for_each(|&s| write_at(&image[s * SECTOR..(s + 1) * SECTOR], s * SECTOR))
+    } else {
+        write_at(image, 0)
+    };
+    written.with_context(|| format!("writing flash image {}", flash.display()))?;
+    Ok(changed.len())
 }
 
 /// The first of `rom.sources` in `dir` with the ROM's size.
@@ -238,7 +244,7 @@ fn word(data: &[u8], index: usize) -> u32 {
 
 /// The image as `SpiFlash::open` sees it (ue2-core devices/flash.rs): a missing file is erased flash, a shorter one is
 /// padded with 0xFF, a longer one is refused. Also whether the file already has the full size.
-fn read_image(path: &Path) -> Result<(Vec<u8>, bool)> {
+pub(crate) fn read_image(path: &Path) -> Result<(Vec<u8>, bool)> {
     let mut image = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
@@ -265,25 +271,32 @@ fn flash_disk(capabilities: u32) -> (usize, usize) {
     }
 }
 
-/// The `/flash` region of `image`: [`flash_disk`]'s, or the other table's when only that one starts with the boot
-/// sector of a volume of its size. Firmware before 3.15 has only the 50T table (w25q_flash.cc:47-54 at v3.14d) and keeps
-/// `/flash` at 0x400000 on a type-3 FPGA too, so after its updater the volume is there.
+/// The `/flash` region of `image`: [`flash_disk`]'s; on a type-3 FPGA the 50T table's instead when only that one
+/// starts with the boot sector of a volume of its size. Firmware before 3.15 has only the 50T table
+/// (w25q_flash.cc:47-54 at v3.14d) and keeps `/flash` at 0x400000 on a type-3 FPGA too, so after its updater the volume
+/// is there. On a type-2 FPGA every firmware uses 0x400000; a volume at 0x580000 (an image from a type-3 run) is not
+/// the one it mounts.
 fn locate_flash_disk(image: &[u8], capabilities: u32) -> (usize, usize) {
     let preferred = flash_disk(capabilities);
-    let other = flash_disk(if preferred.0 == 0x40_0000 { 3 << 28 } else { 0 });
+    let older = flash_disk(0);
     let holds_volume = |(base, sectors): (usize, usize)| {
         let boot = &image[base..base + SECTOR];
         boot[510..512] == [0x55, 0xAA]
             && usize::from(u16::from_le_bytes([boot[11], boot[12]])) == SECTOR
             && usize::from(u16::from_le_bytes([boot[19], boot[20]])) == sectors
     };
-    [preferred, other].into_iter().find(|&region| holds_volume(region)).unwrap_or(preferred)
+    if preferred != older && !holds_volume(preferred) && holds_volume(older) {
+        older
+    } else {
+        preferred
+    }
 }
 
-/// The C64 store's page: the first of the 24 config pages whose id matches (config.cc:127-137).
-fn store_page(image: &[u8]) -> Option<&[u8]> {
-    (0..CONFIG_PAGES)
-        .map(|p| &image[CONFIG_BASE + p * SECTOR..CONFIG_BASE + p * SECTOR + CONFIG_PAGE_SIZE])
+/// The C64 store's page: the first of the chip's config pages whose id matches (config.cc:127-137): 24 at 0xFE8000 on
+/// the S25FL128L, 16 at 0xFF0000 on the W25Q128JV (w25q_flash.cc:256-267).
+fn store_page(image: &[u8], chip: FlashChip) -> Option<&[u8]> {
+    (0..chip.config_pages())
+        .map(|p| &image[chip.config_page_at(p)..chip.config_page_at(p) + CONFIG_PAGE_SIZE])
         .find(|page| page[..4] == C64_STORE_ID.to_le_bytes())
 }
 
@@ -573,7 +586,7 @@ mod tests {
         let dir = rom_dir();
         let tmp = tempfile::tempdir().unwrap();
         let flash = tmp.path().join("flash.bin");
-        let report = write_roms(&flash, CAPS_100T, dir.path(), false).unwrap();
+        let report = write_roms(&flash, CAPS_100T, FlashChip::S25fl128l, dir.path(), false).unwrap();
         assert!(report.formatted);
         assert_eq!(report.outcomes, [Outcome::Written; 3]);
         let image = std::fs::read(&flash).unwrap();
@@ -589,7 +602,7 @@ mod tests {
         assert_eq!(read_file(&fs, "ROMS/BASIC.BIN"), Some(basic));
         assert_eq!(read_file(&fs, "roms/chars.bin"), Some(chars));
 
-        let again = write_roms(&flash, CAPS_100T, dir.path(), false).unwrap();
+        let again = write_roms(&flash, CAPS_100T, FlashChip::S25fl128l, dir.path(), false).unwrap();
         assert!(!again.formatted);
         assert_eq!(again.outcomes, [Outcome::Identical; 3]);
         assert_eq!(again.sectors_written, 0);
@@ -601,7 +614,7 @@ mod tests {
         let dir = rom_dir();
         let tmp = tempfile::tempdir().unwrap();
         let flash = tmp.path().join("flash.bin");
-        write_roms(&flash, CAPS_100T, dir.path(), false).unwrap();
+        write_roms(&flash, CAPS_100T, FlashChip::S25fl128l, dir.path(), false).unwrap();
         let mut image = std::fs::read(&flash).unwrap();
         let (base, sectors) = flash_disk(CAPS_100T);
         {
@@ -611,44 +624,57 @@ mod tests {
         }
         std::fs::write(&flash, &image).unwrap();
 
-        let kept = write_roms(&flash, CAPS_100T, dir.path(), false).unwrap();
+        let kept = write_roms(&flash, CAPS_100T, FlashChip::S25fl128l, dir.path(), false).unwrap();
         assert_eq!(kept.outcomes, [Outcome::Kept, Outcome::Identical, Outcome::Identical]);
         assert_eq!(kept.sectors_written, 0);
         assert!(std::fs::read(&flash).unwrap() == image);
         assert_eq!(read_file(&volume(&flash, CAPS_100T), "roms/kernal.bin"), Some(vec![0x42; 8192]));
 
-        let forced = write_roms(&flash, CAPS_100T, dir.path(), true).unwrap();
+        let forced = write_roms(&flash, CAPS_100T, FlashChip::S25fl128l, dir.path(), true).unwrap();
         assert_eq!(forced.outcomes, [Outcome::Replaced, Outcome::Identical, Outcome::Identical]);
         assert_eq!(read_file(&volume(&flash, CAPS_100T), "roms/kernal.bin"), Some(roms()[0].clone()));
     }
 
+    /// The C64 store's page is found among the chip's config pages: 24 at 0xFE8000 (S25FL128L) or 16 at 0xFF0000
+    /// (W25Q128JV, S47 T4); the other chip's place is not looked at.
     #[test]
     fn c64_roms_store_page_selects_the_names() {
-        let dir = rom_dir();
-        let tmp = tempfile::tempdir().unwrap();
-        let flash = tmp.path().join("flash.bin");
-        let mut image = vec![0xFF; FLASH_SIZE];
-        // Page 0 belongs to the U64 stores (u64_config.cc:99); the C64 store is page 2.
-        image[CONFIG_BASE..CONFIG_BASE + 4].copy_from_slice(&0x5536_3443u32.to_le_bytes());
-        let page = c64_store(&[
-            (0xE1, CFG_TYPE_STRFUNC, b"kernal.901227-03.bin"),
-            // A type mismatch is skipped, so BASIC keeps its default (config.cc:674-677).
-            (0xE2, 0x02, &[1]),
-            // "No file", which list_chars offers (c64.cc:1751-1757).
-            (0xE3, CFG_TYPE_STRFUNC, b""),
-        ]);
-        image[CONFIG_BASE + 2 * SECTOR..CONFIG_BASE + 2 * SECTOR + CONFIG_PAGE_SIZE].copy_from_slice(&page);
-        std::fs::write(&flash, &image).unwrap();
+        for (chip, other) in [(FlashChip::S25fl128l, FlashChip::W25q128), (FlashChip::W25q128, FlashChip::S25fl128l)] {
+            let dir = rom_dir();
+            let tmp = tempfile::tempdir().unwrap();
+            let flash = tmp.path().join("flash.bin");
+            let mut image = vec![0xFF; FLASH_SIZE];
+            let at = |p: usize| chip.config_page_at(p);
+            // Page 0 belongs to the U64 stores (u64_config.cc:99); the C64 store is page 2.
+            image[at(0)..at(0) + 4].copy_from_slice(&0x5536_3443u32.to_le_bytes());
+            let page = c64_store(&[
+                (0xE1, CFG_TYPE_STRFUNC, b"kernal.901227-03.bin"),
+                // A type mismatch is skipped, so BASIC keeps its default (config.cc:674-677).
+                (0xE2, 0x02, &[1]),
+                // "No file", which list_chars offers (c64.cc:1751-1757).
+                (0xE3, CFG_TYPE_STRFUNC, b""),
+            ]);
+            image[at(2)..at(2) + CONFIG_PAGE_SIZE].copy_from_slice(&page);
+            std::fs::write(&flash, &image).unwrap();
 
-        let report = write_roms(&flash, CAPS_100T, dir.path(), false).unwrap();
-        assert_eq!(report.outcomes, [Outcome::Written, Outcome::Written, Outcome::Skipped]);
-        let fs = volume(&flash, CAPS_100T);
-        assert_eq!(read_file(&fs, "roms/kernal.901227-03.bin"), Some(roms()[0].clone()));
-        assert_eq!(read_file(&fs, "roms/kernal.bin"), None);
-        assert_eq!(read_file(&fs, "roms/basic.bin"), Some(roms()[1].clone()));
-        assert_eq!(read_file(&fs, "roms/chars.bin"), None);
-        let after = std::fs::read(&flash).unwrap();
-        assert!(after[CONFIG_BASE..] == image[CONFIG_BASE..], "no config write");
+            let report = write_roms(&flash, CAPS_100T, chip, dir.path(), false).unwrap();
+            assert_eq!(report.outcomes, [Outcome::Written, Outcome::Written, Outcome::Skipped], "{chip:?}");
+            let fs = volume(&flash, CAPS_100T);
+            assert_eq!(read_file(&fs, "roms/kernal.901227-03.bin"), Some(roms()[0].clone()));
+            assert_eq!(read_file(&fs, "roms/kernal.bin"), None);
+            assert_eq!(read_file(&fs, "roms/basic.bin"), Some(roms()[1].clone()));
+            assert_eq!(read_file(&fs, "roms/chars.bin"), None);
+            let after = std::fs::read(&flash).unwrap();
+            assert!(after[0xFE_8000..] == image[0xFE_8000..], "no config write");
+            // The S25FL128L's 24 pages end with the W25Q's 16 (its page 10 is the W25Q's page 2), so it finds a W25Q
+            // store; the W25Q does not look at 0xFE8000-0xFEFFFF and takes the defaults.
+            let fresh = tmp.path().join("other.bin");
+            std::fs::write(&fresh, &image).unwrap();
+            let report = write_roms(&fresh, CAPS_100T, other, dir.path(), false).unwrap();
+            let found = [Outcome::Written, Outcome::Written, Outcome::Skipped];
+            let expected = if other == FlashChip::S25fl128l { found } else { [Outcome::Written; 3] };
+            assert_eq!(report.outcomes, expected, "{other:?}");
+        }
     }
 
     #[test]
@@ -657,7 +683,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let flash = tmp.path().join("flash.bin");
         assert_eq!(flash_disk(CAPS_50T), (0x40_0000, 3048));
-        write_roms(&flash, CAPS_50T, dir.path(), false).unwrap();
+        write_roms(&flash, CAPS_50T, FlashChip::S25fl128l, dir.path(), false).unwrap();
         let mut image = std::fs::read(&flash).unwrap();
         assert!(image[..0x40_0000].iter().all(|&b| b == 0xFF));
         {
@@ -669,7 +695,7 @@ mod tests {
         }
         std::fs::write(&flash, &image).unwrap();
 
-        let report = write_roms(&flash, CAPS_50T, dir.path(), false).unwrap();
+        let report = write_roms(&flash, CAPS_50T, FlashChip::S25fl128l, dir.path(), false).unwrap();
         assert_eq!(report.outcomes, [Outcome::Identical, Outcome::Identical, Outcome::Written]);
         let fs = volume(&flash, CAPS_50T);
         assert_eq!(read_file(&fs, "roms/characters.901225-01.bin"), Some(roms()[2].clone()));
@@ -687,12 +713,16 @@ mod tests {
         assert_eq!(locate_flash_disk(&image, CAPS_100T), (0x40_0000, 3048));
         assert_eq!(locate_flash_disk(&vec![0xFF; FLASH_SIZE], CAPS_100T), (0x58_0000, 2664), "erased: by capabilities");
 
-        let report = write_roms(&flash, CAPS_100T, dir.path(), false).unwrap();
+        let report = write_roms(&flash, CAPS_100T, FlashChip::S25fl128l, dir.path(), false).unwrap();
         assert!(!report.formatted);
         assert_eq!(report.outcomes, [Outcome::Written; 3]);
         let fs = volume(&flash, CAPS_50T);
         assert_eq!(read_file(&fs, "roms/kernal.bin"), Some(roms()[0].clone()));
         assert_eq!(locate_flash_disk(&std::fs::read(&flash).unwrap(), CAPS_100T), (0x40_0000, 3048));
+        // Not the other way round: on a 50T a volume at 0x580000 (from a 100T run) is not /flash.
+        let mut image = vec![0xFF; FLASH_SIZE];
+        mkfs(&mut image[0x58_0000..0x58_0000 + 2664 * SECTOR], 2664, 1).unwrap();
+        assert_eq!(locate_flash_disk(&image, CAPS_50T), (0x40_0000, 3048));
     }
 
     #[test]
@@ -720,7 +750,7 @@ mod tests {
         let mut image = vec![0xFF; FLASH_SIZE];
         image[0x58_0000..0x58_1000].fill(0x00);
         std::fs::write(&flash, &image).unwrap();
-        let err = write_roms(&flash, CAPS_100T, dir.path(), false).err().unwrap();
+        let err = write_roms(&flash, CAPS_100T, FlashChip::S25fl128l, dir.path(), false).err().unwrap();
         assert!(format!("{err:#}").contains("neither a FAT volume nor erased"), "{err:#}");
         assert!(std::fs::read(&flash).unwrap() == image);
 
@@ -731,7 +761,7 @@ mod tests {
         std::fs::write(partial.path().join("basic.901226-01.bin"), basic).unwrap();
         std::fs::write(partial.path().join("chars.bin"), vec![0u8; 2048]).unwrap();
         let fresh = tmp.path().join("fresh.bin");
-        let err = write_roms(&fresh, CAPS_100T, partial.path(), false).err().unwrap();
+        let err = write_roms(&fresh, CAPS_100T, FlashChip::S25fl128l, partial.path(), false).err().unwrap();
         assert!(format!("{err:#}").contains("chars.bin has 2048 bytes"), "{err:#}");
         assert!(!fresh.exists());
     }
