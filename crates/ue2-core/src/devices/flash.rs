@@ -1,12 +1,14 @@
-//! SPI flash controller 0x10060200 + S25FL128L NOR model + overlay-UI config seeding.
-//! Spec: docs/specs/S06-spi-flash.md. Behaviour: docs/hw/06-spi-flash-config.md (H1-H10),
-//! docs/hw/00-memory-map.md §2 C6-C10, C23, C35.
+//! SPI flash controller 0x10060200 + S25FL128L / W25Q128JV NOR model + overlay-UI config seeding.
+//! Spec: docs/specs/S06-spi-flash.md, the W25Q128JV docs/specs/S47-c64u-flash-install.md §3. Behaviour:
+//! docs/hw/06-spi-flash-config.md (H1-H10), docs/hw/00-memory-map.md §2 C6-C10, C23, C35.
 //!
 //! - Controller: DATA/RATE/CTRL/CRC selected by address bits 3:2, CS framing per 06 H7.
-//! - Chip: JEDEC `01 60 18`, so the W25Q and S25FL-K testers reject it and `S25FLxxxL_Flash` claims it
-//!   (06 H1, 00 §3 C8). Every operation completes inside the bus access (06 §Interrupts): SR1 BUSY is 0.
+//! - Chip ([`FlashChip`], `MachineConfig::flash_chip`): the S25FL128L, JEDEC `01 60 18`, which the W25Q and S25FL-K
+//!   testers reject and `S25FLxxxL_Flash` claims (06 H1, 00 §3 C8); or the C64U's W25Q128JV, JEDEC `EF 40 18`, which
+//!   `W25Q_Flash` claims, with its status registers and block protection. Every operation completes inside the bus
+//!   access (06 §Interrupts): SR1 BUSY is 0.
 //! - Persistence: `MachineConfig::flash_image`, written back at most ~0.5 s wall after a program/erase and
-//!   on drop.
+//!   on drop. The W25Q's status registers are not in the image: every run powers up with them 0 (S47 D3).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -44,18 +46,56 @@ const PAGE_SIZE: usize = 0x100;
 const SECTOR_SIZE: usize = 0x1000;
 const SECTOR_COUNT: usize = FLASH_SIZE / SECTOR_SIZE;
 
-/// Manufacturer, type, capacity. The W25Q and S25FL-K testers run first and reject it
-/// (w25q_flash.cc:139-144, s25fl_flash.cc:51-56); `S25FLxxxL_Flash::tester` accepts it
-/// (s25fl_l_flash.cc:65-83). 06 H1, 00 §3 C8.
-pub const JEDEC_ID: [u8; 3] = [0x01, 0x60, 0x18];
+/// The chip on the controller's chip select (S47 §2: `--flash-chip`, or the board model).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FlashChip {
+    /// Infineon S25FL128L: ue2emu's chip since S06, for the U64-II whose chip nobody measured.
+    #[default]
+    S25fl128l,
+    /// Winbond W25Q128JV: the C64U's chip, measured on a board (S47 §1).
+    W25q128,
+}
+
+impl FlashChip {
+    /// The name `--flash-chip` takes (lower case) and the start-up line shows.
+    pub fn name(self) -> &'static str {
+        match self {
+            FlashChip::S25fl128l => "S25FL128L",
+            FlashChip::W25q128 => "W25Q128",
+        }
+    }
+
+    /// Manufacturer, type, capacity as `9F` answers them.
+    /// - S25FL128L `01 60 18`: the W25Q and S25FL-K testers run first and reject it (w25q_flash.cc:139-144,
+    ///   s25fl_flash.cc:51-56); `S25FLxxxL_Flash::tester` accepts it (s25fl_l_flash.cc:65-83). 06 H1, 00 §3 C8.
+    /// - W25Q128JV `EF 40 18`: `W25Q_Flash::tester` accepts it as 4096 sectors (w25q_flash.cc:138-174) and names it
+    ///   "Winbond W25Q128" (w25q_flash.cc:182-196).
+    pub fn jedec_id(self) -> [u8; 3] {
+        match self {
+            FlashChip::S25fl128l => [0x01, 0x60, 0x18],
+            FlashChip::W25q128 => [0xEF, 0x40, 0x18],
+        }
+    }
+
+    /// Config pages of the chip's driver: 24 (s25fl_l_flash.h:9) or 16 (`W25Q_NUM_CONFIG_PAGES`, w25q_flash.h:8).
+    pub fn config_pages(self) -> usize {
+        match self {
+            FlashChip::S25fl128l => 24,
+            FlashChip::W25q128 => 16,
+        }
+    }
+
+    /// Config page `p` = sector `sector_count - pages + p` (w25q_flash.cc:261-267): 0xFE8000 + p × 4 KiB on the
+    /// S25FL128L, 0xFF0000 + p × 4 KiB on the W25Q128JV.
+    pub fn config_page_at(self, p: usize) -> usize {
+        (SECTOR_COUNT - self.config_pages() + p) * SECTOR_SIZE
+    }
+}
 
 /// Answer to `4B`. Not all-00/FF, so the MAC (rmii_interface.cc:123-128) and the hostname suffix
 /// (product.cc:184-191) are not degenerate. 06 H10, 00 §2 C23.
 pub const UID: [u8; 8] = *b"UE2C64U\x01";
 
-/// Config page `p` = sector `sector_count - 24 + p` (w25q_flash.cc:261-267, s25fl_l_flash.h:9).
-const CONFIG_BASE: usize = 0xFE_8000;
-const CONFIG_PAGES: usize = 24;
 /// Logical config page, the part `ConfigPage` reads and writes (w25q_flash.cc:251-254).
 const CONFIG_PAGE_SIZE: usize = 512;
 /// `CFG_USERIF_STORE_ID` "GEN." (userinterface.h:28).
@@ -73,8 +113,10 @@ const FLUSH_DELAY: Duration = Duration::from_millis(500);
 const FLUSH_POLL_CLOCKS: u64 = 10 * CLOCKS_PER_MS;
 
 /// Opcodes (s25fl_l_flash.h:13-45; 3-byte forms and `C7` from w25q_flash.h:10-25; `66`/`99` from
-/// s25fl_l_flash.cc:36-45).
+/// s25fl_l_flash.cc:36-45). The W25Q128JV's own (instruction set table 1 of its datasheet): `01`, `15`, `31`, `11`,
+/// `50`, and `35` as read SR2; it has no 4-byte forms and no `07`.
 mod cmd {
+    pub const WRSR1: u8 = 0x01;
     pub const PP: u8 = 0x02;
     pub const READ: u8 = 0x03;
     pub const WRDI: u8 = 0x04;
@@ -98,35 +140,93 @@ mod cmd {
     pub const CE2: u8 = 0xC7;
     pub const BE: u8 = 0xD8;
     pub const BE4: u8 = 0xDC;
+    pub const W_WRSR3: u8 = 0x11;
+    pub const W_RDSR3: u8 = 0x15;
+    pub const W_WRSR2: u8 = 0x31;
+    pub const W_RDSR2: u8 = 0x35;
+    pub const W_VWREN: u8 = 0x50;
 }
 
-/// Address bytes of an addressed command. The chip stays in its default 3-byte mode; the 4-byte forms carry
-/// their own width (06 §Functional model, H8).
-fn addr_len(op: u8) -> Option<usize> {
+/// Address bytes of an addressed command. The S25FL128L stays in its default 3-byte mode; its 4-byte forms carry
+/// their own width (06 §Functional model, H8). The W25Q128JV has only the 3-byte forms.
+fn addr_len(chip: FlashChip, op: u8) -> Option<usize> {
     match op {
         cmd::READ | cmd::FAST_READ | cmd::PP | cmd::SE | cmd::HBE | cmd::BE => Some(3),
-        cmd::READ4 | cmd::FAST_READ4 | cmd::PP4 | cmd::SE4 | cmd::HBE4 | cmd::BE4 => Some(4),
+        cmd::READ4 | cmd::FAST_READ4 | cmd::PP4 | cmd::SE4 | cmd::HBE4 | cmd::BE4 if chip == FlashChip::S25fl128l => {
+            Some(4)
+        }
         _ => None,
     }
 }
 
 /// Block size cleared by an erase command.
-fn erase_size(op: u8) -> Option<usize> {
+fn erase_size(chip: FlashChip, op: u8) -> Option<usize> {
+    let s25fl = chip == FlashChip::S25fl128l;
     match op {
-        cmd::SE | cmd::SE4 => Some(SECTOR_SIZE),
-        cmd::HBE | cmd::HBE4 => Some(0x8000),
-        cmd::BE | cmd::BE4 => Some(0x1_0000),
+        cmd::SE => Some(SECTOR_SIZE),
+        cmd::HBE => Some(0x8000),
+        cmd::BE => Some(0x1_0000),
         cmd::CE | cmd::CE2 => Some(FLASH_SIZE),
+        cmd::SE4 if s25fl => Some(SECTOR_SIZE),
+        cmd::HBE4 if s25fl => Some(0x8000),
+        cmd::BE4 if s25fl => Some(0x1_0000),
         _ => None,
     }
 }
 
-/// S25FL128L array and command parser. A frame is the bytes clocked while CS is low; its first byte is the
+/// W25Q128JV status register bits (datasheet 7.1, figures 4a-4c).
+mod sr {
+    /// SR2 bit 0: power-supply lock-down.
+    pub const SRL: u8 = 0x01;
+    /// SR2 bit 6: complement protect.
+    pub const CMP: u8 = 0x40;
+    /// Bits a write changes (8.2.5): SR1 SRP SEC TB BP2:0 (SRP from 7.1.1's table), SR2 CMP LB3:1 QE SRL,
+    /// SR3 DRV1:0 WPS. BUSY, WEL, SUS and the reserved bits are not written.
+    pub const WRITABLE: [u8; 3] = [0xFC, 0x7B, 0x64];
+    /// SR2 LB3:1: one-time programmable, never back from 1 to 0 (7.1.3, 8.2.5).
+    pub const OTP: [u8; 3] = [0x00, 0x38, 0x00];
+}
+
+/// The range BP2:0, TB, SEC and CMP protect on the W25Q128JV (datasheet 7.1.8 for CMP = 0, 7.1.9 for CMP = 1), with
+/// WPS = 0. CMP = 1 protects the complement of the CMP = 0 range. SEC = 1 with BP = 110 is in neither table; it is
+/// taken as 32 KiB, as BP = 10x.
+fn w25q_protected(sr1: u8, sr2: u8) -> Range<usize> {
+    let bp = usize::from(sr1 >> 2 & 7);
+    let (bottom, sector) = (sr1 & 0x20 != 0, sr1 & 0x40 != 0);
+    let base = match bp {
+        0 => 0..0,
+        7 => 0..FLASH_SIZE,
+        _ => {
+            let size = if sector { SECTOR_SIZE << (bp - 1).min(3) } else { 0x4_0000 << (bp - 1) };
+            if bottom { 0..size } else { FLASH_SIZE - size..FLASH_SIZE }
+        }
+    };
+    if sr2 & sr::CMP == 0 {
+        base
+    } else if base.is_empty() {
+        0..FLASH_SIZE
+    } else if base.start == 0 {
+        base.end..FLASH_SIZE
+    } else {
+        0..base.start
+    }
+}
+
+/// The NOR array and command parser of the chip. A frame is the bytes clocked while CS is low; its first byte is the
 /// opcode. Write and erase commands execute when CS rises and finish at once.
 struct Nor {
+    chip: FlashChip,
     mem: Vec<u8>,
     /// SR1 bit 1: set by `06`; cleared by `04`, a reset, and every executed program/erase.
     wel: bool,
+    /// W25Q128JV: SR1-SR3 as read, without WEL and BUSY. A volatile write (after `50`) changes only these.
+    sr: [u8; 3],
+    /// W25Q128JV: the non-volatile copies, which a reset (`66`/`99`) loads back (8.2.5, 8.2.37). Power-up is 0 (S47 D3).
+    sr_nv: [u8; 3],
+    /// W25Q128JV: a lone `50` frame makes the next status register write volatile (8.2.2).
+    volatile_we: bool,
+    /// W25Q128JV: the data bytes of a status register write frame.
+    sr_in: [u8; 2],
     /// A lone `66` frame arms the next `99` frame.
     reset_armed: bool,
     /// Opcode of the open frame, `None` until its first byte.
@@ -142,10 +242,15 @@ struct Nor {
 }
 
 impl Nor {
-    fn erased() -> Self {
+    fn erased(chip: FlashChip) -> Self {
         Nor {
+            chip,
             mem: vec![0xFF; FLASH_SIZE],
             wel: false,
+            sr: [0; 3],
+            sr_nv: [0; 3],
+            volatile_we: false,
+            sr_in: [0; 2],
             reset_armed: false,
             op: None,
             count: 0,
@@ -155,9 +260,66 @@ impl Nor {
         }
     }
 
-    /// SR1 = `SRP0 SEC TB BP2 BP1 BP0 WEL BUSY` (w25q_flash.cc:396-397): unprotected, never busy (06 H3).
+    fn w25q(&self) -> bool {
+        self.chip == FlashChip::W25q128
+    }
+
+    /// SR1 = `SRP0 SEC TB BP2 BP1 BP0 WEL BUSY` (w25q_flash.cc:396-397), never busy (06 H3). The S25FL128L's is
+    /// unprotected; the W25Q's carries what its status register writes set.
     fn sr1(&self) -> u8 {
-        u8::from(self.wel) << 1
+        self.sr[0] & sr::WRITABLE[0] | u8::from(self.wel) << 1
+    }
+
+    /// The addresses program and erase commands may not touch: none on the S25FL128L, which is never protected here.
+    fn protected(&self) -> Range<usize> {
+        if self.w25q() {
+            w25q_protected(self.sr[0], self.sr[1])
+        } else {
+            0..0
+        }
+    }
+
+    /// "If any Erase or Program command specifies a memory region that contains protected data portion, this command
+    /// will be ignored" (datasheet 7.1.8 note 3). The datasheet says nothing of WEL for an ignored command; no cycle
+    /// runs, so it stays.
+    fn touches_protected(&self, range: &Range<usize>) -> bool {
+        let p = self.protected();
+        p.start < range.end && range.start < p.end
+    }
+
+    /// `01` (with one or two bytes), `31`, `11` on the W25Q128JV (datasheet 8.2.5): after `50` the volatile registers
+    /// change, after `06` both copies and WEL clears; neither leaves them alone. SRL = 1 refuses every write until
+    /// power-off (7.1.1; SRP needs /WP low to refuse, and the model's /WP is high). LB3:1 never go back to 0.
+    fn write_status(&mut self, op: u8, count: usize) {
+        let volatile = std::mem::take(&mut self.volatile_we);
+        let [b0, b1] = self.sr_in;
+        let writes: &[(usize, u8)] = match (op, count) {
+            (cmd::WRSR1, 1) => &[(0, b0)],
+            (cmd::WRSR1, 2) => &[(0, b0), (1, b1)],
+            (cmd::W_WRSR2, 1) => &[(1, b0)],
+            (cmd::W_WRSR3, 1) => &[(2, b0)],
+            _ => return,
+        };
+        if self.sr[1] & sr::SRL != 0 || !(volatile || self.wel) {
+            return;
+        }
+        let merge = |old: u8, r: usize, v: u8| old & !sr::WRITABLE[r] | v & sr::WRITABLE[r] | old & sr::OTP[r];
+        for &(r, v) in writes {
+            self.sr[r] = merge(self.sr[r], r, v);
+            if !volatile {
+                self.sr_nv[r] = merge(self.sr_nv[r], r, v);
+            }
+        }
+        if !volatile {
+            self.wel = false;
+        }
+    }
+
+    /// `66` then `99`: WEL clears; the W25Q's volatile status registers take their non-volatile values (8.2.37).
+    fn reset(&mut self) {
+        self.wel = false;
+        self.sr = self.sr_nv;
+        self.volatile_we = false;
     }
 
     /// CS falls.
@@ -181,14 +343,23 @@ impl Nor {
         };
         let i = self.count;
         self.count += 1;
+        let w25q = self.w25q();
         match op {
-            cmd::RDID => JEDEC_ID.get(i).copied().unwrap_or(0xFF),
+            cmd::RDID => self.chip.jedec_id().get(i).copied().unwrap_or(0xFF),
             // Repeated on every byte: `wait_ready` polls inside one frame (w25q_flash.cc:492-503).
             cmd::RDSR1 => self.sr1(),
-            cmd::RDSR2 | cmd::RDCR1 => 0x00,
+            cmd::W_RDSR2 if w25q => self.sr[1],
+            cmd::W_RDSR3 if w25q => self.sr[2],
+            cmd::RDSR2 | cmd::RDCR1 if !w25q => 0x00,
+            cmd::WRSR1 | cmd::W_WRSR2 | cmd::W_WRSR3 if w25q => {
+                if let Some(slot) = self.sr_in.get_mut(i) {
+                    *slot = mosi;
+                }
+                0xFF
+            }
             // 4 dummy bytes, then 8 UID bytes (w25q_flash.cc:240-245).
             cmd::RUID => i.checked_sub(4).and_then(|k| self.uid.get(k)).copied().unwrap_or(0xFF),
-            _ => match addr_len(op) {
+            _ => match addr_len(self.chip, op) {
                 Some(n) if i < n => {
                     self.addr = (self.addr << 8) | u32::from(mosi);
                     0xFF
@@ -223,28 +394,38 @@ impl Nor {
         let op = self.op.take()?;
         let count = std::mem::take(&mut self.count);
         let armed = std::mem::take(&mut self.reset_armed);
-        let alen = addr_len(op).unwrap_or(0);
+        let alen = addr_len(self.chip, op);
         let start = self.addr as usize & ADDR_MASK;
+        let w25q = self.w25q();
         match op {
             // Single-byte commands only count alone in their frame; `66 99` in one frame is a no-op
             // (s25fl_l_flash.cc:35-38, 06 Q6).
             cmd::WREN | cmd::WRDI | cmd::RSTEN | cmd::RST if count != 0 => {}
+            cmd::W_VWREN if w25q && count != 0 => {}
             cmd::WREN => self.wel = true,
             cmd::WRDI => self.wel = false,
             cmd::RSTEN => self.reset_armed = true,
-            cmd::RST if armed => self.wel = false,
+            cmd::RST if armed => self.reset(),
+            cmd::W_VWREN if w25q => self.volatile_we = true,
+            cmd::WRSR1 | cmd::W_WRSR2 | cmd::W_WRSR3 if w25q => self.write_status(op, count),
             // Program only clears bits (06 §Functional model).
-            cmd::PP | cmd::PP4 if self.wel && count > alen => {
+            cmd::PP | cmd::PP4 if self.wel && alen.is_some_and(|n| count > n) => {
                 let page = start & !(PAGE_SIZE - 1);
+                if self.touches_protected(&(page..page + PAGE_SIZE)) {
+                    return None;
+                }
                 for (cell, byte) in self.mem[page..page + PAGE_SIZE].iter_mut().zip(&self.page_buf) {
                     *cell &= byte;
                 }
                 self.wel = false;
                 return Some(page..page + PAGE_SIZE);
             }
-            _ if self.wel && count == alen => {
-                let size = erase_size(op)?;
+            _ if self.wel && count == alen.unwrap_or(0) => {
+                let size = erase_size(self.chip, op)?;
                 let base = start & !(size - 1);
+                if self.touches_protected(&(base..base + size)) {
+                    return None;
+                }
                 self.mem[base..base + size].fill(0xFF);
                 self.wel = false;
                 return Some(base..base + size);
@@ -288,7 +469,7 @@ impl Image {
     }
 }
 
-/// SPI master at `FLASH_BASE` with the S25FL128L on its chip select.
+/// SPI master at `FLASH_BASE` with the S25FL128L or the W25Q128JV on its chip select.
 pub struct SpiFlash {
     chip: Nor,
     /// CTRL bit 0, reset 0 (spi_peripheral_io.vhd:157).
@@ -301,14 +482,33 @@ pub struct SpiFlash {
 
 impl SpiFlash {
     /// Volatile flash, fully erased.
-    pub fn volatile() -> Self {
-        SpiFlash { chip: Nor::erased(), force_ss: false, level_ss: true, image: None }
+    pub fn volatile(chip: FlashChip) -> Self {
+        SpiFlash { chip: Nor::erased(chip), force_ss: false, level_ss: true, image: None }
     }
 
     /// Flash backed by the image at `path`, created erased (16 MiB of 0xFF) if missing. A shorter file is
     /// padded with 0xFF; a longer one is refused.
-    pub fn open(path: &Path) -> io::Result<Self> {
-        Self::load(path).map_err(|e| image_error(path, e))
+    pub fn open(path: &Path, chip: FlashChip) -> io::Result<Self> {
+        Self::load(path, chip).map_err(|e| image_error(path, e))
+    }
+
+    /// Which chip this is (S47).
+    pub fn chip(&self) -> FlashChip {
+        self.chip.chip
+    }
+
+    /// The W25Q128JV's status registers SR1-SR3 as `05`/`35`/`15` read them (S47 §3); all 0 on the S25FL128L.
+    pub fn status(&self) -> [u8; 3] {
+        [self.chip.sr1(), self.chip.sr[1], self.chip.sr[2]]
+    }
+
+    /// Byte offset of config page `p` of this chip.
+    fn config_at(&self, p: usize) -> usize {
+        self.chip.chip.config_page_at(p)
+    }
+
+    fn config_page_count(&self) -> usize {
+        self.chip.chip.config_pages()
     }
 
     /// Replace the factory unique ID that `RUID` (0x4B) returns. The firmware derives the Ethernet MAC and the
@@ -317,7 +517,7 @@ impl SpiFlash {
         self.chip.uid = uid;
     }
 
-    fn load(path: &Path) -> io::Result<Self> {
+    fn load(path: &Path, chip: FlashChip) -> io::Result<Self> {
         let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
         let len = file.metadata()?.len();
         if len > FLASH_SIZE as u64 {
@@ -327,7 +527,7 @@ impl SpiFlash {
             ));
         }
         let len = len as usize;
-        let mut flash = Self::volatile();
+        let mut flash = Self::volatile(chip);
         file.read_exact(&mut flash.chip.mem[..len])?;
         if len < FLASH_SIZE {
             file.write_all(&flash.chip.mem[len..])?;
@@ -342,11 +542,12 @@ impl SpiFlash {
         Ok(flash)
     }
 
-    /// Volatile or image-backed per `cfg.flash_image`; seeded with the overlay-UI page if `cfg.overlay_ui`.
+    /// `cfg.flash_chip`, volatile or image-backed per `cfg.flash_image`; seeded with the overlay-UI page if
+    /// `cfg.overlay_ui`.
     pub fn from_config(cfg: &MachineConfig) -> io::Result<Self> {
         let mut flash = match &cfg.flash_image {
-            Some(path) => Self::open(path)?,
-            None => Self::volatile(),
+            Some(path) => Self::open(path, cfg.flash_chip)?,
+            None => Self::volatile(cfg.flash_chip),
         };
         if cfg.overlay_ui && flash.seed_overlay_ui() {
             flash.flush()?;
@@ -358,9 +559,10 @@ impl SpiFlash {
     /// Returns whether a page was written.
     ///
     /// Config page format, derived from the firmware:
-    /// - Location: config page `p` (0..24) is sector `sector_count - 24 + p`, i.e. `0xFE8000 + p * 0x1000`
-    ///   (w25q_flash.cc:261-267; 24 pages s25fl_l_flash.h:9; 4096 sectors s25fl_l_flash.cc:79-83). The
-    ///   firmware reads it with opcode `03` and a 3-byte address (w25q_flash.cc:108-123).
+    /// - Location: config page `p` is sector `sector_count - pages + p` (w25q_flash.cc:261-267; 4096 sectors
+    ///   s25fl_l_flash.cc:79-83, w25q_flash.cc:170-174): `0xFE8000 + p * 0x1000` for the S25FL128L's 24 pages
+    ///   (s25fl_l_flash.h:9), `0xFF0000 + p * 0x1000` for the W25Q128JV's 16 (w25q_flash.h:8). The firmware reads it
+    ///   with opcode `03` and a 3-byte address (w25q_flash.cc:108-123).
     /// - Size: 512 bytes (w25q_flash.cc:251-254), written as a 4 KiB erase plus two 256-byte programs
     ///   (w25q_flash.cc:269-277).
     /// - Bytes 0..4: page id, native little-endian u32 (config.cc:280). The user-interface store id is
@@ -382,18 +584,14 @@ impl SpiFlash {
     /// page carries the id, so a saved choice is never overwritten. Every other store stays absent and the
     /// firmware claims its own page with defaults.
     pub fn seed_overlay_ui(&mut self) -> bool {
-        let page_id = |mem: &[u8], p: usize| {
-            let at = CONFIG_BASE + p * SECTOR_SIZE;
-            u32::from_le_bytes([mem[at], mem[at + 1], mem[at + 2], mem[at + 3]])
-        };
-        let mem = &self.chip.mem;
-        if (0..CONFIG_PAGES).any(|p| page_id(mem, p) == USERIF_STORE_ID) {
+        let pages = self.config_page_count();
+        if (0..pages).any(|p| self.page_id(p) == USERIF_STORE_ID) {
             return false;
         }
-        let Some(p) = (0..CONFIG_PAGES).find(|&p| page_id(mem, p) == 0xFFFF_FFFF) else {
+        let Some(p) = (0..pages).find(|&p| self.page_id(p) == 0xFFFF_FFFF) else {
             return false;
         };
-        let base = CONFIG_BASE + p * SECTOR_SIZE;
+        let base = self.config_at(p);
         let sector = &mut self.chip.mem[base..base + SECTOR_SIZE];
         sector.fill(0xFF);
         sector[..4].copy_from_slice(&USERIF_STORE_ID.to_le_bytes());
@@ -405,10 +603,9 @@ impl SpiFlash {
     /// The records stored for one config page, as the firmware would unpack them (S23 §6, the monitor's `config`).
     /// `None` when no page carries that id.
     pub fn config_page(&self, page: u32) -> Option<Vec<(u8, u8, Vec<u8>)>> {
-        (0..CONFIG_PAGES).find_map(|p| {
-            let at = CONFIG_BASE + p * SECTOR_SIZE;
-            let id = u32::from_le_bytes(self.chip.mem[at..at + 4].try_into().expect("4 bytes"));
-            (id == page).then(|| {
+        (0..self.config_page_count()).find_map(|p| {
+            let at = self.config_at(p);
+            (self.page_id(p) == page).then(|| {
                 page_records(&self.chip.mem[at..at + CONFIG_PAGE_SIZE])
                     .into_iter()
                     .map(|(id, kind, payload)| (id, kind, payload.to_vec()))
@@ -438,13 +635,13 @@ impl SpiFlash {
 
     /// The ids of the config pages in use, in page order (S23 §6, `config flash`).
     pub fn config_pages(&self) -> Vec<u32> {
-        (0..CONFIG_PAGES)
-            .map(|p| {
-                let at = CONFIG_BASE + p * SECTOR_SIZE;
-                u32::from_le_bytes(self.chip.mem[at..at + 4].try_into().expect("4 bytes"))
-            })
-            .filter(|&id| id != 0xFFFF_FFFF)
-            .collect()
+        (0..self.config_page_count()).map(|p| self.page_id(p)).filter(|&id| id != 0xFFFF_FFFF).collect()
+    }
+
+    /// The id word of config page `p`, native little-endian (config.cc:280).
+    fn page_id(&self, p: usize) -> u32 {
+        let at = self.config_at(p);
+        u32::from_le_bytes(self.chip.mem[at..at + 4].try_into().expect("4 bytes"))
     }
 
     /// Put settings records into their config pages (docs/specs/S21-settings.md §5): the first page carrying the
@@ -455,24 +652,21 @@ impl SpiFlash {
         let mut pages: Vec<u32> = records.iter().map(|r| r.page).collect();
         pages.sort_unstable();
         pages.dedup();
+        let count = self.config_page_count();
         for page in pages {
             let wanted: Vec<&Record> = records.iter().filter(|r| r.page == page).collect();
-            let id_at = |mem: &[u8], p: usize| {
-                let at = CONFIG_BASE + p * SECTOR_SIZE;
-                u32::from_le_bytes(mem[at..at + 4].try_into().expect("4 bytes"))
-            };
-            let mem = &self.chip.mem;
-            let Some(p) = (0..CONFIG_PAGES)
-                .find(|&p| id_at(mem, p) == page)
-                .or_else(|| (0..CONFIG_PAGES).find(|&p| id_at(mem, p) == 0xFFFF_FFFF))
+            let Some(p) = (0..count)
+                .find(|&p| self.page_id(p) == page)
+                .or_else(|| (0..count).find(|&p| self.page_id(p) == 0xFFFF_FFFF))
             else {
-                anyhow::bail!("page {page:08x}: all {CONFIG_PAGES} config pages are taken");
+                anyhow::bail!("page {page:08x}: all {count} config pages are taken");
             };
-            let base = CONFIG_BASE + p * SECTOR_SIZE;
-            let old = &mem[base..base + CONFIG_PAGE_SIZE];
+            let base = self.config_at(p);
+            let claimed = self.page_id(p) == page;
+            let old = &self.chip.mem[base..base + CONFIG_PAGE_SIZE];
             let mut placed = vec![false; wanted.len()];
             let mut items: Vec<(u8, u8, Vec<u8>)> = Vec::new();
-            if id_at(mem, p) == page {
+            if claimed {
                 for (id, kind, payload) in page_records(old) {
                     match wanted.iter().position(|r| r.id == id) {
                         Some(w) if !placed[w] => {
@@ -639,7 +833,8 @@ impl IoDevice for SpiFlash {
 
     fn reset(&mut self) {
         // Controller reset state (spi_peripheral_io.vhd:153-160). An open frame is dropped unexecuted; the
-        // array and WEL belong to the chip, which keeps power.
+        // array, WEL and the W25Q's status registers (a lock-down too) belong to the chip, which keeps power over an
+        // IPROG (S47 §3).
         self.force_ss = false;
         self.level_ss = true;
         self.chip.start_frame();
@@ -686,11 +881,21 @@ mod tests {
     /// `SPI_FLASH_DATA` / `SPI_FLASH_CTRL` (w25q_flash.h:27-29).
     const DATA: u32 = FLASH_BASE;
     const CTRL: u32 = FLASH_BASE + 8;
+    /// The S25FL128L's identity and config pages, which the tests below that name no chip use.
+    const JEDEC_ID: [u8; 3] = [0x01, 0x60, 0x18];
+    const CONFIG_BASE: usize = 0xFE_8000;
+    const CONFIG_PAGES: usize = 24;
 
     fn cfg(flash_image: Option<PathBuf>, overlay_ui: bool) -> MachineConfig {
         let mut cfg = MachineConfig::new(PathBuf::new(), PathBuf::new());
         cfg.flash_image = flash_image;
         cfg.overlay_ui = overlay_ui;
+        cfg
+    }
+
+    fn w25q_cfg(flash_image: Option<PathBuf>, overlay_ui: bool) -> MachineConfig {
+        let mut cfg = cfg(flash_image, overlay_ui);
+        cfg.flash_chip = FlashChip::W25q128;
         cfg
     }
 
@@ -1131,7 +1336,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let short = dir.path().join("short.bin");
         std::fs::write(&short, [0x12, 0x34]).unwrap();
-        let flash = SpiFlash::open(&short).unwrap();
+        let flash = SpiFlash::open(&short, FlashChip::S25fl128l).unwrap();
         assert_eq!(flash.chip.mem[..3], [0x12, 0x34, 0xFF]);
         drop(flash);
         let bytes = std::fs::read(&short).unwrap();
@@ -1139,7 +1344,7 @@ mod tests {
         assert_eq!(bytes[..3], [0x12, 0x34, 0xFF]);
         let big = dir.path().join("big.bin");
         std::fs::write(&big, vec![0u8; FLASH_SIZE + 1]).unwrap();
-        assert!(SpiFlash::open(&big).is_err());
+        assert!(SpiFlash::open(&big, FlashChip::S25fl128l).is_err());
     }
 
     #[test]
@@ -1173,7 +1378,7 @@ mod tests {
 
     #[test]
     fn flash_overlay_ui_seed_keeps_existing_pages() {
-        let mut flash = SpiFlash::volatile();
+        let mut flash = SpiFlash::volatile(FlashChip::S25fl128l);
         // Page 0 already claimed by the U64 stores (u64_config.cc:99).
         flash.chip.mem[CONFIG_BASE..CONFIG_BASE + 4].copy_from_slice(&0x5536_3443u32.to_le_bytes());
         assert!(flash.seed_overlay_ui());
@@ -1184,7 +1389,7 @@ mod tests {
         assert!(!flash.seed_overlay_ui());
         assert_eq!(flash.chip.mem[page1 + 7], 0x00);
         // No erased page left: nothing to claim.
-        let mut full = SpiFlash::volatile();
+        let mut full = SpiFlash::volatile(FlashChip::S25fl128l);
         for p in 0..CONFIG_PAGES {
             let at = CONFIG_BASE + p * SECTOR_SIZE;
             full.chip.mem[at..at + 4].copy_from_slice(&(0x100 + p as u32).to_le_bytes());
@@ -1204,7 +1409,7 @@ mod tests {
             0x07, 0x03, 0x00, 0x0A, 0x02, 0x01, 0x01, 0x0B, 0x02, 0x01, 0x01, 0x0C, 0x02, 0x01, 0x00,
             0x0F, 0x02, 0x01, 0x01, 0x10, 0x02, 0x01, 0x01, 0xFF,
         ];
-        let mut flash = SpiFlash::volatile();
+        let mut flash = SpiFlash::volatile(FlashChip::S25fl128l);
         flash.chip.mem[CONFIG_BASE..CONFIG_BASE + saved.len()].copy_from_slice(&saved);
         let before = flash.chip.mem.clone();
         assert!(!flash.seed_overlay_ui(), "a saved user-interface store is never reseeded");
@@ -1244,7 +1449,7 @@ mod tests {
     /// before the end marker; a store without a page gets the first erased one.
     #[test]
     fn settings_edit_the_existing_page_and_claim_an_erased_one() {
-        let mut flash = SpiFlash::volatile();
+        let mut flash = SpiFlash::volatile(FlashChip::S25fl128l);
         assert!(flash.seed_overlay_ui());
         // A C64 page as the firmware writes it, with a duplicate REU record at the end.
         let c64 = 0x4336_3420u32;
@@ -1276,7 +1481,7 @@ mod tests {
 
     #[test]
     fn settings_that_do_not_fit_are_refused() {
-        let mut flash = SpiFlash::volatile();
+        let mut flash = SpiFlash::volatile(FlashChip::S25fl128l);
         let long = vec![b'x'; 255];
         let records: Vec<Record> = (0..2).map(|i| record(0x4E45_5400, i, 0x03, &long)).collect();
         let err = flash.write_settings(&records).unwrap_err().to_string();
@@ -1293,14 +1498,262 @@ mod tests {
     fn settings_written_to_the_image_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flash.bin");
-        let mut flash = SpiFlash::open(&path).unwrap();
+        let mut flash = SpiFlash::open(&path, FlashChip::S25fl128l).unwrap();
         flash.write_settings(&[record(0x4336_3420, 0xC3, 0x02, &[1])]).unwrap();
         flash.flush().unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes[CONFIG_BASE..CONFIG_BASE + 9], [0x20, 0x34, 0x36, 0x43, 0xC3, 0x02, 0x01, 0x01, 0xFF]);
         // Writing the same again changes nothing.
-        let mut again = SpiFlash::open(&path).unwrap();
+        let mut again = SpiFlash::open(&path, FlashChip::S25fl128l).unwrap();
         again.write_settings(&[record(0x4336_3420, 0xC3, 0x02, &[1])]).unwrap();
         assert!(again.image.as_ref().unwrap().dirty.iter().all(|&d| !d));
+    }
+
+    // ---- S47: the W25Q128JV ----
+
+    impl Rig {
+        /// `05`, `35` or `15`, one byte.
+        fn read_sr(&mut self, op: u8) -> u8 {
+            self.write8(CTRL, SPI_FORCE_SS);
+            self.write8(DATA, op);
+            let v = self.read8(DATA);
+            self.cs_high();
+            v
+        }
+
+        /// A status register write as flashlock.cc sends it: the enable (`06` or `50`) in a frame of its own, then
+        /// the opcode and its bytes in one frame, never reading the data register in it.
+        fn write_sr(&mut self, enable: u8, op: u8, bytes: &[u8]) {
+            self.write8(CTRL, SPI_FORCE_SS);
+            self.write8(DATA, enable);
+            self.cs_high();
+            self.write8(CTRL, SPI_FORCE_SS);
+            self.write8(DATA, op);
+            for &b in bytes {
+                self.write8(DATA, b);
+            }
+            self.cs_high();
+        }
+
+        fn status(&mut self) -> [u8; 3] {
+            [self.read_sr(cmd::RDSR1), self.read_sr(cmd::W_RDSR2), self.read_sr(cmd::W_RDSR3)]
+        }
+    }
+
+    /// T1: `W25Q_Flash::tester` takes the chip; the S25FL-K and S25FL-L testers, which run after it, would reject it.
+    #[test]
+    fn w25q_identity_for_the_testers() {
+        let mut rig = Rig::new(&w25q_cfg(None, false));
+        let id = rig.tester_w25q();
+        assert_eq!(id, [0xEF, 0x40, 0x18], "w25q_flash.cc:138-174: Winbond, type 0x40, 128 Mbit");
+        assert!(id[0] != 0x01, "S25FL-K tester rejects (s25fl_flash.cc:51-56)");
+        assert_ne!(rig.tester_s25fl_l(), [0x01, 0x60, 0x18], "S25FL-L tester rejects");
+        assert_eq!(rig.read_serial(), UID);
+        assert_eq!(rig.flash().chip(), FlashChip::W25q128);
+        // And the other way round: the W25Q tester rejects the S25FL128L.
+        assert_ne!(Rig::new(&cfg(None, false)).tester_w25q()[0], 0xEF);
+    }
+
+    /// T2: the commands the W25Q driver sends (w25q_flash.cc), 3-byte addresses only.
+    #[test]
+    fn w25q_read_program_erase() {
+        let mut rig = Rig::new(&w25q_cfg(None, false));
+        let (a, b) = (pattern(0x21), pattern(0x84));
+        // `write_config_page` for config page 3: erase, then two pages (w25q_flash.cc:269-277).
+        assert!(rig.erase_sector(cmd::SE, 3, 0xFF3));
+        assert!(rig.write_page(cmd::PP, 3, 0xFF30, &a));
+        assert!(rig.write_page(cmd::PP, 3, 0xFF31, &b));
+        assert_eq!(rig.read_page(cmd::READ, 3, 0xFF30), a);
+        assert_eq!(rig.read_dev_addr(0xFF_3100, 256), b);
+        // Fast read: one dummy byte.
+        rig.command(cmd::FAST_READ, 0xFF_3000, 3);
+        rig.read8(DATA);
+        assert_eq!([rig.read8(DATA), rig.read8(DATA)], a[..2]);
+        rig.cs_high();
+        // 32 KiB and 64 KiB erases.
+        rig.single(cmd::WREN);
+        rig.command(cmd::HBE, 0xFF_0000, 3);
+        rig.cs_high();
+        assert_eq!(rig.read_page(cmd::READ, 3, 0xFF30), vec![0xFF; PAGE_SIZE]);
+        assert!(rig.write_page(cmd::PP, 3, 0x0010, &a));
+        assert!(rig.write_page(cmd::PP, 3, 0x0100, &b));
+        rig.single(cmd::WREN);
+        rig.command(cmd::BE, 0x00_8000, 3);
+        rig.cs_high();
+        assert_eq!(rig.read_page(cmd::READ, 3, 0x0010), vec![0xFF; PAGE_SIZE], "block 0x000000-0x00FFFF");
+        assert_eq!(rig.read_page(cmd::READ, 3, 0x0100), b, "0x010000 is the next block");
+        // Both chip erases.
+        for ce in [cmd::CE, cmd::CE2] {
+            assert!(rig.write_page(cmd::PP, 3, 0x0100, &a));
+            rig.single(cmd::WREN);
+            rig.single(ce);
+            assert_eq!(rig.read_page(cmd::READ, 3, 0x0100), vec![0xFF; PAGE_SIZE]);
+            assert_eq!(rig.sr1(), 0x00, "chip erase clears WEL");
+        }
+        // The S25FL128L's 4-byte forms are no W25Q commands: nothing is written or erased.
+        assert!(rig.write_page(cmd::PP, 3, 0x0100, &a));
+        rig.single(cmd::WREN);
+        rig.command(cmd::PP4, 0x0000_0200, 4);
+        rig.write8(DATA, 0x00);
+        rig.cs_high();
+        rig.command(cmd::SE4, 0x0000_0000, 4);
+        rig.cs_high();
+        assert_eq!(rig.sr1(), 0x02, "WEL still set: neither frame was a command");
+        assert_eq!(rig.read_page(cmd::READ, 3, 0x0100), a);
+        assert_eq!(rig.read_dev_addr(0x200, 1), [0xFF]);
+    }
+
+    /// The datasheet's table 7.1.8 (WPS = 0, CMP = 0): (SEC, TB, BP) → protected range.
+    #[rustfmt::skip]
+    const CMP0: [(u8, u8, u8, usize, usize); 22] = [
+        (0, 0, 0b001, 0xFC_0000, 0x100_0000), (0, 0, 0b010, 0xF8_0000, 0x100_0000), (0, 0, 0b011, 0xF0_0000, 0x100_0000),
+        (0, 0, 0b100, 0xE0_0000, 0x100_0000), (0, 0, 0b101, 0xC0_0000, 0x100_0000), (0, 0, 0b110, 0x80_0000, 0x100_0000),
+        (0, 1, 0b001, 0, 0x04_0000), (0, 1, 0b010, 0, 0x08_0000), (0, 1, 0b011, 0, 0x10_0000),
+        (0, 1, 0b100, 0, 0x20_0000), (0, 1, 0b101, 0, 0x40_0000), (0, 1, 0b110, 0, 0x80_0000),
+        (1, 0, 0b001, 0xFF_F000, 0x100_0000), (1, 0, 0b010, 0xFF_E000, 0x100_0000), (1, 0, 0b011, 0xFF_C000, 0x100_0000),
+        (1, 0, 0b100, 0xFF_8000, 0x100_0000), (1, 0, 0b101, 0xFF_8000, 0x100_0000),
+        (1, 1, 0b001, 0, 0x1000), (1, 1, 0b010, 0, 0x2000), (1, 1, 0b011, 0, 0x4000),
+        (1, 1, 0b100, 0, 0x8000), (1, 1, 0b101, 0, 0x8000),
+    ];
+
+    /// T3: every row of tables 7.1.8 and 7.1.9 (CMP = 1 protects the complement: e.g. SEC 0 TB 1 BP 101 →
+    /// 0x400000-0xFFFFFF, SEC 1 TB 0 BP 001 → 0x000000-0xFFEFFF).
+    #[test]
+    fn w25q_protection_table() {
+        let sr1 = |sec: u8, tb: u8, bp: u8| sec << 6 | tb << 5 | bp << 2;
+        for sec in 0..2 {
+            for tb in 0..2 {
+                assert_eq!(w25q_protected(sr1(sec, tb, 0), 0), 0..0, "BP 000: none");
+                assert_eq!(w25q_protected(sr1(sec, tb, 7), 0), 0..FLASH_SIZE, "BP 111: all");
+                assert_eq!(w25q_protected(sr1(sec, tb, 0), sr::CMP), 0..FLASH_SIZE, "CMP 1, BP 000: all");
+                assert!(w25q_protected(sr1(sec, tb, 7), sr::CMP).is_empty(), "CMP 1, BP 111: none");
+            }
+        }
+        for (sec, tb, bp, start, end) in CMP0 {
+            assert_eq!(w25q_protected(sr1(sec, tb, bp), 0), start..end, "SEC {sec} TB {tb} BP {bp:03b}");
+            let complement = if start == 0 { end..FLASH_SIZE } else { 0..start };
+            assert_eq!(w25q_protected(sr1(sec, tb, bp), sr::CMP), complement, "CMP 1, SEC {sec} TB {tb} BP {bp:03b}");
+        }
+        assert_eq!(w25q_protected(sr1(0, 1, 0b101), sr::CMP), 0x40_0000..FLASH_SIZE);
+        assert_eq!(w25q_protected(sr1(1, 0, 0b001), sr::CMP), 0..0xFF_F000);
+        // SEC 1 with BP 110 is in neither table: 32 KiB like BP 10x.
+        assert_eq!(w25q_protected(sr1(1, 1, 0b110), 0), 0..0x8000);
+    }
+
+    /// T3: status register writes after `06` (both copies, WEL cleared) and after `50` (the volatile copy only, WEL
+    /// untouched), read-only bits, the one-time LB bits, a reset back to the non-volatile copy, and a protected
+    /// program and erase.
+    #[test]
+    fn w25q_status_registers_and_protection() {
+        let mut rig = Rig::new(&w25q_cfg(None, false));
+        assert_eq!(rig.status(), [0, 0, 0], "power-up: all 0 (S47 D3)");
+        // Without an enable nothing changes.
+        rig.write8(CTRL, SPI_FORCE_SS);
+        rig.write8(DATA, cmd::WRSR1);
+        rig.write8(DATA, 0x34);
+        rig.cs_high();
+        assert_eq!(rig.status(), [0, 0, 0]);
+        // Non-volatile: SR1, then SR1 and SR2 in one `01`, SR3; read-only and reserved bits stay 0.
+        rig.write_sr(cmd::WREN, cmd::WRSR1, &[0xFF]);
+        assert_eq!(rig.status(), [0xFC, 0, 0], "SRP SEC TB BP2:0 written, WEL cleared, BUSY 0");
+        rig.write_sr(cmd::WREN, cmd::WRSR1, &[0x00, 0xFE]);
+        assert_eq!(rig.status(), [0x00, 0x7A, 0], "SR2: CMP LB3:1 QE written, SUS and S10 not (SRL left 0 here)");
+        rig.write_sr(cmd::WREN, cmd::W_WRSR2, &[0x00]);
+        assert_eq!(rig.read_sr(cmd::W_RDSR2), 0x38, "LB3:1 are one-time: they stay 1");
+        rig.write_sr(cmd::WREN, cmd::W_WRSR3, &[0xFF]);
+        assert_eq!(rig.read_sr(cmd::W_RDSR3), 0x64, "DRV1:0 WPS");
+        // A frame of the wrong length is not executed.
+        rig.write_sr(cmd::WREN, cmd::W_WRSR3, &[0x00, 0x00]);
+        assert_eq!(rig.read_sr(cmd::W_RDSR3), 0x64);
+        assert_eq!(rig.sr1() & 0x02, 0x02, "and WEL stays");
+        rig.single(cmd::WRDI);
+        // Volatile: after `50`, WEL stays 0 and a reset brings the non-volatile value back.
+        rig.write_sr(cmd::W_VWREN, cmd::WRSR1, &[0x34]);
+        assert_eq!(rig.read_sr(cmd::RDSR1), 0x34);
+        rig.write_sr(cmd::W_VWREN, cmd::W_WRSR3, &[0x00]);
+        rig.single(cmd::RSTEN);
+        rig.single(cmd::RST);
+        assert_eq!(rig.status(), [0x00, 0x38, 0x64], "reset: the non-volatile copies");
+        // `50` is good for one write only.
+        rig.write_sr(cmd::W_VWREN, cmd::WRSR1, &[0x34]);
+        rig.write8(CTRL, SPI_FORCE_SS);
+        rig.write8(DATA, cmd::WRSR1);
+        rig.write8(DATA, 0x00);
+        rig.cs_high();
+        assert_eq!(rig.read_sr(cmd::RDSR1), 0x34);
+        // TB 1, BP 101: 0x000000-0x3FFFFF. Program and erase there are ignored; outside they work.
+        let data = pattern(0x5A);
+        assert!(rig.write_page(cmd::PP, 3, 0x1000, &data));
+        assert_eq!(rig.read_page(cmd::READ, 3, 0x1000), vec![0xFF; PAGE_SIZE]);
+        rig.single(cmd::WREN);
+        rig.command(cmd::PP, 0x3F_FF00, 3);
+        rig.write8(DATA, 0x00);
+        rig.cs_high();
+        assert_eq!(rig.read_dev_addr(0x3F_FF00, 1), [0xFF]);
+        assert_eq!(rig.sr1(), 0x36, "an ignored program leaves WEL set");
+        rig.single(cmd::WRDI);
+        assert!(rig.write_page(cmd::PP, 3, 0x4000, &data));
+        assert_eq!(rig.read_page(cmd::READ, 3, 0x4000), data);
+        // A 64 KiB erase at 0x3F0000 and the chip erase touch the protected range; a sector erase at 0x400000 not.
+        rig.single(cmd::WREN);
+        rig.command(cmd::BE, 0x3F_0000, 3);
+        rig.cs_high();
+        rig.single(cmd::WREN);
+        rig.single(cmd::CE);
+        assert_eq!(rig.read_page(cmd::READ, 3, 0x4000), data);
+        rig.single(cmd::WRDI);
+        assert!(rig.erase_sector(cmd::SE, 3, 0x400));
+        assert_eq!(rig.read_page(cmd::READ, 3, 0x4000), vec![0xFF; PAGE_SIZE]);
+    }
+
+    /// T3: MultiCore's T152 lock (flashlock.cc `flashlock_apply`): a volatile SR1 write of TB + BP 101, then a
+    /// volatile SR2 write with SRL. It reads back `34 01`, a program at 0x100000 is ignored, and no status register
+    /// write gets through any more until a new machine; an IPROG's controller reset does not lift it.
+    #[test]
+    fn w25q_flashlock_holds_until_power_off() {
+        let mut rig = Rig::new(&w25q_cfg(None, false));
+        let cur1 = rig.read_sr(cmd::RDSR1);
+        rig.write_sr(cmd::W_VWREN, cmd::WRSR1, &[(cur1 & !0x7C | 0x34) & !0x80]);
+        assert_eq!(rig.read_sr(cmd::RDSR1) & 0x80, 0, "SRP clear");
+        let cur2 = rig.read_sr(cmd::W_RDSR2);
+        rig.write_sr(cmd::W_VWREN, cmd::W_WRSR2, &[cur2 & !0x40 | 0x01]);
+        assert_eq!([rig.read_sr(cmd::RDSR1), rig.read_sr(cmd::W_RDSR2)], [0x34, 0x01], "\"status 34 01\"");
+        assert!(rig.write_page(cmd::PP, 3, 0x1000, &pattern(1)));
+        assert_eq!(rig.read_page(cmd::READ, 3, 0x1000), vec![0xFF; PAGE_SIZE]);
+        // Gideon's protect_disable (w25q_flash.cc:390-424): `06 01 00`, `06 31 00` change nothing now.
+        rig.write_sr(cmd::WREN, cmd::WRSR1, &[0x00]);
+        rig.write_sr(cmd::WREN, cmd::W_WRSR2, &[0x00]);
+        rig.write_sr(cmd::W_VWREN, cmd::WRSR1, &[0x00]);
+        assert_eq!([rig.read_sr(cmd::RDSR1) & 0xFC, rig.read_sr(cmd::W_RDSR2)], [0x34, 0x01]);
+        rig.flash().reset();
+        assert_eq!([rig.read_sr(cmd::RDSR1) & 0xFC, rig.read_sr(cmd::W_RDSR2)], [0x34, 0x01], "IPROG: the chip keeps power");
+        // Power-off: a new machine starts at 0.
+        assert_eq!(Rig::new(&w25q_cfg(None, false)).status(), [0, 0, 0]);
+    }
+
+    /// T4: the W25Q driver's 16 config pages at 0xFF0000 (w25q_flash.cc:256-267): the overlay seed, the page list,
+    /// the monitor's records and the settings writer use them, and leave 0xFE8000 alone.
+    #[test]
+    fn w25q_config_pages_at_ff0000() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flash.bin");
+        let mut rig = Rig::new(&w25q_cfg(Some(path.clone()), true));
+        assert_eq!(rig.read_dev_addr(0xFF_0000, 8), [0x2E, 0x4E, 0x45, 0x47, 0x08, 0x02, 0x01, 0x01]);
+        assert_eq!(rig.read_dev_addr(CONFIG_BASE as u32, 4), [0xFF; 4], "not the S25FL128L's page 0");
+        let flash = rig.flash();
+        assert_eq!(flash.config_pages(), vec![USERIF_STORE_ID]);
+        assert_eq!(flash.config_page(USERIF_STORE_ID), Some(vec![(CFG_USERIF_ITYPE, CFG_TYPE_ENUM, vec![1])]));
+        flash.write_settings(&[record(0x4336_3420, 0xC3, 0x02, &[1])]).unwrap();
+        assert_eq!(flash.config_pages(), vec![USERIF_STORE_ID, 0x4336_3420]);
+        assert_eq!(flash.chip.mem[0xFF_1000..0xFF_1009], [0x20, 0x34, 0x36, 0x43, 0xC3, 0x02, 0x01, 0x01, 0xFF]);
+        // 16 pages: the 17th store finds none.
+        for p in 2..16 {
+            let at = FlashChip::W25q128.config_page_at(p);
+            flash.chip.mem[at..at + 4].copy_from_slice(&(0x100 + p as u32).to_le_bytes());
+        }
+        let err = flash.write_settings(&[record(0x4E45_5400, 0x10, 0x03, b"h")]).unwrap_err().to_string();
+        assert!(err.contains("all 16 config pages are taken"), "{err}");
+        assert!(flash.chip.mem[0xFE_8000..0xFF_0000].iter().all(|&b| b == 0xFF));
+        assert_eq!((FlashChip::W25q128.config_page_at(15), FlashChip::S25fl128l.config_page_at(23)), (0xFF_F000, 0xFF_F000));
     }
 }

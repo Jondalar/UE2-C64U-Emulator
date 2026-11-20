@@ -93,8 +93,9 @@ trx64-monitor = { path = "<TRX64 checkout>/crates/trx64-monitor" }
 The repository ships no firmware and no ROMs; `.gitignore` keeps firmware, ROM and media images out of it. Bring your
 own:
 
-- **Firmware:** an `ultimate.elf` (your build, or `scripts/build-firmware.sh`), an `ultimate.app`, or a `.ue2` update
-  file (the upstream `update.ue2`, the Commodore `c64u_v1.1.0.ue2`), passed with `--firmware`.
+- **Firmware:** an `ultimate.elf` (your build, or `scripts/build-firmware.sh`), an `ultimate.app`, a `.ue2` update
+  file (the upstream `update.ue2`, the Commodore `c64u_v1.1.0.ue2`), or a MultiCore `.txu`, whose app part runs
+  (`docs/specs/S46-multicore-txu.md`), passed with `--firmware`.
 - **Roms directory:** `roms/` of a GideonZ/1541ultimate clone, passed with `--roms` (default
   `firmware/1541ultimate/roms` under the repo root the binary was built from, so a Homebrew install always needs
   `--roms`). The window and the `png` control command read the overlay font `chars.bin` there
@@ -138,11 +139,12 @@ is RESTORE.
 | Option | Meaning |
 |---|---|
 | `--config FILE` | Read `run` flags from a TOML file (section 4) |
-| `--firmware ELF` (alias `--elf`) | Firmware image: `ultimate.elf` (with symbols), `ultimate.app` or a `.ue2`; default `firmware/1541ultimate/target/u64ii/riscv/ultimate/result/ultimate.elf` |
+| `--firmware ELF` (alias `--elf`) | Firmware image: `ultimate.elf` (with symbols), `ultimate.app`, a `.ue2`, or a MultiCore `.txu` (its app part; the host bitstream is not used); default `firmware/1541ultimate/target/u64ii/riscv/ultimate/result/ultimate.elf` |
 | `--roms DIR` | Firmware roms directory: overlay font `chars.bin`, TRX64 ROM seeds, `--c64-roms` source; default `firmware/1541ultimate/roms` |
 | `--flash FILE` | Persistent SPI flash image, created erased if missing |
-| `--caps HEX` | ITU capability word; default `34000226` (drive B's bit included since S27). Given explicitly it is used as it stands, so the frontend adds none of its own bits (EEPROM, UCI, sampler) — that is how a machine without one of them is modelled |
-| `--board MODEL` | Which label the board wears: `u64ii` (default) or `c64u`. The revision register says `0x17` either way -- it is one piece of hardware -- so the difference is the Bling Board, the LED and keyboard controller the C64U carries. `c64u` makes `BLINGBOARD_INSTALLED` answer present; 3.15 reads it once, for a heading in the LED settings, and a firmware built from Commodore's branch reads it for `isCommodoreBoard()` |
+| `--caps HEX` | ITU capability word; default `34000226`, FPGA type 3 (XC7A100T), drive B's bit included since S27; with `--board c64u` `24000226`, FPGA type 2 (XC7A50T). Given explicitly it is used as it stands, so the frontend adds none of its own bits (EEPROM, UCI, sampler) — that is how a machine without one of them is modelled |
+| `--board MODEL` | The board: `u64ii` (default) or `c64u`. The revision register says `0x17` either way -- it is one piece of hardware -- and `c64u` makes `BLINGBOARD_INSTALLED` answer present, the LED and keyboard controller the C64U carries (3.15 reads it once, for a heading in the LED settings; a firmware built from Commodore's branch reads it for `isCommodoreBoard()`). `c64u` also picks what was measured on a C64U: the XC7A50T and the W25Q128 flash. `--caps` and `--flash-chip` win over the model (S47) |
+| `--flash-chip CHIP` | The SPI flash chip: `s25fl128l` (JEDEC `01 60 18`, config pages at 0xFE8000) or `w25q128` (JEDEC `EF 40 18`, 16 config pages at 0xFF0000, status registers and block protection, all 0 at every start); default `w25q128` with `--board c64u`, else `s25fl128l`. The start-up line names it: `flash: W25Q128 (--board c64u), FPGA type 2`. A 100T with the W25Q: `--flash-chip w25q128` without a board, or `--board c64u --caps 34000226` |
 | `--no-overlay-ui` | Do not seed the overlay user interface into blank flash config |
 | `--settings FILE.cfg` | Firmware settings from a `.cfg` in the firmware's own format, written into the flash before boot at every start; only the settings to change are needed; repeatable, later files win; a bad value stops the start. `ue2emu settings [--firmware F]` prints every setting of an image with its default (`docs/specs/S21-settings.md`) |
 
@@ -379,7 +381,7 @@ target/release/ue2emu run --config ue2emu.toml                       # config: l
 target/release/ue2emu run --config ue2emu.toml --flash other.bin --headless
 ```
 
-## 5. `ue2emu install`: populating the flash with a `.ue2` updater
+## 5. `ue2emu install`: populating the flash with a `.ue2` updater or a `.txu`
 
 Hardware gets its flash contents from the updater inside `update.ue2`, not from a copy of the application.
 `ue2emu install` does the same: it runs the updater record inside the emulator with the normal device set, answers its
@@ -401,6 +403,7 @@ target/release/ue2emu run --flash run/flash.bin
 | `--reformat-flash` | Answer Yes to "Reformat Flash Disk?": erases everything on `/flash` (ROMs, carts, web UI, your files) |
 | `--reset-config` | Answer Yes to "Reset Configuration?": resets all saved settings |
 | `--c64 trx64\|none` | C64 behind the cart/DMA registers, as for `run` |
+| `--board`, `--caps`, `--flash-chip` | The machine the updater runs on, as for `run` (section 3): `--board c64u` gives the C64U's XC7A50T and W25Q128 |
 | `--roms DIR` | Firmware roms directory that seeds the TRX64 ROMs; default `firmware/1541ultimate/roms` |
 | `--timeout S` | Emulated seconds without the updater's power-off request before giving up; default 600 |
 | `--c64-roms [DIR]` | After the updater and the flash check, put KERNAL, BASIC and CHAR from DIR (default `--roms`) into `/flash/roms`. It runs afterwards because the updater reformats a `/flash` that holds files |
@@ -411,6 +414,35 @@ The firmware console goes to stdout. The answered questions, the final C64 scree
 check go to stderr. The exit status is 0 only when the updater has switched the machine off and the flash check passes.
 Code: `crates/ue2emu/src/install.rs`, `loader::load_updater` and `loader::embedded_app` in
 `crates/ue2-core/src/loader.rs`, the ESP32 loader and `U64Ctrl::power_event` in `crates/ue2-core/src/devices/wifi.rs`.
+
+### A MultiCore `.txu`
+
+A `.txu` holds no updater: `install --update X.txu` checks the parts as the host app's `txu_stage` does (header and CRC,
+each part's SHA-256, the host bitstream's header length, IDCODE and host key, the app record) and, only if all pass,
+writes them as its `fw_write_parts` does: the app at 0x220000 over the sectors it covers, the bitstream at 0 and the
+rest of its slot erased. The regions are read back. No machine runs; `--yes`, `--timeout` and the other updater
+options say that they do nothing. A TXU1 package is the XC7A50T's: without `--caps` or `--board` the FPGA type is
+that, and a type-3 machine is refused (`docs/specs/S46-multicore-txu.md` §4).
+
+```
+install: flash: W25Q128 (--board c64u), FPGA type 2
+install: trx64host_update_b4730f57.txu: TRX update 0.2.0-dev+b4730f57 (b4730f5771ac778) for the XC7A50T: host bitstream 1549789 bytes, key cd508203, app 1106496 bytes
+install: host interface: provides 1, needs 1 (0: no such part; not checked against the flash)
+install: flash image txu.bin: 650 changed 4 KiB sector(s) written
+install: flash 0x000000: host bitstream, 1549789 bytes, key cd508203; the slot erased up to 0x220000
+install: flash 0x220000: app, 1106496 bytes, identical to trx64host_update_b4730f57.txu
+```
+
+### C64U, 100T and older images
+
+- **`--board c64u`** runs the updater on the XC7A50T with the W25Q128: Commodore's `c64u_v1.1.0.ue2` writes its
+  application to 0x220000, the firmware keeps its 16 config pages at 0xFF0000 and `/flash` at 0x400000. MultiCore's
+  tester updater passes its W25Q128 and FPGA checks there, also in its board build (S47 §4).
+- **100T with the W25Q** (`--flash-chip w25q128`): the upstream `update.ue2` writes its application to 0x3C0000,
+  `/flash` stays at 0x580000, the config pages move to 0xFF0000.
+- **Older images.** A flash image made with `--board c64u` before S47 was a 100T with the S25FL128L. It keeps working
+  with `--board c64u --flash-chip s25fl128l --caps 34000226`; with plain `--board c64u` the firmware finds its settings
+  only partly and formats a new `/flash` at 0x400000.
 
 ### How it works
 
@@ -501,9 +533,10 @@ All runs start from an erased flash; install runs flat out (`--speed` does not a
 
 ### Known gaps
 
-- **Flash protection is not modelled.** `S25FLxxxL_Flash::protect_disable` / `protect_configure` read the register
-  with opcode 0x65 and write it with 0x01 (s25fl_l_flash.cc:193-287); the model answers 0xFF and ignores the write
-  (`Status register before locking: FF, requested: 34`). No flow depends on it.
+- **The S25FL128L's flash protection is not modelled.** `S25FLxxxL_Flash::protect_disable` / `protect_configure` read
+  the register with opcode 0x65 and write it with 0x01 (s25fl_l_flash.cc:193-287); the model answers 0xFF and ignores
+  the write (`Status register before locking: FF, requested: 34`). No flow depends on it. The W25Q128's status
+  registers and block protection are modelled (S47 §3).
 - **ESP32 flash contents are discarded.** The stub keeps identifying as V1.14, so the Commodore updater flashes the
   module again on every install. There is no FLASH_DATA checksum check.
 - **The ROM banner is the ESP32-C3 text.** The module type on U64-II is not confirmed in doc 04; the firmware only

@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use ue2_core::devices::flash::FlashChip;
 use ue2_core::machine::{LogFlags, MachineConfig};
 
 use runner::{RunOptions, Speed};
@@ -48,7 +49,7 @@ enum Cmd {
 
 #[derive(Args)]
 struct SettingsArgs {
-    /// Firmware image: ultimate.elf, ultimate.app or a .ue2 update file
+    /// Firmware image: ultimate.elf, ultimate.app, a .ue2 update file or a MultiCore .txu
     /// [default: firmware/1541ultimate/target/u64ii/riscv/ultimate/result/ultimate.elf]
     #[arg(long = "firmware", visible_alias = "elf")]
     elf: Option<PathBuf>,
@@ -78,6 +79,69 @@ enum RingArg {
     Off,
 }
 
+/// S47: `--flash-chip`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FlashChipArg {
+    /// Infineon S25FL128L, JEDEC 01 60 18: config at 0xFE8000
+    S25fl128l,
+    /// Winbond W25Q128JV, JEDEC EF 40 18, the C64U's: config at 0xFF0000, status registers and block protection
+    W25q128,
+}
+
+/// The board model and what it picks: label, FPGA type and flash chip (`run`, `install`;
+/// docs/specs/S47-c64u-flash-install.md §2).
+#[derive(Args)]
+pub struct ModelArgs {
+    /// ITU capability word, hex [default: 34000226, an XC7A100T; with --board c64u 24000226, an XC7A50T]
+    #[arg(long, value_parser = parse_hex)]
+    caps: Option<u32>,
+    /// The board: u64ii (default) or c64u, the C64 Ultimate: the Bling Board, an XC7A50T and the W25Q128 flash. --caps
+    /// and --flash-chip win over what the model picks
+    #[arg(long, value_name = "MODEL", value_parser = ["u64ii", "c64u"])]
+    board: Option<String>,
+    /// The SPI flash chip: s25fl128l or w25q128 [default: w25q128 with --board c64u, else s25fl128l]
+    #[arg(long, value_enum, value_name = "CHIP")]
+    flash_chip: Option<FlashChipArg>,
+}
+
+/// `CAPAB_FPGA_TYPE`, capability bits 29:28 (itu.h): 2 the XC7A50T, 3 the XC7A100T (w25q_flash.cc:82-84).
+pub const CAPAB_FPGA_TYPE: u32 = 0x3000_0000;
+
+impl ModelArgs {
+    /// Whether `--caps` or `--board` names the FPGA type.
+    pub fn names_fpga(&self) -> bool {
+        self.caps.is_some() || self.board.is_some()
+    }
+
+    /// The model into `cfg`: the board's label, the capability word (`--caps` as given, else the default with the
+    /// board's FPGA type) and the chip (`--flash-chip`, else the board's). Returns the start-up line that names the
+    /// chip and where it came from.
+    pub fn apply(&self, cfg: &mut MachineConfig) -> String {
+        let c64u = self.board.as_deref() == Some("c64u");
+        if c64u {
+            cfg.board = ue2_core::devices::board::Board::C64U;
+        }
+        match self.caps {
+            Some(caps) => {
+                cfg.capabilities = caps;
+                cfg.capabilities_explicit = true;
+            }
+            // S47 D2: the C64U's FPGA is the XC7A50T.
+            None if c64u => cfg.capabilities = cfg.capabilities & !CAPAB_FPGA_TYPE | 2 << 28,
+            None => {}
+        }
+        let (chip, why) = match (self.flash_chip, self.board.as_deref()) {
+            (Some(FlashChipArg::S25fl128l), _) => (FlashChip::S25fl128l, "--flash-chip"),
+            (Some(FlashChipArg::W25q128), _) => (FlashChip::W25q128, "--flash-chip"),
+            (None, Some("c64u")) => (FlashChip::W25q128, "--board c64u"),
+            (None, Some(_)) => (FlashChip::S25fl128l, "--board u64ii"),
+            (None, None) => (FlashChip::S25fl128l, "default"),
+        };
+        cfg.flash_chip = chip;
+        format!("flash: {} ({why}), FPGA type {}", chip.name(), cfg.capabilities >> 28 & 3)
+    }
+}
+
 /// The C64 behind the cart/DMA registers (docs/specs/S14-c64-trx64.md).
 #[derive(Clone, Copy, ValueEnum)]
 enum C64Arg {
@@ -93,7 +157,7 @@ struct RunArgs {
     /// flags on the command line replace the file's (docs/examples/ue2emu.example.toml)
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
-    /// Firmware image: ultimate.elf (with symbols), ultimate.app or a .ue2 update file
+    /// Firmware image: ultimate.elf (with symbols), ultimate.app, a .ue2 update file or a MultiCore .txu (its app)
     /// [default: firmware/1541ultimate/target/u64ii/riscv/ultimate/result/ultimate.elf]
     #[arg(long = "firmware", visible_alias = "elf")]
     elf: Option<PathBuf>,
@@ -109,9 +173,8 @@ struct RunArgs {
     /// C64 behind the cart/DMA registers [default: trx64 when built with the trx64 feature, else none]
     #[arg(long, value_enum)]
     c64: Option<C64Arg>,
-    /// ITU capability word, hex [default: 34000226]
-    #[arg(long, value_parser = parse_hex)]
-    caps: Option<u32>,
+    #[command(flatten)]
+    model: ModelArgs,
     /// Emulated 100 MHz clocks per instruction, at least 1 [default: 4]
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     clocks_per_insn: Option<u64>,
@@ -138,9 +201,6 @@ struct RunArgs {
     /// Logging: unmapped, io, irq, cart (comma separated)
     #[arg(long, value_delimiter = ',')]
     log: Vec<String>,
-    /// Which label the board wears: u64ii (default) or c64u, the same hardware with the Bling Board present
-    #[arg(long, value_name = "MODEL", value_parser = ["u64ii", "c64u"])]
-    board: Option<String>,
     /// TRX64-Ultimate's IO block at 0x101A0000 and the rest of its bitstream: the ID, the interrupt, the RGB565 pixel
     /// layer over the C64, the reSID8 control, 1541-only drives and the expansion port's slot block. auto: on for TRX
     /// firmware; a bare --trx-io is on (docs/specs/S37-trx-pixel-layer.md, S43-trx-resid8-drive-slot.md)
@@ -273,19 +333,13 @@ fn run(a: RunArgs) -> Result<()> {
     let roms = a.roms.unwrap_or_else(|| repo_root().join("firmware/1541ultimate/roms"));
 
     let mut cfg = MachineConfig::new(elf, roms);
-    if let Some(caps) = a.caps {
-        cfg.capabilities = caps;
-        cfg.capabilities_explicit = true;
-    }
+    eprintln!("{}", a.model.apply(&mut cfg));
     if let Some(c) = a.clocks_per_insn {
         cfg.clocks_per_insn = c;
     }
     cfg.flash_image = a.flash;
     cfg.sd_image = a.sd;
     cfg.overlay_ui = !a.no_overlay_ui;
-    if a.board.as_deref() == Some("c64u") {
-        cfg.board = ue2_core::devices::board::Board::C64U;
-    }
     cfg.trx_io = match a.trx_io {
         TrxIoArg::Auto => ue2_core::TrxIo::Auto,
         TrxIoArg::On => ue2_core::TrxIo::On,
@@ -320,7 +374,7 @@ fn run(a: RunArgs) -> Result<()> {
     }
     let audio = audio::configure(a.audio, a.headless);
     // Before the machine opens the image.
-    a.c64_roms.apply(cfg.flash_image.as_deref(), cfg.capabilities, &cfg.rom_dir)?;
+    a.c64_roms.apply(cfg.flash_image.as_deref(), cfg.capabilities, cfg.flash_chip, &cfg.rom_dir)?;
 
     let opts = RunOptions {
         speed: match a.speed {
@@ -357,5 +411,59 @@ fn run(a: RunArgs) -> Result<()> {
         runner::run_headless(cfg, opts)
     } else {
         window::run_window(cfg, opts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::*;
+    use ue2_core::devices::board::Board;
+
+    /// `ue2emu run ARGS`, its model applied to a fresh configuration.
+    fn run_model(args: &[&str]) -> (MachineConfig, String) {
+        let argv: Vec<OsString> = ["ue2emu", "run"].iter().chain(args).map(OsString::from).collect();
+        let argv = config::with_file(Cli::command(), argv).unwrap();
+        let Cmd::Run(a) = Cli::try_parse_from(argv).unwrap().cmd else { panic!("run") };
+        let mut cfg = MachineConfig::new(PathBuf::new(), PathBuf::new());
+        let line = a.model.apply(&mut cfg);
+        (cfg, line)
+    }
+
+    /// S47 T5: the board model picks the chip and the FPGA type; --flash-chip and --caps win over it.
+    #[test]
+    fn the_model_picks_chip_and_fpga() {
+        let pick = |args: &[&str]| {
+            let (cfg, line) = run_model(args);
+            (cfg.flash_chip, cfg.capabilities, cfg.capabilities_explicit, cfg.board == Board::C64U, line)
+        };
+        let (chip, caps, explicit, c64u, line) = pick(&[]);
+        assert_eq!((chip, caps, explicit, c64u), (FlashChip::S25fl128l, 0x3400_0226, false, false));
+        assert_eq!(line, "flash: S25FL128L (default), FPGA type 3");
+        assert_eq!(pick(&["--board", "u64ii"]).4, "flash: S25FL128L (--board u64ii), FPGA type 3");
+        let (chip, caps, explicit, c64u, line) = pick(&["--board", "c64u"]);
+        assert_eq!((chip, caps, explicit, c64u), (FlashChip::W25q128, 0x2400_0226, false, true));
+        assert_eq!(line, "flash: W25Q128 (--board c64u), FPGA type 2");
+        // A 100T C64U: the model's chip, the word's FPGA.
+        let (chip, caps, explicit, c64u, _) = pick(&["--board", "c64u", "--caps", "34000226"]);
+        assert_eq!((chip, caps, explicit, c64u), (FlashChip::W25q128, 0x3400_0226, true, true));
+        let (chip, _, _, _, line) = pick(&["--board", "c64u", "--flash-chip", "s25fl128l"]);
+        assert_eq!((chip, line.as_str()), (FlashChip::S25fl128l, "flash: S25FL128L (--flash-chip), FPGA type 2"));
+        let (chip, caps, ..) = pick(&["--flash-chip", "w25q128"]);
+        assert_eq!((chip, caps), (FlashChip::W25q128, 0x3400_0226), "a 100T U64-II with the W25Q");
+    }
+
+    /// S47 T5: `flash-chip` and `board` as `--config` keys.
+    #[test]
+    fn the_model_from_a_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("ue2emu.toml");
+        std::fs::write(&file, "board = 'c64u'\nflash-chip = 's25fl128l'\n").unwrap();
+        let (cfg, line) = run_model(&["--config", file.to_str().unwrap()]);
+        assert_eq!((cfg.flash_chip, cfg.capabilities >> 28 & 3), (FlashChip::S25fl128l, 2));
+        assert_eq!(line, "flash: S25FL128L (--flash-chip), FPGA type 2");
+        let (cfg, _) = run_model(&["--config", file.to_str().unwrap(), "--flash-chip", "w25q128"]);
+        assert_eq!(cfg.flash_chip, FlashChip::W25q128, "the command line wins");
     }
 }

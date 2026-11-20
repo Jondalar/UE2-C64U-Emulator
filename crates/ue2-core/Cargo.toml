@@ -10,6 +10,7 @@ rv32 = { path = "../rv32" }
 anyhow = "1"
 object = "0.36"
 cpp_demangle = "0.4"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

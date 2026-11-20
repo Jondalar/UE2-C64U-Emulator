@@ -157,7 +157,7 @@ Open questions from `docs/hw` that still affect what the boot shows:
   and there is no Ethernet (`docs/status/usb.md`, `docs/status/network.md`).
 - **Closed U64-II top level.** The CPU instance, IP identity and address aliasing come from the open U2+ RTL (00
   Q-A1, Q-A2, Q-A4). BOARDREV 0xB8 (rev 0x17) and ITU `g_version` 0x25 are assumptions (Q-B2, Q-B3). The flash part
-  (S25FL128L) is an assumption too (Q-B5).
+  of the Elite II (S25FL128L) is an assumption too (Q-B5); the C64U's W25Q128JV is measured (`--board c64u`, S47).
 - **I2C:** the EDID EEPROM on channel 0 is modelled (1080p60 HDMI monitor), so "EDID Header incorrect." no longer
   appears (`docs/status/fixes.md` §5). The codec, hub, expanders and PLLs still ACK every byte and read 0xFF.
 - **WiFi** is a frame-level u64ctrl stub (doc 04 T0): identify, voltages and power settings answer; scan returns

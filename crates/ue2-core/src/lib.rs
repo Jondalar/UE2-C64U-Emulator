@@ -15,5 +15,6 @@ pub mod render;
 pub mod settings;
 pub mod symbols;
 pub mod time;
+pub mod txu;
 
 pub use machine::{Machine, MachineConfig, RunExit, TrxIo};

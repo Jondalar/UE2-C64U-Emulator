@@ -25,7 +25,9 @@ What works, by milestone. Details are in the linked files.
   while the machine runs by `C64_REU_ENABLE` and `C64_REU_SIZE` (`docs/status/reu.md`). Joysticks on both control
   ports, the USB mouse on POTX/POTY (S32, S36). What is still missing is in `docs/status/gaps.md`.
 - **Install** (`docs/status/install.md`): the upstream `update.ue2` and the Commodore `c64u_v1.1.0.ue2` populate the
-  flash; the Commodore 1.1.0 application boots and opens its menu. Its network services ship disabled.
+  flash; the Commodore 1.1.0 application boots and opens its menu. Its network services ship disabled. A MultiCore
+  `.txu` is checked and written as the host app does (S46). `--board c64u` is the measured C64U: XC7A50T and the
+  W25Q128 flash (S47).
 - **Speed** (60 s emulated at `--speed max`, upstream ELF, no flash, Apple M4): 6.0 s wall with `--c64 trx64`,
   0.74 s with `--c64 none`. Realtime headless with TRX64 takes about 19 % of one core.
 - **MultiCore** (`docs/specs/S44-multicore-cores.md`): the MultiCore core application starts as any core from a
@@ -33,7 +35,7 @@ What works, by milestone. Details are in the linked files.
   app starts a DFX .cor (VIC-20) and a large one (A1200) through the ICAP loader, and coreapp's "Return to host menu"
   boots the host again (phase B, `scripts/smoke-s44-host.sh` with MultiCore's kit). The picture follows the
   MultiCore host's HDMI mode (`docs/specs/S45-multicore-video.md`): the hand-over's video, the apps' mode requests,
-  `--screen` for the monitor the host app reads.
+  `--screen` for the monitor the host app reads. `run --firmware X.txu` runs the host app of an update package (S46).
 - **Debugging** (`docs/status/gdb.md`): GDB on the firmware's RISC-V (`--gdb`) with symbols, software
   breakpoints and the FreeRTOS task list; the C64 side is served by the VICE binary monitor port
   (`docs/status/monitor.md`).

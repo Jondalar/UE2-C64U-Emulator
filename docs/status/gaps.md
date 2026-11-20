@@ -51,6 +51,6 @@ shows up), accepted as a limit, **out of scope**, or **dropped**; an item withou
 - **HDMI scan lines — out of scope (2026-09-24):** accepted and ignored. `c64.md`
 - **Expansion port timing — dropped.** No contention, no PHI2 or address-setup timing; only the DMA byte cost is
   measured. It would take a logic analyser on the port, for exotic hardware carts only. `cart-slot.md`
-- **Top level.** Capability word, BOARDREV, flash part and the freeze button's matrix position are assumptions that
-  work. Read what can be read on the C64U (REST, monitor) when the occasion comes; no plan of its own. `boot.md`,
+- **Top level.** Capability word, BOARDREV, the Elite II's flash part and the freeze button's matrix position are
+  assumptions that work (the C64U's flash and FPGA are measured, S47). Read what can be read on the C64U (REST, monitor) when the occasion comes; no plan of its own. `boot.md`,
   `carts.md`

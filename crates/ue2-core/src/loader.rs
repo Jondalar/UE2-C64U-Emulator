@@ -1,4 +1,5 @@
-//! Firmware image loader: ELF, `.app` and `.ue2`. Spec: docs/specs/S02-core.md
+//! Firmware image loader: ELF, `.app`, `.ue2` and MultiCore's `.txu`. Spec: docs/specs/S02-core.md, the `.txu`
+//! docs/specs/S46-multicore-txu.md §3.
 //!
 //! `ultimate.elf` is ELF32-LE-RISCV with entry `_start` = 0x00030000 and one RWE PT_LOAD segment: file part
 //! .text/detect_sid/.rodata/.data, zero tail .bss (docs/hw/01-cpu-boot-memory.md §B; docs/hw/00-memory-map.md
@@ -10,8 +11,10 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use object::elf::{FileHeader32, EM_RISCV, PT_LOAD};
 use object::read::elf::{FileHeader, ProgramHeader};
 use object::{Endianness, FileKind};
+use sha2::{Digest, Sha256};
 
 use crate::bus::{BOOT_BRAM_PAGE, IO_BIT};
+use crate::txu;
 
 #[derive(Clone, Debug)]
 pub struct LoadedElf {
@@ -82,6 +85,9 @@ pub enum ImageFormat {
     /// Update file loaded as the updater itself ([`load_updater`], `ue2emu install`): every record from the start of
     /// the file, first one at 0x03000000 (target/u64ii/riscv/update/linker.x).
     Updater,
+    /// MultiCore update package (`crate::txu`): its app part, an `.app` record, is loaded; `app_offset` is its file
+    /// offset. A host part is not used: the FPGA is the emulator's device models.
+    Txu { app_offset: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -90,16 +96,21 @@ pub struct LoadedFirmware {
     pub entry: u32,
     /// (load address, length) per loaded record or PT_LOAD segment.
     pub segments: Vec<(u32, u32)>,
+    /// What the image is, for the start-up lines (a `.txu`'s version and parts); empty for the other formats.
+    pub notes: Vec<String>,
 }
 
-/// Load a firmware image into `ram`, detecting the format by content: ELF magic, an `.app` whose first record
+/// Load a firmware image into `ram`, detecting the format by content: ELF magic, `TXU1`, an `.app` whose first record
 /// loads at [`APP_BASE`], or a `.ue2` update container that embeds `ultimate.app`.
 pub fn load_firmware(path: &Path, ram: &mut [u8]) -> Result<LoadedFirmware> {
     let name = path.display();
     let data = std::fs::read(path).with_context(|| format!("reading {name}"))?;
     if data.starts_with(b"\x7FELF") {
         let elf = load_elf(path, ram)?;
-        return Ok(LoadedFirmware { format: ImageFormat::Elf, entry: elf.entry, segments: elf.segments });
+        return Ok(LoadedFirmware { format: ImageFormat::Elf, entry: elf.entry, segments: elf.segments, notes: Vec::new() });
+    }
+    if txu::is_txu(&data) {
+        return load_txu(path, &data, ram);
     }
     let first = record_at(&data, 0).with_context(|| format!("{name}: neither an ELF nor an .app/.ue2 image"))?;
     let (format, offset) = if first.dest == APP_BASE {
@@ -116,7 +127,34 @@ pub fn load_firmware(path: &Path, ram: &mut [u8]) -> Result<LoadedFirmware> {
     };
     let (entry, segments) =
         load_records(&data[offset..], ram).with_context(|| format!("{name}: bad .app record at offset {offset:#x}"))?;
-    Ok(LoadedFirmware { format, entry, segments })
+    Ok(LoadedFirmware { format, entry, segments, notes: Vec::new() })
+}
+
+/// S46 §3: a `.txu`'s app part, read as `txu_probe` reads the header, checked against its SHA-256 and as the boot ROM
+/// takes a record, loaded as an `.app`. A package without an app part is refused.
+fn load_txu(path: &Path, data: &[u8], ram: &mut [u8]) -> Result<LoadedFirmware> {
+    let name = path.display();
+    let txu = txu::Txu::parse(data).with_context(|| format!("{name}"))?;
+    let Some(app) = txu.app() else {
+        bail!("{name} holds only a host bitstream; ue2emu runs the app");
+    };
+    let record = app.bytes(data);
+    let sha: [u8; 32] = Sha256::digest(record).into();
+    ensure!(sha == app.sha256, "{name}: the app part does not match its SHA-256");
+    txu::check_app_record(record, txu.fpga.app_slot).with_context(|| format!("{name}"))?;
+    let (entry, segments) = load_records(record, ram).with_context(|| format!("{name}: bad app record"))?;
+    let rec = record_at(record, 0).expect("checked above");
+    let mut notes = vec![format!(
+        "{name}: TRX update {} ({}), app {} bytes at {:#010x}, entry {entry:#010x}",
+        txu.version, txu.commit, rec.len, rec.dest
+    )];
+    if let Some(host) = txu.host() {
+        notes.push(format!(
+            "{name}: host part (key {:08x}, {} bytes) not used: the FPGA is the emulator's",
+            txu.host_key, host.size
+        ));
+    }
+    Ok(LoadedFirmware { format: ImageFormat::Txu { app_offset: app.off as usize }, entry, segments, notes })
 }
 
 /// Load the updater of an update file (`update.ue2`, Commodore `.ue2`) instead of the application it embeds: the
@@ -128,12 +166,13 @@ pub fn load_updater(path: &Path, ram: &mut [u8]) -> Result<LoadedFirmware> {
     let data = std::fs::read(path).with_context(|| format!("reading {name}"))?;
     if data.starts_with(b"\x7FELF") {
         let elf = load_elf(path, ram)?;
-        return Ok(LoadedFirmware { format: ImageFormat::Elf, entry: elf.entry, segments: elf.segments });
+        return Ok(LoadedFirmware { format: ImageFormat::Elf, entry: elf.entry, segments: elf.segments, notes: Vec::new() });
     }
+    ensure!(!txu::is_txu(&data), "{name}: a MultiCore .txu holds no updater; install writes its parts itself");
     let first = record_at(&data, 0).with_context(|| format!("{name}: neither an ELF nor an update file"))?;
     ensure!(first.dest != APP_BASE, "{name}: application image (first record at {APP_BASE:#x}), not an updater");
     let (entry, segments) = load_records(&data, ram).with_context(|| format!("{name}: bad updater record"))?;
-    Ok(LoadedFirmware { format: ImageFormat::Updater, entry, segments })
+    Ok(LoadedFirmware { format: ImageFormat::Updater, entry, segments, notes: Vec::new() })
 }
 
 /// The `ultimate.app` embedded in an update file, from its first record header to the end of the record with the
@@ -446,6 +485,53 @@ pub(crate) mod tests {
         let image = elf(ELFCLASS32, EM_RISCV, 0x30000, &[(PT_LOAD, 0x30000, &[0x13, 0, 0, 0], 4)]);
         let fw = load_fw(&image, &mut ram).unwrap();
         assert_eq!((fw.format, fw.entry), (ImageFormat::Elf, 0x30000));
+    }
+
+    /// S46 T1: a `.txu` loads its app part as the `.app` alone loads, with or without a host part.
+    #[test]
+    fn txu_loads_its_app_part_like_the_app() {
+        use crate::txu::{pack, tests::bit, AppIn, HostIn};
+        // check_app_record takes one record: the host app is one (`hostapp.app`), entering inside it.
+        let one = app_record(APP_BASE, APP_BASE + 4, &app_payload());
+        let mut expected = vec![0xEE; RAM_SIZE];
+        let plain = load_fw(&one, &mut expected).unwrap();
+        let host = bit(0x0362_C093, Some(0x1234_5678));
+        for package in [
+            pack(None, Some(AppIn { app: &one, iface_needed: 1 }), "v1", "abc"),
+            pack(Some(HostIn { bit: &host, iface_provided: 1 }), Some(AppIn { app: &one, iface_needed: 1 }), "v1", "abc"),
+        ] {
+            let mut ram = vec![0xEE; RAM_SIZE];
+            let fw = load_fw(&package, &mut ram).unwrap();
+            assert!(matches!(fw.format, ImageFormat::Txu { app_offset } if package[app_offset..].starts_with(&one)));
+            assert_eq!((fw.entry, &fw.segments), (plain.entry, &plain.segments));
+            assert!(ram == expected);
+            assert!(fw.notes[0].ends_with(": TRX update v1 (abc), app 10 bytes at 0x00030000, entry 0x00030004"), "{:?}", fw.notes);
+            assert_eq!(fw.notes.len(), 1 + usize::from(package.len() > 300));
+        }
+    }
+
+    /// S46 T2: `run` refuses a host-only package, a damaged app part and a broken header; `install`'s updater loader
+    /// never takes a `.txu`.
+    #[test]
+    fn txu_refusals() {
+        use crate::txu::{pack, tests::bit, AppIn, HostIn};
+        let mut ram = vec![0; RAM_SIZE];
+        let err = |image: &[u8], ram: &mut [u8]| format!("{:#}", load_fw(image, ram).unwrap_err());
+        let host = bit(0x0362_C093, Some(0x1234_5678));
+        let host_only = pack(Some(HostIn { bit: &host, iface_provided: 1 }), None, "v", "c");
+        assert!(err(&host_only, &mut ram).contains("holds only a host bitstream; ue2emu runs the app"));
+        let one = app_record(APP_BASE, APP_BASE, &app_payload());
+        let mut damaged = pack(None, Some(AppIn { app: &one, iface_needed: 1 }), "v", "c");
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        assert!(err(&damaged, &mut ram).contains("the app part does not match its SHA-256"));
+        let mut header = pack(None, Some(AppIn { app: &one, iface_needed: 1 }), "v", "c");
+        header[40] ^= 1;
+        assert!(err(&header, &mut ram).contains("does not match its checksum"));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), pack(None, Some(AppIn { app: &one, iface_needed: 1 }), "v", "c")).unwrap();
+        let refused = format!("{:#}", load_updater(file.path(), &mut ram).unwrap_err());
+        assert!(refused.contains("holds no updater"), "{refused}");
     }
 
     #[test]

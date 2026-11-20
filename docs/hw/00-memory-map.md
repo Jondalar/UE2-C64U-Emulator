@@ -396,7 +396,7 @@ Order is derived from: crt0.S:53-218, the `.init_array` order (ELF), riscv_main.
 2. **Q-B2: ITU generics.** `g_edge_init`/`g_edge_write` (0x85 assumed, §3 C2), `g_version` (0x25 assumed, the ultimate_logic_32.vhd:13 default), UART generics. (01 Q2; 02 Q2, Q4, Q8; 09 Q2; 11 Q3)
 3. **Q-B3: Board revision.** BOARDREV values on shipped boards, C64U vs U64E-II. (03 Q7, Q8)
 4. **Q-B4: C64 core.** `C64_CORE_VERSION`; power-on state of C64_MODE reset / C64_STOP; CLOCK_DETECT bits 1/2/3/5. (10 Q1, Q6, Q13)
-5. **Q-B5: Flash part.** S25FL128L (24 config pages at 0xFE8000) or W25Q128 (16 at 0xFF0000)? This decides which `Flash` subclass answers `get_flash()` and hence the UID/MAC source. (06 Q1; 08 Q6)
+5. **Q-B5: Flash part.** S25FL128L (24 config pages at 0xFE8000) or W25Q128 (16 at 0xFF0000)? This decides which `Flash` subclass answers `get_flash()` and hence the UID/MAC source. (06 Q1; 08 Q6) Answered for the C64U: W25Q128JV (S47 §1); open for the Elite II.
 6. **Q-B6: PHY.** Part number, reset/clock source. (08 Q4)
 7. **Q-B7: USB hardware.** ULPI PHY identity; USB2513 port wiring / on-board devices. (09 Q5, Q7)
 
