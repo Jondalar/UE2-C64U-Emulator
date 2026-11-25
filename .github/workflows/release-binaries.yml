@@ -6,7 +6,8 @@
 #   (Debian 12, Ubuntu 24.04 and later).
 #
 # A published release uploads the archives to it. Run by hand (workflow_dispatch) on a branch, it builds, checks and
-# keeps them as workflow artifacts only.
+# keeps them as workflow artifacts only. Those are uploaded unzipped (archive: false, one file per artifact, named after
+# the file), so a download is the archive itself rather than a zip around it.
 
 name: release-binaries
 
@@ -124,10 +125,16 @@ jobs:
           echo "ZIP=dist/$name.zip" >> "$GITHUB_ENV"
 
       - name: Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: windows-x86_64
-          path: dist/*.zip*
+          path: ${{ env.ZIP }}
+          archive: false
+
+      - name: Artifact checksum
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.ZIP }}.sha256
+          archive: false
 
       - name: Release asset
         if: github.event_name == 'release'
@@ -199,12 +206,19 @@ jobs:
           done
           ls -l "$out"
           (cd dist && tar -czf "$name.tar.gz" "$name" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "TGZ=dist/$name.tar.gz" >> "$GITHUB_ENV"
 
       - name: Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: linux-${{ matrix.arch }}
-          path: dist/*.tar.gz*
+          path: ${{ env.TGZ }}
+          archive: false
+
+      - name: Artifact checksum
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.TGZ }}.sha256
+          archive: false
 
   # The Debian container has no gh; upload from the runner.
   linux-release:
@@ -212,9 +226,9 @@ jobs:
     needs: linux
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          pattern: linux-*
+          pattern: ue2emu-*-linux-*
           merge-multiple: true
           path: dist
 
