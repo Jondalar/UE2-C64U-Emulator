@@ -1,8 +1,12 @@
-# Windows binaries for a published release (docs/specs/S22-windows.md §5): ue2emu-X.Y.Z-windows-x86_64.zip with
-# ue2emu.exe, ue2-mcp.exe, the libslirp DLLs, the VC runtime and the licences, plus a .sha256 next to it.
+# Binaries for a published release, each with a .sha256 next to it:
+# - ue2emu-X.Y.Z-windows-x86_64.zip (docs/specs/S22-windows.md §5): ue2emu.exe, ue2-mcp.exe, the libslirp DLLs, the VC
+#   runtime and the licences.
+# - ue2emu-X.Y.Z-linux-x86_64.tar.gz and -linux-aarch64.tar.gz: ue2emu, ue2-mcp and the licence, linked against the
+#   system's libslirp, glib and ALSA. Built on Debian 12, so they run on glibc 2.36 and later with libslirp 4.7 or newer
+#   (Debian 12, Ubuntu 24.04 and later).
 #
-# A published release uploads the zip to it. Run by hand (workflow_dispatch) on a branch, it builds, checks and keeps
-# the zip as a workflow artifact only.
+# A published release uploads the archives to it. Run by hand (workflow_dispatch) on a branch, it builds, checks and
+# keeps them as workflow artifacts only.
 
 name: release-binaries
 
@@ -130,3 +134,91 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ github.event.release.tag_name }}" "$ZIP" "$ZIP.sha256" --clobber
+
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    # Debian 12: the oldest glibc (2.36) with the libslirp 4.7 API that crates/ue2-net/src/ffi.rs uses.
+    container: debian:12
+    steps:
+      - name: System libraries
+        run: |
+          set -eu
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl git build-essential pkg-config \
+            libslirp-dev libasound2-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          set -eu
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux-${{ matrix.arch }}
+
+      - name: Build
+        run: cargo build --release --locked -p ue2emu -p ue2-mcp
+
+      - name: Version
+        id: version
+        run: |
+          set -eu
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "${{ github.event_name }}" = release ] && [ "v$v" != "${{ github.event.release.tag_name }}" ]; then
+            echo "Cargo.toml says $v, the release is ${{ github.event.release.tag_name }}"
+            exit 1
+          fi
+          [ "$(target/release/ue2emu --version)" = "ue2emu $v" ]
+          [ "$(target/release/ue2-mcp --version)" = "ue2-mcp $v" ]
+          echo "v=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        run: |
+          set -eu
+          name="ue2emu-${{ steps.version.outputs.v }}-linux-${{ matrix.arch }}"
+          out="dist/$name"
+          mkdir -p "$out"
+          cp target/release/ue2emu target/release/ue2-mcp "$out/"
+          cp LICENSE "$out/LICENSE.txt"
+          # The shared libraries the binaries need; winit loads X11, Wayland and xkbcommon at run time.
+          for bin in "$out/ue2emu" "$out/ue2-mcp"; do
+            echo "$(basename "$bin"):"
+            objdump -p "$bin" | awk '/NEEDED/ {print "  " $2}'
+          done
+          ls -l "$out"
+          (cd dist && tar -czf "$name.tar.gz" "$name" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+
+      - name: Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*.tar.gz*
+
+  # The Debian container has no gh; upload from the runner.
+  linux-release:
+    if: github.event_name == 'release'
+    needs: linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          merge-multiple: true
+          path: dist
+
+      - name: Release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber --repo "${{ github.repository }}"

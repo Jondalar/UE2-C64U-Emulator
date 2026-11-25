@@ -48,7 +48,8 @@ brew install jondalar/ue2emu/ue2emu
 ```
 
 To build from source, see [docs/status/install.md](docs/status/install.md). macOS is the main platform. Linux builds
-and passes CI but has not been used in practice. Windows builds in CI; the releases have a Windows zip.
+and passes CI but has not been used in practice; the releases have Linux tarballs (x86-64, aarch64). Windows builds in
+CI; the releases have a Windows zip.
 
 ## Getting started
 
