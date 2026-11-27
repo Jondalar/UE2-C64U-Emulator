@@ -45,6 +45,7 @@ scripts/smoke-all.sh                                      # release build, every
   development package, version 4.7 or newer (Debian 12, Ubuntu 24.04). `--net vmnet-bridged` is macOS only. Releases
   carry `ue2emu-X.Y.Z-linux-x86_64.tar.gz` and `-linux-aarch64.tar.gz`, built on Debian 12 (glibc 2.36 or newer); they
   need the runtime packages `libslirp0`, `libglib2.0-0` and `libasound2` (`libasound2t64` on Ubuntu 24.04).
+  They also need the X11 or Wayland client libraries and libxkbcommon if not run `--headless`.
 - **Windows** (x86-64, MSVC; [S22](../specs/S22-windows.md)): built and tested in CI on `windows-latest`; releases
   carry `ue2emu-X.Y.Z-windows-x86_64.zip` (the two exes, the libslirp DLLs and the VC runtime: unzip and run). Networking
   is `--net user` only; `socket-vmnet` and `vmnet-bridged` need macOS. A guest file name Windows refuses (`CON`,
